@@ -12,6 +12,9 @@ export const MAX_TOTAL = 40 // 总量 ≤40（pruneLedger）
 
 const nowOf = (o) => (typeof o.now === 'function' ? o.now() : Date.now())
 
+/** 预审否决的记忆保留量（只用来挡住「同一句闲聊每轮反复送审」，不参与任何账）。 */
+const MAX_SCREEN_VETO = 60
+
 function normalize(raw) {
   const t = raw && typeof raw === 'object' ? raw : {}
   return {
@@ -19,6 +22,8 @@ function normalize(raw) {
     actions: Array.isArray(t.actions) ? t.actions.filter((n) => Number(n) > 0) : [], // 动作时间戳（预算用）
     ticks: Array.isArray(t.ticks) ? t.ticks.slice(-6) : [], // 最近 6 次心跳（§10.2 面板看节奏）
     lastTick: t.lastTick || null,
+    // 立项前预审否决过的素材（2026-11-05 少爷定）：sourceId + 时间 + 理由
+    screenVetoes: Array.isArray(t.screenVetoes) ? t.screenVetoes.filter((x) => x && x.id).slice(-MAX_SCREEN_VETO) : [],
   }
 }
 
@@ -76,7 +81,7 @@ export function createBook({ file = '', now = () => Date.now(), maxActive = MAX_
     /** 全量（面板用）。 */
     list() { return state.tasks.map((t) => ({ ...t, steps: (t.steps || []).map((s) => ({ ...s })) })) },
     activeCount: () => active().length,
-    meta: () => ({ ticks: [...state.ticks], lastTick: state.lastTick, actions: state.actions.length }),
+    meta: () => ({ ticks: [...state.ticks], lastTick: state.lastTick, actions: state.actions.length, screenVetoes: state.screenVetoes.length }),
 
     /** 记一次心跳（面板「最近 6 次心跳间隔」用）。 */
     heartbeat(outcome = '', at = nowOf({ now })) {
@@ -213,6 +218,22 @@ export function createBook({ file = '', now = () => Date.now(), maxActive = MAX_
       save()
       return { ok: true }
     },
+
+    /**
+     * 记一笔「立项前预审否决」（2026-11-05 少爷定）：只用来让同一句废话别每轮反复送审，不参与账。
+     * @param {{id:string, why?:string, title?:string}} o
+     */
+    screenVeto({ id, why = '', title = '' } = {}) {
+      const sid = String(id || '')
+      if (!sid) return { ok: false }
+      const at = nowOf({ now })
+      state.screenVetoes = [...state.screenVetoes.filter((x) => x.id !== sid), { id: sid, why: String(why).slice(0, 160), title: String(title).slice(0, 80), at }].slice(-MAX_SCREEN_VETO)
+      save()
+      return { ok: true }
+    },
+
+    /** 预审否决过的素材 id 列表（冷却由调用方按时间判，这里只给数据）。 */
+    screenVetoes() { return state.screenVetoes.map((x) => ({ ...x })) },
 
     /** 面板状态汇总。 */
     summary() {

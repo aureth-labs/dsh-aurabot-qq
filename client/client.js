@@ -2315,7 +2315,13 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             showPv && pv ? h('div', { className: 'ab-note', style: { marginTop: 8 } },
               h('div', { className: 'ab-small' }, '素材 ' + pv.materialCount + ' 条 · 候选 ' + pv.candidates.length + ' 个（阈值 ' + pv.thresholds.minCuriosity + '）'),
               pv.candidates.map((c) => h('div', { key: c.title, className: 'ab-small', style: { marginTop: 4 } }, '✓ 「' + c.title + '」 ' + c.score.toFixed(2) + ' — ' + c.reason)),
-              pv.rejected.slice(0, 3).map((x, i) => h('div', { key: i, className: 'ab-small ab-muted', style: { marginTop: 2 } }, '✗ 「' + x.title + '」 ' + x.score.toFixed(2) + ' — ' + x.why))) : null),
+              pv.rejected.slice(0, 3).map((x, i) => h('div', { key: i, className: 'ab-small ab-muted', style: { marginTop: 2 } }, '✗ 「' + x.title + '」 ' + x.score.toFixed(2) + ' — ' + x.why)),
+              // 预审否决（账本里记着的，2026-11-05 少爷定）：让她「想办但被拦下」的东西看得见
+              (s && s.screenVetoes && s.screenVetoes.length)
+                ? h('div', { style: { marginTop: 8, paddingTop: 8, borderTop: '1px dashed var(--ab-line, #dbe5ea)' } },
+                  h('div', { className: 'ab-small ab-muted' }, '立项前预审拦下的（6 小时内不再送审）：'),
+                  s.screenVetoes.slice(-5).reverse().map((v, i) => h('div', { key: i, className: 'ab-small ab-muted', style: { marginTop: 2 } }, '⊘ 「' + v.title + '」 — ' + v.why)))
+                : null) : null),
         ),
         // ---------- 卡 2：她在想的事 ----------
         h(Card, { title: '她在想的事', desc: '进行中 ' + (sm.active || 0) + ' · 办成 ' + (sm.done || 0) + ' · 卡住 ' + (sm.blocked || 0) + ' · 放弃 ' + (sm.abandoned || 0) },

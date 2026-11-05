@@ -21,7 +21,7 @@ import { join } from 'node:path'
 export default {
   id: 'autotelic',
   name: '自驱引擎（实验）',
-  version: '0.4.0',
+  version: '0.4.1',
   description: '给她自己的后台会话与账本：独立 preset、机械审计（哈希链）、好奇判分与立项、L1 分级执行（反思/每日一页/做梦）、Python 与用户模块（P3）、技能库与提案通道（P4）。默认关闭，全关时插件行为与旧版一致。',
   files: ['autotelic/audit.js', 'autotelic/engine.js', 'autotelic/book.js', 'autotelic/runtime.js', 'autotelic/exec.js', 'autotelic/reflect.js', 'autotelic/python.js', 'autotelic/skills.js', 'autotelic/takeover.js'],
   // 独立标签页「自驱引擎」（页面在 client/client.js：TABS/TAB_MODS/NAV_GROUPS/Autotelic 组件）。
@@ -95,6 +95,9 @@ export default {
       personaName: () => '', // 人格名（素材提权重用）；取不到就空着
       ledgerFile: api.dataDir('ledger.json'),
       evalTurn: (prompt, { model, timeoutMs }) => api.core.hub.runSystemTurn('autotelic-eval', '自驱 · 好奇自评', prompt, { timeoutMs, noTools: true, key: 'eval', model }),
+      // 立项前预审（2026-11-05 少爷定）：专门的会话 key（screen），不跟自评/工作间抢同一轮；
+      // 没配便宜模型时用主模型跑（预审是「进待办前」的唯一语义闸，不能因为没配便宜模型就不审）
+      screenTurn: (prompt, opts = {}) => api.core.hub.runSystemTurn('autotelic-screen', '自驱 · 立项前预审', prompt, { ...opts, noTools: true, key: 'screen' }),
       // L1 分级执行器（P2.1）：做事回合 + 非工具路径的审计记账（§4.1 ③）
       act: createExec({
         settings: () => api.settings(),
@@ -387,6 +390,8 @@ export default {
         proposals: (() => { try { return readdirSync(api.dataDir('proposals')).filter((f) => f.endsWith('.md')).length } catch { return 0 } })(),
         sayPending: (() => { try { return (JSON.parse(readFileSync(api.dataDir('say-pending.json'), 'utf8') || '[]') || []).length } catch { return 0 } })(),
         takeover: takeoverView(takeoverBackup()),
+        // 立项前预审否决过的素材（面板「她为什么没立项」用；2026-11-05 少爷定）
+        screenVetoes: runtime.book().screenVetoes().slice(-20),
       }
     })
     // 零副作用预览（验收 2/3）：今天会立什么项、为什么、分数多少、落选原因。
@@ -518,6 +523,7 @@ export default {
 
 function tickMessage(r) {
   if (r.outcome === 'proposed') return `立项了 ${r.added?.length || 0} 个：${(r.added || []).map((a) => `「${a.title}」`).join('、')}`
+  if (r.outcome === 'screened-out') return `这轮想办的全被立项前预审拦了（${(r.vetoed || []).map((v) => `「${v.title}」`).join('、')}）`
   if (r.outcome === 'skipped-busy') return '上一轮还没想完，先不叠'
   if (r.outcome === 'skipped-no-material') return '素材不足，这轮不立项'
   if (r.outcome === 'below-threshold') return '这轮没有够得着阈值的方向（预览里看落选原因）'

@@ -14,12 +14,15 @@
 /** 瞬态失败特征（hub 的后台会话冷却 / 等太久 / 上一轮没结束）。 */
 const TRANSIENT_RE = /冷却|等太久|还没结束/
 
-import { gatherMaterials, proposeTasks, mergeModelScores } from './engine.js'
+import { gatherMaterials, proposeTasks, mergeModelScores, buildScreenPrompt, parseScreenVerdicts, trivialWhy } from './engine.js'
 import { createBook } from './book.js'
 import { inQuietHours } from '../purpose/engine.js'
 import {
   reviewDue, buildDailyPage, dreamDue, distillDream, writeReflection, createJournal, dayKey as dayKeyOf,
 } from './reflect.js'
+
+/** 预审否决的记忆冷却（2026-11-05 少爷定）：同一句废话别每分钟反复送审。默认 6 小时。 */
+const SCREEN_VETO_COOL_MS = 6 * 3600_000
 
 /** 解析 'provider/model' 形式的便宜模型配置（留空 = 关闭自评）。 */
 export function parseEvalModel(v) {
@@ -52,8 +55,10 @@ export function isQuietNow(settings, at = Date.now()) {
  * @param {string} [o.ledgerFile] ledger.json 路径
  * @param {object} [o.log]
  * @param {(prompt:string, opts:object)=>Promise<string>} [o.evalTurn] 便宜模型自评回合（测试注入 fake）
+ * @param {(prompt:string, opts:object)=>Promise<string>} [o.screenTurn] 立项前预审回合；
+ *   没配 evalModel 时用**主模型**跑（默认复用 evalTurn 的接线；测试注入 fake）
  */
-export function createRuntime({ settings, cfg = {}, hub = {}, memoryOf = null, personaName = '', ledgerFile = '', log, evalTurn = null, now = () => Date.now(), act = null, journal = null, auditNote = null, auditStat = null } = {}) {
+export function createRuntime({ settings, cfg = {}, hub = {}, memoryOf = null, personaName = '', ledgerFile = '', log, evalTurn = null, screenTurn = null, now = () => Date.now(), act = null, journal = null, auditNote = null, auditStat = null } = {}) {
   let running = false
   let book = null
   let bookLimits = ''
@@ -138,6 +143,8 @@ export function createRuntime({ settings, cfg = {}, hub = {}, memoryOf = null, p
       activeTasks: tasks.filter((t) => t.status === 'active'),
       recentTitles,
       coolSourceIds,
+      // 预审否决过的素材在冷却期内不再送审（少爷定：同一句废话不许每分钟反复烧模型）
+      screenCoolIds: bk.screenVetoes().filter((x) => at - (x.at || 0) < SCREEN_VETO_COOL_MS).map((x) => x.id),
       minCuriosity: s.minCuriosity,
       maxCandidates: Number(s.maxCandidates) || 3,
       now: at,
@@ -157,6 +164,64 @@ export function createRuntime({ settings, cfg = {}, hub = {}, memoryOf = null, p
       rejected: rejected.slice(0, 12),
       thresholds: { minCuriosity: Number(settings().minCuriosity) },
     }
+  }
+
+  /**
+   * 【立项前预审】（2026-11-05 少爷定）：进待办之前先判值不值得办。
+   * 工作间里她自己的自审靠不住——立项后她看的是自己立的题，天然会给自己找理由
+   * （真机账本：把「我刚安装dsh那天就有」判成「完整整句，非寒暄，值得做」放行了）。
+   * 所以再往前挪一道：**审查员视角、进账本之前**，不值得的直接不立项，记冷却 + 审计。
+   *
+   * 模型不可用（回合失败 / 回包解析不出来）时**不默认放行**：本地启发式能判定的直接否掉，
+   * 判不出来的**押到下一拍**（deferred），宁可晚一轮，也别偷偷放一句废话进待办。
+   * @param {object[]} candidates proposeTasks 的候选
+   * @returns {Promise<{kept:object[], vetoed:object[], deferred:object[]}>}
+   */
+  async function screenCandidates(candidates = []) {
+    if (!candidates.length) return { kept: [], vetoed: [], deferred: [] }
+    const bk = bookFor()
+    const veto = (c, why) => {
+      bk.screenVeto({ id: c.sourceId || c.title, title: c.title, why })
+      auditNote?.({ kind: 'autotelic/screen', tool: 'pre-review', args: { task: c.title }, outcome: why })
+    }
+    const model = parseEvalModel(settings().evalModel)
+    let verdicts = null
+    // 预审这条不能依赖「主人配了便宜模型」——真机上 evalModel 是空的（少爷没配），
+    // 那样预审就永远走本地启发式、等于没装闸。所以没配便宜模型时用**主模型**审：
+    // 代价是每个候选多一次主模型后台回合，但它是「进待办前」的唯一一道语义闸。
+    const turn = typeof screenTurn === 'function' ? screenTurn : (model && typeof evalTurn === 'function' ? evalTurn : null)
+    if (!turn) log?.warn?.('自驱：立项前预审没接线（没有 screenTurn / evalTurn），这轮候选全部押后——检查模块接线')
+    if (turn) {
+      try {
+        const opts = model ? { model, timeoutMs: 60000 } : { timeoutMs: 60000, noTools: true, key: 'screen' }
+        verdicts = parseScreenVerdicts(await turn(buildScreenPrompt(candidates), opts))
+      } catch (error) { log?.debug?.('自驱：立项前预审回合失败，押后或本地判：', error?.message) }
+    }
+    const kept = []
+    const vetoed = []
+    const deferred = []
+    candidates.forEach((c, idx) => {
+      // 模型给了裁决就按裁决；没给（或这条没评到）→ 本地兜底；本地再判不出来就**押后**，
+      // 绝不当成「值得」放行——闸失效等于没装闸（2026-11-05 少爷口径）。
+      let worth = null
+      let why = ''
+      if (verdicts) {
+        const v = verdicts.find((x) => x.i === idx + 1)
+        if (v) { worth = v.worth; why = v.why }
+      }
+      if (worth === null) {
+        const local = trivialWhy(c.title)
+        if (local) { worth = false; why = local }
+      }
+      if (worth === null) { deferred.push({ ...c, why: '预审这轮没给出裁决（模型不可用或没评到），押到下一拍再审' }); return }
+      if (worth) { kept.push(c); return }
+      const reason = why || '预审判这件事不值得办'
+      vetoed.push({ ...c, why: `立项前预审否决：${reason}` })
+      veto(c, reason)
+    })
+    if (vetoed.length) log?.info?.(`自驱：立项前预审否决 ${vetoed.length} 条（${vetoed.map((v) => v.title).join('、')}）`)
+    if (deferred.length) log?.debug?.(`自驱：预审没裁决 ${deferred.length} 条，押到下一拍`)
+    return { kept, vetoed, deferred }
   }
 
   /** 心跳（§4.5）：每分钟判定该不该立项；立项落账。返回 tick 结局（面板心跳节奏用）。 */
@@ -189,15 +254,26 @@ export function createRuntime({ settings, cfg = {}, hub = {}, memoryOf = null, p
             if (m) mergeModelScores(JSON.parse(m[0]), candidates).forEach((c, i) => { if (c && candidates[i]) candidates[i] = c })
           } catch (error) { log?.debug?.('自驱：模型自评失败，用公式分：', error?.message) }
         }
+        // 【立项前预审】（2026-11-05 少爷定）：值不值得办，进账本之前就判掉——
+        // 别等立项了再让她在工作间里自审（自己审自己靠不住，真机已证）。
+        const screened = await screenCandidates(candidates)
+        const kept = screened.kept
         const added = []
-        for (const c of candidates) {
+        if (screened.vetoed.length) detail.vetoed = screened.vetoed.map((v) => ({ title: v.title, why: v.why }))
+        if (screened.deferred.length) detail.deferred = screened.deferred.map((v) => ({ title: v.title, why: v.why }))
+        for (const c of kept) {
           const r = bk.addTask(c)
           if (r.ok) added.push({ id: r.task.id, title: r.task.title, score: r.task.score, reason: r.task.reason })
           else { log?.debug?.(`自驱：候选「${c.title}」没立项：${r.why}`); noWhy = noWhy || r.why }
         }
-        // 场景 7 与「活跃已满」分开标注：预算见底 ≠ 手头满了
-        outcome = added.length ? 'proposed' : (/活跃任务已满/.test(noWhy || '') ? 'active-full' : 'skipped-budget')
-        detail = { added, rejected: rejected.length }
+        // 场景 7 与「活跃已满」分开标注：预算见底 ≠ 手头满了；
+        // 「全被预审否决」与「预审没裁决押后」也各自单独标注，面板能看出卡在哪一道。
+        outcome = added.length
+          ? 'proposed'
+          : (kept.length === 0 && screened.vetoed.length ? 'screened-out'
+            : (kept.length === 0 && screened.deferred.length ? 'screen-deferred'
+              : (/活跃任务已满/.test(noWhy || '') ? 'active-full' : 'skipped-budget')))
+        detail = { ...detail, added, rejected: rejected.length }
       }
       bk.heartbeat(outcome)
       if (outcome === 'proposed') log?.info?.(`自驱：立项 ${detail.added.length} 个（${detail.added.map((a) => a.title).join('、')}）`)

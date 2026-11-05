@@ -61,11 +61,12 @@ export function curiosityOf(material, { recentTitles = [] } = {}) {
  * @param {string[]} o.recentTitles 最近任务方向（含已完结，判新鲜度）
  * @param {number} o.minCuriosity 阈值（ext.autotelic.minCuriosity）
  * @param {number} o.maxCandidates 最多返回几个候选
+ * @param {string[]} [o.screenCoolIds] 立项前预审否决过的素材 id（冷却期内不再反复送审，2026-11-05 少爷定）
  * @returns {{candidates:object[], rejected:object[], lastOutcome:string}}
  *   candidate = { title, reason, score, parts, todos:[{desc, level:'L0'}], sourceId }
  *   rejected  = { title, score, why }（面板要能看到分数与落选原因，验收场景 3）
  */
-export function proposeTasks({ materials = [], activeTasks = [], recentTitles = [], coolSourceIds = [], minCuriosity = 0.55, maxCandidates = 3, now = Date.now() } = {}) {
+export function proposeTasks({ materials = [], activeTasks = [], recentTitles = [], coolSourceIds = [], screenCoolIds = [], minCuriosity = 0.55, maxCandidates = 3, now = Date.now() } = {}) {
   if (!Array.isArray(materials) || !materials.length) return { candidates: [], rejected: [], lastOutcome: 'skipped-no-material' }
   const scored = materials
     .map((m) => ({ m, c: curiosityOf(m, { recentTitles }) }))
@@ -76,6 +77,8 @@ export function proposeTasks({ materials = [], activeTasks = [], recentTitles = 
   // 同源硬身份（2026-11-05 修「重复立项饿死引擎」）：标题是截断片段，相似度不稳定，sourceId 才可靠
   const activeSourceIds = new Set(activeTasks.map((t) => String(t.sourceId || '')).filter(Boolean))
   const coolSet = new Set(coolSourceIds.map(String))
+  // 预审否决过的素材（2026-11-05 少爷定）：同一条不值得办的话，别每分钟反复送审烧模型。
+  const screenSet = new Set(screenCoolIds.map(String))
   for (const { m, c } of scored) {
     const title = c.topic || String(m.text || '').slice(0, 40)
     if (!title || title.length < 2) { rejected.push({ title, score: c.score, why: '素材太短，立不出方向' }); continue }
@@ -88,6 +91,7 @@ export function proposeTasks({ materials = [], activeTasks = [], recentTitles = 
     const sid = String(m.id || '')
     if (sid && activeSourceIds.has(sid)) { rejected.push({ title, score: c.score, why: '同源素材已有进行中的任务' }); continue }
     if (sid && coolSet.has(sid)) { rejected.push({ title, score: c.score, why: '同源素材最近做过（冷却中），先换个方向' }); continue }
+    if (sid && screenSet.has(sid)) { rejected.push({ title, score: c.score, why: '同源素材立项前预审已否决（不值得办），冷却中' }); continue }
     if (candidates.some((x) => textSimilarity(x.title, title) > 0.6)) { rejected.push({ title, score: c.score, why: '和本轮别的候选重复' }); continue }
     if (c.score < minCuriosity) { rejected.push({ title, score: c.score, why: `好奇分 ${c.score.toFixed(2)} < 阈值 ${Number(minCuriosity).toFixed(2)}` }); continue }
     candidates.push({
@@ -139,6 +143,54 @@ export function mergeModelScores(arr, candidates) {
     if (model == null || !Number.isFinite(model)) return c
     return { ...c, score: Number((0.6 * c.score + 0.4 * model).toFixed(3)), modelScore: model }
   })
+}
+
+/**
+ * 【立项前预审】（2026-11-05 少爷定）——进待办之前先判「这事到底值不值得办」。
+ * 真机实证：只靠工作间里她自己再自审一遍不可靠——立项后她看的是自己立的题，
+ * 天然会给自己找理由（账本里「我刚安装dsh那天就有」的自审原话就是
+ * 「这句是完整整句（主语/过去动作/dsh/时间锚），非寒暄，值得做」，于是放行了）。
+ * 所以闸门挪到**进账本之前**，并且用「审查员」视角（不是提议者）来判。
+ */
+export function buildScreenPrompt(candidates = []) {
+  return [
+    '你是审查员，不是提议者。下面几条是自驱引擎想替她立的事——一旦立项，她就要花时间和算力去办。',
+    '',
+    '逐条判断：这到底值不值得她花时间亲手办？',
+    '- 值得：有可查证的内容、能产出一条她自己的判断、跟主人或她自己的行为有关。',
+    '- 不值得：寒暄、称呼、闲聊应答、撒娇、别人随口一句没有实义的话、',
+    '  只关于「我们怎么说话 / 你叫什么」这类对话本身的评价、超短碎片、重复。',
+    '- 拿不准就当不值得。宁可漏一件，也别让她去办一句废话。',
+    '',
+    '只输出 JSON 数组，不要解释：[{"i":1,"worth":true},{"i":2,"worth":false,"why":"只是一句闲聊应答"}]',
+    '',
+    ...candidates.map((c, i) => `${i + 1}. 「${c.title}」　立项理由：${c.reason || '（无）'}`),
+  ].join('\n')
+}
+
+/** 预审回包解析：认 i + worth；解析不出来返回 null（调用方走本地兜底，不默认放行）。 */
+export function parseScreenVerdicts(raw) {
+  const text = String(raw || '')
+  const m = text.match(/\[[\s\S]*\]/)
+  if (!m) return null
+  try {
+    const arr = JSON.parse(m[0])
+    if (!Array.isArray(arr)) return null
+    return arr
+      .map((x) => ({ i: Number(x?.i) || 0, worth: x?.worth === true, why: String(x?.why || '').slice(0, 160) }))
+      .filter((x) => x.i > 0)
+  } catch { return null }
+}
+
+/** 本地兜底（审查回合不可用 / 回包是垃圾时）：「嗯嗯好的」这类纯应答直接判不值得。 */
+export function trivialWhy(text) {
+  const t = String(text || '').trim()
+  if (!t) return '空素材'
+  const plain = t.replace(/[，。！？、~～.,!?\s]/g, '')
+  if (plain.length < 6) return `去掉标点只剩 ${plain.length} 字，没有可办的内容`
+  if (/^(嗯|哦|啊|哈|呵|好|是|对|行|在吗|晚安|早安|早上好|你好|谢谢|收到|拜拜|再见|么么|啾|汪|喵)/.test(t)) return '寒暄/应答，没有可办的内容'
+  if (/^[^，。！？]{0,8}(吗|呢|吧)$/.test(t)) return '短问答，没有可办的内容'
+  return ''
 }
 
 /** 素材采集（§3 P1.1：照 purpose 的写法抄，放在 autotelic 里，不依赖未导出的 purpose 内部函数）。 */

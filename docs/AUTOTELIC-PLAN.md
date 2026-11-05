@@ -259,6 +259,7 @@ level 仍是 `social`，所以 `buildTools` 照常调用（`566`：只跳过 `ch
 | 1.4 | 死循环熔断：`(tool,args,observation)` 指纹，同指纹 2 次即 `abandoned` |
 | 1.5 | `/autotelic/preview`：零副作用预览（今天会立什么项、为什么、分数多少） |
 | 1.6 | 面板：任务列表 + 每条的理由（`reason` 必填，防拍脑袋） |
+| 1.7 | **立项前预审**（2026-11-05 少爷定）：候选进账本之前先用「审查员视角」判一次值不值得办，不值得直接不立项（记冷却 + 审计 `autotelic/screen`）。常开、无开关 |
 
 **⚠️ 1.1 不能指望「复用 `collectMaterials` 就完事」**（2026-11-04 审查，已核实）：
 
@@ -610,6 +611,7 @@ L2   跑白名单外的 shell 命令 / 调 onebot / 发消息      → 拒绝（
 | 1 | 默认关（`enabled:false`） | 模块不做任何 IO；purpose/speakup/出站治理**逐项不变** |
 | 2 | 素材不足 | 不立项，`lastTick.outcome='skipped-no-material'` |
 | 3 | 好奇分 < 阈值 | 不立项，素材留池，面板可见分数与落选原因 |
+| 3b | **立项前预审否决** | 候选进账本之前由「审查员视角」判「值不值得办」；否决的不立项，`lastTick.outcome='screened-out'`，面板可见 `vetoed` 明细，同一 `sourceId` 6 小时内不再送审 |
 | 4 | 立项 | 账本出现 task，`reason` 非空，至少 1 条 todo |
 | 5 | 单步失败 2 次 | 写反思，任务 `blocked`，不无限重试 |
 | 6 | 死循环 | 同指纹 2 次 → `abandoned`，面板可见熔断原因 |

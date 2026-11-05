@@ -9,7 +9,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { proposeTasks, buildTodos } from '../src/autotelic/engine.js'
+import { proposeTasks, buildTodos, buildScreenPrompt, parseScreenVerdicts, trivialWhy } from '../src/autotelic/engine.js'
 import { createBook } from '../src/autotelic/book.js'
 import { createRuntime } from '../src/autotelic/runtime.js'
 import { buildActPrompt, parseActMemo } from '../src/autotelic/exec.js'
@@ -177,6 +177,148 @@ test('进工作间自审不通过 → 任务直接 abandoned（不算失败、�
   assert.match(t3.why, /自审不通过/, '关掉原因写清楚')
   assert.ok(closed.some((e) => e.kind === 'autotelic/abandon'), '自审否决要进审计')
   assert.equal(saved.actions.length, 1, '这一轮确实起了回合，占一次动作预算')
+})
+
+// —— 立项前预审（2026-11-05 少爷定）：值不值得办，进待办之前就判掉 ——
+// 真机证据：只靠工作间自审不灵——「我刚安装dsh那天就有」被自审判成
+// 「完整整句（主语/过去动作/dsh/时间锚），非寒暄，值得做」放行了，任务跑完记 done。
+// 根因：说这话的是提议者自己，不是审查员；且闸在立项之后（已经占了坑、烧了预算）。
+
+test('预审提示词：审查员视角 + 明确「拿不准当不值得」+ 要 JSON 裁决', () => {
+  const prompt = buildScreenPrompt([
+    { title: '我刚安装dsh那天就有', reason: '群友说，戳中 install 需要' },
+    { title: '学一下算命的流派划分', reason: '好奇' },
+  ])
+  assert.match(prompt, /审查员，不是提议者/, '必须是第三方视角，不能让她自己审自己')
+  assert.match(prompt, /值得她花时间亲手办/, '判的就是值不值得办')
+  assert.match(prompt, /拿不准就当不值得/, '默认偏严')
+  assert.match(prompt, /worth/, '要结构化裁决，别只要一段话')
+  assert.match(prompt, /我刚安装dsh那天就有/, '候选要带进去')
+  assert.match(prompt, /学一下算命的流派/, '第二个候选也要带')
+})
+
+test('预审回包解析：认 i/worth/why；没数组或垃圾返回 null（不默认放行）', () => {
+  const ok = parseScreenVerdicts('[{"i":1,"worth":true},{"i":2,"worth":false,"why":"只是闲聊应答"}]')
+  assert.equal(ok.length, 2)
+  assert.equal(ok[0].worth, true)
+  assert.equal(ok[1].worth, false)
+  assert.match(ok[1].why, /闲聊/)
+  assert.equal(parseScreenVerdicts('我觉得都不错'), null, '没有 JSON 数组 = 没裁决')
+  assert.equal(parseScreenVerdicts('[bad json'), null)
+  assert.equal(parseScreenVerdicts('[{"worth":true}]').length, 0, '没有 i 定位不了，丢掉')
+})
+
+test('本地兜底：纯应答/寒暄/超短碎片判不值得；有实义内容的放行', () => {
+  for (const t of ['嗯嗯好的', '早上好', '晚安', '在吗', '哈哈', '嘻嘻', '']) {
+    assert.ok(trivialWhy(t).length > 0, `「${t}」该判不值得，实得空（放行了）`)
+  }
+  assert.equal(trivialWhy('学一下算命的流派划分'), '', '有内容的方向不该被本地误拦')
+  assert.equal(trivialWhy('我刚安装dsh那天就有'), '', '本地启发式判不出语义，交给模型（这是设计口径）')
+})
+
+/** 造一个只关心「预审」的运行时（allowAct=false，tick 不推进任务）。
+ *  预审走独立注入的 screenTurn（真机上没配 evalModel 时也用主模型，不能用 evalTurn 分流糊弄）。 */
+function mkScreenRuntime(t, { screenReply, prefix = {} } = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'autotelic-screen-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const ledgerFile = join(root, 'ledger.json')
+  const notes = []
+  let calls = 0
+  // 素材时间戳必须固定：素材 id = `qq:<chatId>:<时间戳>`，每轮重新算 Date.now() 会让
+  // 同一句话每轮的 sourceId 都变，预审冷却就永远命不中（真机上是固定聊天流水，不会这样）
+  const msgAt = Date.now() - 60_000
+  const rt = createRuntime({
+    settings: () => ({ ...BASE_SETTINGS, allowAct: false, ...prefix }),
+    hub: {
+      chatLogDays: () => ['2026-11-05'],
+      chatLogOf: () => [{ chatId: 'group:1130575035', who: 'member', uid: '1215734464', text: '我刚安装dsh那天就有', t: msgAt }],
+    },
+    cfg: { ownerQQ: '749830684' },
+    memoryOf: () => ({ list: () => [] }),
+    ledgerFile,
+    auditNote: (e) => notes.push(e),
+    screenTurn: async (prompt, opts) => {
+      calls += 1
+      return typeof screenReply === 'function' ? screenReply(prompt, opts) : screenReply
+    },
+    log: { info: () => {}, warn: () => {}, debug: () => {} },
+  })
+  return { rt, ledgerFile, notes, calls: () => calls }
+}
+
+test('预审判不值得 → 不立项（一个都不进待办），记冷却 + 进审计（修「这句也立项」）', async (t) => {
+  const { rt, ledgerFile, notes } = mkScreenRuntime(t, { screenReply: '[{"i":1,"worth":false,"why":"群友随口一句，没有可办的内容"}]', prefix: { minCuriosity: 0.1 } })
+  const r = await rt.tick()
+  assert.equal(r.outcome, 'screened-out', `全被拦住要标 screened-out，实得 ${r.outcome}`)
+  const saved = JSON.parse(readFileSync(ledgerFile, 'utf8'))
+  assert.equal(saved.tasks.length, 0, '预审否决的东西一个都不许进待办')
+  assert.equal(saved.screenVetoes.length, 1, '否决要记下来（挡重复送审）')
+  assert.match(saved.screenVetoes[0].why, /随口/, '理由要存')
+  assert.ok(notes.some((e) => e.kind === 'autotelic/screen'), '预审否决要进审计')
+  assert.equal(r.vetoed.length, 1, 'tick 回包要带否决明细（面板看得见）')
+})
+
+test('预审说值得 → 照常立项（别把闸做成一律拦）', async (t) => {
+  const { rt } = mkScreenRuntime(t, { screenReply: '[{"i":1,"worth":true}]', prefix: { minCuriosity: 0.1 } })
+  const r = await rt.tick()
+  assert.equal(r.outcome, 'proposed')
+  assert.equal(rt.book().list().length, 1)
+})
+
+test('预审冷却：同一条素材否决后不再每轮反复送审（省模型调用）', async (t) => {
+  const { rt, calls } = mkScreenRuntime(t, { screenReply: '[{"i":1,"worth":false,"why":"没有可办的内容"}]', prefix: { minCuriosity: 0.1 } })
+  await rt.tick() // 第一次：真送审 + 否决
+  assert.equal(calls(), 1, '第一轮要真调一次模型')
+  const r2 = await rt.tick() // 第二轮：同源素材被冷却挡住，连候选都不生成
+  assert.notEqual(r2.outcome, 'screened-out', `冷却后不该再走预审，实得 ${r2.outcome}`)
+  assert.equal(calls(), 1, '第二轮不许再调模型（否决已记冷却）')
+})
+
+test('预审回合失败 → 不偷偷放行：本地判不出的押到下一拍，绝不进待办', async (t) => {
+  const { rt, ledgerFile } = mkScreenRuntime(t, { screenReply: () => { throw new Error('模型炸了') }, prefix: { minCuriosity: 0.1 } })
+  const r = await rt.tick()
+  // 「我刚安装dsh那天就有」本地启发式判不出语义（不是明显废话）→ 押后，这一轮不立项
+  assert.equal(r.outcome, 'screen-deferred', `没裁决就要押后，实得 ${r.outcome}`)
+  const saved = JSON.parse(readFileSync(ledgerFile, 'utf8'))
+  assert.equal(saved.tasks.length, 0, '没审过的绝不许偷偷进待办（闸失效=没装闸）')
+  assert.equal(r.deferred.length, 1, 'tick 回包要带押后明细')
+})
+
+test('预审回合失败但本地能判（纯应答）→ 直接否掉，不必押后', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'autotelic-screen3-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const rt = createRuntime({
+    settings: () => ({ ...BASE_SETTINGS, allowAct: false, minCuriosity: 0.1 }),
+    hub: { chatLogDays: () => ['2026-11-05'], chatLogOf: () => [{ chatId: 'private:749830684', who: 'owner', uid: '749830684', text: '早安呀，今天天气真好呢', t: Date.now() - 60_000 }] },
+    cfg: { ownerQQ: '749830684' },
+    memoryOf: () => ({ list: () => [] }),
+    ledgerFile: join(root, 'ledger.json'),
+    screenTurn: async () => { throw new Error('模型炸了') },
+    log: { info: () => {}, warn: () => {}, debug: () => {} },
+  })
+  const r = await rt.tick()
+  assert.equal(r.outcome, 'screened-out', `纯应答本地就能否，实得 ${r.outcome}`)
+  assert.equal(rt.book().list().length, 0)
+})
+
+test('没配 evalModel（真机现状）也照样走预审：闸不能因为「没配便宜模型」就失效', async (t) => {
+  const seen = []
+  const root = mkdtempSync(join(tmpdir(), 'autotelic-screen2-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const rt = createRuntime({
+    settings: () => ({ ...BASE_SETTINGS, allowAct: false, minCuriosity: 0.1 }), // evalModel 留空＝真机口径
+    hub: { chatLogDays: () => ['2026-11-05'], chatLogOf: () => [{ chatId: 'group:1130575035', who: 'member', uid: '1215734464', text: '我刚安装dsh那天就有', t: Date.now() - 60_000 }] },
+    cfg: { ownerQQ: '749830684' },
+    memoryOf: () => ({ list: () => [] }),
+    ledgerFile: join(root, 'ledger.json'),
+    screenTurn: async (prompt, opts) => { seen.push(opts); return '[{"i":1,"worth":false,"why":"群友随口一句"}]' },
+    log: { info: () => {}, warn: () => {}, debug: () => {} },
+  })
+  const r = await rt.tick()
+  assert.equal(seen.length, 1, 'evalModel 空着，预审也必须真跑一次')
+  assert.equal(seen[0].model, undefined, '没配便宜模型时用主模型（不指定 model）')
+  assert.equal(r.outcome, 'screened-out')
+  assert.equal(rt.book().list().length, 0, '这句不进待办')
 })
 
 // —— 附带：buildTodos 的产物能被 addTask 原样落账 ——

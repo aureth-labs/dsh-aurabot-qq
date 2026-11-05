@@ -189,7 +189,7 @@ const fakeSettings = (over = {}) => ({
   ...over,
 })
 
-function mkRuntime(t, { settings = {}, act, memory, auditNote, auditStat, evalTurn } = {}) {
+function mkRuntime(t, { settings = {}, act, memory, auditNote, auditStat, evalTurn, screenTurn } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'aurabot-p2-'))
   const ledgerFile = join(root, 'ledger.json')
   const logs = []
@@ -201,6 +201,9 @@ function mkRuntime(t, { settings = {}, act, memory, auditNote, auditStat, evalTu
     memoryOf: () => memStore,
     ledgerFile,
     evalTurn: evalTurn || null,
+    // 立项前预审（2026-11-05 少爷定）：生产口径是模块壳必接线，测试默认给「一律值得」，
+    // 只关心其它行为的用例不必每处自己造；要测预审本身请显式传 screenTurn。
+    screenTurn: screenTurn === undefined ? async () => '[{"i":1,"worth":true}]' : screenTurn,
     act,
     journal: createJournal(root),
     auditNote,
