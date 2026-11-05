@@ -432,8 +432,11 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
           const cred = friend ? null : engineCredential() // 朋友各有各的账本，仍走引擎自己直投
           const deliverOpts = { userText: MOOD_PREFIX }
           if (cred) { deliverOpts.enginePolicy = cred; deliverOpts.enginePolicyName = 'purpose' }
+          // 不带 own:true：这条是别处（目的回合）发的，hub 只把「实际成功发出」的文本记进 saidElsewhere，
+          // 主人在 QQ 私聊回复时补进她的上下文（#133 同款桥接；#211 review 后改为按真发出结果记）。
           const r = await hub.deliver(chatIdOf(cfg, friend), text, deliverOpts)
-          outcome = r && typeof r === 'object' ? 'sent' : 'silent' // deliver 吞错只返回 undefined / {missedAt}
+          // 真发出去过才算 sent：deliver 返回 {sent, failed}，sent 空 = 一条都没发出去（吞错/拦截/dry-run）
+          outcome = r && typeof r === 'object' && String(r.sent || '').trim() ? 'sent' : 'silent'
         } catch (error) {
           outcome = 'delivery-failed'
           log.warn?.('目的：投递失败：', error?.message)

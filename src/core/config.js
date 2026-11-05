@@ -106,6 +106,11 @@ export const DEFAULTS = {
     enabled: true,
     faces: true, // 回复里能夹 QQ 自带的小黄脸（<face:名字>）
     autoChance: 0.35, // 文字回复自动配一张表情的概率
+    // 主动给对方的原消息贴 QQ 表情：这是新行为，默认关；开了之后按自己的概率算，
+    // 不从 autoChance 取值（两者是不同动作，隐式联动会让升级后的人莫名其妙被贴表情，#216 review）
+    react: false, // 主动贴表情总开关，默认关
+    reactChance: 0.15, // 主动贴表情的概率，独立默认值
+    reactMaxPerHour: 10, // 每个会话每小时最多主动贴几次
     collect: true, // 偷表情
     // 怎么偷：auto = 看到就收（默认，保持原行为）；ask = 她挑（先记着，喜欢才凭编号收）；owner = 只听主人的（只有主人语境下才提示/允许收）
     collectMode: 'auto',
@@ -238,7 +243,11 @@ export const DEFAULTS = {
     awakeTo: 23,
   },
   mood: { enabled: true, halfLifeHours: 3, judge: false, base: 60 }, // base：心情基线（0~100 里算「平常」的那个值）；judge：每轮聊完用模型判一次心情（更准，每轮多一次很短的调用）；关着用关键词
-  chat: { seedHistory: false, seedHistoryCount: 20 }, // seedHistory：新会话第一次说话时先补最近几条历史（默认关）
+  // seedHistory：新会话第一次说话时先补最近几条历史（默认关）
+  // everyStep：一轮里她分几段说就发几条（默认关 = 只发最后一段）。私聊多是闲聊，连着说的几句可能是不同话题，
+  //   只发最后一段会让人以为她只回了一个话题；干活时前面多是工具调用前后的过程话，开着会显得啰嗦
+  // rescueFromThinking：整轮一段正文都没写时，从思考里捞出她自己定稿的那段（默认关，捞不到就不发）
+  chat: { seedHistory: false, seedHistoryCount: 20, everyStep: false, rescueFromThinking: false },
   memory: {
     enabled: true, recallCount: 6, recallMode: 'always', recallTriggers: ['上次', '上回', '之前', '以前', '那天', '那次', '还记得', '记不记得', '说过', '提过', '答应', '约好', '那时候'],
     dailyConsolidate: true, consolidateTimes: ['04:00', '16:00'], keepChatlogDays: 7, keepChatlogSet: false, mergeGroups: false, compress: true, compressAfterDays: 14, instantCommands: true, groupMemory: true, searchRrf: true,
@@ -406,6 +415,10 @@ export function normalize(raw) {
   c.voice.http.body = bodyText(c.voice.http.body)
   c.voice.http.sampleRate = num(c.voice.http.sampleRate, 24000, 8000, 48000)
   c.stickers.autoChance = num(c.stickers.autoChance, 0.35, 0, 1)
+  // 主动贴表情：自己的概率（默认 0.15），不从 autoChance 取值；老配置里存成 null 的按默认算
+  c.stickers.reactChance = num(c.stickers.reactChance ?? 0.15, 0.15, 0, 1)
+  c.stickers.reactMaxPerHour = num(c.stickers.reactMaxPerHour, 10, 0, BIG)
+  c.stickers.react = bool(c.stickers.react, false)
   c.stickers.faces = c.stickers.faces !== false
   c.stickers.collectMode = ['ask', 'auto', 'owner'].includes(c.stickers.collectMode) ? c.stickers.collectMode : 'auto'
   c.stickers.maxPerHour = num(c.stickers.maxPerHour, 20, 0, BIG)
@@ -542,6 +555,8 @@ export function normalize(raw) {
   c.chat = c.chat || {}
   c.chat.seedHistory = bool(c.chat.seedHistory, false)
   c.chat.seedHistoryCount = num(c.chat.seedHistoryCount, 20, 1, BIG)
+  c.chat.everyStep = bool(c.chat.everyStep, false)
+  c.chat.rescueFromThinking = bool(c.chat.rescueFromThinking, false)
   c.memory.recallCount = num(c.memory.recallCount, 6, 0, BIG)
   c.memory.recallMode = c.memory.recallMode === 'trigger' ? 'trigger' : 'always'
   c.memory.recallTriggers = [...new Set((Array.isArray(c.memory.recallTriggers) ? c.memory.recallTriggers : String(c.memory.recallTriggers || '').split(/[\n,，;；]+/)).filter((x) => typeof x === 'string').map((x) => x.trim().slice(0, 40)).filter(Boolean))].slice(0, 100)
