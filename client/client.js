@@ -575,11 +575,14 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     function Row({ label, hint, children }) {
       return h('div', { className: 'ab-row' }, h('div', { className: 'ab-label' }, h('b', null, label), hint ? h('small', null, hint) : null), h('div', { className: 'ab-ctl' }, children))
     }
-    function Card({ title, desc, icon, right, children, className }) {
-      return h('div', { className: cx('ab-card', className) },
-        title ? h('div', { className: 'ab-flex', style: { marginBottom: desc ? 0 : 10 } }, h('h3', null, icon || null, title), h('div', { className: 'ab-spacer' }), right || null) : null,
-        desc ? h('p', { className: 'ab-desc' }, desc) : null,
-        children)
+    function Card({ title, desc, icon, right, children, className, collapsible, defaultOpen = true }) {
+      const [open, setOpen] = useState(!collapsible || defaultOpen)
+      const head = title ? h('div', { className: 'ab-flex', style: { marginBottom: (desc && open) ? 0 : 10 } },
+        h('h3', { onClick: collapsible ? () => setOpen((v) => !v) : undefined, style: collapsible ? { cursor: 'pointer', userSelect: 'none' } : undefined },
+          icon || null, title,
+          collapsible ? h('span', { className: 'ab-muted', style: { marginLeft: 6, fontSize: 11 } }, open ? '▾ 收起' : '▸ 展开') : null),
+        h('div', { className: 'ab-spacer' }), right || null) : null
+      return h('div', { className: cx('ab-card', className) }, head, desc && open ? h('p', { className: 'ab-desc' }, desc) : null, open ? children : null)
     }
     function Btn({ kind, small, onClick, disabled, children, title }) {
       const [busy, setBusy] = useState(false)
@@ -4142,6 +4145,13 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       }
       return h('div', { className: 'ab-grid' },
         progBar,
+        // 市场地址是低频设置：默认折叠，点标题才展开，别占着市场上面一整块
+        h(Card, { title: '模块市场地址', collapsible: true, defaultOpen: false, desc: '换成你自己的索引源——自建索引、国内镜像（如 gitee / ghproxy 中转）、内网部署都行。留空 = 用内置的 GitHub 地址。换好后市场会立即按新地址刷新。' },
+          h(Row, { label: '索引地址', hint: '完整 http(s) 链接，指向 index.json。默认：' + (regDef || 'GitHub 仓库') },
+            h('input', { className: 'ab-input', style: { width: 'min(420px, 100%)' }, value: regUrl, placeholder: 'https://…/registry/index.json', onChange: (e) => setRegUrl(e.target.value) })),
+          h('div', { className: 'ab-flex', style: { marginTop: 8 } },
+            h(Btn, { small: true, disabled: busy === 'reg', onClick: saveReg }, busy === 'reg' ? '保存中…' : '保存地址'),
+            h(Btn, { small: true, disabled: busy === 'reg' || !regUrl, onClick: () => { setRegUrl(''); saveReg() } }, '恢复内置 GitHub 地址'))),
         h(Card, { title: '模块市场', desc: '给ta装更多本事。模块由社区提供、维护者审核后上架；它们和插件在同一进程运行，能接触账号配置，装之前看清下面列的能力。下载次数来自模块库 GitHub Releases（更新也算一次），只是热度参考。', right: h(Btn, { small: true, kind: 'ghost', onClick: () => load(true) }, '刷新') },
           h('div', { className: 'ab-flex' },
             h('input', { className: 'ab-input', placeholder: '搜模块', value: q, onChange: (e) => setQ(e.target.value) }),
@@ -4150,12 +4160,6 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           cats.length > 1 ? h('div', { className: 'ab-flex', style: { marginTop: 10 } }, [''].concat(cats).map((c) => h('button', { key: c || 'any', type: 'button', className: cx('ab-chip', cat === c && 'on'), onClick: () => setCat(c) }, c ? CATEGORY_LABEL[c] || c : '全部分类'))) : null,
           stats.failed && list.length ? h('div', { className: 'ab-small ab-muted', style: { marginTop: 8 } }, '这次没读到下载次数（GitHub 接口连不上或额度用完了），先按上架顺序排。') : null,
           ((data && data.revoked) || []).map((r) => h('div', { key: r.id, className: 'ab-note err', style: { marginTop: 10 } }, '「' + r.id + '」' + r.version + ' 已撤回：' + r.reason + '。建议关闭或卸载。'))),
-        h(Card, { title: '模块市场地址', desc: '换成你自己的索引源——自建索引、国内镜像（如 gitee / ghproxy 中转）、内网部署都行。留空 = 用内置的 GitHub 地址。换好后市场会立即按新地址刷新。' },
-          h(Row, { label: '索引地址', hint: '完整 http(s) 链接，指向 index.json。默认：' + (regDef || 'GitHub 仓库') },
-            h('input', { className: 'ab-input', style: { width: 'min(420px, 100%)' }, value: regUrl, placeholder: 'https://…/registry/index.json', onChange: (e) => setRegUrl(e.target.value) })),
-          h('div', { className: 'ab-flex', style: { marginTop: 8 } },
-            h(Btn, { small: true, disabled: busy === 'reg', onClick: saveReg }, busy === 'reg' ? '保存中…' : '保存地址'),
-            h(Btn, { small: true, disabled: busy === 'reg' || !regUrl, onClick: () => { setRegUrl(''); saveReg() } }, '恢复内置 GitHub 地址'))),
         !data ? h(Empty, { icon: '⏳', text: '加载中…' }) : null,
         data && data.ok === false ? h('div', { className: 'ab-note warn' }, '市场打不开：' + data.message) : null,
         data && data.ok !== false && !shown.length ? h(Empty, { icon: '🐟', text: list.length ? '没有符合条件的模块' : '市场里还没有模块' }) : null,
