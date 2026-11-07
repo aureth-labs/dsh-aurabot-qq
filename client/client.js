@@ -2765,7 +2765,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       if (!p) return null
       const s = p.status || {}
       const drives = Object.entries(s.drives || {}).sort((a, b) => (b[1] || 0) - (a[1] || 0)).slice(0, 5)
-      const moods = Object.entries(s.moods || {}).filter(([, v]) => (v || 0) > 0.02).sort((a, b) => (b[1] || 0) - (a[1] || 0))
+      const moods = Object.keys(EMOTION_LABELS).map((k) => [k, Number((s.moods || {})[k]) || 0]).sort((a, b) => (b[1] || 0) - (a[1] || 0))
       const goals = (s.goals || []).slice(0, 3)
       const chain = [
         ['素材', s.materialCount], ['观察', s.observationCount], ['目标假设', s.goalCount], ['候选', s.candidateCount], ['今日', (s.countToday ?? p.count) + '/' + (s.dailyMax ?? p.dailyMax ?? '?')],
@@ -2787,9 +2787,10 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             h('span', { className: 'ab-small', style: { width: 42, flexShrink: 0 } }, DRIVE_LABELS[k] || k),
             h('div', { className: 'ab-mood', style: { flex: 1 } }, h('i', { style: { width: Math.round((v || 0) * 100) + '%' } })),
             h('span', { className: 'ab-muted ab-small', style: { width: 34, textAlign: 'right' } }, Math.round((v || 0) * 100) + '%'))))) : null,
-        // 心情进度条：与驱力同款的每维一条（数据是引擎里的心情向量，随时间衰减、被最近行动抬升）
-        p.enabled && moods.length ? h(Row, { label: '心情', hint: '各种心情现在的强弱；会随时间淡去，最近一次行动的心情最明显' },
-          h('div', { style: { flex: 1, minWidth: 180 } }, moods.map(([k, v]) => h('div', { key: k, className: 'ab-flex', style: { marginBottom: 3 } },
+        // 心情进度条：与驱力同款的每维一条（数据是引擎里的心情向量，随时间衰减、被最近行动抬升）。
+        // 十种情绪全部固定显示，0% 也占一条——一眼看清「现在有什么心情、没什么心情」。
+        p.enabled ? h(Row, { label: '心情', hint: '各种心情现在的强弱；会随时间淡去，最近一次行动的心情最明显' },
+          h('div', { style: { flex: 1, minWidth: 180 } }, moods.map(([k, v]) => h('div', { key: k, className: 'ab-flex', style: { marginBottom: 3, opacity: v > 0.02 ? 1 : 0.45 } },
             h('span', { className: 'ab-small', style: { width: 42, flexShrink: 0 } }, (EMOTION_ICONS[k] || '💭') + (EMOTION_LABELS[k] || k)),
             h('div', { className: 'ab-mood', style: { flex: 1 } }, h('i', { style: { width: Math.round((v || 0) * 100) + '%' } })),
             h('span', { className: 'ab-muted ab-small', style: { width: 34, textAlign: 'right' } }, Math.round((v || 0) * 100) + '%'))))) : null,
