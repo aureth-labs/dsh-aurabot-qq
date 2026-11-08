@@ -393,6 +393,7 @@ export function normalize(raw) {
   g.interjectChance = num(g.interjectChance, 0.15, 0, 1)
   g.cooldownSec = num(g.cooldownSec, 90, 0, BIG)
   g.maxPerHour = num(g.maxPerHour, 6, 0, BIG)
+  g.mustMaxPerHour = num(g.mustMaxPerHour, 100, 0, BIG)
   g.minRecentMessages = num(g.minRecentMessages, 3, 0, BIG)
   g.activeWindowSec = num(g.activeWindowSec, 300, 1, BIG)
   if (!Array.isArray(g.quietHours) || g.quietHours.length !== 2) g.quietHours = DEFAULT_GROUP_POLICY.quietHours

@@ -100,6 +100,7 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
   const quoteCache = new Map() // chatId|replyId → { ok, who, uid, text, images, stickers, records, isBot }  引用消息解析缓存
   const groupInterjects = new Map() // groupId → [t]  她主动开口（插话、接话）的时间
   const groupSaid = new Map() // groupId → [t]  她每次在群里说话的时间（刹车用）
+  const groupMusts = new Map() // groupId → [t]  她因被 @/叫到而必回的时间（每小时必回上限用；主人触发的不计入）
   const groupRefs = new Map() // groupId → { 编号: { mid, uid } }  上一段提示词里的编号，引用回复用
   const groupEngaged = new Map() // groupId → 加入话题到什么时候（毫秒）
   const groupEngagedRun = new Map() // groupId → 没人叫她、连着接了几次话
@@ -1818,6 +1819,7 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
         recentTimes: (groupBuf.get(msg.groupId) || []).map((x) => x.t),
         interjectTimes: groupInterjects.get(msg.groupId) || [],
         botReplyTimes: groupSaid.get(msg.groupId) || [],
+        mustTimes: groupMusts.get(msg.groupId) || [],
       })
       if (hooks?.groupDecide) {
         try {
@@ -2125,6 +2127,12 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
         const arr = (groupInterjects.get(gid) || []).filter((t) => Date.now() - t < 3600_000)
         arr.push(Date.now())
         groupInterjects.set(gid, arr)
+      }
+      // 必回也按小时记账：这段里只要有群友（非主人）@/叫到她就记一次；主人触发的不计入（主人除外）
+      if (p.mode === 'must' && ![...p.senders].some((id) => isOwner(getConfig(), id))) {
+        const arr = (groupMusts.get(gid) || []).filter((t) => Date.now() - t < 3600_000)
+        arr.push(Date.now())
+        groupMusts.set(gid, arr)
       }
       const gp = await groupPrompt(p.chat, p.mode, Math.max(0, 4 - p.images.length))
       if (disposed) return

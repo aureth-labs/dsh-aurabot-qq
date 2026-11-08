@@ -70,6 +70,22 @@ test('群聊：@、引用、唤醒词必回', () => {
   assert.equal(decideGroupReply(base({ mentioned: true, hour: 3 })).reply, true)
 })
 
+test('群聊：每小时 @/唤醒词必回上限，超过不回，主人除外', () => {
+  const cap = (o = {}) => base({ policy: policyFor({ mustMaxPerHour: 3 }, {}, 1), mustTimes: [1, 2, 3].map((i) => 10_000_000 - 60_000 * i), ...o })
+  // 超上限：@、引用、叫名字都不回了
+  assert.match(decideGroupReply(cap({ mentioned: true })).reason, /回够了/)
+  assert.match(decideGroupReply(cap({ repliedToBot: true })).reason, /回够了/)
+  assert.match(decideGroupReply(cap({ text: '肥鱼在吗' })).reason, /回够了/)
+  // 主人说话不受限
+  assert.equal(decideGroupReply(cap({ mentioned: true, fromOwner: true })).mode, 'must')
+  // 小时滚过去就又能回了
+  assert.equal(decideGroupReply(cap({ mentioned: true, mustTimes: [1, 2, 3].map((i) => 10_000_000 - 3_600_000 * i) })).mode, 'must')
+  // 上限设 0 = 不限制
+  assert.equal(decideGroupReply(cap({ mentioned: true, policy: policyFor({ mustMaxPerHour: 0 }, {}, 1) })).mode, 'must')
+  // 没超上限照常必回
+  assert.equal(decideGroupReply(cap({ mentioned: true, mustTimes: [10_000_000 - 60_000] })).mode, 'must')
+})
+
 test('群聊：插话受概率、冷却、上限、静默、冷群约束', () => {
   assert.equal(decideGroupReply(base({})).mode, 'interject')
   assert.equal(decideGroupReply(base({ rand: () => 0.5, relevance: 0.3 })).reply, false)
