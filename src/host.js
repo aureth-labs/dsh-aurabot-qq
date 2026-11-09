@@ -13,7 +13,7 @@ import { readFileSync, existsSync, writeFileSync, unlinkSync, statSync, mkdirSyn
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
-import { loadConfig, saveConfig, publicConfig, mergeFromPanel } from './core/config.js'
+import { loadConfigCached, watchConfig, saveConfig, publicConfig, mergeFromPanel } from './core/config.js'
 import { createLogger } from './core/logger.js'
 import { registerSecret, redact } from './core/redact.js'
 import { createOneBotClient } from './onebot/client.js'
@@ -65,10 +65,16 @@ export function apply(ctx) {
     const restored = applyPendingRestore()
     if (restored) log.info(`已恢复备份：${restored} 个文件，原来的文件在 backups/ 里留了底`)
   } catch (error) { log.error('恢复备份失败：', error.message) }
-  let cfg = loadConfig()
+  let cfg = loadConfigCached()
   let mods = null
   let bridge = null
-  const getConfig = () => cfg
+  // 热更新：磁盘上的 config.json 被改过（手改 / 别的进程写）就换成新的，不用重启插件。
+  // setConfig 写盘后缓存已经同步，所以自己改出来的那次不会重复触发。
+  const getConfig = () => {
+    const fresh = loadConfigCached()
+    if (fresh && fresh !== cfg) cfg = fresh
+    return cfg
+  }
   setSsrpMode(() => (getConfig().security && getConfig().security.ssrfMode === 'loose' ? 'loose' : 'strict'))
   const secrets = () => { for (const k of ['webuiPassword', 'httpToken', 'wsToken']) registerSecret(cfg.snowluma[k]); registerSecret(cfg.imageGen.apiKey); registerSecret(cfg.bridge.token) }
   const setConfig = (next) => {
@@ -88,9 +94,31 @@ export function apply(ctx) {
   secrets()
   seedPersonas()
 
+  // 监听配置文件变化：自己手改 plugins-data/aurabot/config.json 也能立刻生效，不用重启插件。
+  // 面板保存走 setConfig（已经处理过副作用），这里只处理「从外面改」的情况。
+  ctx.effect(() => watchConfig((fresh) => {
+    const before = cfg
+    if (!fresh || fresh === before) return
+    const same = JSON.stringify(fresh) === JSON.stringify(before)
+    cfg = fresh
+    if (same) return
+    secrets()
+    if (bridge && before.bridge.dshTools !== cfg.bridge.dshTools) bridge.refresh()
+    if (mods && (JSON.stringify(before.modules) !== JSON.stringify(cfg.modules) || before.safeMode !== cfg.safeMode)) mods.sync().catch(() => {})
+    mods?.emit('config', cfg, before)
+    log.info('配置文件被改过，已经重新读取（不用重启）')
+  }), 'aurabot: 监听配置变化')
+
   // ---------- 人格与规则：通过提示词变量注入到 Aurabot 的两个 preset ----------
   const variable = (n, fn) => ctx.effect(() => ctx.systemPrompt.variable(n, (...args) => captureSystemPrompt(n, cleanText(fn(...args)))), `aurabot: 变量 ${n}`)
-  const rulesOpts = (kind) => (mods ? { off: mods.builtinOff(), extra: mods.rules(kind) } : {})
+  // 常驻提示里「现在能发的表情」那一份：只在 index 模式下才会真用到，取的时候才查（别每轮都读盘）
+  const stickerIndex = () => {
+    try {
+      if ((cfg.stickers?.promptMode || 'skill') !== 'index') return null
+      return mods?.use?.('stickers')?.usable?.() || null
+    } catch (error) { return null }
+  }
+  const rulesOpts = (kind) => (mods ? { off: mods.builtinOff(), extra: mods.rules(kind), stickers: stickerIndex() } : {})
   // 扩展模块能整段改写人格和规则（同步：提示词变量不能等）
   const rewrite = (event, text, ...args) => { const r = mods ? mods.filterSync(event, text, ...args) : text; return typeof r === 'string' ? r : r === null ? '' : text }
   variable('aurabot_persona', () => rewrite('persona', currentPersonaText(cfg.persona.current)))
@@ -723,7 +751,7 @@ export function apply(ctx) {
       stats: hub.stats(),
       // 模块关着时给个空壳，面板照常显示
       mood: use('mood')?.state?.() ?? { value: 0, label: '心情模块关着', reason: '', history: [] },
-      stickers: { count: stickers.library().items.length },
+      stickers: { count: stickers.library().items.length, usable: (stickers.usable?.() || []).length },
       diary: diary ? { next: diary.nextTime(), last: diary.history()[0] || null } : { next: 0, last: null },
       qzoneSocial: use('qzone-social')?.state?.() ?? null,
       speakUp: use('speakup')?.state?.() ?? { count: 0 },
@@ -853,6 +881,14 @@ export function apply(ctx) {
     if (Number.isFinite(b.petScale)) patch.petScale = Math.min(2, Math.max(0.5, Math.round(b.petScale * 20) / 20))
     // 松手后落地：布尔透传（模块侧缺省当开，别让老面板把抛掷关没）
     if (typeof b.petReleaseLand === 'boolean') patch.petReleaseLand = b.petReleaseLand
+    // 物理手感（从 dsh-pet 的 physics 段搬来）：以前写死在素材包配置里、面板改不了。
+    // 口径与模块 settings 的 min/max 完全对齐，坏值一律忽略（别让一次手滑把桌宠手感搞崩）。
+    if (Number.isFinite(b.physicsGravity)) patch.physicsGravity = Math.min(6000, Math.max(100, Math.round(b.physicsGravity)))
+    if (Number.isFinite(b.physicsRestitution)) patch.physicsRestitution = Math.min(1, Math.max(0, Math.round(b.physicsRestitution * 100) / 100))
+    if (Number.isFinite(b.physicsGroundFriction)) patch.physicsGroundFriction = Math.min(20, Math.max(0, Math.round(b.physicsGroundFriction * 10) / 10))
+    if (typeof b.physicsCeilingBounce === 'boolean') patch.physicsCeilingBounce = b.physicsCeilingBounce
+    if (Number.isFinite(b.physicsThrowPower)) patch.physicsThrowPower = Math.min(3, Math.max(0.1, Math.round(b.physicsThrowPower * 10) / 10))
+    if (typeof b.physicsPetCollision === 'boolean') patch.physicsPetCollision = b.physicsPetCollision
     // 对话框（pet 1.0.5 起在模块库，模块自己的 settings 同样不渲染成表单；这里仍是唯一写入通道）
     for (const k of ['petChatEnabled', 'petChatBlurHide']) {
       if (typeof b[k] === 'boolean') patch[k] = b[k]
@@ -869,6 +905,22 @@ export function apply(ctx) {
     // 历史上限与保留天数：与模块 settings 的 min/max 对齐（10~2000 条；0 天 = 永久保留）
     if (Number.isFinite(b.petChatMaxEntries)) patch.petChatMaxEntries = Math.min(2000, Math.max(10, Math.round(b.petChatMaxEntries)))
     if (Number.isFinite(b.petChatRetentionDays)) patch.petChatRetentionDays = Math.min(3650, Math.max(0, Math.round(b.petChatRetentionDays)))
+    // 待办 / 按住说话 / 余额（2026-11-06 新增三项，口径同上面的对话框：
+    // 内建模块的 settings 不渲染成表单，这里是唯一的写入通道，所以必须在这里放行）
+    for (const k of ['petTodoEnabled', 'petHearEnabled', 'petHearSendToChat', 'petBalanceEnabled']) {
+      if (typeof b[k] === 'boolean') patch[k] = b[k]
+    }
+    for (const [k, max] of [['petTodoHotkey', 40], ['petHearModelDir', 500], ['petBalanceCurrency', 8]]) {
+      if (typeof b[k] === 'string') patch[k] = b[k].trim().slice(0, max)
+    }
+    // API Key：只收 sk- 开头或空（空 = 不查）。不校验死，但挡掉明显不是 Key 的整段文本
+    if (typeof b.petBalanceKey === 'string') {
+      const k = b.petBalanceKey.trim().slice(0, 200)
+      if (!k || /^[A-Za-z0-9_-]{8,200}$/.test(k)) patch.petBalanceKey = k
+    }
+    // 刷新间隔：模块 settings 是 5~1440 分钟（调太密等于一直打接口）
+    if (Number.isFinite(b.petBalanceMinutes)) patch.petBalanceMinutes = Math.min(1440, Math.max(5, Math.round(b.petBalanceMinutes)))
+
     if (typeof b.whisperLines === 'string') patch.whisperLines = b.whisperLines.slice(0, 4000)
     // 素材包下载地址：内建模块的 settings 字段不渲染成表单（同上），这里是它唯一的写入通道。
     // 只收 http/https（或空 = 回到内置默认），别把 file:// 之类塞进来当下载源
@@ -913,6 +965,75 @@ export function apply(ctx) {
     // 聊天联动动作（1.2.0 起 pet 模块代码在 mods 仓；核心侧 /panel/pet/config 仍是这些键的面板写入通道）
     if (typeof b.chatBehaviorEnabled === 'boolean') patch.chatBehaviorEnabled = b.chatBehaviorEnabled
     if (typeof b.chatBehaviorWhitelist === 'string') patch.chatBehaviorWhitelist = b.chatBehaviorWhitelist.slice(0, 2000)
+    // 初始位置（出生点）与边距：从 dsh-pet 的 position 段搬来。同样因为 pet 是内建模块、
+    // 自己的 settings 不渲染成表单，这里是它们唯一的写入通道——不补，面板上根本改不了出生点。
+    if (['bottom-right', 'bottom-left', 'top-right', 'top-left'].includes(b.petCorner)) patch.petCorner = b.petCorner
+    for (const [k, hi] of [['petMarginX', 2000], ['petMarginY', 2000]]) {
+      if (Number.isFinite(b[k])) patch[k] = Math.min(hi, Math.max(0, Math.round(b[k])))
+    }
+    // ===================== 2026-11-06 补齐「面板点不到」的那批设置 =====================
+    // 背景：pet 是**内建模块**，client.js 的 hasUi() 会用 `!TABS.some(t => t.id === m.id)` 把
+    // 「有同名内置标签页的模块」整块排除掉 —— 所以模块自己声明的 79 项 settings 和 panel.js
+    // 一个都不会渲染；「桌宠」页加载的是写死在 client.js 里的 PetPanel。
+    // 结果就是：模块里有、面板上没有。下面这批键以前只有 API 能写，主人点不到，现在补上。
+    // （每项的 min/max 都与 index.mjs 的 PET_SETTINGS 声明逐项对齐，坏值一律夹取，绝不透传。）
+
+    // ---- 多开：再养几只（每只的细节走 /panel/pet/extra/pet 那条子路由） ----
+    if (Number.isFinite(b.petExtraCount)) patch.petExtraCount = Math.min(4, Math.max(0, Math.round(b.petExtraCount)))
+
+    // ---- 待办到点提醒 ----
+    if (typeof b.petTodoEnabled === 'boolean') patch.petTodoEnabled = b.petTodoEnabled
+    if (typeof b.petTodoHotkey === 'string') patch.petTodoHotkey = b.petTodoHotkey.trim().slice(0, 40)
+
+    // ---- 按住说话（本地语音识别） ----
+    if (typeof b.petHearEnabled === 'boolean') patch.petHearEnabled = b.petHearEnabled
+    if (typeof b.petHearSendToChat === 'boolean') patch.petHearSendToChat = b.petHearSendToChat
+    if (typeof b.petHearModelDir === 'string') patch.petHearModelDir = b.petHearModelDir.trim().slice(0, 500)
+
+    // ---- 余额播报 ----
+    if (typeof b.petBalanceEnabled === 'boolean') patch.petBalanceEnabled = b.petBalanceEnabled
+    if (Number.isFinite(b.petBalanceMinutes)) patch.petBalanceMinutes = Math.min(1440, Math.max(5, Math.round(b.petBalanceMinutes)))
+    if (typeof b.petBalanceCurrency === 'string') patch.petBalanceCurrency = b.petBalanceCurrency.trim().toUpperCase().slice(0, 8)
+    // API Key：只收「空」或形似 Key 的串（别让一段随手粘的文本落进配置；密码字段面板不回显）
+    if (typeof b.petBalanceKey === 'string') {
+      const k = b.petBalanceKey.trim().slice(0, 200)
+      if (!k || /^[A-Za-z0-9_-]{8,200}$/.test(k)) patch.petBalanceKey = k
+    }
+
+    // ---- 动作频率权重（dsh-pet 的 animationWeights 口径：-1 = 跟随素材包） ----
+    // 三项之和 > 100 时由模块侧夹到 100（随机动作吃余量），这里只守住单项区间。
+    for (const k of ['animWeightIdle', 'animWeightTurn', 'animWeightMove']) {
+      if (Number.isFinite(b[k])) patch[k] = Math.min(100, Math.max(-1, Math.round(b[k])))
+    }
+
+    // ---- 气泡字体 / 字号 ----
+    if (typeof b.customFont === 'boolean') patch.customFont = b.customFont
+    if (typeof b.fontFollowPet === 'boolean') patch.fontFollowPet = b.fontFollowPet
+    if (['candy', 'yahei', 'youyuan', 'kaiti', 'simsun', 'comic', 'system'].includes(b.fontFamily)) patch.fontFamily = b.fontFamily
+    if (Number.isFinite(b.fontSize)) patch.fontSize = Math.min(200, Math.max(4, Math.round(b.fontSize)))
+
+    // ---- 语音播报（总开关 + 三个细分 + 音量） ----
+    for (const k of ['voiceEnabled', 'voiceWhisperEnabled', 'voiceChatEnabled', 'voiceTodoEnabled']) {
+      if (typeof b[k] === 'boolean') patch[k] = b[k]
+    }
+    if (Number.isFinite(b.voiceVolume)) patch.voiceVolume = Math.min(1, Math.max(0, Math.round(b.voiceVolume * 100) / 100))
+
+    // ---- 零散的桌面小动作：点击音效 / 梗图 / 说梦话 ----
+    for (const k of ['clickSound', 'memeBubble', 'dreamTalk']) {
+      if (typeof b[k] === 'boolean') patch[k] = b[k]
+    }
+
+    // ---- 天气接口模板（留空 = 用内置 wttr.in；只收 http/https） ----
+    if (typeof b.petWeatherUrl === 'string') {
+      const u = b.petWeatherUrl.trim().slice(0, 500)
+      if (!u || /^https?:\/\//i.test(u)) patch.petWeatherUrl = u
+    }
+
+    // ---- 气泡形式（文字 / 文字+语音）----
+    if (b.modality === 'text' || b.modality === 'voice') patch.modality = b.modality
+    // ---- 主动搭话载体（qq / pet）----
+    if (b.carrier === 'qq' || b.carrier === 'pet') patch.carrier = b.carrier
+
     if (!Object.keys(patch).length) return { ok: false, message: '没有可保存的字段' }
     setConfig(mergeFromPanel(cfg, { ext: { pet: patch } }))
     log.info(`面板已保存桌宠设置｜${Object.keys(patch).map((k) => k + '=' + String(patch[k]).slice(0, 20)).join(' ')}`)
@@ -972,12 +1093,50 @@ export function apply(ctx) {
     if (publicBaseUrlOf()) return remotePetHint()
     const pet = use('pet')
     if (typeof pet?.launch !== 'function') return { ok: false, available: false, message: '桌宠模块还没就绪，启动不了桌宠' }
-    return { ok: true, result: redactTokens(await Promise.resolve(pet.launch())) }
+    // by:'panel' —— 人点的启动，模块据此记「她想开着」，下次 DSH 起来会自动拉起
+    return { ok: true, result: redactTokens(await Promise.resolve(pet.launch({ by: 'panel' }))) }
   })
   route('/panel/pet/stop', async () => {
     const pet = use('pet')
     if (typeof pet?.stop !== 'function') return { ok: false, available: false, message: '桌宠模块还没就绪，停不了桌宠' }
-    return { ok: true, result: redactTokens(await Promise.resolve(pet.stop())) }
+    // by:'panel' —— 人点的停止，模块据此记「她不想开着」，下次 DSH 起来不会自己冒出来
+    return { ok: true, result: redactTokens(await Promise.resolve(pet.stop({ by: 'panel' }))) }
+  })
+  // 随 DSH 自动启动开关（模块内建 settings 不渲染表单，走这里透传）
+  route('/panel/pet/autostart', async (req) => {
+    const b = await readBody(req)
+    const pet = use('pet')
+    if (typeof pet?.setAutoStart !== 'function') return { ok: false, available: false, message: '桌宠模块还没就绪或版本太旧，改不了自动启动' }
+    return { ok: true, result: redactTokens(await Promise.resolve(pet.setAutoStart(b && b.enabled === true))) }
+  })
+  // 出生点（角落 + 边距）。放 /panel/* 而不是模块路由：面板页面拿不到 pet 的 bearer 令牌
+  // （host-token 在数据目录里，浏览器读不到），模块路由全都过 guard() 就必然 401。
+  // 这里转调模块自带的 setPosition()，由模块自己落盘；核心这份不存业务字段。
+  route('/panel/pet/position', async (req) => {
+    const b = await readBody(req)
+    const pet = use('pet')
+    if (typeof pet?.setPosition !== 'function') return { ok: false, available: false, message: '桌宠模块还没就绪或版本太旧，改不了出生点' }
+    return { ok: true, result: redactTokens(await Promise.resolve(pet.setPosition(b || {}))) }
+  })
+  // ---------- 多开：每只额外宠物的名字 / 形象包 / 大小 / 人格 ----------
+  // 为什么要有这层代理：pet 模块的 /extra/pets、/extra/pet 走的是自己的 guard()，
+  // 要求 x-pet-token，而浏览器里的面板拿不到那个令牌（只有 Electron 客户端知道）。
+  // 所以面板一律走这里 → 宿主用模块导出函数代劳（和 /panel/pet/position 同一套路）。
+  route('/panel/pet/extra/pets', async () => {
+    const pet = use('pet')
+    if (typeof pet?.extraPets !== 'function') {
+      return { ok: false, available: false, message: '桌宠模块还没就绪或版本太旧（需要 1.0.11+），读不到多开设置' }
+    }
+    return { ok: true, ...redactTokens(await Promise.resolve(pet.extraPets())) }
+  })
+  route('/panel/pet/extra/pet', async (req) => {
+    const b = await readBody(req)
+    const pet = use('pet')
+    if (typeof pet?.setExtraPet !== 'function') {
+      return { ok: false, available: false, message: '桌宠模块还没就绪或版本太旧（需要 1.0.11+），改不了这一只的设置' }
+    }
+    const r = await Promise.resolve(pet.setExtraPet(Number(b?.slot), b && typeof b === 'object' ? b : {}))
+    return r && r.ok === false ? { ...r, available: true } : { ok: true, ...redactTokens(r) }
   })
   // 轮换令牌（安全）：旧的立即失效，客户端必须重新下载包。跨机部署时这是唯一的应急手段
   // （令牌一旦泄露，只有换掉它才收得回口子）。

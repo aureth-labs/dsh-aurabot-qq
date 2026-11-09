@@ -1,5 +1,6 @@
 // 插件配置：默认值 + 归一化 + 读写。配置文件 ~/.dsh/plugins-data/aurabot/config.json
 
+import { statSync, watch } from 'node:fs'
 import { dataDir, readJson, writeJson } from './store.js'
 import { DEFAULT_GROUP_POLICY } from '../chat/group-policy.js'
 import { LEVELS, PROFILE_PERM_KEYS, PROFILE_PERM_LEVELS, profilePermDefault } from '../chat/access.js'
@@ -116,6 +117,23 @@ export const DEFAULTS = {
     caption: true, // 用视觉模型起备注
     // 起名单独挑的模型：{ provider, model }；留空 = 跟随聊天用的模型
     captionModel: { provider: '', model: '' },
+    // ---- 用哪张：规则与开关 ----
+    // 黑名单：一行一条，命中的一律不用。可写前缀 tag: name: emotion: group: pack: id: file:，
+    // 比如 tag:嘲讽 会挡掉所有带这个标签的；不带前缀时按名字/标签/编号模糊匹配。
+    blacklist: [],
+    // 白名单：非空时只留命中的（黑名单仍然优先）。
+    whitelist: [],
+    // all = 全都能用（靠黑名单挑掉不要的）；allowlist = 只用手动开着的那些（单张 on 字段）
+    mode: 'all',
+    // ---- 常驻提示的预算 ----
+    // skill = 只教她怎么写 <sticker:…>（最省）；hint = 再加一句提示；index = 再列一份精简清单；
+    // off = 不往提示词里写任何表情相关的话（工具还在）。
+    promptMode: 'skill',
+    indexLimit: 40, // index 模式最多列几张
+    searchLimit: 5, // sticker_find / 模糊匹配默认给几条
+    // ---- 文字表情 ----
+    templates: true, // 允许现场渲染文字表情（举牌 / 想 / 葱卷 / 对联 / 抱）
+    banwords: true, // 渲染前过一遍屏蔽词表（表在 sticker-kit/vendor/meme/banwords.json）
   },
   diary: {
     enabled: true,
@@ -138,7 +156,8 @@ export const DEFAULTS = {
     enabled: false,
     sessdata: '', // B 站 Cookie 里的 SESSDATA（登录凭证）
     biliJct: '', // B 站 Cookie 里的 bili_jct（发评论要用）。两个都不填也能看视频，只是不能评论
-    ownerName: '', // 主人的 B 站昵称：她写 @主人 时 @ 这个号
+    ownerName: '', // 主人的 B 站昵称：她写 @主人 时 @ 这个号（要真的 @ 上必须填）
+    ownerMid: '', // 主人的 B 站 mid：私信只发这个号，填了才能收发私信
     cookie: '', // 由上面两个拼出来给接口用；老配置的整串会自动拆到上面两个里
     autoBrowse: true, // 定时自己去刷
     intervalHours: 4, // 多久刷一轮
@@ -154,13 +173,43 @@ export const DEFAULTS = {
     danmakuEnabled: false, // 主人主动打开后才允许发送弹幕
     autoDanmaku: false, // 刷完自己发弹幕，另行开启
     maxDanmakuPerDay: 3, // 手动和自动共用提交上限（失败也计数）
-    shareToOwner: true, // 看到好玩的私聊分享给主人
+    shareToOwner: true, // 看到好玩的分享给主人（往哪分享看下面的 shareTo）
+    // 分享走哪：bili = B 站私信（最自然，要互关）| qq = QQ 私聊发链接 | both = 两边 | off = 不主动分享，主人问才说
+    shareTo: 'bili',
     like: false, // 顺手点赞
-    vision: false, // 可选：ffmpeg 抽帧交给视觉模型
+    vision: false, // 可选：看画面（优先用 B 站自带的故事板，没 ffmpeg 也能用）
     visionFrames: 6,
     ffmpegPath: '', // 留空从 PATH 查找
-    shotChance: 0.35, // 刷完发截图给主人；0 = 不自动发
-    shotLibrary: 300,
+    // ---- 私信 ----
+    // 能读也能回：别人（主要是主人）在 B 站私信她，她看得见，也能回。
+    dmEnabled: false, // 总开关，默认关：先确认互关再打开
+    dmOnlyOwner: true, // 只回主人一个人；关掉的话别人私信也会回（不建议，容易被当骚扰）
+    dmPollMinutes: 1, // 隔几分钟看一次私信（查一次只读、不花 token；1 分钟回得才像人）
+    dmMaxPerDay: 30, // 每天最多发几条（和评论分开算）
+    dmGapSec: 15, // 两条私信之间至少隔几秒
+    // ---- 防套话 / 查重 ----
+    styleGuard: true, // 发评论前过一遍：开头套话、跟自己旧评论撞、跟这条视频热评撞 → 不发，让它重写
+    // ---- @ 主人 ----
+    // 自动评论里，即使模型没写 @主人 也强制补一个在最前面（老大要每条评论都 @ 他）。
+    // 关掉 = 只把模型写的 @主人 提到最前，没写就不加。
+    alwaysAtOwner: true,
+    // ---- 点赞 / 收藏（默认关，而且要写得出理由才点）----
+    fav: false, // 收藏（一条视频只做一种表态：赞或收藏二选一）
+    likePerRound: 3, // 每轮最多点几个赞（硬顶 5）
+    likePerDay: 10, // 每天最多点几个赞（硬顶 10）
+    favPerDay: 8, // 每天最多收藏几个（硬顶 8）
+    favFolderId: 0, // 收藏到哪个收藏夹；0 = 默认收藏夹
+    // ---- 圈地自萌：只回 UP 主主动邀请的楼中楼，绝不发新楼 ----
+    circleMode: false, // 总开关，默认关
+    circleOwnerUid: 0, // 谁的作品下可以回（通常就是主人自己的 B 站 mid）
+    circleScope: 5, // 只看他最近几个投稿的评论区
+    circlePerRound: 2, // 每轮最多回几条邀请
+    circlePollMinutes: 10, // 隔几分钟扫一次邀请
+    // ---- 日报 / 封面墙 / 肥鱼日记 ----
+    report: true, // 每轮跑完写一份 markdown 日报（按天归档）
+    diary: true, // 一天写一篇「鱼日记」，用她自己的口气
+    // ---- 请求节流 ----
+    throttledMs: 800, // 每次请求 B 站接口之间至少隔多久（0 = 不节流）
   },
   // 刷抖音：专用浏览器（独立登录资料，不碰你平时的浏览器），经 CDP 控制。浏览 / 点赞 / 评论 / 分享各项权限在 profilePerms.douyin*。
   douyin: {
@@ -297,6 +346,12 @@ const num = (v, d, lo, hi) => {
 const bool = (v, d) => (typeof v === 'boolean' ? v : d)
 const qq = (v) => String(v ?? '').replace(/\D/g, '')
 const qqList = (v) => [...new Set((Array.isArray(v) ? v : String(v || '').split(/[\s,，;；]+/)).map(qq).filter(Boolean))]
+/** 规则清单（黑名单 / 白名单）：一行一条，也接受数组；去空行、去重、单条限 60 字、整表限 max 条。 */
+const ruleList = (v, max = 200) => [...new Set(
+  (Array.isArray(v) ? v : String(v || '').split(/[\r\n]+/))
+    .map((x) => String(x ?? '').trim().slice(0, 60))
+    .filter(Boolean),
+)].slice(0, max)
 const hhmm = (v, d) => (/^\d{1,2}:\d{2}$/.test(String(v)) ? String(v) : d)
 // 严格校验 'YYYY-MM-DD'（面板手填/配置文件手改都可能乱），非法日期当没填。
 const dateKey = (v) => {
@@ -403,6 +458,15 @@ export function normalize(raw) {
     const model = String(m.model || '').trim()
     return provider && model ? { provider, model } : { provider: '', model: '' }
   })()
+  // 黑名单 / 白名单：一行一条；去掉空行、去重、限个长度，免得手滑粘一坨进来
+  c.stickers.blacklist = ruleList(c.stickers.blacklist, 200)
+  c.stickers.whitelist = ruleList(c.stickers.whitelist, 200)
+  c.stickers.mode = c.stickers.mode === 'allowlist' ? 'allowlist' : 'all'
+  c.stickers.promptMode = ['skill', 'hint', 'index', 'off'].includes(c.stickers.promptMode) ? c.stickers.promptMode : 'skill'
+  c.stickers.indexLimit = Math.round(num(c.stickers.indexLimit, 40, 0, 500))
+  c.stickers.searchLimit = Math.round(num(c.stickers.searchLimit, 5, 1, 20))
+  c.stickers.templates = bool(c.stickers.templates, true)
+  c.stickers.banwords = bool(c.stickers.banwords, true)
   c.diary.timesPerDay = num(c.diary.timesPerDay, 2, 0, 48)
   c.diary.windowStart = hhmm(c.diary.windowStart, '10:00')
   c.diary.windowEnd = hhmm(c.diary.windowEnd, '23:30')
@@ -446,10 +510,28 @@ export function normalize(raw) {
   const b = c.bili
   Object.assign(b, splitBiliCookie(b))
   for (const k of ['enabled', 'autoBrowse', 'comment', 'reply', 'shareToOwner', 'like', 'vision', 'danmakuEnabled', 'autoDanmaku']) b[k] = bool(b[k], DEFAULTS.bili[k])
+  b.shareTo = ['bili', 'qq', 'both', 'off'].includes(b.shareTo) ? b.shareTo : 'bili'
+  for (const k of ['dmEnabled', 'dmOnlyOwner', 'styleGuard', 'alwaysAtOwner']) b[k] = bool(b[k], DEFAULTS.bili[k])
+  // 点赞 / 收藏：额度两头钳死（引擎里还会再比一次，两处同源，谁都不许绕过）
+  for (const k of ['fav', 'circleMode', 'report', 'diary']) b[k] = bool(b[k], DEFAULTS.bili[k])
+  b.likePerRound = Math.round(num(b.likePerRound, 3, 0, 5))
+  b.likePerDay = Math.round(num(b.likePerDay, 10, 0, 10))
+  b.favPerDay = Math.round(num(b.favPerDay, 8, 0, 8))
+  b.favFolderId = Math.round(num(b.favFolderId, 0, 0, BIG))
+  // 圈地自萌
+  b.circleOwnerUid = Math.round(num(b.circleOwnerUid, 0, 0, BIG))
+  b.circleScope = Math.round(num(b.circleScope, 5, 1, 20))
+  b.circlePerRound = Math.round(num(b.circlePerRound, 2, 1, 5))
+  b.circlePollMinutes = Math.round(num(b.circlePollMinutes, 10, 1, 240))
+  // 圈地自萌与「自动评论」互斥：开了圈地就不许发新楼，否则「绝不发新楼」就是空话。
+  // 用保存后的最终状态判断，避免直接 POST circleMode=true 时绕过互斥。
+  if (b.circleMode) { b.comment = false }
+  b.dmPollMinutes = num(b.dmPollMinutes, 1, 1, BIG)
+  b.dmMaxPerDay = Math.round(num(b.dmMaxPerDay, 30, 0, BIG))
+  b.dmGapSec = num(b.dmGapSec, 15, 0, BIG)
+  b.throttledMs = Math.round(num(b.throttledMs, 800, 0, 10000))
   b.visionFrames = Math.round(num(b.visionFrames, 6, 1, 100))
   b.ffmpegPath = String(b.ffmpegPath || '').trim()
-  b.shotChance = num(b.shotChance, 0.35, 0, 1)
-  b.shotLibrary = Math.round(num(b.shotLibrary, 300, 1, BIG))
   b.intervalHours = num(b.intervalHours, 4, 0.1, BIG)
   b.maxRunsPerDay = num(b.maxRunsPerDay, 3, 0, BIG)
   b.perRun = num(b.perRun, 3, 1, BIG)
@@ -693,6 +775,16 @@ export function splitBiliCookie({ sessdata = '', biliJct = '', cookie = '' } = {
 
 const FILE = () => dataDir('config.json')
 
+/** 配置文件当前的「指纹」（修改时间 + 大小）：用来判断磁盘上有没有被外部改过。 */
+export function configStamp() {
+  try {
+    const s = statSync(FILE())
+    return `${s.mtimeMs}:${s.size}`
+  } catch (error) {
+    return ''
+  }
+}
+
 /** 在某次更新里新增、会替她公开发东西的功能。以后再加这类功能，把配置键名加到这里。 */
 export const OPT_IN_ON_UPDATE = ['qzoneSocial', 'bili', 'douyin']
 
@@ -705,9 +797,54 @@ export function loadConfig() {
   return normalize(raw)
 }
 
+// 热更新缓存：文件没动就直接给上一次的结果，动了（手改 / 别的进程写）就重读。
+// 这样直接改 plugins-data/aurabot/config.json 也能立刻生效，不用重启插件。
+// 指纹检查节流到 500ms 一次：getConfig() 一轮对话里会被调很多次，不必每次都 stat。
+let cache = { stamp: null, cfg: null, checkedAt: 0 }
+const STAMP_INTERVAL_MS = 500
+
+/** 带缓存的 loadConfig：文件没变返回同一个对象，变了返回新的。 */
+export function loadConfigCached() {
+  const now = Date.now()
+  if (cache.cfg && now - cache.checkedAt < STAMP_INTERVAL_MS) return cache.cfg
+  const stamp = configStamp()
+  if (cache.cfg && cache.stamp === stamp) {
+    cache.checkedAt = now
+    return cache.cfg
+  }
+  const cfg = loadConfig()
+  cache = { stamp, cfg, checkedAt: now }
+  return cfg
+}
+
+/** 清掉缓存，下次 loadConfigCached 一定重读。 */
+export function forgetConfigCache() {
+  cache = { stamp: null, cfg: null, checkedAt: 0 }
+}
+
+/** 监听配置文件变化，变了就清缓存并回调新配置（fs.watch 提前失效，取配置时还会再比一次指纹）。 */
+export function watchConfig(onChange) {
+  let timer = null
+  try {
+    const w = watch(FILE(), { persistent: false }, () => {
+      forgetConfigCache()
+      if (typeof onChange !== 'function') return
+      clearTimeout(timer)
+      timer = setTimeout(() => { try { onChange(loadConfigCached()) } catch (error) {} }, 200)
+      timer.unref?.()
+    })
+    w.on?.('error', () => {})
+    w.unref?.()
+    return () => { try { w.close() } catch (error) {} }
+  } catch (error) {
+    return () => {}
+  }
+}
+
 export function saveConfig(cfg) {
   const c = normalize(cfg)
   writeJson(FILE(), c)
+  cache = { stamp: configStamp(), cfg: c, checkedAt: Date.now() }
   return c
 }
 

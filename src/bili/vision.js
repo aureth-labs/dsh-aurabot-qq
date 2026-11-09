@@ -1,14 +1,15 @@
-// 看画面：从 B 站 DASH 流里按时间点抽几帧，交给视觉模型描述画面。
+// 看画面：优先用 B 站自带的「故事板」裁图（不用 ffmpeg、不下载视频流），
+// 故事板拿不到才退回从 DASH 流里用 ffmpeg 抽帧，再交给视觉模型描述。
 //
-// ffmpeg 直接读取 CDN 流并定位抽帧；下载量和耗时取决于视频与 CDN 的 seek 支持。
-// 没开开关 / 没 ffmpeg / 没 cid / 流地址取不到 / 模型明确不支持图片时跳过，
+// 没开开关 / 拿不到 cid / 画面都取不到 / 模型明确不支持图片时跳过，
 // 不影响原来「标题 + 简介 + 字幕 + 热评」的文本流程。
 
 import { spawn } from 'node:child_process'
 import { UA } from './api.js'
 import { askModel, canSeeImages } from '../core/llm.js'
-import { findFfmpeg } from '../core/img.js'
+import { findFfmpeg, findSharp } from '../core/img.js'
 import { assertPublicUrl } from '../core/net.js'
+import { frameTargets, pickTiles } from './storyboard.js'
 
 // ffmpeg 的查找已经抽到 core/img.js（生图那边也要用），这里保留导出，老的引用不受影响
 export { findFfmpeg }
@@ -124,7 +125,8 @@ export function windowAt(windows, sec) {
 }
 
 /**
- * 看画面主流程：取流 → 抽帧 → 视觉描述。
+ * 看画面主流程：先用 B 站自带的故事板裁图（不用 ffmpeg、不下载视频流），
+ * 故事板拿不到才退回 ffmpeg 抽帧。
  * 返回 { text, frames }：text 是画面描述（不可用时为空串），frames 是 [{sec, buf}] 抽到的帧
  * （调用方可以存下来当截图用；关掉看画面时两个都为空）。
  */
@@ -132,8 +134,68 @@ export async function lookWithVision({ dsh, api, info, getConfig, log, deps = {}
   const empty = { text: '', frames: [] }
   const full = getConfig()
   const c = (full && full.bili) || {}
-  if (!c.vision || !dsh || !api || typeof api.playurl !== 'function') return empty
+  if (!c.vision || !dsh || !api) return empty
   if (!info || !info.cid) return empty
+  try {
+    if (await (deps.canSeeImages || canSeeImages)(dsh, full) === false) {
+      log?.debug('看画面跳过：当前模型不支持图片')
+      return empty
+    }
+    // ① 先试故事板：B 站自己把每 N 秒抽一帧拼成一张图，裁一块就行 —— 比 ffmpeg 轻，
+    //    也是「没装 ffmpeg」时唯一能看画面的路。
+    const sb = await lookViaStoryboard({ api, info, c, log, deps })
+    if (sb.frames.length) {
+      const text = await (deps.describeFrames || describeFrames)(dsh, { info, frames: sb.frames.map((f) => f.buf), cfg: full })
+      return { text: String(text || '').trim(), frames: sb.frames }
+    }
+  } catch (error) {
+    log?.debug('故事板看画面失败：', error.message)
+  }
+  // ② 退回 ffmpeg
+  return lookViaFfmpeg({ dsh, api, info, getConfig, log, deps, full, c })
+}
+
+/** 故事板裁图：不需要 ffmpeg，只要有 sharp。 */
+async function lookViaStoryboard({ api, info, c, log, deps }) {
+  const empty = { frames: [] }
+  if (typeof api.storyboard !== 'function' || typeof api.storyboardTile !== 'function') return empty
+  let sharp = null
+  try { sharp = await (deps.findSharp || findSharp)({}) } catch (error) { sharp = null }
+  if (!sharp) {
+    log?.debug('故事板跳过：没有 sharp 裁不了图')
+    return empty
+  }
+  // 多 P 视频的故事板通常只覆盖第 1P：目标时刻按第 1P 的时长算
+  const pages = Array.isArray(info.pages) ? info.pages : []
+  const covered = Number((pages[0] && pages[0].duration) || info.duration) || 0
+  const sb = await api.storyboard({ bvid: info.bvid, aid: info.aid, cid: info.cid, duration: Number(info.duration) || 0, coveredSec: covered })
+  if (!sb.ok) {
+    log?.debug('故事板拿不到：', sb.reason || '')
+    return empty
+  }
+  const targets = frameTargets(sb.covered, { count: c.visionFrames || 3 })
+  const picks = pickTiles(sb.entries, targets)
+  if (!picks.length) return empty
+  // 一张拼图里排几块：B 站实测是 10×10 = 100 块（4800x2700，单块 480x270）。
+  // ⚠️ 不能拿 entries 数量去估 —— entries 是「覆盖到的时间块总数」，不等于「每张拼图装几块」，
+  //    估出来会偏小，块号一错位就裁到隔壁画面的时间上。
+  const perSheet = Number(sb.tiles) || 100
+  const frames = []
+  for (const [tileIndex, ts] of picks) {
+    const sheetNo = Math.floor(tileIndex / perSheet)
+    const sheetUrl = sb.sheets[sheetNo] || sb.sheets[0]
+    if (!sheetUrl) continue
+    const buf = await api.storyboardTile(sheetUrl, tileIndex % perSheet, { cols: perSheet, tw: sb.tw, th: sb.th, sharp })
+    if (buf) frames.push({ sec: Math.round(ts), buf })
+  }
+  if (!frames.length) log?.debug('故事板裁出来的帧都是空的')
+  return { frames }
+}
+
+/** ffmpeg 抽帧：故事板拿不到时的兜底。 */
+async function lookViaFfmpeg({ dsh, api, info, getConfig, log, deps, full, c }) {
+  const empty = { text: '', frames: [] }
+  if (typeof api.playurl !== 'function') return empty
   const ffmpeg = (deps.findFfmpeg || findFfmpeg)(c.ffmpegPath)
   if (!ffmpeg) {
     log?.debug('看画面跳过：没找到 ffmpeg')
@@ -142,10 +204,6 @@ export async function lookWithVision({ dsh, api, info, getConfig, log, deps = {}
   const assertUrl = deps.assertPublicUrl || assertPublicUrl
   const frames = []
   try {
-    if (await (deps.canSeeImages || canSeeImages)(dsh, full) === false) {
-      log?.debug('看画面跳过：当前模型不支持图片')
-      return empty
-    }
     const pu = await api.playurl({ bvid: info.bvid, aid: info.aid, cid: info.cid })
     // 优先 DASH；很多账号 / 视频只回 durl（渐进式 MP4），这时按段落定位照样能抽帧。
     const stream = pickVideoStream(pu && pu.video)

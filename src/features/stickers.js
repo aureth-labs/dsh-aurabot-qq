@@ -27,22 +27,27 @@ export function stickerPath(item) {
   return join(dir(), item.file)
 }
 
-/** 模糊匹配：备注 / 标签里包含关键词得分高；完全找不到返回 null。 */
+/** 模糊匹配：备注 / 标签 / 用途说明（summary、use）里包含关键词得分高；完全找不到返回 null。 */
 export function matchSticker(items, query) {
   const q = String(query || '').trim()
   if (!q || !items.length) return null
   let best = null
   let bestScore = 0
   for (const it of items) {
-    const hay = [it.name || '', ...(it.tags || [])]
+    const hay = [
+      { text: it.name || '', weight: 3 },
+      ...((it.tags || []).map((t) => ({ text: t, weight: 2 }))),
+      { text: it.summary || '', weight: 1 },
+      { text: it.use || '', weight: 1 },
+    ]
     let s = 0
-    for (const h of hay) {
+    for (const { text: h, weight } of hay) {
       if (!h) continue
-      if (h === q) s = Math.max(s, 10)
-      else if (h.includes(q) || q.includes(h)) s = Math.max(s, 6)
+      if (h === q) s = Math.max(s, 10 * weight)
+      else if (h.includes(q) || q.includes(h)) s = Math.max(s, 6 * weight)
       else {
         const common = [...q].filter((c) => h.includes(c)).length
-        if (common >= 2) s = Math.max(s, common / Math.max(q.length, 1) * 4)
+        if (common >= 2) s = Math.max(s, common / Math.max(q.length, 1) * 4 * weight)
       }
     }
     if (s > bestScore || (s === bestScore && s > 0 && Math.random() < 0.5)) {
@@ -56,11 +61,69 @@ export function matchSticker(items, query) {
 /** 打了这个标签的表情不参与自动配（太吓人、容易误会的梗图靠手动发）。 */
 export const NEVER_RANDOM = '不随机'
 
-/** 自动配表情：先按回复里的词匹配，匹配不到随机挑一张；带「不随机」标签的不参与。 */
-export function pickForReply(items, replyText) {
+// ---------------------------------------------------------------- 黑名单 / 白名单 / 单张开关
+
+/** 规则能写的前缀：tag: name: emotion: group: pack: id: file:；不带前缀按名字 / 标签 / 编号模糊匹配。 */
+export const RULE_PREFIXES = ['tag', 'name', 'emotion', 'group', 'pack', 'id', 'file']
+
+const has = (v, want) => String(v || '').toLowerCase().includes(want)
+
+/** 一条规则命中这张表情没有。规则写错（空的、只有前缀）就当没命中，不会误伤。 */
+export function ruleHit(item, rule) {
+  const raw = String(rule ?? '').trim()
+  if (!raw || !item) return false
+  const m = /^([a-z]+)\s*:\s*(.*)$/i.exec(raw)
+  const mode = m ? m[1].toLowerCase() : ''
+  const want = String(m ? m[2] : raw).trim().toLowerCase()
+  if (!want) return false
+  switch (mode) {
+    case 'tag': return (item.tags || []).some((t) => has(t, want))
+    case 'name': return has(item.name, want)
+    case 'emotion': return has(item.emotion, want)
+    case 'group': return has(item.group, want) || has(item.pack, want) || has(item.packKey, want)
+    case 'pack': return has(item.pack, want) || has(item.group, want) || has(item.packKey, want)
+    case 'id': return has(item.nkId, want) || has(item.md5, want) || has(item.file, want)
+    case 'file': return has(item.file, want)
+    case '': // 没写前缀：哪都能对上就算
+      return has(item.name, want) || (item.tags || []).some((t) => has(t, want)) ||
+        has(item.md5, want) || has(item.nkId, want) || has(item.file, want) ||
+        has(item.emotion, want) || has(item.use, want) || has(item.summary, want)
+    default: // 不认识的前缀（比如写错了）：按无前缀处理，别整条规则失效
+      return has(item.name, want) || (item.tags || []).some((t) => has(t, want))
+  }
+}
+
+/**
+ * 能用的表情：去掉手动停用的、黑名单命中的；白名单非空时只留命中的；
+ * mode = 'allowlist' 时只留手动开着的（其余一律不用）。
+ * 面板要「全部看得见」，所以过滤只在这些地方用：自动配、模糊匹配、给模型列的清单。
+ */
+export function usableStickers(items, cfg = {}) {
+  const list = Array.isArray(items) ? items : []
+  const c = cfg && typeof cfg === 'object' ? cfg : {}
+  const black = (Array.isArray(c.blacklist) ? c.blacklist : []).filter((r) => String(r ?? '').trim())
+  const white = (Array.isArray(c.whitelist) ? c.whitelist : []).filter((r) => String(r ?? '').trim())
+  return list.filter((it) => {
+    if (!it) return false
+    if (it.off === true) return false // 单张停用（7）
+    if (black.length && black.some((r) => ruleHit(it, r))) return false
+    if (c.mode === 'allowlist') return it.on === true // 只用手动开着的（7）
+    if (white.length && !white.some((r) => ruleHit(it, r))) return false
+    return true
+  })
+}
+
+/** 这张表情现在能不能用（面板上标灰、工具里拦一道都用它）。 */
+export function stickerUsable(item, cfg = {}) {
+  return usableStickers([item], cfg).length === 1
+}
+
+/** 自动配表情：先按回复里的词匹配，匹配不到随机挑一张；带「不随机」标签的不参与，黑名单/停用的也不参与。 */
+export function pickForReply(items, replyText, cfg = {}) {
   if (!items.length) return null
-  const pool = items.filter((i) => !(i.tags || []).includes(NEVER_RANDOM))
-  if (!pool.length) return null // 全被打上标签时，这一轮就不自动配
+  const usable = usableStickers(items, cfg)
+  const pool = usable.filter((i) => !(i.tags || []).includes(NEVER_RANDOM))
+  if (!pool.length) return null // 全被打上标签 / 全被屏蔽时，这一轮就不自动配
   const words = DEFAULT_TAGS.concat(pool.flatMap((i) => i.tags || []))
   for (const w of words) {
     if (w && String(replyText).includes(w)) {
@@ -81,6 +144,105 @@ export function pickEvict(items) {
 
 export function createStickerStore({ dsh, getConfig, onebot, log }) {
   const recent = [] // 每小时限额
+
+  /** 当前配置里跟「用哪张」有关的几项（黑名单 / 白名单 / 模式）。 */
+  function rules() {
+    const s = getConfig().stickers || {}
+    return {
+      blacklist: Array.isArray(s.blacklist) ? s.blacklist : [],
+      whitelist: Array.isArray(s.whitelist) ? s.whitelist : [],
+      mode: s.mode === 'allowlist' ? 'allowlist' : 'all',
+    }
+  }
+
+  /** 能用的那部分（给自动配、模糊匹配、给模型列清单用）。 */
+  function usable() {
+    return usableStickers(loadLibrary().items, rules())
+  }
+
+  /** 模糊匹配：只在能用的表情里找，黑名单 / 停用的不会被发出去。 */
+  function match(query) {
+    return matchSticker(usable(), query)
+  }
+
+  /** 按回复内容挑一张（自动配）：同样只在能用的里挑。 */
+  function pick(text) {
+    return pickForReply(loadLibrary().items, text, rules())
+  }
+
+  /** 单张停用 / 启用（7）。off=true 就是不再用它；on=true 是「白名单模式」下的允许名单。 */
+  function setEnabled(md5, enabled) {
+    const lib = loadLibrary()
+    const it = lib.items.find((i) => i.md5 === md5)
+    if (!it) return { ok: false, reason: '没有这张' }
+    if (enabled) {
+      delete it.off
+      it.on = true
+    } else {
+      delete it.on
+      it.off = true
+    }
+    saveLibrary(lib)
+    return { ok: true, item: it }
+  }
+
+  /** 一次改一批（面板多选后用）。 */
+  function setEnabledMany(md5s, enabled) {
+    const list = [...new Set((Array.isArray(md5s) ? md5s : []).map((x) => String(x || '').trim()).filter(Boolean))]
+    if (!list.length) return { ok: false, changed: 0, message: '没选表情' }
+    const lib = loadLibrary()
+    let changed = 0
+    for (const it of lib.items) {
+      if (!list.includes(it.md5)) continue
+      if (enabled) { delete it.off; it.on = true } else { delete it.on; it.off = true }
+      changed++
+    }
+    saveLibrary(lib)
+    return { ok: true, changed, message: `${enabled ? '启用' : '停用'}了 ${changed} 张` }
+  }
+
+  /** 全部恢复正常（把 on / off 都清掉）。模式是 allowlist 时会提醒：那种模式下清掉标记等于一张都不开。 */
+  function resetEnabled() {
+    const lib = loadLibrary()
+    for (const it of lib.items) { delete it.on; delete it.off }
+    saveLibrary(lib)
+    const mode = rules().mode
+    return {
+      ok: true,
+      message: mode === 'allowlist'
+        ? '单张标记都清掉了。但现在是「只用手动开着的」模式，清掉标记等于一张都不开——要恢复全能用，把模式切回「全都能用」'
+        : '全部表情恢复成默认（黑名单仍然生效）',
+    }
+  }
+
+  /**
+   * 面板用：每张都带上「现在能不能用」和为什么不能用，方便标灰、给出原因。
+   * 库本身不裁剪（主人要能看见全部、能改回来）。
+   */
+  function libraryWithState() {
+    const r = rules()
+    const items = loadLibrary().items
+    const okSet = new Set(usableStickers(items, r).map((i) => i.md5))
+    return items.slice().reverse().map((it) => {
+      let why = ''
+      if (!okSet.has(it.md5)) {
+        if (it.off === true) why = '手动停用了'
+        else if (r.mode === 'allowlist' && it.on !== true) why = '只用手动开着的（白名单模式）'
+        else if (r.blacklist.some((x) => ruleHit(it, x))) why = '命中黑名单：' + r.blacklist.find((x) => ruleHit(it, x))
+        else if (r.whitelist.length) why = '不在白名单里'
+        else why = '不可用'
+      }
+      return { ...it, usable: okSet.has(it.md5), why }
+    })
+  }
+
+  /** 面板用：一条规则现在会命中几张（让人一眼看清这条规则是不是写错了）。 */
+  function rulePreview(rule) {
+    const items = loadLibrary().items
+    const hits = items.filter((it) => ruleHit(it, rule))
+    return { rule: String(rule ?? ''), count: hits.length, sample: hits.slice(0, 5).map((i) => i.name || i.md5.slice(0, 8)) }
+  }
+
 
   /** 面板里给起名单独挑的模型；没挑（或者只填了一半）就返回 null = 跟随聊天用的模型。 */
   function captionModelOf(cfg = getConfig()) {
@@ -448,5 +610,13 @@ export function createStickerStore({ dsh, getConfig, onebot, log }) {
     return { ok: true, total: queue.length, started: true, status: captionStatus(), message: `开始给 ${queue.length} 张表情起名字（后台跑，可以关掉面板）` }
   }
 
-  return { importFromQQ, collect, addFromBuffer, remove, removeMany, rename, segmentFor, markUsed, trim, captionLibrary, captionStatus, captionCancel, captionTargets, dispose, library: loadLibrary, match: (q) => matchSticker(loadLibrary().items, q), pickForReply: (t) => pickForReply(loadLibrary().items, t) }
+  return {
+    importFromQQ, collect, addFromBuffer, remove, removeMany, rename, segmentFor, markUsed, trim,
+    captionLibrary, captionStatus, captionCancel, captionTargets, dispose,
+    library: loadLibrary,
+    // 面板用：带「能不能用 / 为什么不能用」的全量库
+    libraryWithState,
+    // 规则与开关（黑名单 / 白名单 / 单张启停）
+    rules, usable, match, pickForReply: pick, setEnabled, setEnabledMany, resetEnabled, rulePreview,
+  }
 }

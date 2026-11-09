@@ -23,11 +23,15 @@ test('检查登录后解除旧登录暂停，刷新凭证不必等待缓存到�
   assert.equal((await b.account()).isLogin, false)
   assert.equal(b.state().canPost, false)
   cfg.bili.cookie = 'SESSDATA=new; bili_jct=csrf'
+  // 凭证变了：缓存 key 不同，会真的重新核验
   assert.equal((await b.account()).isLogin, true)
   assert.equal(b.state().canPost, true)
   assert.equal(b.state().comments, 2)
   assert.equal(readJson(file).replies, 1)
   assert.equal(calls, 2)
+  // 同一份新凭证再核验一次：已经恢复过的会话不重复解除（loginPauseRecovery.sessionKey 拦住）
+  assert.equal((await b.account(true)).isLogin, true)
+  assert.equal(calls, 3)
 })
 
 test('核验时切换凭证或停止模块，不用过时结果解除暂停', async () => {
