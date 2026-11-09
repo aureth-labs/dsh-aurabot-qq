@@ -184,7 +184,7 @@ test('B 站 Cookie 分两个框填：纯值、带前缀、整串都认；老配�
   const { splitBiliCookie, publicConfig, mergeFromPanel } = await import('../src/core/config.js')
   assert.equal(splitBiliCookie({ sessdata: 'aaa', biliJct: 'bbb' }).cookie, 'SESSDATA=aaa; bili_jct=bbb')
   assert.equal(splitBiliCookie({ sessdata: 'SESSDATA=aaa', biliJct: 'bili_jct=bbb' }).cookie, 'SESSDATA=aaa; bili_jct=bbb')
-  assert.deepEqual(splitBiliCookie({ sessdata: 'buvid3=z; SESSDATA=a%2C1; bili_jct=b; x=1' }), { sessdata: 'a%2C1', biliJct: 'b', cookie: 'SESSDATA=a%2C1; bili_jct=b' })
+  assert.deepEqual(splitBiliCookie({ sessdata: 'buvid3=z; SESSDATA=a%2C1; bili_jct=b; x=1' }), { sessdata: 'a%2C1', biliJct: 'b', buvid3: 'z', buvid4: '', dedeUserId: '', cookie: 'SESSDATA=a%2C1; bili_jct=b; buvid3=z' })
   const cur = normalize({ bili: { cookie: 'SESSDATA=old1234; bili_jct=jct9876' } })
   assert.equal(cur.bili.sessdata, 'old1234')
   const pub = publicConfig(cur).bili

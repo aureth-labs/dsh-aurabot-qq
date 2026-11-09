@@ -8,6 +8,8 @@ import { avatarSource } from '../profile/index.js'
 import { resolvePainting } from '../../features/paintings.js'
 import { segmentBytes } from '../../core/net.js'
 import { createDanmaku, danmakuPanelRequest } from './danmaku.js'
+import { createQrLogin } from '../../bili/qr-login.js'
+import { dataDir } from '../../core/store.js'
 
 export default {
   id: 'bili',
@@ -15,7 +17,7 @@ export default {
   version: '1.1.0',
   description: '看别人发的 B 站视频；定时自己刷、评论、回评论；可选发弹幕；抽帧看画面、发截图；按权限改自己的头像 / 签名（bili_watch / bili_comment / bili_danmaku / qq_send_shot / bili_set_avatar / bili_set_sign）',
   tab: 'bili',
-  files: ['bili/duty.js', 'bili/api.js', 'bili/vision.js', 'bili/shots.js', 'bili/danmaku.js', 'bili/login-pause.js'],
+  files: ['bili/duty.js', 'bili/api.js', 'bili/vision.js', 'bili/shots.js', 'bili/danmaku.js', 'bili/login-pause.js', 'bili/qr-login.js'],
   setup(api) {
     const { hub } = api.core
     const lastImage = new Map() // chatId → 最近一张图的网址（给 bili_set_avatar 的 last 用）
@@ -190,6 +192,32 @@ export default {
       return api.core.http.send(res, 200, readFileSync(p), 'image/jpeg')
     })
     api.route('/bili/shot/delete', async (req) => bili.deleteShot(String((await api.core.http.body(req)).file || '')))
+
+    // 扫码登录：机器人自己起浏览器拿一张只属于它的票，拿到后自动写配置（只写一次）
+    const qr = createQrLogin({ log: api.log, dataDir })
+    const savedQr = new Set()
+    api.route('/bili/qr/start', async () => qr.start())
+    api.route('/bili/qr/status', async (req) => {
+      const id = String(api.core.http.query(req).id || '')
+      const r = await qr.poll(id)
+      if (r.state !== 'done') return { ok: r.state !== 'error', state: r.state, message: r.message }
+      if (!r.creds) return { ok: false, state: 'error', message: '票没拿到，重新生成一个' }
+      if (savedQr.has(id)) return { ok: true, state: 'done', account: r.account }
+      try {
+        const { sessdata, biliJct, buvid3, buvid4, dedeUserId } = r.creds
+        api.setConfig({ bili: { sessdata, biliJct, buvid3, buvid4, dedeUserId } })
+        savedQr.add(id)
+        return { ok: true, state: 'done', account: r.account }
+      } catch (e) {
+        return { ok: false, state: 'error', message: '票拿到了但保存失败：' + e.message }
+      }
+    })
+    api.route('/bili/qr/cancel', async (req) => {
+      const id = String((await api.core.http.body(req)).id || '')
+      savedQr.delete(id)
+      return qr.cancel(id)
+    })
+    api.onDispose(() => qr.dispose())
     return bili
   },
 }

@@ -6195,9 +6195,67 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     }
 
 /** B 站 Cookie：SESSDATA 和 bili_jct 分两个框填（前缀已经写好），可以显示 / 隐藏；粘整串也行，会自动拆开。 */
-    function BiliCookie({ draft, setDraft }) {
+    function BiliCookie({ draft, setDraft, load }) {
       const [show, setShow] = useState(false)
+      const [qr, setQr] = useState(null) // { id?, png?, state: 'loading'|'waiting'|'expired'|'error', message? }
+      const qrTimer = useRef(null)
+      const qrId = useRef('')
       const b = draft.bili
+      const stopQr = () => { if (qrTimer.current) { clearInterval(qrTimer.current); qrTimer.current = null } }
+      const cancelQr = (id) => { if (id) post('/bili/qr/cancel', { id }).catch(() => {}) }
+      const closeQr = () => { const id = qrId.current; qrId.current = ''; stopQr(); setQr(null); cancelQr(id) }
+      const pollQr = (id) => {
+        stopQr()
+        const tick = async () => {
+          try {
+            const r = await get('/bili/qr/status?id=' + encodeURIComponent(id))
+            if (qrId.current !== id) return // 浮层已经关了，别再往旧会话上轮询
+            if (r.state === 'done') {
+              qrId.current = ''
+              stopQr()
+              setQr(null)
+              if (load) load()
+              return
+            }
+            if (r.state === 'expired' || r.state === 'error') {
+              stopQr()
+              setQr({ id, state: r.state, message: r.message || (r.state === 'expired' ? '二维码过期了' : '出错了，重试一下') })
+            }
+          } catch {}
+        }
+        tick()
+        qrTimer.current = setInterval(tick, 1500)
+      }
+      const openQr = async () => {
+        const old = qrId.current
+        qrId.current = ''
+        stopQr()
+        cancelQr(old)
+        setQr({ state: 'loading' })
+        const r = await post('/bili/qr/start')
+        if (!r || !r.id) { setQr({ state: 'error', message: (r && r.message) || '出码失败，重试一下' }); return }
+        if (!r.png) { qrId.current = r.id; setQr({ id: r.id, state: 'error', message: r.message || '没出码，重试一下' }); return }
+        qrId.current = r.id
+        setQr({ id: r.id, png: r.png, state: 'waiting' })
+        pollQr(r.id)
+      }
+      // 组件卸载时一定要清定时器并通知后端收浏览器
+      useEffect(() => () => { const id = qrId.current; qrId.current = ''; if (qrTimer.current) clearInterval(qrTimer.current); cancelQr(id) }, [])
+      const modal = !qr ? null : h('div', {
+        style: { position: 'fixed', inset: 0, background: 'rgba(12,28,38,.45)', zIndex: 80, display: 'flex', alignItems: 'center', justifyContent: 'center' },
+        onClick: closeQr,
+      }, h('div', {
+        style: { background: '#fff', borderRadius: 12, padding: '20px 24px', width: 300, textAlign: 'center', boxShadow: '0 12px 40px rgba(0,0,0,.25)' },
+        onClick: (e) => e.stopPropagation(),
+      },
+        h('div', { style: { fontWeight: 600, marginBottom: 10 } }, '扫码登录 B 站'),
+        qr.png ? h('img', { src: 'data:image/png;base64,' + qr.png, width: 200, height: 200, alt: '二维码', style: { display: 'block', margin: '0 auto', borderRadius: 6 } }) : null,
+        h('div', { className: 'ab-muted ab-small', style: { marginTop: 10 } },
+          qr.state === 'loading' ? '正在出码…' : qr.state === 'waiting' ? '等你扫码…' : qr.state === 'expired' ? '二维码过期了' : (qr.message || '出错了')),
+        qr.state === 'waiting' ? h('div', { className: 'ab-muted ab-small', style: { marginTop: 6 } }, '用手机 B 站 App 扫这个码，扫完在手机上点确认。票只存在这台服务器上，跟你自己浏览器登录的那个号互不影响。') : null,
+        h('div', { className: 'ab-flex', style: { justifyContent: 'center', marginTop: 12 } },
+          qr.state === 'expired' || qr.state === 'error' ? h(Btn, { small: true, kind: 'primary', onClick: openQr }, '重新生成') : null,
+          h(Btn, { small: true, kind: 'ghost', onClick: closeQr }, '取消'))))
       const field = (key, prefix, setKey, hintKey, ph) => h('div', { className: 'ab-flex', style: { flexWrap: 'nowrap', marginBottom: 6 } },
         h('code', { className: 'ab-small', style: { minWidth: 82, textAlign: 'right' } }, prefix),
         h('input', {
@@ -6211,8 +6269,10 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           field('biliJct', 'bili_jct=', 'biliJctSet', 'biliJctHint', '粘贴 bili_jct 的值'),
           h('div', { className: 'ab-flex' },
             h(Btn, { small: true, onClick: () => setShow(!show) }, show ? '隐藏' : '显示'),
+            h(Btn, { small: true, kind: 'primary', onClick: openQr }, '扫码登录'),
             b.sessdataSet || b.biliJctSet ? h(Btn, { small: true, kind: 'ghost', onClick: () => { if (confirm('清空保存的 B 站 Cookie？')) setDraft(setPath(setPath(setPath(draft, 'bili.sessdata', null), 'bili.biliJct', null), 'bili.cookie', null)) } }, '清空') : null,
-            h('span', { className: 'ab-muted ab-small' }, '「显示」看的是正在填的内容；保存过的出于安全不回传，只显示结尾几位'))))
+            h('span', { className: 'ab-muted ab-small' }, '「显示」看的是正在填的内容；保存过的出于安全不回传，只显示结尾几位')),
+          modal))
     }
 
 /** 本地接口：数据目录 local/ 里的脚本接管语音合成、生图、翻唱换声、语音识别。 */
@@ -6674,7 +6734,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const acct = s && s.account
       return h('div', { className: 'ab-grid' },
         h(Card, { title: '刷 B 站', right: f.sw('bili.enabled'), desc: 'ta会定时去 B 站刷几个视频：从ta的兴趣、记忆里你喜欢的东西和下面的关键词里挑方向去搜，读简介、字幕和热评，再按自己的性格决定评不评论、要不要私聊分享给你、记住什么。看过的、评过的都记成ta的经历，聊天时会自然提起。你在 QQ 里发 B 站链接或分享卡片，ta也能点进去看完再聊。' },
-          h(BiliCookie, { draft, setDraft }),
+          h(BiliCookie, { draft, setDraft, load }),
           h('div', { className: 'ab-flex', style: { marginTop: 4 } },
             h(Btn, { small: true, onClick: async () => { await get('/bili/account'); load() } }, '检查登录'),
             acct ? h('span', { className: 'ab-small', style: { color: acct.isLogin ? 'var(--ab-ok)' : 'var(--ab-warn)' } }, acct.isLogin ? '已登录：' + acct.uname : '没登录（只能看，不能评论）') : null),

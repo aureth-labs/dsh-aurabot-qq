@@ -182,8 +182,11 @@ export const DEFAULTS = {
     enabled: false,
     sessdata: '', // B 站 Cookie 里的 SESSDATA（登录凭证）
     biliJct: '', // B 站 Cookie 里的 bili_jct（发评论要用）。两个都不填也能看视频，只是不能评论
+    buvid3: '', // 设备指纹之一：扫码登录时跟票一起发下来，重启后要沿用同一个，不然容易被风控
+    buvid4: '', // 设备指纹之一：跟 buvid3 配套，一起发下来、一起保存
+    dedeUserId: '', // 这个号自己的 UID（Cookie 里的 DedeUserID），跟票绑在一起
     ownerName: '', // 主人的 B 站昵称：她写 @主人 时 @ 这个号
-    cookie: '', // 由上面两个拼出来给接口用；老配置的整串会自动拆到上面两个里
+    cookie: '', // 由上面几个拼出来给接口用；老配置的整串会自动拆到上面几个里
     autoBrowse: true, // 定时自己去刷
     intervalHours: 4, // 多久刷一轮
     maxRunsPerDay: 3,
@@ -952,10 +955,25 @@ export function cookieValue(raw, key) {
 }
 
 /**
- * B 站 Cookie 整理成两个值：粘了整串 / 带了「SESSDATA=」前缀的都认得；老配置只有整串的拆开。
- * 返回 {sessdata, biliJct, cookie}，cookie 是拼好给接口用的。
+ * 把票和设备指纹拼成接口要的 Cookie 串。字段顺序固定：SESSDATA → bili_jct → buvid3 → buvid4 → DedeUserID。
+ * 扫码登录、配置归一化、手工粘贴三条路都走这里——各拼一份的话，字段或顺序漂移一次，票就和指纹对不上了。
  */
-export function splitBiliCookie({ sessdata = '', biliJct = '', cookie = '' } = {}) {
+export function buildBiliCookie({ sessdata = '', biliJct = '', buvid3 = '', buvid4 = '', dedeUserId = '' } = {}) {
+  return [
+    sessdata && `SESSDATA=${sessdata}`,
+    biliJct && `bili_jct=${biliJct}`,
+    buvid3 && `buvid3=${buvid3}`,
+    buvid4 && `buvid4=${buvid4}`,
+    dedeUserId && `DedeUserID=${dedeUserId}`,
+  ].filter(Boolean).join('; ')
+}
+
+/**
+ * B 站 Cookie 整理成完整指纹：粘了整串 / 带了「SESSDATA=」前缀的都认得；老配置只有整串的拆开。
+ * 返回 {sessdata, biliJct, buvid3, buvid4, dedeUserId, cookie}，cookie 是拼好给接口用的。
+ * 设备指纹三项优先用字段，为空时从整串 cookie 里补（扫码登录写回配置后，重启也沿用同一个指纹）。
+ */
+export function splitBiliCookie({ sessdata = '', biliJct = '', cookie = '', buvid3 = '', buvid4 = '', dedeUserId = '' } = {}) {
   const a = String(sessdata || '').trim()
   const b = String(biliJct || '').trim()
   // 框里粘的是「xxx=…」这种整串或带前缀的：从里面取；纯值原样用
@@ -971,7 +989,19 @@ export function splitBiliCookie({ sessdata = '', biliJct = '', cookie = '' } = {
     s = cookieValue(cookie, 'SESSDATA')
     j = cookieValue(cookie, 'bili_jct')
   }
-  return { sessdata: s, biliJct: j, cookie: [s && `SESSDATA=${s}`, j && `bili_jct=${j}`].filter(Boolean).join('; ') }
+  // 指纹：字段优先；没填就从整串 cookie / 粘进来的整串里找。都没有就保持空串，不产生空段。
+  let b3 = String(buvid3 || '').trim()
+  let b4 = String(buvid4 || '').trim()
+  let uid = String(dedeUserId || '').trim()
+  if (!b3 || !b4 || !uid) {
+    const sources = [cookie, isRaw(a) ? a : '', isRaw(b) ? b : ''].filter(Boolean)
+    for (const src of sources) {
+      if (!b3) b3 = cookieValue(src, 'buvid3')
+      if (!b4) b4 = cookieValue(src, 'buvid4')
+      if (!uid) uid = cookieValue(src, 'DedeUserID')
+    }
+  }
+  return { sessdata: s, biliJct: j, buvid3: b3, buvid4: b4, dedeUserId: uid, cookie: buildBiliCookie({ sessdata: s, biliJct: j, buvid3: b3, buvid4: b4, dedeUserId: uid }) }
 }
 
 const FILE = () => dataDir('config.json')
