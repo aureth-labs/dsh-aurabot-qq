@@ -252,3 +252,50 @@ test('整合 #81：订阅接法保留构图优先级，通过提示词引导，�
   assert.equal(seen[2].prompt, '猫')
   assert.ok(seen.every((body) => body.size === 'auto'))
 })
+
+test('构图：她选竖图就加构图描述（Codex 不认尺寸）', async () => {
+  const seen = []
+  const fetchImpl = async (url, init) => {
+    seen.push(JSON.parse(init.body))
+    return new Response(JSON.stringify({ data: [{ b64_json: b64 }] }), { status: 200 })
+  }
+  const gen = createImageGen({
+    getConfig: () => normalize({ imageGen: { enabled: true, provider: 'codex' } }),
+    log: silent,
+    fetchImpl,
+    codexAuth: { status: () => ({ loggedIn: true }), ensureAccess: async () => ({ access: 'T', accountId: 'A' }) },
+  })
+  await gen.generate('一只猫', { shape: 'portrait' })
+  assert.match(seen[0].prompt, /竖版构图（2:3）/)
+  assert.equal(seen[0].size, 'auto')
+  await gen.generate('一只猫', { shape: 'wide' })
+  assert.match(seen[1].prompt, /宽幅横版构图（16:9）/)
+})
+
+test('构图：面板钉死比例时，她没指定也按钉死的来；让她自己定则不加构图描述', async () => {
+  const seen = []
+  const fetchImpl = async (url, init) => { seen.push(JSON.parse(init.body)); return new Response(JSON.stringify({ data: [{ b64_json: b64 }] }), { status: 200 }) }
+  const mk = (shape) => createImageGen({
+    getConfig: () => normalize({ imageGen: { enabled: true, provider: 'codex', shape } }),
+    log: silent,
+    fetchImpl,
+    codexAuth: { status: () => ({ loggedIn: true }), ensureAccess: async () => ({ access: 'T', accountId: 'A' }) },
+  })
+  await mk('square').generate('猫')
+  assert.match(seen[0].prompt, /方图构图（1:1）/)
+  await mk('her').generate('猫')
+  assert.equal(seen[1].prompt, '猫', '让她自己定时不硬塞构图描述')
+})
+
+test('构图：OpenAI 兼容接口用真实尺寸（1024x1536 / 1536x1024）', async () => {
+  const seen = []
+  const fetchImpl = async (url, init) => { seen.push({ url, body: JSON.parse(init.body) }); return new Response(JSON.stringify({ data: [{ b64_json: b64 }] }), { status: 200 }) }
+  const cfg = normalize({ imageGen: { enabled: true, provider: 'openai', baseUrl: 'https://api.example.com/v1', model: 'img-1', size: '1024x1024' } })
+  const gen = createImageGen({ getConfig: () => cfg, log: silent, fetchImpl })
+  await gen.generate('猫', { shape: 'portrait' })
+  assert.equal(seen[0].body.size, '1024x1536')
+  await gen.generate('猫', { shape: 'landscape' })
+  assert.equal(seen[1].body.size, '1536x1024')
+  await gen.generate('猫')
+  assert.equal(seen[2].body.size, '1024x1024', '没指定就用面板的兜底尺寸')
+})

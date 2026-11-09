@@ -2,7 +2,7 @@
 // 出站策略源：主动发言的「门闸判定」与「额度账本」（B 线）
 //
 // 来源：
-//   · 接口契约 —— `.pm-handoff/CONTRACT.md` 第二节「策略源接口」（2026-11-03 PM 核实代码后定稿）；
+//   · 接口契约 —— 见 docs/OUTBOUND-POLICY-DESIGN.md §4「策略源接口」；
 //   · 「主动搭话」判定口径 —— `src/features/companion.js` 的 createSpeakUp（L165-280）：
 //     tick 里的 `awake && idleOk && count < maxPerDay && Date.now() >= nextAt`；
 //     reserve 复用同一判定，commit 成功才 `count++` 并重排 nextAt；
@@ -477,7 +477,7 @@ export function createPurposePolicy({ getConfig, engine, state, now, dataDir, lo
    * purpose-state.json），策略源再养一份只会漂移互锁（2026-11-04 实测：引擎到点开口反被
    * 策略账本的旧排程以 cooldown 拦死）。排程时间在这里只做面板展示。
    * role='review'（broker 代发审查）更宽：只看开关/安静时段/在途串行，
-   * 不占任何额度（少爷定的规矩：代发不占目的引擎的说话额度，审查只凭记忆与心情）。
+   * 不占任何额度（代发不占目的引擎的说话额度，审查只凭记忆与心情）。
    */
   function evaluate({ at } = {}, role = 'speak') {
     const t = Number(at) || clock()
@@ -725,7 +725,7 @@ export function createPurposePolicy({ getConfig, engine, state, now, dataDir, lo
   /**
    * 代发审查预占（broker 档 api.proactive.submit 专用）：
    * 只做「引擎开着 + 清醒时段 + 在途串行」三道闸，**不占生成尝试/逻辑发言额度、不看排程**
-   * （少爷定的口径：代发审查不参考目的引擎自己的说话剩余时间，只凭记忆与心情决断内容）。
+   * （代发审查不参考目的引擎自己的说话剩余时间，只凭记忆与心情决断内容）。
    * 结算必须走 commit(reserveId, …, 'review')：只清挂起，不动账。
    */
   function reserveReview({ to, itemId, at } = {}) {

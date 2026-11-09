@@ -3,10 +3,14 @@
 // 导出 speak(text) → { file, engine }：聊天中枢发语音时找它。替换这个模块就能换成任何你想要的念法。
 
 import { existsSync, readFileSync } from 'node:fs'
-import { textToSpeech, edgeInstalled, installEdge, voiceConverters } from '../../voice/tts.js'
+import { textToSpeech, edgeInstalled, installEdge, voiceConverters, volcanoResourceFor, volcanoSynth } from '../../voice/tts.js'
+import { VOLCANO_VOICES } from '../../voice/volcano-voices.js'
+import { breezeBalance, breezeClaim, breezeSession, autoClaimOnce, breezeVoices } from '../../voice/breeze.js'
 import { createSongVoice } from '../../voice/rvc.js'
 import { toMono16k } from '../../voice/wav.js'
 import { fileOf } from '../../local/local.js'
+import { asrConfigured, transcribeAudio } from '../../voice/asr.js'
+import { mergeFromPanel, normalize } from '../../core/config.js'
 
 export default {
   id: 'voice',
@@ -14,19 +18,26 @@ export default {
   version: '1.0.0',
   description: '发语音条：把她的话念出来（关掉后想发语音时改发文字）',
   tab: 'voice',
-  files: ['voice/tts.js', 'voice/rvc.js'],
+  files: ['voice/tts.js', 'voice/asr.js', 'voice/rvc.js', 'voice/volcano-voices.js'],
   setup(api) {
     const { hub, onebot, local, http } = api.core
 
-    async function speak(text) {
-      // 本地接口接管语音合成；出错退回内置
-      if (local.active('tts')) {
+    async function speak(text, voice = api.config().voice, { useLocal = true } = {}) {
+      // 本地接口接管语音合成；出错退回内置。试听用 useLocal=false，避免「本地接口」把任何引擎都顶掉
+      if (useLocal && local.active('tts')) {
         try {
           const file = fileOf(await local.call('tts', { text }))
           if (file && existsSync(file)) return { file, engine: 'local' }
         } catch (error) {}
       }
-      return textToSpeech(text, api.config().voice, api.log)
+      return textToSpeech(text, voice, api.log)
+    }
+
+    /** 试听用：把面板上「还没保存」的语音草稿合并进当前配置；空着的 Key 沿用已保存的。 */
+    function voiceFromBody(body) {
+      const saved = api.config()
+      if (!body || !body.voice || typeof body.voice !== 'object') return saved.voice
+      try { return normalize(mergeFromPanel(saved, { voice: body.voice })).voice } catch (error) { return saved.voice }
     }
 
     // 语音条变声：如果面板里选了「翻唱里导入的音色」，TTS 后再用 RVC 换成她的声音。
@@ -52,11 +63,62 @@ export default {
 
     api.route('/voice/test', async (req) => {
       const b = await http.body(req)
-      const { file, engine } = await speak(String(b.text || '你好呀，我是大肥鱼'))
+      // 面板会带上当前页面的 voice 草稿：没保存也能试听，空密钥用已保存的
+      const voice = voiceFromBody(b)
+      const { file, engine } = await speak(String(b.text || '你好呀，我是大肥鱼'), voice, { useLocal: false })
       const buf = readFileSync(file)
       return { ok: true, engine, mime: file.endsWith('.wav') ? 'audio/wav' : 'audio/mpeg', data: buf.toString('base64') }
     })
     api.route('/voice/install', async () => installEdge(api.log))
+    // 自检云端识别：先用内置语音念一句，再交给配好的 ASR 服务
+    api.route('/voice/asr-provider-test', async (req) => {
+      const b = await http.body(req)
+      const voice = voiceFromBody(b)
+      if (!asrConfigured(voice)) return { ok: false, message: '没配置云端识别（面板「语音 → 听语音」里选一个）' }
+      const text = String(b.text || '今天想吃白米饭')
+      let file
+      try {
+        const r = await textToSpeech(text, { engine: process.platform === 'win32' ? 'windows' : 'edge' }, api.log)
+        file = r.file
+      } catch (error) {
+        return { ok: false, message: '生成测试语音失败：' + error.message }
+      }
+      try {
+        const t = Date.now()
+        const heard = await transcribeAudio(readFileSync(file), voice, api.log)
+        return { ok: Boolean(heard), said: text, heard, provider: voice.asrApi?.provider || '', ms: Date.now() - t }
+      } catch (error) {
+        return { ok: false, message: '识别失败：' + error.message }
+      }
+    })
+
+    // 单独试听一个音色：用面板上「还没保存」的 Key / 音色 / 语速直接念一句，方便一个个挑。
+    // 面板里 Key 框是密码框、保存后不回传原文，所以这里没传 Key 就用存好的那份。
+    api.route('/voice/volcano-preview', async (req) => {
+      const b = await http.body(req)
+      const saved = api.config().voice.volcano || {}
+      const c = {
+        apiKey: String(b.apiKey || '').trim() || String(saved.apiKey || ''),
+        voiceType: String(b.voiceType || saved.voiceType || '').trim(),
+        resourceId: String(b.resourceId || saved.resourceId || '').trim(),
+        speedRatio: Number(b.speedRatio) || Number(saved.speedRatio) || 1,
+      }
+      if (!c.apiKey) return { ok: false, message: '先在上面把 API Key 填上，再试听' }
+      try {
+        const file = await volcanoSynth(String(b.text || '你好呀，我是大肥鱼。这个声音你听着怎么样？'), c)
+        const buf = readFileSync(file)
+        return { ok: true, engine: 'volcano', mime: 'audio/mpeg', data: buf.toString('base64') }
+      } catch (error) {
+        return { ok: false, message: String((error && error.message) || error) }
+      }
+    })
+
+    // 面板「豆包语音」的音色下拉：火山官方预置音色，按语种 / 性别分组，2.0 排在 1.0 前面。
+    // resourceId 一起给出去，面板选中时顺手写进配置，省得猜模型版本。
+    api.route('/voice/volcano-voices', async () => ({
+      ok: true,
+      voices: VOLCANO_VOICES.map((v) => ({ id: v.id, name: v.name, group: v.group, ver: v.ver, scene: v.scene || '', resourceId: volcanoResourceFor(v.id) })),
+    }))
 
     // DSH 自带语音识别：看状态 / 下载模型
     const stt = () => api.dsh.get('speechToText')
@@ -99,6 +161,42 @@ export default {
       return { ok: Boolean(heard), said: text, heard, ms: Date.now() - t }
     })
 
-    return { speak, edgeInstalled }
+    // ── Breeze 云端额度：查余额 / 领每日额度 ─────────────────────────────
+  // 只跟 BreezeBlue 的站点接口打交道；本机自建（mode=local）不走这套，也不需要 Key。
+  api.route('/voice/breeze-status', async () => {
+    const b = api.config().voice?.breeze || {}
+    const local = b.mode === 'local'
+    const bal = local ? { ok: true, hasKey: false, balance: null, note: '本地自建不用额度' } : await breezeBalance(b)
+    const s = breezeSession()
+    return {
+      ok: true,
+      mode: local ? 'local' : 'cloud',
+      hasKey: Boolean(String(b.key || '').trim()),
+      online: bal.ok,
+      balance: bal.balance,
+      note: bal.note,
+      emailSet: Boolean(String(b.email || '').trim()),
+      passwordSet: Boolean(b.password),
+      autoClaim: Boolean(b.autoClaim),
+      lastClaimAt: Number(s?.lastClaimAt) || 0,
+      lastTier: s?.lastTier || '',
+    }
+  })
+  // 列出云端音色（面板「列出音色」按钮）
+  api.route('/voice/breeze-voices', async () => {
+    const b = api.config().voice?.breeze || {}
+    if (b.mode === 'local') return { ok: false, message: '本地自建模式不用选云端音色' }
+    return breezeVoices(b)
+  })
+  api.route('/voice/breeze-claim', async () => {
+    const b = api.config().voice?.breeze || {}
+    const r = await breezeClaim(b, { log: api.log })
+    const bal = await breezeBalance(b)
+    return { ok: true, message: r.message, reward: r.reward, tier: r.tier, balance: bal.balance }
+  })
+  // 每小时醒一次：只有「选了 Breeze + 云端 + 开了自动领取 + 填了账号」才真的去领，一天最多一次
+  api.every(3600_000, () => autoClaimOnce(api.config(), { log: api.log }), '领 Breeze 额度')
+
+  return { speak, edgeInstalled }
   },
 }

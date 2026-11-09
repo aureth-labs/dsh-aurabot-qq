@@ -2,7 +2,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-const { drawResultBlocks, imageToolBlock, drawToolMessage } = await import('../src/features/imagegen.js')
+const { drawResultBlocks, imageToolBlock, drawToolMessage, createImageGen } = await import('../src/features/imagegen.js')
 const { shrinkImage, shrinkWithSharp, findSharp } = await import('../src/core/img.js')
 const { defineTool } = await import('../src/tools/tools.js')
 
@@ -97,4 +97,36 @@ test('defineTool：自定义 render 生效，默认 render 不变', () => {
   const plain = defineTool({ name: 't2', description: 'd', execute: async () => ({ ok: true }) })
   assert.deepEqual(plain.output.render({}, { ok: true, message: '好了' }), [{ type: 'text', text: '好了' }])
   assert.deepEqual(plain.output.render({}, { ok: false, message: '坏了' }), [{ type: 'text', text: '✗ 坏了' }])
+})
+
+test('drawToolMessage：三种情况（给看了 / 开关关着没给看 / 看不了图）', () => {
+  assert.equal(drawToolMessage({ visual: true, seeOwn: true }), '画好发出去了')
+  const off = drawToolMessage({ visual: true, seeOwn: false })
+  assert.match(off, /没把图给你看/)
+  assert.doesNotMatch(off, /你自己看到的画面/, '不再有「你自己看到的画面」那段描述')
+  for (const msg of [drawToolMessage({ visual: true }), off, drawToolMessage({ visual: false })]) {
+    assert.doesNotMatch(msg, /存在\s*[A-Za-z]:[\\/]|\.png|读它/, '任何情况都不给文件路径')
+  }
+})
+
+function stubDsh (mods) {
+  return { llm: { resolveModelInfo: async () => ({ inputModalities: mods }) }, get: () => null }
+}
+const makeGen = (dsh, cfg) => createImageGen({
+  getConfig: () => cfg,
+  log: { info () {}, warn () {}, debug () {}, error () {} },
+  local: { active: () => false },
+  dsh,
+  codexAuth: { status: () => ({ loggedIn: false }) },
+})
+const baseCfg = { model: { provider: 'p', model: 'm', vision: 'auto' }, imageGen: { enabled: true, provider: 'openai', baseUrl: 'http://x', model: 'm', seeOwn: true } }
+
+test('canSee：按「视觉能力」开关 + 模型元数据判定，拿不准当不能', async () => {
+  const withModel = (model, vision = 'auto') => ({ ...baseCfg, model: { provider: 'p', model, vision } })
+  assert.equal(await makeGen(stubDsh(['text']), withModel('m-on', 'on')).canSee(), true, '手动声明支持 → 能看')
+  assert.equal(await makeGen(stubDsh(['text', 'image']), withModel('m-off', 'off')).canSee(), false, '手动声明不支持 → 不能看')
+  assert.equal(await makeGen(stubDsh(['text', 'image']), withModel('m-see')).canSee(), true)
+  assert.equal(await makeGen(stubDsh(['text']), withModel('m-blind')).canSee(), false)
+  assert.equal(await makeGen(stubDsh(undefined), withModel('m-unknown')).canSee(), false, '宿主没说清楚 → 当不能看')
+  assert.equal(await makeGen(null, withModel('m-nodsh')).canSee(), false, '没有 dsh → 不能看')
 })

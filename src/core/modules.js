@@ -9,11 +9,12 @@
 // 接口说明给写模块的人看：src/modules/API.md（每次启动复制到数据目录 modules/ 里）。
 
 import { existsSync, readdirSync, statSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
-import { join, dirname, relative, resolve, sep } from 'node:path'
+import { join, dirname, relative, resolve, sep, isAbsolute } from 'node:path'
 import { pathToFileURL, fileURLToPath } from 'node:url'
 import { dataDir } from './store.js'
 import { registerSecretField } from './config.js'
 import { defineTool } from '../tools/tools.js'
+import { selfName } from '../persona/personas.js'
 
 /** 扩展接口版本：只加不改。哪天不得不改已有的东西才升到 2，并在更新说明里写清楚怎么迁移。 */
 export const API_VERSION = 1
@@ -497,6 +498,9 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
   const modCfg = (id) => getConfig().modules?.[id] || {}
   const isEnabled = (id) => modCfg(id).enabled !== false
   const isUserOn = () => !getConfig().safeMode
+  // 接口挂在哪：内置模块（以及从内置搬到社区库的那几个）沿用原来的根路径，别的模块挂在自己的 /ext/<id>/ 下。
+  // 面板里的 call('/x') 要用同一份判断决定基址（见 status().routesAtRoot），两边不能各算各的。
+  const routesAtRoot = (id) => builtinDefs.has(id) || STABLE_ROUTES.has(id)
 
   // ---------- 给模块的 api ----------
   function makeApi(id, source, rec) {
@@ -529,7 +533,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       return off
     }
     // 内置模块和替换它的版本用原来的路径（内置的面板页照常能用）；新模块放在 /ext/模块id/ 下
-    const prefix = builtinDefs.has(id) || STABLE_ROUTES.has(id) ? '' : `/ext/${id}`
+    const prefix = routesAtRoot(id) ? '' : `/ext/${id}`
     const def = rec.def
     // 模块拿到的 core：hub 换成「宿主按模块身份封装」的白名单副本（三审 #177：原型链斩断，
     // 模块摸不到原始 runSubagentTurn / subagentFor）；core 本体用 Proxy 转发，
@@ -585,7 +589,8 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       emit: writable('emit', (event, ...args) => emit(event, ...args)),
       every: (ms, fn, label = '定时任务') => {
         const t = setInterval(() => {
-          if (!active()) return
+          // 调试模式不跑定时任务：刷 B 站、逛空间、主动搭话、整理记忆这些都别在调试里自己动
+          if (!active() || getConfig().debug) return
           Promise.resolve().then(() => { if (active()) return fn() }).catch((error) => note(id, label, error))
         }, Math.max(1000, Number(ms) || 60_000))
         t.unref?.()
@@ -596,12 +601,13 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
         t.unref?.()
         return track(() => clearTimeout(t))
       },
-      route: (path, handler) => {
+      route: (path, handler, options = {}) => {
         if (!active()) return () => {}
+        if (options.access != null && options.access !== 'panel') throw new Error('路由 access 只支持 panel')
         const full = '/aurabot/api' + prefix + (String(path).startsWith('/') ? path : '/' + path)
         const cur = routes.get(full)
         if (cur && cur.id !== id && live.has(cur.id)) throw new Error(`接口 ${full} 已经被模块「${cur.id}」占了`)
-        const route = { id, handler: guard(`接口 ${path}`, handler) }
+        const route = { id, handler: guard(`接口 ${path}`, handler), access: options.access || null }
         routes.set(full, route)
         return track(() => { if (routes.get(full) === route) routes.delete(full) })
       },
@@ -623,7 +629,8 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       sendFile: writable('sendFile', (chatId, file, name) => governedSend(core, id, { chatId: String(chatId) }, () => core.hub.sendFile(String(chatId), file, name), obLog)),
       // 把一个音频文件当语音条发出去（不走念文字）
       sendVoiceFile: writable('sendVoiceFile', (chatId, file, note) => governedSend(core, id, { chatId: String(chatId) }, () => core.hub.sendVoiceFile(String(chatId), file, note || `[${id}] 语音`), obLog)),
-      ask: writable('ask', (opts) => core.ask(typeof opts === 'string' ? { text: opts } : opts)),
+      // module: id —— 这次模型调用的用量记到哪个模块名下（面板「概览」的 token 明细）
+      ask: writable('ask', (opts) => core.ask(typeof opts === 'string' ? { text: opts, module: id } : { ...opts, module: id })),
       think: writable('think', (prompt, opts = {}) => core.hub.runSystemTurn(`ext-${id}`, opts.title || def.name || id, String(prompt), opts)),
       onebot: writable('onebot', (action, params, opts) => core.onebot.call(action, params, opts)),
       // 出站治理面（主动发言策略，见 docs/OUTBOUND-POLICY-DESIGN.md）。
@@ -1046,7 +1053,12 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
         routes: [...routes].filter(([, r]) => r.id === id).map(([p]) => p.replace('/aurabot/api', '')),
         settings: rec?.source === 'user' || (!rec && u) ? (def.settings || []) : [],
         defaults: def.defaults || {},
-        panel: Boolean(rec?.source === 'user' && def.panel),
+        // 内置模块也能带面板：内置和用户模块走同一条加载链路，面板只按「定义里有没有声明 panel」判断。
+        // 不再要求 rec.source === 'user'，否则内置模块写了 panel.js 也永远显示不出来。
+        // 仍然要求模块在跑（rec 存在），没跑起来的模块没有面板代码可读。
+        panel: Boolean(rec && def.panel),
+        // 接口是不是挂在根路径（内置模块的老路径）；面板里的 call() 靠它决定加不加 /ext/<id> 前缀
+        routesAtRoot: routesAtRoot(id),
         tab: def.tab || '',
         flag: typeof def.flag === 'string' ? def.flag : (def.settings || []).some((f) => f?.key === 'enabled') ? 'enabled' : '',
         keepPanel: Boolean(def.keepPanel),
@@ -1065,13 +1077,29 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     return names
   }
 
-  /** 自己写的模块的面板代码（panel.js），面板拿去执行。 */
+  /** file 是不是在 root 目录里面（root 自己不算；越过 root 的 ../ 一律不算）。 */
+  function inside(root, file) {
+    const rel = relative(resolve(root), resolve(file))
+    return Boolean(rel) && !rel.startsWith('..') && !isAbsolute(rel)
+  }
+
+  /**
+   * 模块的面板代码（panel.js），面板拿去执行。
+   * 内置模块也允许带面板：两者本来就是同一条加载链路，面板只需要「定义里声明了 panel」。
+   * 面板文件从模块自己的文件夹读：用户模块在数据目录 modules/<id>，内置模块在 src/modules/<id>；
+   * 两边都要求落在各自的根目录里，防止 panel 写成 ../../xxx 去读根目录外面的文件。
+   */
   function panelSource(id) {
     const rec = live.get(id)
-    if (!rec || rec.source !== 'user' || !rec.def.panel) return null
-    const u = userSeen.get(id)
-    const file = typeof rec.def.panel === 'string' ? resolve(u.dir, rec.def.panel) : join(u.dir, 'panel.js')
-    if (!file.startsWith(u.dir) || !existsSync(file)) return null
+    if (!rec || !rec.def.panel) return null
+    // 内置模块的根目录是 src/modules/<id>；id 先按 ID_RE 校验，别让奇怪的名字把根目录带到外面去。
+    const builtin = rec.source !== 'user'
+    const root = builtin
+      ? (ID_RE.test(String(id)) ? join(BUILTIN_DIR, id) : '')
+      : (rec.dir || userSeen.get(id)?.dir || '')
+    if (!root) return null
+    const file = resolve(root, typeof rec.def.panel === 'string' ? rec.def.panel : 'panel.js')
+    if (!inside(root, file) || !existsSync(file)) return null
     return readFileSync(file, 'utf8')
   }
 
@@ -1128,7 +1156,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
 
   function promptFor(id) {
     const dir = id ? join(userDir(), id) : userDir()
-    return `帮我修改 Aurabot（大肥鱼 QQ 插件）的扩展模块：${dir}\n`
+    return `帮我修改 Aurabot（${selfName(getConfig())} QQ 插件）的扩展模块：${dir}\n`
       + `先完整读一遍「${join(userDir(), DOC)}」了解模块怎么写、能用哪些接口，再按我的要求改：\n`
       + '【这里写你想让她多会什么、改成什么样】\n'
       + `只改 ${userDir()} 里的文件，不要动插件本身的代码；改完保存会自动重新加载，到面板「已安装」页看有没有报错，再告诉我怎么试。`
@@ -1144,6 +1172,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     // 插件核心自己听事件（不属于任何模块，不会被撤掉）
     listen: (event, fn) => { const item = { id: '@core', fn }; listeners.set(event, [...(listeners.get(event) || []), item]); return () => listeners.set(event, (listeners.get(event) || []).filter((x) => x !== item)) }, contextFor, rules, commands, dshTools, builtinOff, handle,
     hasRoute: (path) => routes.has(path),
+    routeAccess: (path) => routes.get(path)?.access || null,
     dir: userDir,
   }
 }

@@ -204,11 +204,11 @@ test('下载源：自动模式下官方源慢就用国内镜像；老配置自�
   assert.equal(normalize({ song: { pypiMirror: 'tuna' } }).song.pypiMirror, 'cn')
 })
 
-test('检查更新：GitHub 连不上就走 jsDelivr', async () => {
+test('检查更新：Release Atom 连不上就走 GitHub API', async () => {
   const u = await import('../src/core/update.js')
   const seen = []
-  const check = u.createUpdateChecker({ pkg: { version: '0.2.0', repository: 'https://github.com/a/b' }, fetchImpl: async (url) => { seen.push(url); if (url.includes('raw.githubusercontent')) throw new Error('reset'); return { ok: true, json: async () => ({ version: '0.3.0' }) } } })
+  const check = u.createUpdateChecker({ pkg: { version: '0.2.0', repository: 'https://github.com/a/b' }, fetchImpl: async (url) => { seen.push(url); if (url.includes('releases.atom')) throw new Error('reset'); return { ok: true, json: async () => [{ tag_name: 'v0.3.0', draft: false }] } } })
   const r = await check({ force: true })
   assert.equal(r.newer, true)
-  assert.ok(seen[1].includes('cdn.jsdelivr.net'))
+  assert.ok(seen[1].includes('api.github.com'))
 })

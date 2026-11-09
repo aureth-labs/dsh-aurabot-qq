@@ -52,7 +52,7 @@ test('提炼只接受本人或主人来源，手动标签优先', async (t) => {
   const output = { facts: [], people: [{ qq: a, like: { text: '讨厌', speaker: a } }, { qq: b, like: { text: '喜欢', speaker: a } }, { qq: owner, like: { text: '讨厌', speaker: owner } }] }
   const { memory, rows } = fixture(t, output)
   memory.savePersonaPerson(a, { tags: ['朋友'] })
-  for (const uid of [a, b, owner]) rows.push({ chatId: 'group:777', uid, who: uid, text: '聊天', t: Date.now() })
+  for (const uid of [a, b, owner]) rows.push({ chatId: 'group:777', uid, who: uid, text: '聊天', t: Date.now(), interaction: [uid] })
   await memory.consolidate({ includeToday: true })
   assert.deepEqual(memory.personTags(a), ['朋友'])
   assert.deepEqual(memory.personTags(b), [])
@@ -62,7 +62,7 @@ test('提炼只接受本人或主人来源，手动标签优先', async (t) => {
 test('模型形成喜恶并替换原来的喜恶，其他标签保留', async (t) => {
   const { memory, rows, dir } = fixture(t, { facts: [], people: [{ qq: a, like: { text: '讨厌', speaker: a } }] })
   writeFileSync(join(dir, 'memories.json'), JSON.stringify({ items: [], profiles: { [a]: { tags: ['喜欢', '朋友'] } } }))
-  rows.push({ chatId: 'group:777', uid: a, who: '甲', text: '你好', t: Date.now() })
+  rows.push({ chatId: 'group:777', uid: a, who: '甲', text: '你好', t: Date.now(), interaction: [a] })
   await memory.consolidate({ includeToday: true })
   assert.deepEqual(memory.personTags(a), ['朋友', '讨厌'])
   assert.equal(memory.dislikes(a), true)

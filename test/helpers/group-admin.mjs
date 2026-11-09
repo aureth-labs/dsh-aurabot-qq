@@ -25,11 +25,11 @@ export default {
       if (!(chat.kind === 'group' || level === 'full')) return []
       return defineTool({
         name: 'qq_group_admin',
-        description: '群管理：禁言 / 解禁 / 踢人 / 改头衔 / 发群公告。只有主人要求时才能用；别人要求会被系统拒绝。',
+        description: '群管理：禁言 / 解禁 / 全体禁言 / 解除全体禁言 / 踢人 / 改头衔 / 发群公告。只有主人要求时才能用；别人要求会被系统拒绝。',
         properties: {
-          action: { type: 'string', enum: ['ban', 'unban', 'kick', 'title', 'notice'], description: 'ban 禁言，unban 解禁，kick 踢出，title 改专属头衔，notice 发公告' },
+          action: { type: 'string', enum: ['ban', 'unban', 'whole_ban', 'whole_unban', 'kick', 'title', 'notice'], description: 'ban 禁言某人，unban 解除某人的禁言，whole_ban 全体禁言（整个群都禁言），whole_unban 解除全体禁言，kick 踢出，title 改专属头衔，notice 发公告' },
           group_id: str('群号；在群里用时可省略，默认当前群'),
-          user_id: str('对象 QQ 号（notice 不需要）'),
+          user_id: str('对象 QQ 号（notice、全体禁言不需要）'),
           minutes: int('禁言分钟数，默认 10'),
           text: str('头衔内容或公告内容'),
         },
@@ -42,7 +42,8 @@ export default {
           if (!gid) return { ok: false, message: '不知道是哪个群' }
           if (!cfg.allow.groups.includes(String(gid))) return { ok: false, message: '这个群不在白名单里' }
           const uid = Number(user_id || 0)
-          if (action !== 'notice' && !uid) return { ok: false, message: '要说清楚对谁（QQ 号）' }
+          const whole = action === 'whole_ban' || action === 'whole_unban'
+          if (!whole && action !== 'notice' && !uid) return { ok: false, message: '要说清楚对谁（QQ 号）' }
           if (uid && String(uid) === String(cfg.ownerQQ) && action !== 'unban' && action !== 'title') return { ok: false, message: '不能对主人做这个' }
           const role = await groupRoles.get(gid, { fresh: true })
           if (role && !groupRoles.canManage(role)) return { ok: false, message: '我在这个群只是普通成员，没有管理权限' }
@@ -51,6 +52,9 @@ export default {
           switch (action) {
             case 'ban': await onebot.call('set_group_ban', { group_id: gid, user_id: uid, duration: Math.max(1, Number(minutes) || 10) * 60 }); break
             case 'unban': await onebot.call('set_group_ban', { group_id: gid, user_id: uid, duration: 0 }); break
+            // 全体禁言：整个群禁言 / 解除（OneBot v11 的 set_group_whole_ban）
+            case 'whole_ban': await onebot.call('set_group_whole_ban', { group_id: gid, enable: true }); break
+            case 'whole_unban': await onebot.call('set_group_whole_ban', { group_id: gid, enable: false }); break
             case 'kick': await onebot.call('set_group_kick', { group_id: gid, user_id: uid, reject_add_request: false }); break
             case 'title': await onebot.call('set_group_special_title', { group_id: gid, user_id: uid, special_title: String(text || '') }); break
             case 'notice': await onebot.call('_send_group_notice', { group_id: gid, content: String(text || '') }); break

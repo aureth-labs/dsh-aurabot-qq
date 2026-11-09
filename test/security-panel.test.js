@@ -2,6 +2,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
+import { normalize } from '../src/core/config.js'
 
 const client = readFileSync(new URL('../client/client.js', import.meta.url), 'utf8')
 const host = readFileSync(new URL('../src/host.js', import.meta.url), 'utf8')
@@ -9,7 +10,7 @@ const config = readFileSync(new URL('../src/core/config.js', import.meta.url), '
 
 test('安全防护页接上了页签、组件、搜索和 SSRF 模式配置', () => {
   assert.ok(client.includes("{ id: 'security', label: '安全防护' }"), '缺安全防护页签')
-  assert.ok(client.includes("tabs: ['connect', 'model', 'access', 'security', 'backup', 'about', 'logs']"), '安全防护要注册在系统组')
+  assert.ok(client.includes("tabs: ['connect', 'model', 'access', 'browser', 'security', 'backup', 'about', 'logs']"), '安全防护要注册在系统组')
   assert.ok(client.includes('security: Security'), '组件表缺 security → Security')
   assert.ok(client.includes('function Security({ st, draft, setDraft })'), '缺 Security 组件')
   assert.ok(client.includes("security: '安全 防护 ssrf 内网 图片"), '搜索索引缺安全防护关键词')
@@ -29,6 +30,11 @@ test('危险命令确认放在安全防护页，不能藏在聊天页', () => {
   const security = client.slice(securityStart, logsStart)
   assert.ok(security.includes('security.dangerConfirm'), '安全防护页缺危险命令确认')
   assert.ok(!group.includes('security.dangerConfirm'), '聊天页不该再出现危险命令确认')
+})
+
+test('危险命令确认默认开启，显式关闭仍然生效', () => {
+  assert.equal(normalize({}).security.dangerConfirm, true, '新配置应该默认开启')
+  assert.equal(normalize({ security: { dangerConfirm: false } }).security.dangerConfirm, false, '显式关掉不能被改成开')
 })
 
 test('安全防护页：远端管理与可信反代有 UI，且配置走 security 段（首审 P1-3）', () => {

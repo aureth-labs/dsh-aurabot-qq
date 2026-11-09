@@ -43,6 +43,7 @@ export function createOneBotClient({ endpoint, onEvent, onState, log, retryDelay
   let echoSeq = 0
   let stopGeneration = 0
   let explicitlyStopped = false // 初次 start 前仍允许调用，stop 后须重新 start
+  let hasConnected = false // 首次连上之前不要退避到 30 秒，网关一就绪就尽快接上
   const pending = new Map()
   const retryWaits = new Set()
 
@@ -161,6 +162,7 @@ export function createOneBotClient({ endpoint, onEvent, onState, log, retryDelay
     }
     ws = sock
     sock.onopen = () => {
+      hasConnected = true
       backoff = RECONNECT_MIN
       setState('connected')
       log.info('已连上 QQ 网关（WS）')
@@ -199,11 +201,16 @@ export function createOneBotClient({ endpoint, onEvent, onState, log, retryDelay
     clearTimeout(timer)
     if (stopped) return
     timer = setTimeout(connect, backoff)
-    backoff = Math.min(RECONNECT_MAX, backoff * 2)
+    // 首次连接前（SnowLuma 正在登录 QQ、OneBot 端口还没起）最多等 3 秒；
+    // 已经连过再断线才恢复到 30 秒，避免正常断线时刷屏。
+    const cap = hasConnected ? RECONNECT_MAX : 3000
+    backoff = Math.min(cap, Math.max(RECONNECT_MIN, backoff * 2))
   }
 
   return {
     call,
+    isConnected: () => state === 'connected',
+    state: () => state,
     start() {
       if (!stopped) return
       explicitlyStopped = false

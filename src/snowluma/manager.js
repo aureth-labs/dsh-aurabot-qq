@@ -7,9 +7,82 @@
 import { spawn, execFile } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { existsSync, readFileSync, unlinkSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
 import net from 'node:net'
 import { registerSecret } from '../core/redact.js'
+import { classifyQqVersion } from './qq-version.js'
+import { snowlumaCompat } from './compat.js'
+import { parseProcessLines } from './process-info.js'
+
+// QQ 进程的 exe 路径和文件版本从 PID 查：SnowLuma 的 /api/processes 不返回 path。
+// 只用于「老版 QQ」软提示；失败/超时一律当未知，不影响注入。
+const pidInfoCache = new Map()
+async function processDetails(pids) {
+  const list = [...new Set((pids || []).map((n) => Number(n)).filter((n) => Number.isInteger(n) && n > 0))]
+  if (!list.length) return new Map()
+  const missing = list.filter((pid) => {
+    const hit = pidInfoCache.get(pid)
+    return !hit || Date.now() - hit.at > 10 * 60_000
+  })
+  if (missing.length && process.platform === 'win32') {
+    const script = `$ids = ${missing.join(',')}; Get-Process -Id $ids -ErrorAction SilentlyContinue | ForEach-Object { $p = ''; try { $p = $_.Path } catch {}; $v = ''; if ($p) { try { $v = (Get-Item -LiteralPath $p).VersionInfo.FileVersion } catch {} }; Write-Output ("{0}|{1}|{2}" -f $_.Id, $p, $v) }`
+    const text = await new Promise((resolve) => {
+      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { timeout: 5000, windowsHide: true }, (error, stdout) => resolve(String(stdout || '')))
+    })
+    const found = parseProcessLines(text)
+    for (const pid of missing) {
+      const hit = found.find((x) => x.pid === pid) || { path: '', version: '' }
+      pidInfoCache.set(pid, { ...hit, at: Date.now() })
+    }
+  }
+  return new Map(list.map((pid) => [pid, pidInfoCache.get(pid) || { path: '', version: '' }]))
+}
+
+async function qqInfoOf(pid) {
+  const hit = (await processDetails([pid])).get(Number(pid)) || { path: '', version: '' }
+  const version = actualQqVersion(hit.path, hit.version)
+  return { version, path: hit.path, ...classifyQqVersion(version, hit.path) }
+}
+
+// QQ.exe 是启动器，热更新后它的 FileVersion 仍是 baseVersion（例如 9.9.22）；
+// 真实运行版本在 <QQ_NT>\versions\config.json 的 curVersion。面板必须读这个值。
+export function actualQqVersion(path, fallback) {
+  const p = String(path || '')
+  try {
+    if (/[\\/]QQ(?:NT|_NT)[\\/]QQ\.exe$/i.test(p) || /[\\/]versions[\\/][^\\/]+[\\/]QQ\.exe$/i.test(p)) {
+      const root = /[\\/]versions[\\/]/i.test(p) ? p.replace(/[\\/]versions[\\/].*$/i, '') : dirname(p)
+      const cfg = readJsonSafe(join(root, 'versions', 'config.json'))
+      const v = cfg?.curVersion || cfg?.baseVersion
+      if (v) return String(v)
+    }
+  } catch (error) {}
+  return fallback
+}
+
+// SnowLuma 只列出它能接的 QQ NT 进程；老版 QQ（非 NT）不会出现在它的列表里。
+// 这里独立扫一遍系统里的 QQ/TIM 进程，只挑出老版的用于提示，不参与注入。
+let oldQqCache = { at: 0, list: [] }
+async function oldQqProcesses() {
+  if (process.platform !== 'win32') return []
+  if (Date.now() - oldQqCache.at < 60_000) return oldQqCache.list
+  const script = `Get-Process -Name QQ,TIM -ErrorAction SilentlyContinue | ForEach-Object { $p = ''; try { $p = $_.Path } catch {}; $v = ''; if ($p) { try { $v = (Get-Item -LiteralPath $p).VersionInfo.FileVersion } catch {} }; Write-Output ("{0}|{1}|{2}" -f $_.Id, $p, $v) }`
+  const text = await new Promise((resolve) => {
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { timeout: 5000, windowsHide: true }, (error, stdout) => resolve(String(stdout || '')))
+  })
+  const seen = new Set()
+  const list = []
+  for (const row of parseProcessLines(text)) {
+    // 同一个 QQ 客户端会开多个进程（主进程/辅助进程），按安装路径只报一条
+    const key = row.path || `version:${row.version}` || `pid:${row.pid}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    const info = classifyQqVersion(row.version, row.path)
+    if (info.nt !== false) continue // 只报老版；NT 的交给 SnowLuma 列表
+    list.push({ pid: row.pid, path: row.path, qqVersion: row.version, nt: false, versionLabel: info.label })
+  }
+  oldQqCache = { at: Date.now(), list }
+  return list
+}
 
 export const DOWNLOAD_PAGE = 'https://github.com/SnowLuma/SnowLuma/releases/latest'
 
@@ -181,7 +254,14 @@ export function createSnowLumaManager({ getConfig, log, savePassword }) {
   const rejected = new Set()
 
   const cfg = () => getConfig().snowluma
-  const base = () => `http://127.0.0.1:${cfg().webuiPort}`
+  // SnowLuma 自己的默认控制台端口是 5099（开了 Hyper-V 的 Windows 常把它划进保留段）。
+  // 插件配置里的 webuiPort 才是真相：控制台请求用它，启动时也用 SNOWLUMA_WEBUI_PORT 传给它
+  // （SnowLuma 的 env 覆盖 runtime.json，且不会写回配置，最干净）。
+  const port = () => {
+    const n = Number(cfg().webuiPort)
+    return Number.isInteger(n) && n > 0 && n < 65536 ? n : 15099
+  }
+  const base = () => `http://127.0.0.1:${port()}`
 
   async function api(path, { method = 'GET', body, auth = true } = {}) {
     const headers = { 'content-type': 'application/json' }
@@ -276,6 +356,8 @@ export function createSnowLumaManager({ getConfig, log, savePassword }) {
       env.SNOWLUMA_WEBUI_BOOTSTRAP_PASSWORD = pw
       token = ''
     }
+    // 控制台端口：用 env 覆盖，SnowLuma 会按它起 WebUI（不改它的 runtime.json）
+    env.SNOWLUMA_WEBUI_PORT = String(port())
     try {
       child = spawn(exe, ['./index.mjs'], { cwd: inst.dir, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], detached: false })
     } catch (error) {
@@ -327,9 +409,10 @@ export function createSnowLumaManager({ getConfig, log, savePassword }) {
 
   async function processes() {
     const j = await api('/api/processes')
-    return (j.list || []).map((p) => ({
+    const rows = (j.list || []).map((p) => ({
       pid: p.pid,
       name: p.name,
+      path: p.path || '',
       injected: Boolean(p.injected),
       connected: Boolean(p.connected),
       loggedIn: Boolean(p.loggedIn),
@@ -339,8 +422,22 @@ export function createSnowLumaManager({ getConfig, log, savePassword }) {
       nickname: p.account?.nickname || '',
       isBot: String(p.account?.uin ?? p.uin ?? '') === String(getConfig().botQQ),
     }))
+    // 版本读取只做软提示：按 PID 缓存 10 分钟，读不到就是未知
+    const details = await processDetails(rows.map((row) => row.pid))
+    for (const row of rows) {
+      const hit = details.get(row.pid) || { path: '', version: '' }
+      row.path = row.path || hit.path
+      const actualVersion = actualQqVersion(row.path, hit.version)
+      const info = classifyQqVersion(actualVersion, row.path)
+      row.qqVersion = actualVersion
+      row.nt = info.nt
+      row.tooOld = Boolean(info.tooOld)
+      row.versionLabel = info.label
+    }
+    return rows
   }
 
+  const QQ_NT_HINT = '如果 QQ 是老版本（非 NT），SnowLuma 注入不了，请升级到 QQ NT 版（9.9 及以上）'
   /** 只给机器人号注入；别的号（主人的主号）碰都不碰。 */
   async function attachBot() {
     const bot = getConfig().botQQ
@@ -354,22 +451,31 @@ export function createSnowLumaManager({ getConfig, log, savePassword }) {
     }
     const { proc, reason, unverified } = pickBotProcess(list, bot, { exclude: [...rejected] })
     if (!proc) {
-      lastAttach = { at: Date.now(), ok: false, message: reason }
+      // 有 QQ 进程但一个都认不出/不匹配时，最常见的原因之一就是老版本 QQ（非 NT）
+      const ntHint = list.length && /没看到|认不出|看不到/.test(String(reason || '')) ? `（${QQ_NT_HINT}）` : ''
+      lastAttach = { at: Date.now(), ok: false, message: reason + ntHint }
       return lastAttach
     }
+    const qq = await qqInfoOf(proc.pid)
+    // 老版 QQ 只提示、不拦：仍然尝试注入，失败时把检测到的版本一起说出来
+    const versionNote = qq.nt === false
+      ? `（检测到 QQ ${qq.version || '版本未知'}，${qq.versionLabel}；SnowLuma 只能注入 NT 版）`
+      : qq.tooOld
+        ? `（检测到 QQ ${qq.version}，低于 SnowLuma 2.4 要求的 9.9.33，请升级 QQ）`
+        : ''
     if (unverified) pendingVerify = { pid: proc.pid, at: Date.now() }
     const note = unverified ? '（SnowLuma 没报账号，连上后会核对是不是机器人号，不是就立刻断开）' : ''
     if (proc.injected && proc.connected) {
-      lastAttach = { at: Date.now(), ok: true, message: `机器人号（pid ${proc.pid}）已接入${note}` }
+      lastAttach = { at: Date.now(), ok: true, message: `机器人号（pid ${proc.pid}）已接入${note}${versionNote}` }
       return lastAttach
     }
     try {
       const r = await api(`/api/processes/${proc.pid}/load`, { method: 'POST' })
       const ok = Boolean(r.success)
-      lastAttach = { at: Date.now(), ok, message: ok ? `已给 QQ 进程（pid ${proc.pid}）注入${note}` : r.message || '注入失败' }
+      lastAttach = { at: Date.now(), ok, message: ok ? `已给 QQ 进程（pid ${proc.pid}）注入${note}${versionNote}` : `${r.message || '注入失败'}（${QQ_NT_HINT}）${versionNote}` }
       log.info(lastAttach.message)
     } catch (error) {
-      lastAttach = { at: Date.now(), ok: false, message: `注入失败：${error.message}` }
+      lastAttach = { at: Date.now(), ok: false, message: `注入失败：${error.message}（${QQ_NT_HINT}）${versionNote}` }
     }
     return lastAttach
   }
@@ -429,7 +535,7 @@ export function createSnowLumaManager({ getConfig, log, savePassword }) {
     const inst = detectInstall(cfg().dir)
     if (!inst.installed) return 0
     const out = await new Promise((res) => execFile('netstat', ['-ano', '-p', 'TCP'], { windowsHide: true }, (e, so) => res(String(so || ''))))
-    const line = out.split(/\r?\n/).find((l) => new RegExp(`127\\.0\\.0\\.1:${cfg().webuiPort}\\s+\\S+\\s+LISTENING`).test(l))
+    const line = out.split(/\r?\n/).find((l) => new RegExp(`127\\.0\\.0\\.1:${port()}\\s+\\S+\\s+LISTENING`).test(l))
     const pid = Number(line ? line.trim().split(/\s+/).pop() : 0)
     if (!pid) return 0
     const path = await new Promise((res) => execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `(Get-Process -Id ${pid}).Path`], { windowsHide: true }, (e, so) => res(String(so || '').trim())))
@@ -493,11 +599,15 @@ export function createSnowLumaManager({ getConfig, log, savePassword }) {
 
   return {
     detect: () => detectInstall(cfg().dir),
+    /** 版本兼容性：面板据此提示升级（见 ./compat.js） */
+    compat: () => snowlumaCompat(detectInstall(cfg().dir).version),
     endpoint: () => readOneBotEndpoint(cfg().dir, getConfig().botQQ),
     running,
     start,
     stop,
     processes,
+    /** 系统里 SnowLuma 接不了的老版 QQ（只用于提示） */
+    oldQqProcesses,
     attachBot,
     confirmLogin,
     /** 手动点「接入机器人号」时清掉之前核对失败的记录，让主人能重试 */

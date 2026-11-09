@@ -98,6 +98,7 @@ export function createStickerStore({ dsh, getConfig, onebot, log }) {
         return { name: '', tags: [], noVision: true }
       }
       const ask = (extra = {}) => askModel(dsh, {
+        module: 'stickers',
         cfg,
         ...(target ? { model: target } : {}),
         system: '你给表情包起名字。只输出一行：不超过 12 个字的中文备注，描述这个表情表达的情绪或内容（例如「委屈巴巴的小猫」「得意地叉腰」）。然后空格，再写 1~3 个标签，从这些里挑：' + DEFAULT_TAGS.join('、') + '。格式：备注 #标签1 #标签2',
@@ -129,6 +130,7 @@ export function createStickerStore({ dsh, getConfig, onebot, log }) {
   /** 收一张表情。seg 必须已经过 isStickerSegment 严格判定。 */
   async function collect(seg, from) {
     const cfg = getConfig().stickers
+    if (getConfig().debug) return { ok: false, reason: '调试模式，不收表情' } // 调试不往表情库里添东西
     if (!cfg.enabled || !cfg.collect) return { ok: false, reason: '偷表情关着' }
     const now = Date.now()
     while (recent.length && now - recent[0] > 3600_000) recent.shift()
@@ -141,7 +143,7 @@ export function createStickerStore({ dsh, getConfig, onebot, log }) {
       return { ok: false, reason: '下载失败：' + error.message }
     }
     const { width, height } = imageSize(buf)
-    if (!stickerSizeOk({ width, height, bytes: buf.length })) return { ok: false, reason: `尺寸不像表情（${width}x${height}，${Math.round(buf.length / 1024)}KB）` }
+    if (!stickerSizeOk({ width, height, bytes: buf.length }, { maxSide: cfg.maxSide })) return { ok: false, reason: `尺寸不像表情（${width}x${height}，${Math.round(buf.length / 1024)}KB，上限 ${cfg.maxSide || 520}px）` }
     const md5 = createHash('md5').update(buf).digest('hex')
     const lib = loadLibrary()
     if (lib.items.some((i) => i.md5 === md5)) return { ok: false, reason: '已经有了' }
@@ -185,12 +187,40 @@ export function createStickerStore({ dsh, getConfig, onebot, log }) {
     return { ok: true, item }
   }
 
+  /**
+   * 「她挑」模式：把聊天里收到的那个表情直接收下来。
+   * 名字是她自己起的，所以不走后台看图起名；也不占「每小时最多收」的额度。
+   */
+  async function saveFromSegment(seg, { name = '', tags = [], from = 'picked' } = {}) {
+    if (getConfig().debug) return { ok: false, reason: '调试模式，不收表情' }
+    const cfg = getConfig().stickers
+    if (!cfg.enabled) return { ok: false, reason: '表情包模块关着' }
+    let buf
+    try {
+      buf = await segmentBytes(seg, onebot, { maxBytes: 1.5 * 1024 * 1024 })
+    } catch (error) {
+      return { ok: false, reason: '拿不到这张图：' + error.message }
+    }
+    const { width, height } = imageSize(buf)
+    if (!stickerSizeOk({ width, height, bytes: buf.length }, { maxSide: cfg.maxSide })) {
+      return { ok: false, reason: `尺寸不像表情（${width}x${height}，${Math.round(buf.length / 1024)}KB）` }
+    }
+    return await addFromBuffer(buf, { name, tags, from })
+  }
+
   /** 手动添加（工具 / 面板上传）。 */
   async function addFromBuffer(buf, { name = '', tags = [], from = 'manual', toQQ = true } = {}) {
     const md5 = createHash('md5').update(buf).digest('hex')
     const lib = loadLibrary()
     const exist = lib.items.find((i) => i.md5 === md5)
-    if (exist) return { ok: true, item: exist, existed: true }
+    if (exist) {
+      // 已经在库里了（很常见：她刚收到这张图时后台自动收过一次）。这次给的名字/标签别白丢。
+      let touched = false
+      if (name && !exist.name) { exist.name = String(name).slice(0, 12); touched = true }
+      if (Array.isArray(tags) && tags.length && !(exist.tags || []).length) { exist.tags = tags; touched = true }
+      if (touched) saveLibrary(lib)
+      return { ok: true, item: exist, existed: true, touched }
+    }
     const mime = mimeOf(buf)
     if (!mime.startsWith('image/')) return { ok: false, reason: '不是图片' }
     mkdirSync(dir(), { recursive: true })
@@ -448,5 +478,5 @@ export function createStickerStore({ dsh, getConfig, onebot, log }) {
     return { ok: true, total: queue.length, started: true, status: captionStatus(), message: `开始给 ${queue.length} 张表情起名字（后台跑，可以关掉面板）` }
   }
 
-  return { importFromQQ, collect, addFromBuffer, remove, removeMany, rename, segmentFor, markUsed, trim, captionLibrary, captionStatus, captionCancel, captionTargets, dispose, library: loadLibrary, match: (q) => matchSticker(loadLibrary().items, q), pickForReply: (t) => pickForReply(loadLibrary().items, t) }
+  return { importFromQQ, collect, addFromBuffer, saveFromSegment, remove, removeMany, rename, segmentFor, markUsed, trim, captionLibrary, captionStatus, captionCancel, captionTargets, dispose, library: loadLibrary, match: (q) => matchSticker(loadLibrary().items, q), pickForReply: (t) => pickForReply(loadLibrary().items, t) }
 }

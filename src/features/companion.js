@@ -4,6 +4,9 @@ import { dataDir, readJson, writeJson } from '../core/store.js'
 import { askModel } from '../core/llm.js'
 import { cleanText, clipText } from '../core/text.js'
 import { shouldDeferBackground } from '../core/offpeak.js'
+import { followUpHint } from './memory.js'
+import { moodReason } from './mood-context.js'
+import { selfName } from '../persona/personas.js'
 
 // ---------------- 心情 ----------------
 // 0~100，基线 60。聊天里的话按关键词推一推，随时间按半衰期回到基线。
@@ -85,6 +88,7 @@ export function createMood({ getConfig, dsh, log }) {
   }
   /** 推一下心情（d 可正可负），记下原因。 */
   function nudge(d, reason) {
+    if (getConfig().debug) return // 调试模式不动心情：心情是持久状态，调试不该留下痕迹
     if (!getConfig().mood.enabled || !d) return
     const s = load()
     const before = current()
@@ -92,6 +96,7 @@ export function createMood({ getConfig, dsh, log }) {
     s.at = Date.now()
     reason = cleanText(reason)
     s.reason = reason
+    s.reasonAt = s.at
     // 保留 200 条：20 条只够两小时，出问题查不到原因（实测需要回溯半天以上）
     s.history = [{ at: Date.now(), from: before, to: Math.round(s.value), reason }, ...(s.history || [])].slice(0, 200)
     save(s)
@@ -122,6 +127,7 @@ export function createMood({ getConfig, dsh, log }) {
      */
     async judge({ userText, reply, who = '对方', origin = 'user' }) {
       const cfg = getConfig().mood
+      if (getConfig().debug) return null // 调试模式不判心情（省一次模型调用，也不留下状态）
       if (!cfg.enabled || !cfg.judge || !dsh) return null
       // 峰谷省钱：峰时不跑这次额外模型调用，observe() 已经用关键词兜底；谷时恢复模型判断
       if (shouldDeferBackground(getConfig())) {
@@ -133,8 +139,9 @@ export function createMood({ getConfig, dsh, log }) {
       const scene = origin === 'speak-up' ? `这一轮是她自己想${who}了、主动去找${who}说话（不是被叫来干活）` : `这一轮是${who}在跟她说话`
       try {
         const out = await askModel(dsh, {
+        module: 'mood',
           cfg: getConfig(),
-          system: '你在判断聊天角色「大肥鱼」聊完一轮后的心情变化。她现在心情 ' + v + '/100（' + base() + ' 是平常）。' + scene + '。只看这一轮真正影响她心情的东西：被夸、被关心、被惦记会开心；被凶、被冷落、被嫌弃会难过；开玩笑的「讨厌~」「笨蛋」不算真骂。只输出 JSON：{"delta": -15~15 的整数, "reason": "十几个字的理由", "confidence": 0~1 你有多确定}。没什么影响就 delta 为 0。',
+          system: `你在判断聊天角色「${selfName(getConfig())}」聊完一轮后的心情变化。她现在心情 ` + v + '/100（' + base() + ' 是平常）。' + scene + '。只看这一轮真正影响她心情的东西：被夸、被关心、被惦记会开心；被凶、被冷落、被嫌弃会难过；开玩笑的「讨厌~」「笨蛋」不算真骂。只输出 JSON：{"delta": -15~15 的整数, "reason": "十几个字的理由", "confidence": 0~1 你有多确定}。没什么影响就 delta 为 0。',
           text: `${origin === 'speak-up' ? '她主动说' : who + '说'}：${String(userText || '').slice(0, 600)}\n她回：${String(reply || '').slice(0, 600)}`,
           maxTokens: 400,
           temperature: 0.2,
@@ -155,7 +162,7 @@ export function createMood({ getConfig, dsh, log }) {
       const label = moodLabel(v)
       const style = MOOD_STYLE[label]
       if (!style) return ''
-      return `（你现在${label}${s.reason ? '，因为' + cleanText(s.reason) : ''}。这会自然地影响你说话：${style}。不用说出来自己心情如何。）`
+      return `（你现在${label}${moodReason(s, v, base())}。这会自然地影响你说话：${style}。不用说出来自己心情如何。）`
     },
   }
 }
@@ -187,8 +194,19 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory }) {
     '看看现在几点，按时间说点应景的（早上、饭点、深夜）',
   ]
 
+  function followUpReceipt(item) {
+    let counted = false
+    return item ? { onDelivered() {
+      if (counted) return
+      counted = true
+      memory?.()?.markFollowUpAsked?.(item.id)
+    } } : {}
+  }
+
   async function fire(reason = '定时', { nudge = false } = {}) {
     const cfg = getConfig()
+    if (!cfg.enabled || !cfg.speakUp.enabled || !cfg.ownerQQ || isMuted?.(`private:${cfg.ownerQQ}`) || memory?.()?.dislikes?.(cfg.ownerQQ)) return
+    const followUp = !nudge ? memory?.()?.dueFollowUp?.(cfg.ownerQQ) : null
     const owner = cfg.ownerName || '主人'
     const idle = Math.round((Date.now() - lastPrivateAt()) / 60000)
     const angle = ANGLES[Math.floor(Math.random() * ANGLES.length)]
@@ -196,16 +214,19 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory }) {
       ? `【系统提醒，不是${owner}说的话】你刚才跟${owner}说「${String(hub.lastBotToOwner?.text || '').slice(-60)}」，${owner}已经 ${idle} 分钟没回了。可以轻轻追一句（比如「人呢」「睡着啦？」，或者换个话题），别催、别抱怨；觉得${owner}在忙就只回 [沉默]。`
       : `【系统提醒，不是${owner}说的话】你已经 ${idle > 600 ? '很久' : idle + ' 分钟'}没和${owner}私聊了，想主动找${owner}说点什么。这次的由头可以是：${angle}。优先用手里真实的素材（最近做过的事、记忆里的、聊天流水里能查到的），没有真实素材就别硬找，也不要编；用你自己的口气，一两句就好，别用模板、别解释为什么来找；实在不想说就只回 [沉默]。`
     log.info(`主动搭话（${reason}）`)
-    await hub.pushToSession({ chatId: `private:${cfg.ownerQQ}`, kind: 'private', userId: cfg.ownerQQ, nickname: owner }, [{ type: 'text', text: prompt }], '')
+    await hub.pushToSession({ chatId: `private:${cfg.ownerQQ}`, kind: 'private', userId: cfg.ownerQQ, nickname: owner }, [{ type: 'text', text: [prompt, followUpHint(followUp)].filter(Boolean).join('\n') }], '', followUpReceipt(followUp))
   }
 
   /** 找白名单里的人：不提主人的事，这是她和对方自己的聊天。 */
   async function fireFriend(qq) {
+    const cfg = getConfig()
+    if (!cfg.enabled || !cfg.speakUp.enabled || !(cfg.speakUp.allow || []).map(String).includes(String(qq)) || isMuted?.(`private:${qq}`) || memory?.()?.dislikes?.(qq)) return
+    const followUp = memory?.()?.dueFollowUp?.(qq)
     const idle = Math.round((Date.now() - (hub.lastPrivateAt?.(qq) || 0)) / 60000)
     const angle = ANGLES[Math.floor(Math.random() * ANGLES.length)]
     const prompt = `【系统提醒，不是对方说的话】你已经 ${idle > 600 ? '很久' : idle + ' 分钟'}没和这位朋友私聊了，想主动找对方说点什么。这次的由头：${angle}。只说你和对方之间的事，别提主人或别人的私事。`
     log.info(`主动搭话（白名单 ${qq}）`)
-    await hub.pushToSession({ chatId: `private:${qq}`, kind: 'private', userId: qq, nickname: qq }, [{ type: 'text', text: prompt }], '')
+    await hub.pushToSession({ chatId: `private:${qq}`, kind: 'private', userId: qq, nickname: qq }, [{ type: 'text', text: [prompt, followUpHint(followUp)].filter(Boolean).join('\n') }], '', followUpReceipt(followUp))
   }
 
   /** 白名单：每人单独算次数和间隔，一分钟最多找一个人，不一口气群发。 */
@@ -236,7 +257,7 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory }) {
     const c = cfg.speakUp
     if (!cfg.enabled || !c.enabled) return
     if (cfg.ext?.purpose?.enabled === true) return // 目的引擎开着时由它主动找人，两套都跑同一个人会被找两次
-    if (isMuted?.(`private:${cfg.ownerQQ}`)) { // 主人在私聊里让她闭嘴了：只管主人这边，白名单照旧
+    if (isMuted?.(`private:${cfg.ownerQQ}`) || memory?.()?.dislikes?.(cfg.ownerQQ)) { // 主人在私聊里让她闭嘴了：只管主人这边，白名单照旧
       const s = load()
       if (!(await tickFriends(cfg, s))) save(s)
       return

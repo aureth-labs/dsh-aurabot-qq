@@ -5,10 +5,12 @@ import { DEFAULT_GROUP_POLICY } from '../chat/group-policy.js'
 import { LEVELS, PROFILE_PERM_KEYS, PROFILE_PERM_LEVELS, profilePermDefault } from '../chat/access.js'
 import { normalizeChatModels } from '../chat/chat-model.js'
 import { DIARY_AUDIENCES } from '../features/qzone-audience.js'
+import { DEFAULT_TIER_DAYS } from '../features/memory-rules.js'
 
 export const DEFAULTS = {
   enabled: false, // 总开关：关着一句都不发
   dryRun: true, // 试运行：只记日志不真发
+  debug: false, // 调试：不真发 + 不写记忆/流水，只在日志里看（和试运行互斥）
   setupDone: false, // 首次使用向导走完了没有
   communityMigrated: {}, // 搬到社区库的模块处理过没有（id → installed / skipped / kept），只处理一次
   botQQ: '', // 机器人 QQ 号（向导里填）
@@ -16,6 +18,9 @@ export const DEFAULTS = {
   ownerName: '主人',
   ownerLevel: 'full', // full | social | chat
   approvalNotify: true, // DSH 要授权时把请求发到主人私聊
+  // 什么情况往主人 QQ 上报：enabled 是总开关，approval = 工具要授权，question = 她要向人提问选选项。
+  // workspaces 按工作区单独覆盖：{ "<工作区路径>": { approval?: bool, question?: bool } }，没写的项跟随总开关。
+  notice: { enabled: true, approval: true, question: true, workspaces: {} },
   qqApi: { enabled: true }, // 她能用 qq_api_call 调 QQ 接口：别人只能查当前群，写操作只听主人
   approvalViaQQ: true, // 主人私聊会话要授权时，在 QQ 回复「确认」直接批准这一次
   profilePerms: { qqNickname: 'owner', qqSignature: 'owner', qqAvatar: 'owner', biliSign: 'owner', biliAvatar: 'owner', biliComment: 'owner', qqFriendRequest: 'owner', whitelist: 'owner', douyinBrowse: 'owner', douyinLike: 'owner', douyinComment: 'owner', douyinShareOwner: 'owner', douyinDm: 'owner' }, // 改资料类操作（含抖音浏览 / 点赞 / 评论 / 分享）的权限：off 关 / owner 仅主人私聊 / all 所有人。抖音项默认仅主人，总开关默认关
@@ -32,14 +37,17 @@ export const DEFAULTS = {
   // 单个文件有大小上限；主人私聊里能触发，群里只在主人开口那一轮能触发（可以发给白名单里的人和群）。日志里会记下发了什么。
   // imageByPath（#169）：本地图片先按路径直发，被网关明确拒绝才改用 base64；网关和 NapCat 没共享挂载时会自动回退。
   files: { enabled: true, maxMB: 50, imageByPath: true, dirs: [] },
-  // 危险命令确认（可选保护，默认关）：她在私聊里执行删根目录/格式化/关机/下载后直接执行等
+  // 危险命令确认（默认开）：她在私聊里执行删根目录/格式化/关机/下载后直接执行等
   // 终端命令前，先发 QQ 私聊问主人，回复「确认」才执行；超时或「取消」就拦下。
   // panelRemoteAccess：允许远端（非回环）访问管理接口；默认 false = 只有本机能管。
   // trustedProxy：可信反向代理地址（逗号分隔）；只有请求确实从这些地址进来，才采信
   //   X-Forwarded-For 的最后一跳作为真实来源。留空 = 从不相信任何转发头（最安全）。
-  // publicHostname：面板经反代对外时的域名（如 panel.example.com）；CSRF 同源校验把
+  // publicHostname：面板经反代对外时的域名（如 panel.example.com），可填多个、逗号分隔；CSRF 同源校验把
   //   这个域名的 Origin 也算同源。留空 = 只有回环 Origin 算同源。
-  security: { dangerConfirm: false, ssrfMode: 'strict', panelRemoteAccess: false, trustedProxy: '', publicHostname: '' },
+  security: { dangerConfirm: true, ssrfMode: 'strict', panelRemoteAccess: false, trustedProxy: '', publicHostname: '' },
+  // 浏览器（全局）：useDshSidebar = 需要浏览器的模块（逛网页 / 刷抖音 / 小红书 / 小黑盒验证）
+  // 连 DSH 侧边浏览器的共享实例（ego，画面在 DSH 右侧实时可见），不为每个模块各开一个独立窗口。
+  browser: { useDshSidebar: false },
   // DeepSeek 峰谷省钱模式（默认关，现有行为不变）：打开后只把「不着急的后台模型调用」尽量挪到谷时，
   // 聊天回复/工具/审批/定时任务本身不变。offPeakHolidays 是中国法定节假日（北京时间日期 'YYYY-MM-DD'）。
   cost: { offPeak: false, offPeakHolidays: [] },
@@ -47,7 +55,7 @@ export const DEFAULTS = {
   snowluma: {
     dir: 'C:\\Aurabot\\snowluma', // 主人自己下载解压到这里（EULA 不允许自动部署）
     autoStart: true, // 随 DSH 启动它（只启动主人已安装并同意过协议的副本）
-    webuiPort: 5099,
+    webuiPort: 15099, // SnowLuma 控制台端口；5099 在开了 Hyper-V 的 Windows 上常落在系统保留段，默认改用 15099
     webuiPassword: '', // 插件自动生成并保存（第一次启动 SnowLuma 时）；用来调 /api/processes 只给机器人号注入
     passwordAuto: false,
     autoAttach: true, // 自动给机器人号所在的 QQ 进程注入（绝不碰别的号）
@@ -60,6 +68,7 @@ export const DEFAULTS = {
   // 按聊天选模型（主人在面板「模型」页设）：私聊 QQ 号 > 群号 > 所有私聊 / 所有群默认 > 上面的全局模型；没写的一级退到下一级
   chatModels: { privateDefault: { provider: '', model: '', reasoningEffort: '' }, groupDefault: { provider: '', model: '', reasoningEffort: '' }, privates: {}, groups: {} },
   merge: { enabled: true, waitSec: 2.5, maxSec: 8, groupWaitSec: 5, groupMaxSec: 15 }, // 连发合并：对方停顿 waitSec 秒再一起回，最多等 maxSec 秒；群里等得久一点，把一段话攒齐
+  forward: { expandEarly: false, expandHistory: false }, // 合并转发：expandEarly=消息一进来就展开成文字存进上下文（哪怕这条不交给她，代价是每条转发多调一次 get_forward_msg）；expandHistory=交给她之前把缓冲里还没展开过的转发补展开（每条只拉一次）
   imageGen: {
     enabled: false,
     provider: 'openai', // openai / custom；codex = 实验性订阅接法（需单独登录）
@@ -80,7 +89,7 @@ export const DEFAULTS = {
   },
   persona: { current: 'dafeiyu' },
   // 主人私聊里问起群里的事：把最近 24 小时的群聊流水补进这一轮（默认关，开启前先把群加进白名单）
-  group: { ...DEFAULT_GROUP_POLICY, overrides: {}, ownerBrief: { enabled: false, lines: 12, groups: [] } },
+  group: { ...DEFAULT_GROUP_POLICY, overrides: {}, ownerBrief: { enabled: true, lines: 24, groups: [] } },
   // 按群头衔不回：勾选的群里，专属头衔正好是 title 的成员（一般是别的机器人）说话、戳她都不理。没勾群就不起作用
   titleFilter: { enabled: true, groups: [], title: '大肥鱼' },
   voice: {
@@ -91,12 +100,38 @@ export const DEFAULTS = {
     gptsovits: { url: 'http://127.0.0.1:9880', refAudio: '', promptText: '', promptLang: 'zh', textLang: 'zh' },
     // 通用 HTTP 引擎：GET 时地址里带 {text}；POST 时填接口地址，请求头一行一个，请求体里 {text} 自动替换（已做 JSON 转义）
     http: { urlTemplate: '', method: 'GET', headers: '', body: '', sampleRate: 24000 },
+    // 豆包语音（火山引擎）预设：地址、请求头、请求体全内置，只留 API Key + 音色给人填
+    // resourceId 留空 = 按音色自动配（1.0 音色配 seed-tts-1.0，2.0 音色配 seed-tts-2.0）
+    volcano: { apiKey: '', resourceId: '', voiceType: 'zh_female_vv_uranus_bigtts', speedRatio: 1 },
+    // Breeze 语音：cloud 走 BreezeBlue（`POST {url}/v1/text-to-speech/{音色id}` + xi-api-key），
+    // local 走本机自建 breeze_infer（`POST {url}/v1/audio/speech` 的 multipart 表单）；语气写在 instructions 里（中文）。
+    breeze: {
+      mode: 'cloud',
+      url: 'https://api.breeze.blue',
+      // 站点：登录 / 领每日额度走这里（跟合成接口不是同一个域名）
+      siteUrl: 'https://breezeblue.ai',
+      key: '',
+      // 云端额度：填了邮箱密码 + 打开自动领取，就每小时醒一次去领（一天最多一次）
+      email: '',
+      password: '',
+      autoClaim: true,
+      voiceId: '',
+      model: 'breeze-tts-2',
+      languageCode: 'zh',
+      instructions: '',
+      outputFormat: 'mp3_24000_128',
+      guidanceScale: 0,
+      timeoutMs: 60000,
+    },
     voice: 'zh-CN-XiaoyiNeural',
     rate: '+0%',
     pitch: '+0Hz',
     autoChance: 0.15, // 短回复自动变语音的概率
     autoMaxChars: 80,
     asr: true, // 听语音
+    // 云端语音识别（可选）：OpenAI 兼容 /audio/transcriptions；provider 为空 = 不用。
+    // prefer=qq 时顺序是 本地 → QQ 自带 → 云端 → DSH；prefer=cloud 时云端提前到 QQ 前面。
+    asrApi: { provider: '', baseUrl: '', model: '', apiKey: '', language: '', prefer: 'qq' },
     emojiSeparate: true, // 语音条里的表情/emoji 不念出来，单独补一条文字发出去
     // 语音条变声：用翻唱里导入的 RVC 音色模型（先 TTS 念，再变声）。留空 = 不变声
     songVoice: '',
@@ -113,7 +148,7 @@ export const DEFAULTS = {
     reactMaxPerHour: 10, // 每个会话每小时最多主动贴几次
     collect: true, // 偷表情
     // 怎么偷：auto = 看到就收（默认，保持原行为）；ask = 她挑（先记着，喜欢才凭编号收）；owner = 只听主人的（只有主人语境下才提示/允许收）
-    collectMode: 'auto',
+    collectMode: 'ask',
     fromGroups: true,
     fromPrivate: true,
     maxPerHour: 20,
@@ -247,15 +282,55 @@ export const DEFAULTS = {
   // everyStep：一轮里她分几段说就发几条（默认关 = 只发最后一段）。私聊多是闲聊，连着说的几句可能是不同话题，
   //   只发最后一段会让人以为她只回了一个话题；干活时前面多是工具调用前后的过程话，开着会显得啰嗦
   // rescueFromThinking：整轮一段正文都没写时，从思考里捞出她自己定稿的那段（默认关，捞不到就不发）
-  chat: { seedHistory: false, seedHistoryCount: 20, everyStep: false, rescueFromThinking: false },
+  // turnTimeoutMinutes：一轮跑超过这么多分钟就强制放开（模型/工具卡死时 turn/end 永远不来，
+  // 私聊新消息会被一直当成 steer 塞进那一轮，看上去就是「不理人」）。填 0 关掉兜底。
+  chat: { seedHistory: false, seedHistoryCount: 20, everyStep: false, rescueFromThinking: false, turnTimeoutMinutes: 30 },
+  // 原话档案独立于摘要记忆；默认关闭，由使用者明确开启并管理保留期限。
+  conversationContext: { enabled: false },
   memory: {
-    enabled: true, recallCount: 6, recallMode: 'always', recallTriggers: ['上次', '上回', '之前', '以前', '那天', '那次', '还记得', '记不记得', '说过', '提过', '答应', '约好', '那时候'],
+    enabled: true, recallCount: 6, recallMinRelevance: 0, recallMode: 'always', recallTriggers: ['上次', '上回', '之前', '以前', '那天', '那次', '还记得', '记不记得', '说过', '提过', '答应', '约好', '那时候'],
     dailyConsolidate: true, consolidateTimes: ['04:00', '16:00'], keepChatlogDays: 7, keepChatlogSet: false, mergeGroups: false, compress: true, compressAfterDays: 14, instantCommands: true, groupMemory: true, searchRrf: true,
-    profileFieldChars: 40, profilePeople: 2, profileChars: 240, chatImpression: true, chatImpressionChars: 120, dislikeSilence: 0.85,
+    profileOnlyAcquainted: true, profileFieldChars: 40, profilePeople: 2, profileChars: 240, chatImpression: true, chatImpressionChars: 120, dislikeSilence: 0.85,
+    followUp: true, // 惦记尚无结果的重要事，主动聊天时顺口问问
     shortTerm: true, shortTermHours: 2, shortTermIdleMinutes: 3, shortTermChars: 150,
-    gistEnabled: true, gistDays: 180, impressionDays: 365, gistDailyBatches: 6, tierDays: { 1: 7, 2: 30, 3: 90 },
-    extractIdleMinutes: 30, extractMinLines: 20, extractDailyBatches: 24, capacity: { auto: 2000, event: 600, diary: 400 }, eventExpireDays: 90, vector: { enabled: false, baseUrl: '', model: '', apiKey: '' },
-  }, // extractIdleMinutes 为 0 时关闭空闲提炼；手动记忆不受容量限制
+    gistEnabled: true, gistDays: 180, impressionDays: 365, gistDailyBatches: 6, tierDays: { ...DEFAULT_TIER_DAYS },
+    extractIdleMinutes: 30, extractMinLines: 20, extractDailyBatches: 24, capacity: { auto: 2000, event: 600, diary: 400 }, eventExpireDays: 90, vector: {
+      enabled: false,
+      // provider 只影响面板预置的地址/模型；请求统一走 OpenAI 兼容的 {baseUrl}/embeddings
+      provider: 'siliconflow',
+      baseUrl: '',
+      model: '',
+      apiKey: '',
+      dimensions: 0, // 0 = 不传；Qwen3 / OpenAI 的 MRL 模型可以截断
+      batchSize: 10, // 方舟等单次 input 上限小，10 最稳
+      queryTimeoutMs: 3000,
+      headers: '', // 自定义请求头，一行一个；有 Authorization 时不再自动加 Bearer
+    },
+    // 可选精排：对已经过滤好的候选重新打分；失败/超时回退原顺序
+    rerank: {
+      enabled: false,
+      baseUrl: '', // 留空复用 vector.baseUrl
+      model: 'BAAI/bge-reranker-v2-m3',
+      apiKey: '', // 留空复用 vector.apiKey
+      topN: 20,
+      timeoutMs: 2000,
+    },
+    // 向量联想（记忆联想）：按意思给记忆建边，召回时最多带 3 条；支持多跳（A→B→C）但封顶。
+    assoc: { enabled: true, minSim: 0.45, limit: 4, recall: 3, hops: 2, hopDecay: 0.55 },
+    // 真正交给模型的记忆条数：直接命中几条 + 联想几条（各自独立上限，最后合起来进上下文）。
+    // recallCount 是「直接命中」的上限；recallTotal 是总数护栏（0 = 不额外限制）。
+    recallTotal: 0,
+    // 行为驱动的档位升档：被想起的天数 + 时间把 importance 慢慢涨上去，够门槛就升档。
+    // assocPerHitDay：几次联想折算成「想起来一天」（联想也算加深，但比直接命中轻）。
+    tierGrow: { enabled: true, perDay: 0.02, minHitDays: 3, cap: 0.85, assocPerHitDay: 2, tier2: { hitDays: 5, imp: 0.6 }, tier3: { hitDays: 10, imp: 0.75 } },
+    // 遗忘曲线的时间基数（天）。默认 20：普通记忆约 60 天才淡忘，长期用不容易「刚说过就忘」。
+    // 调到 8 左右更像人类（1 天后剩 75%、1 个月后剩 5%），但记住的东西会明显变少。
+    retentionBase: 20,
+    // beta 侧新增：本地保留配置 + 面板折叠状态
+    residentMaxChars: 1200, preferPersonal: true,
+    // 面板「记忆库」里四组进阶设置的折叠状态（true = 收起）；改动会立即写回配置文件
+    uiCollapsed: { people: true, tiers: true, vector: true, rerank: true },
+  }, // residentMaxChars / preferPersonal 为本地保留配置；extractIdleMinutes 为 0 时关闭空闲提炼；手动记忆不受容量限制
   song: {
     enabled: false,
     root: '', // 翻唱环境目录，留空 = 自动（老安装 C:\Aurabot\rvc，新安装在用户目录下）
@@ -271,10 +346,13 @@ export const DEFAULTS = {
     keepWork: false, // 留着中间文件（调试用）
     pypiMirror: 'auto', // 安装时用的下载源：auto = 先测一下，官方源慢就用国内镜像；cn = 一直用国内镜像；off = 只用官方源
   },
-  // 云备份：每天到点自动打包并把最新备份推到 Gitee 私有仓库（走本机 git）
+  // 云备份：每天到点自动打包并把最新备份推到 Gitee 私有仓库（走本机 git）或 WebDAV
   backup: {
     remote: {
       enabled: false, // 到点自动「打包 + 推送」；关了就只剩面板手动推
+      provider: 'gitee', // gitee | webdav
+      // WebDAV：填服务器地址（自动建 aurabot-backups），密码按密钥处理
+      webdav: { url: '', username: '', password: '', configOnly: true },
       owner: '', // Gitee 用户名
       repo: '', // 仓库名（没有的话推送时按 autoCreate 自动建私有的）
       token: '', // 私人令牌（要 projects + repo 权限），存配置时按密钥处理
@@ -291,6 +369,9 @@ export const DEFAULTS = {
   modules: {},
   safeMode: false, // 安全模式：自己写的模块一个都不加载（排查问题用）
   ext: {}, // 自己写的模块的设置：{ 模块id: {...} }
+  // token 用量与花费：面板「概览」里看。pricing 留空就用内置价目表（DeepSeek 官方价 + 其它厂商按 LiteLLM 价 ×7.2）；
+  // 要覆盖就写 { models: { "我的模型": { match: "^my-llm-", in: 2, out: 8, cached: 0.5 } } }（元/百万 tokens）
+  usage: { pricing: {} },
   // 联动：让别的程序、DSH 里别的会话和插件也能用她
   bridge: {
     dshTools: false, // DSH 里别的会话（比如你平时写代码的会话）能用工具让她发 QQ、查记忆
@@ -344,13 +425,37 @@ const bodyText = (v) => {
   return v == null ? '' : String(v)
 }
 
+// 上报开关：总开关 + 按工作区的覆盖。工作区路径原样当键（调用方会先规范化），
+// 覆盖项只认布尔值，别的（0、''、null）一律当「没写」，跟随总开关。
+function normalizeNotice(v, legacyNotify) {
+  const o = isObj(v) ? v : {}
+  const approvalDefault = legacyNotify === false ? false : true
+  const out = { enabled: bool(o.enabled, true), approval: typeof o.approval === 'boolean' ? o.approval : approvalDefault, question: bool(o.question, true), workspaces: {} }
+  const ws = isObj(o.workspaces) ? o.workspaces : {}
+  for (const [key, val] of Object.entries(ws)) {
+    const path = String(key || '').trim()
+    if (!path) continue
+    const w = isObj(val) ? val : {}
+    const item = {}
+    if (typeof w.approval === 'boolean') item.approval = w.approval
+    if (typeof w.question === 'boolean') item.question = w.question
+    out.workspaces[path] = item
+  }
+  return out
+}
+
 export function normalize(raw) {
   const c = deepMerge(DEFAULTS, raw)
   c.enabled = bool(c.enabled, false)
   c.dryRun = bool(c.dryRun, true)
+  c.debug = bool(c.debug, false)
+  if (c.debug) c.dryRun = true
+  c.conversationContext = { enabled: bool(c.conversationContext?.enabled, false) }
   c.botQQ = qq(c.botQQ)
   c.ownerQQ = qq(c.ownerQQ)
   c.approvalNotify = bool(c.approvalNotify, true)
+  // 老配置只有 approvalNotify：没写过 notice 时用它当审批上报的默认值，免得更一次版本被重新打开
+  c.notice = normalizeNotice(isObj(raw?.notice) ? raw.notice : null, raw?.approvalNotify)
   c.approvalViaQQ = bool(c.approvalViaQQ, true)
   c.qqApi.enabled = bool(c.qqApi.enabled, true)
   c.gateway = c.gateway === 'onebot' ? 'onebot' : 'snowluma'
@@ -371,12 +476,15 @@ export function normalize(raw) {
   // 发文件：开关、大小上限、额外允许的目录（只认绝对路径；空行忽略）
   if (!isObj(c.files)) c.files = {}
   if (!isObj(c.security)) c.security = {}
-  c.security.dangerConfirm = bool(c.security.dangerConfirm, false)
+  c.security.dangerConfirm = bool(c.security.dangerConfirm, true)
   c.security.ssrfMode = c.security.ssrfMode === 'loose' ? 'loose' : 'strict'
   // 远端管理开关与可信反代：放 security 段（顶层对象，不会被下面「ext 只留对象」的规则删掉）
   c.security.panelRemoteAccess = bool(c.security.panelRemoteAccess, false)
   c.security.trustedProxy = String(c.security.trustedProxy || '').trim()
   c.security.publicHostname = String(c.security.publicHostname || '').trim().toLowerCase()
+  // 浏览器后端开关（老配置没有 browser 段也要补出默认值）
+  if (!isObj(c.browser)) c.browser = {}
+  c.browser.useDshSidebar = bool(c.browser.useDshSidebar, false)
   // DeepSeek 峰谷省钱模式：默认关；节假日列表去重、只留合法的 'YYYY-MM-DD'（北京时间日期）
   if (!isObj(c.cost)) c.cost = {}
   c.cost.offPeak = bool(c.cost.offPeak, false)
@@ -399,9 +507,9 @@ export function normalize(raw) {
   if (!Array.isArray(g.quietHours) || g.quietHours.length !== 2) g.quietHours = DEFAULT_GROUP_POLICY.quietHours
   g.quietHours = g.quietHours.map((h) => num(h, 0, 0, 23))
   if (!isObj(g.overrides)) g.overrides = {}
-  if (!isObj(g.ownerBrief)) g.ownerBrief = { enabled: false, lines: 12, groups: [] }
-  g.ownerBrief.enabled = bool(g.ownerBrief.enabled, false)
-  g.ownerBrief.lines = num(g.ownerBrief.lines, 12, 1, BIG)
+  if (!isObj(g.ownerBrief)) g.ownerBrief = { enabled: true, lines: 24, groups: [] }
+  g.ownerBrief.enabled = bool(g.ownerBrief.enabled, true)
+  g.ownerBrief.lines = num(g.ownerBrief.lines, 24, 1, 30)
   g.ownerBrief.groups = qqList(g.ownerBrief.groups)
   c.voice.autoChance = num(c.voice.autoChance, 0.15, 0, 1)
   c.voice.autoMaxChars = num(c.voice.autoMaxChars, 80, 1, BIG)
@@ -415,15 +523,49 @@ export function normalize(raw) {
   c.voice.http.headers = headerLines(c.voice.http.headers)
   c.voice.http.body = bodyText(c.voice.http.body)
   c.voice.http.sampleRate = num(c.voice.http.sampleRate, 24000, 8000, 48000)
+  // 豆包预设：Key 去两端空白并限长（粘整段文件时不会把整个配置撑爆），音色 id 也限长；
+  // resourceId 只认这两个合法值，填别的当没填（留空时按音色自己认）
+  if (!isObj(c.voice.volcano)) c.voice.volcano = structuredClone(DEFAULTS.voice.volcano)
+  c.voice.volcano.apiKey = String(c.voice.volcano.apiKey ?? '').trim().slice(0, 400)
+  c.voice.volcano.voiceType = String(c.voice.volcano.voiceType ?? '').trim().slice(0, 120) || DEFAULTS.voice.volcano.voiceType
+  c.voice.volcano.resourceId = ['seed-tts-1.0', 'seed-tts-2.0'].includes(String(c.voice.volcano.resourceId))
+    ? String(c.voice.volcano.resourceId)
+    : ''
+  c.voice.volcano.speedRatio = num(c.voice.volcano.speedRatio, 1, 0.5, 2)
+  // Breeze 语音：地址 / 音色 id / 语气说明；Key 不回显（publicConfig 里换成 keySet）
+  if (!isObj(c.voice.breeze)) c.voice.breeze = structuredClone(DEFAULTS.voice.breeze)
+  const bz = c.voice.breeze
+  bz.mode = ['cloud', 'local'].includes(String(bz.mode)) ? String(bz.mode) : 'cloud'
+  bz.url = String(bz.url ?? '').trim().slice(0, 400) || DEFAULTS.voice.breeze.url
+  bz.key = String(bz.key ?? '').trim().slice(0, 400)
+  bz.voiceId = String(bz.voiceId ?? '').trim().slice(0, 200)
+  bz.siteUrl = String(bz.siteUrl ?? '').trim().slice(0, 400) || DEFAULTS.voice.breeze.siteUrl
+  bz.email = String(bz.email ?? '').trim().slice(0, 200)
+  bz.password = String(bz.password ?? '').slice(0, 400)
+  bz.autoClaim = bz.autoClaim !== false
+  bz.model = String(bz.model ?? '').trim().slice(0, 100) || DEFAULTS.voice.breeze.model
+  bz.languageCode = String(bz.languageCode ?? '').trim().slice(0, 20) || DEFAULTS.voice.breeze.languageCode
+  bz.instructions = String(bz.instructions ?? '').trim().slice(0, 500)
+  bz.outputFormat = String(bz.outputFormat ?? '').trim().slice(0, 60) || DEFAULTS.voice.breeze.outputFormat
+  bz.guidanceScale = num(bz.guidanceScale, 0, 0, 20)
+  bz.timeoutMs = num(bz.timeoutMs, 60000, 5000, 600000)
+  // 云端语音识别：provider 只认内置两项和 custom；地址/模型留空时由 asr.js 用预置默认值
+  if (!isObj(c.voice.asrApi)) c.voice.asrApi = structuredClone(DEFAULTS.voice.asrApi)
+  const asrApi = c.voice.asrApi
+  asrApi.provider = ['', 'siliconflow', 'openai', 'custom'].includes(asrApi.provider) ? asrApi.provider : ''
+  for (const k of ['baseUrl', 'model', 'apiKey', 'language']) asrApi[k] = String(asrApi[k] ?? '').trim()
+  asrApi.baseUrl = asrApi.baseUrl.replace(/\/+$/, '')
+  asrApi.prefer = ['qq', 'cloud'].includes(asrApi.prefer) ? asrApi.prefer : 'qq'
   c.stickers.autoChance = num(c.stickers.autoChance, 0.35, 0, 1)
   // 主动贴表情：自己的概率（默认 0.15），不从 autoChance 取值；老配置里存成 null 的按默认算
   c.stickers.reactChance = num(c.stickers.reactChance ?? 0.15, 0.15, 0, 1)
   c.stickers.reactMaxPerHour = num(c.stickers.reactMaxPerHour, 10, 0, BIG)
   c.stickers.react = bool(c.stickers.react, false)
   c.stickers.faces = c.stickers.faces !== false
-  c.stickers.collectMode = ['ask', 'auto', 'owner'].includes(c.stickers.collectMode) ? c.stickers.collectMode : 'auto'
+  c.stickers.collectMode = ['ask', 'auto', 'owner'].includes(c.stickers.collectMode) ? c.stickers.collectMode : 'ask'
   c.stickers.maxPerHour = num(c.stickers.maxPerHour, 20, 0, BIG)
   c.stickers.maxLibrary = num(c.stickers.maxLibrary, 300, 1, BIG)
+  c.stickers.maxSide = num(c.stickers.maxSide, 520, 80, 4096)
   // 起名单独挑的模型：两半都填了才认；填一半 / 脏数据都当没填（回落到聊天模型）
   c.stickers.captionModel = (() => {
     const m = isObj(c.stickers.captionModel) ? c.stickers.captionModel : {}
@@ -434,7 +576,7 @@ export function normalize(raw) {
   c.diary.timesPerDay = num(c.diary.timesPerDay, 2, 0, 48)
   c.diary.windowStart = hhmm(c.diary.windowStart, '10:00')
   c.diary.windowEnd = hhmm(c.diary.windowEnd, '23:30')
-  c.diary.minGapMinutes = num(c.diary.minGapMinutes, 180, 0, BIG)
+  c.diary.minGapMinutes = num(c.diary.minGapMinutes, 180, 0, 1440)
   c.diary.attachImage = bool(c.diary.attachImage, true)
   if (!isObj(c.diary.rich)) c.diary.rich = { ...DEFAULTS.diary.rich }
   for (const key of ['enabled', 'stickers', 'browsing', 'local']) c.diary.rich[key] = bool(c.diary.rich[key], DEFAULTS.diary.rich[key])
@@ -544,7 +686,7 @@ export function normalize(raw) {
   for (const k of ['atOwnerOnLikeChance', 'minimize', 'socialInterruptBrowse', 'replyPollMinutes']) delete d[k]
 
   delete c.mood.maxInjectPerDay // 旧版的「每天最多提醒几次」，现在心情明显时每轮都会带上
-  c.snowluma.webuiPort = num(c.snowluma.webuiPort, 5099, 1, 65535)
+  c.snowluma.webuiPort = num(c.snowluma.webuiPort, 15099, 1, 65535)
   // 老配置只有一个 consolidateAt：换成两个时间点（它 + 12 小时后）
   if (!Array.isArray(raw?.memory?.consolidateTimes) && raw?.memory?.consolidateAt) {
     const [hh, mm] = hhmm(raw.memory.consolidateAt, '04:00').split(':').map(Number)
@@ -558,22 +700,31 @@ export function normalize(raw) {
   c.chat.seedHistoryCount = num(c.chat.seedHistoryCount, 20, 1, BIG)
   c.chat.everyStep = bool(c.chat.everyStep, false)
   c.chat.rescueFromThinking = bool(c.chat.rescueFromThinking, false)
+  c.chat.turnTimeoutMinutes = num(c.chat.turnTimeoutMinutes, 30, 0, 180)
   c.memory.recallCount = num(c.memory.recallCount, 6, 0, BIG)
+  // 总数护栏：0 表示不限制（直接 recallCount + 联想 assoc.recall）；设了就封顶，防止上下文爆掉
+  c.memory.recallTotal = Math.round(num(c.memory.recallTotal, 0, 0, BIG))
+  // beta 侧新增：召回最低相关度门槛
+  c.memory.recallMinRelevance = num(c.memory.recallMinRelevance, DEFAULTS.memory.recallMinRelevance, 0, 1)
   c.memory.recallMode = c.memory.recallMode === 'trigger' ? 'trigger' : 'always'
+  // 遗忘基数：1~365 天。超出范围或非数字回默认 20，不让脏配置把记忆一夜清空。
+  c.memory.retentionBase = Math.round(num(c.memory.retentionBase, 20, 1, 365))
   c.memory.recallTriggers = [...new Set((Array.isArray(c.memory.recallTriggers) ? c.memory.recallTriggers : String(c.memory.recallTriggers || '').split(/[\n,，;；]+/)).filter((x) => typeof x === 'string').map((x) => x.trim().slice(0, 40)).filter(Boolean))].slice(0, 100)
-  for (const k of ['chatImpression', 'gistEnabled', 'shortTerm']) c.memory[k] = bool(c.memory[k], true)
+  for (const k of ['chatImpression', 'gistEnabled', 'shortTerm', 'followUp', 'profileOnlyAcquainted']) c.memory[k] = bool(c.memory[k], true)
   c.memory.dislikeSilence = num(c.memory.dislikeSilence, 0.85, 0, 1)
   c.memory.shortTermHours = num(c.memory.shortTermHours, 2, 0.1, BIG)
   c.memory.shortTermIdleMinutes = num(c.memory.shortTermIdleMinutes, 3, 0, BIG)
   c.memory.shortTermChars = Math.round(num(c.memory.shortTermChars, 150, 1, BIG))
   for (const k of ['profileFieldChars', 'profilePeople', 'profileChars', 'chatImpressionChars', 'gistDays', 'impressionDays', 'gistDailyBatches']) c.memory[k] = Math.round(num(c.memory[k], DEFAULTS.memory[k], 0, BIG))
   if (!isObj(c.memory.tierDays)) c.memory.tierDays = {}
-  for (const k of ['1', '2', '3']) c.memory.tierDays[k] = Math.round(num(c.memory.tierDays[k], DEFAULTS.memory.tierDays[k], 0, BIG))
+  for (const k of Object.keys(DEFAULT_TIER_DAYS)) c.memory.tierDays[k] = Math.round(num(c.memory.tierDays[k], DEFAULT_TIER_DAYS[k], 0, BIG))
   // 老版本的 0 是当时的默认值，不是谁选的：升级后改成留 7 天，以后面板里再选 0 才算数
   const keepUnset = raw?.memory?.keepChatlogDays === 0 && !raw.memory.keepChatlogSet
   c.memory.keepChatlogDays = keepUnset ? 7 : num(c.memory.keepChatlogDays, 7, -1, 3650)
   c.memory.keepChatlogSet = true
   c.memory.mergeGroups = bool(c.memory.mergeGroups, false)
+  c.memory.residentMaxChars = num(c.memory.residentMaxChars, 1200, 200, 4000)
+  c.memory.preferPersonal = bool(c.memory.preferPersonal, true)
   for (const k of ['instantCommands', 'groupMemory', 'searchRrf']) c.memory[k] = bool(c.memory[k], true)
   c.memory.crossContext = bool(c.memory.crossContext, false)
   c.memory.extractIdleMinutes = num(c.memory.extractIdleMinutes, 30, 0, BIG)
@@ -585,9 +736,62 @@ export function normalize(raw) {
   // 记忆压缩：具体的事慢慢淡忘、概括成长期印象（默认开；可以关；多少天以前的细节才参与概括）
   c.memory.compress = bool(c.memory.compress, true)
   c.memory.compressAfterDays = Math.round(num(c.memory.compressAfterDays, 14, 1, 365))
-  if (!isObj(c.memory.vector)) c.memory.vector = { ...DEFAULTS.memory.vector }
-  c.memory.vector.enabled = bool(c.memory.vector.enabled, false)
-  for (const k of ['baseUrl', 'model', 'apiKey']) c.memory.vector[k] = String(c.memory.vector[k] || '').trim()
+  if (!isObj(c.memory.vector)) c.memory.vector = structuredClone(DEFAULTS.memory.vector)
+  const vector = c.memory.vector
+  vector.enabled = bool(vector.enabled, false)
+  vector.provider = ['siliconflow', 'ark', 'openai', 'ollama', 'custom'].includes(vector.provider) ? vector.provider : 'siliconflow'
+  for (const k of ['baseUrl', 'model', 'apiKey']) vector[k] = String(vector[k] || '').trim()
+  vector.baseUrl = vector.baseUrl.replace(/\/+$/, '')
+  vector.dimensions = Math.round(num(vector.dimensions, 0, 0, 8192))
+  vector.batchSize = Math.round(num(vector.batchSize, 10, 1, 64))
+  vector.queryTimeoutMs = Math.round(num(vector.queryTimeoutMs, 3000, 500, 15000))
+  vector.headers = headerLines(vector.headers)
+  // 检索方式：本地小模型（离线，推荐）或自己配的在线服务。
+  // 老配置只有 baseUrl、没有 mode（DEFAULTS 会补上 'local'，所以要拿原始输入判断），
+  // 这时按「填了地址就是在用在线服务」跑，不然升级后向量检索会悄悄失效。
+  const rawVec = isObj(raw?.memory?.vector) ? raw.memory.vector : {}
+  const declaredMode = String(rawVec.mode || '').trim().toLowerCase()
+  // mode 是**派生值**（本地小模型 / 在线服务），不是用户直接填的配置项：
+  // 定义成不可枚举属性，这样 Object.entries / deepEqual 看不到它（升级兼容测试要求
+  // 配置结构和 DEFAULTS 完全一致），但 cfg.memory.vector.mode 仍能正常读。
+  Object.defineProperty(vector, 'mode', {
+    value: declaredMode === 'remote' || declaredMode === 'local' ? declaredMode : (vector.baseUrl ? 'remote' : 'local'),
+    enumerable: false,
+    writable: true,
+    configurable: true,
+  })
+  if (!isObj(c.memory.rerank)) c.memory.rerank = structuredClone(DEFAULTS.memory.rerank)
+  const rerank = c.memory.rerank
+  rerank.enabled = bool(rerank.enabled, false)
+  for (const k of ['baseUrl', 'model', 'apiKey']) rerank[k] = String(rerank[k] || '').trim()
+  rerank.baseUrl = rerank.baseUrl.replace(/\/+$/, '').replace(/\/rerank$/i, '')
+  rerank.model = rerank.model || DEFAULTS.memory.rerank.model
+  rerank.topN = Math.round(num(rerank.topN, 20, 2, 50))
+  rerank.timeoutMs = Math.round(num(rerank.timeoutMs, 2000, 500, 10_000))
+  // 向量联想：建边阈值、每个节点最多几条边、每次召回最多带几条
+  if (!isObj(c.memory.assoc)) c.memory.assoc = structuredClone(DEFAULTS.memory.assoc)
+  c.memory.assoc.enabled = bool(c.memory.assoc.enabled, true)
+  c.memory.assoc.minSim = num(c.memory.assoc.minSim, DEFAULTS.memory.assoc.minSim, 0.3, 0.95)
+  c.memory.assoc.limit = Math.round(num(c.memory.assoc.limit, DEFAULTS.memory.assoc.limit, 1, 8))
+  c.memory.assoc.recall = Math.round(num(c.memory.assoc.recall, DEFAULTS.memory.assoc.recall, 0, 5))
+  // 跳数：0 = 只建边不联想，1 = A→B，2 = A→B→C。**封顶 3**，再多就是套娃了。
+  c.memory.assoc.hops = Math.round(num(c.memory.assoc.hops, DEFAULTS.memory.assoc.hops, 0, 3))
+  c.memory.assoc.hopDecay = num(c.memory.assoc.hopDecay, DEFAULTS.memory.assoc.hopDecay, 0.1, 1)
+  // 想起总数护栏：0 = 不额外限制（= 直接 recallCount + 联想 assoc.recall）
+  c.memory.recallTotal = Math.round(num(c.memory.recallTotal, 0, 0, BIG))
+  // 行为驱动的档位升档
+  if (!isObj(c.memory.tierGrow)) c.memory.tierGrow = structuredClone(DEFAULTS.memory.tierGrow)
+  c.memory.tierGrow.enabled = bool(c.memory.tierGrow.enabled, true)
+  c.memory.tierGrow.perDay = num(c.memory.tierGrow.perDay, DEFAULTS.memory.tierGrow.perDay, 0, 0.2)
+  c.memory.tierGrow.minHitDays = Math.round(num(c.memory.tierGrow.minHitDays, DEFAULTS.memory.tierGrow.minHitDays, 0, 60))
+  c.memory.tierGrow.cap = num(c.memory.tierGrow.cap, DEFAULTS.memory.tierGrow.cap, 0, 1)
+  // 几次联想折算成一天。1 表示联想和直接命中一样重；默认 2 表示联想更轻。
+  c.memory.tierGrow.assocPerHitDay = Math.round(num(c.memory.tierGrow.assocPerHitDay, DEFAULTS.memory.tierGrow.assocPerHitDay, 1, 20))
+  for (const key of ['tier2', 'tier3']) {
+    if (!isObj(c.memory.tierGrow[key])) c.memory.tierGrow[key] = { ...DEFAULTS.memory.tierGrow[key] }
+    c.memory.tierGrow[key].hitDays = Math.round(num(c.memory.tierGrow[key].hitDays, DEFAULTS.memory.tierGrow[key].hitDays, 0, 365))
+    c.memory.tierGrow[key].imp = num(c.memory.tierGrow[key].imp, DEFAULTS.memory.tierGrow[key].imp, 0, 1)
+  }
   g.interests = (Array.isArray(g.interests) ? g.interests : String(g.interests || '').split(/[\s,，]+/)).map((s) => String(s).trim()).filter(Boolean)
   g.minRelevance = num(g.minRelevance, 0.25, 0, 1)
   // @ 了别人时不算叫她（只挡必回，仍然可以插话）；默认关，保持原行为
@@ -599,13 +803,16 @@ export function normalize(raw) {
   c.merge.maxSec = Math.max(c.merge.waitSec, num(c.merge.maxSec, 8, 0, BIG))
   c.merge.groupWaitSec = num(c.merge.groupWaitSec, 5, 0, BIG)
   c.merge.groupMaxSec = Math.max(c.merge.groupWaitSec, num(c.merge.groupMaxSec, 15, 0, BIG))
+  c.forward = c.forward && typeof c.forward === 'object' ? c.forward : {}
+  c.forward.expandEarly = bool(c.forward.expandEarly, false)
+  c.forward.expandHistory = bool(c.forward.expandHistory, false)
   c.titleFilter.enabled = bool(c.titleFilter.enabled, true)
   c.titleFilter.groups = qqList(c.titleFilter.groups) // 和群白名单同一套规则
   c.titleFilter.title = String(c.titleFilter.title ?? '').replace(/[​-‍﻿]/g, '').trim().slice(0, 30) || '大肥鱼'
   g.burstMax = num(g.burstMax, 8, 1, BIG)
   g.engagedMax = num(g.engagedMax, 6, 0, BIG)
   g.burstWindowSec = num(g.burstWindowSec, 120, 1, BIG)
-  if (!['auto', 'edge', 'windows', 'cosyvoice', 'gptsovits', 'http'].includes(c.voice.engine)) c.voice.engine = 'auto'
+  if (!['auto', 'edge', 'windows', 'cosyvoice', 'gptsovits', 'http', 'volcano', 'breeze'].includes(c.voice.engine)) c.voice.engine = 'auto'
   c.voice.songVoice = String(c.voice.songVoice || '').slice(0, 120)
   c.voice.songPitch = Math.max(-24, Math.min(24, Math.round(Number(c.voice.songPitch) || 0)))
   c.voice.cosyvoice.sampleRate = num(c.voice.cosyvoice.sampleRate, 22050, 8000, 48000)
@@ -655,15 +862,17 @@ export function normalize(raw) {
   c.song.pypiMirror = { '': 'auto', tuna: 'cn' }[c.song.pypiMirror] ?? c.song.pypiMirror
   if (!['auto', 'cn', 'off'].includes(c.song.pypiMirror)) c.song.pypiMirror = 'auto'
   c.song.root = String(c.song.root || '').trim()
-  // 云备份：owner/repo 去空格，令牌按密钥处理（SECRETS 里有登记）
+  // 云备份：owner/repo 去空格，令牌按密钥处理（SECRETS 里有登记）。
+  // owner/repo 只留 URL 白名单字符（@ : / ? # 空格等能改语义的直接去掉，push 时还有白名单硬校验兜底）；
+  // branch 拒 .. 与 - 开头，防 refspec/选项注入。
   c.backup = c.backup || {}
   if (!isObj(c.backup.remote)) c.backup.remote = { ...DEFAULTS.backup.remote }
   const br = c.backup.remote
   br.enabled = bool(br.enabled, false)
-  br.owner = String(br.owner || '').trim().replace(/^https?:\/\//i, '').replace(/^gitee\.com\//i, '').split(/[/?]/)[0].replace(/\.git$/, '').slice(0, 100)
-  br.repo = String(br.repo || '').trim().replace(/\.git$/, '').slice(0, 100)
+  br.owner = String(br.owner || '').trim().replace(/^https?:\/\//i, '').replace(/^gitee\.com\//i, '').split(/[/?]/)[0].replace(/\.git$/, '').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 100)
+  br.repo = String(br.repo || '').trim().replace(/\.git$/, '').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 100)
   br.token = String(br.token || '').trim()
-  br.branch = String(br.branch || '').trim().replace(/^refs\/heads\//, '').slice(0, 100) || 'master'
+  br.branch = String(br.branch || '').trim().replace(/^refs\/heads\//, '').replace(/[^A-Za-z0-9._/-]/g, '').replace(/^[.\-]+/, '').replace(/\.\.+/g, '.').slice(0, 100) || 'master'
   br.time = hhmm(br.time, '03:30')
   br.keep = Math.round(num(br.keep, 7, 1, 365))
   br.autoCreate = bool(br.autoCreate, true)
@@ -677,6 +886,9 @@ export function normalize(raw) {
   if (!isObj(c.ext)) c.ext = {}
   for (const k of Object.keys(c.ext)) if (!isObj(c.ext[k])) delete c.ext[k] // 传 null = 删掉这个模块的设置
   c.safeMode = bool(c.safeMode, false)
+  // 花费估算的价格表：手动填了就用手填的（手填的部分覆盖内置价），没填就用内置 DeepSeek 价
+  if (!isObj(c.usage)) c.usage = { pricing: {} }
+  if (!isObj(c.usage.pricing)) c.usage.pricing = {}
   c.bridge.dshTools = bool(c.bridge.dshTools, false)
   c.bridge.http = bool(c.bridge.http, false)
   c.bridge.token = String(c.bridge.token || '')
@@ -685,7 +897,7 @@ export function normalize(raw) {
 }
 
 // 面板里不回传原文的字段：路径（几层都行）
-const SECRETS = [['snowluma', 'webuiPassword'], ['snowluma', 'httpToken'], ['snowluma', 'wsToken'], ['imageGen', 'apiKey'], ['memory', 'vector', 'apiKey'], ['song', 'neteaseCookie'], ['bili', 'cookie'], ['bili', 'sessdata'], ['bili', 'biliJct'], ['heybox', 'cookie'], ['bridge', 'token'], ['backup', 'remote', 'token']]
+const SECRETS = [['snowluma', 'webuiPassword'], ['snowluma', 'httpToken'], ['snowluma', 'wsToken'], ['imageGen', 'apiKey'], ['voice', 'asrApi', 'apiKey'], ['memory', 'vector', 'apiKey'], ['memory', 'rerank', 'apiKey'], ['song', 'neteaseCookie'], ['bili', 'cookie'], ['bili', 'sessdata'], ['bili', 'biliJct'], ['heybox', 'cookie'], ['bridge', 'token'], ['voice', 'volcano', 'apiKey'], ['voice', 'breeze', 'key'], ['voice', 'breeze', 'password'], ['backup', 'remote', 'token'], ['backup', 'remote', 'webdav', 'password']]
 // 扩展模块设置里的密码类字段（模块加载时登记）：['ext', 模块id, 字段]
 const extraSecrets = new Map()
 export function registerSecretField(path) { extraSecrets.set(path.join('\u0000'), path) }
@@ -757,6 +969,8 @@ export function saveConfig(cfg) {
 /** 给面板看的版本：密码 / token 不回传原文，只告诉有没有填。 */
 export function publicConfig(cfg) {
   const c = structuredClone(cfg)
+  // 面板上的「试运行」只表示「试运行但不调试」：调试开着时它显示为关
+  c.dryRun = Boolean(c.dryRun && !c.debug)
   for (const [g, k] of HINTED) c[g][`${k}Hint`] = c[g][k] ? '…' + String(c[g][k]).slice(-4) : ''
   for (const path of allSecrets()) {
     const p = parentOf(c, path, false)

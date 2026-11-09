@@ -104,7 +104,6 @@ export async function startMockOneBot({ selfId = '20000002', token = 'mock-token
       case 'comment_qzone': case 'like_qzone': return null
       case 'get_forward_msg': return { messages: (state.forwards || {})[params.id] || [] }
       case 'send_poke': return null
-      case 'get_group_msg_history': case 'get_friend_msg_history': return { messages: state.history || [] }
       case 'get_stranger_info': return String(params.user_id) === String(selfId)
         ? { user_id: Number(selfId), ...state.selfProfile }
         : { user_id: params.user_id, nickname: '路人' + params.user_id }

@@ -13,10 +13,13 @@ import { readFileSync, existsSync, writeFileSync, unlinkSync, statSync, mkdirSyn
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
+import net from 'node:net'
 import { loadConfig, saveConfig, publicConfig, mergeFromPanel } from './core/config.js'
 import { createLogger } from './core/logger.js'
+import { encodeResponse } from './core/http-compress.js'
 import { registerSecret, redact } from './core/redact.js'
 import { createOneBotClient } from './onebot/client.js'
+import { createOutbox } from './onebot/outbox.js'
 import { createSnowLumaManager, DOWNLOAD_PAGE } from './snowluma/manager.js'
 import { createHub, workspaceDirOf } from './chat/hub.js'
 import { normalizeSelection } from './chat/chat-model.js'
@@ -25,18 +28,21 @@ import { createLocal, fileOf, toImageBuffer } from './local/local.js'
 import { createGroupRoles } from './chat/group-roles.js'
 import { defaultModel, askModel, modelReasoning, modelVision, clearReasoningCache, clearVisionCache } from './core/llm.js'
 import { mimeOf } from './chat/inbound.js'
+import { createMediaAccess } from './core/media.js'
 import { buildFaceIndex } from './chat/faces.js'
 import { FACE_TABLE } from './chat/face-table.js'
 import { dataDir, ensureDir } from './core/store.js'
-import { createUpdateChecker, changelogSection } from './core/update.js'
+import { initUsage, usageReport } from './core/usage.js'
+import { createUpdateChecker, changelogSection, hostEnv, updatePlan, repoOf } from './core/update.js'
 import { parseCommand, runCommand, createMutes, commandList } from './chat/commands.js'
 import { listPersonas, readPersona, savePersona, deletePersona, currentPersonaText, rulesText, seedPersonas } from './persona/personas.js'
 import { createModules, API_VERSION } from './core/modules.js'
-import { createCommunity, REGISTRY_URL } from './core/community.js'
+import { createCommunity, REGISTRY_URL, GITEE_MIRROR } from './core/community.js'
 import { createApprovalRelay } from './security/approval.js'
+import { createNoticeRelay, normalizeWorkspace } from './features/notice.js'
 import { captureSystemPrompt } from './security/leak-guard.js'
 import { applyPendingRestore, cancelRestore, createBackup, listBackups, pendingModules, pendingRestore, saveUpload, setPendingModules, stageRestore } from './core/backup.js'
-import { pushBackup } from './core/backup-push.js'
+import { pushBackup, listWebdavBackups, downloadWebdavBackup } from './core/backup-push.js'
 import { cleanText } from './core/text.js'
 import { createBridge } from './core/bridge.js'
 import { createDangerGuard, safeOwnedSession } from './security/danger.js'
@@ -54,7 +60,70 @@ const PKG = (() => {
   try { return JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')) } catch (error) { return { version: '?' } }
 })()
 const VERSION = PKG.version
+const STARTED_AT = Date.now()
 const PREFIX = '/aurabot/api'
+
+/**
+ * 自动更新要在宿主上跑 `dsh plugin add`：
+ * - 桌面版：用 DSH 自带的 Electron 可执行文件 + app.asar 里的 cli.js（等价于 dsh.cmd / dsh 脚本）；
+ * - 网页版：PATH 里的 dsh（Windows 上 .cmd 要过 shell）。
+ */
+function updateExec(env, args) {
+  if (env.mode === 'desktop' && env.resourcesPath) {
+    const cliJs = join(env.resourcesPath, 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh-desktop-host', 'lib', 'cli.js')
+    if (existsSync(cliJs)) {
+      return { cmd: process.execPath, cmdArgs: [cliJs, ...args], env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, shell: false }
+    }
+  }
+  return { cmd: env.cli, cmdArgs: args, env: process.env, shell: process.platform === 'win32' }
+}
+
+/** 本机端口有没有人在听（诊断用，别拿它当业务判断）。 */
+function tcpOpen(port, host = '127.0.0.1', timeoutMs = 800) {
+  return new Promise((resolve) => {
+    const socket = new net.Socket()
+    let done = false
+    const finish = (value) => {
+      if (done) return
+      done = true
+      try { socket.destroy() } catch (error) {}
+      resolve(value)
+    }
+    socket.setTimeout(timeoutMs)
+    socket.once('connect', () => finish(true))
+    socket.once('timeout', () => finish(false))
+    socket.once('error', () => finish(false))
+    socket.connect(port, host)
+  })
+}
+
+/** 跑更新命令，收集输出；3 分钟没结束就杀掉。 */
+function runUpdate(cmd, args, env, shell = false) {
+  return new Promise((resolve) => {
+    let out = ''
+    let done = false
+    const finish = (value) => { if (!done) { done = true; resolve(value) } }
+    let child
+    try {
+      child = spawn(cmd, args, { env, shell, windowsHide: true })
+    } catch (error) {
+      return finish({ ok: false, message: '启动更新命令失败：' + error.message })
+    }
+    const timer = setTimeout(() => {
+      try { child.kill() } catch (error) {}
+      finish({ ok: false, message: '更新超时（3 分钟），可能网络不通', output: out.slice(-4000) })
+    }, 180000)
+    child.stdout?.on('data', (b) => { out += String(b) })
+    child.stderr?.on('data', (b) => { out += String(b) })
+    child.on('error', (error) => { clearTimeout(timer); finish({ ok: false, message: '更新失败：' + error.message }) })
+    child.on('exit', (code) => {
+      clearTimeout(timer)
+      finish(code === 0
+        ? { ok: true, message: '更新命令跑完了，重启 DSH 生效', output: out.slice(-4000) }
+        : { ok: false, message: '更新命令退出码 ' + code, output: out.slice(-4000) })
+    })
+  })
+}
 
 /**
  * 这个 DSH 会话是不是 Aurabot 的 QQ 聊天会话（私聊/群聊各对应一个 DSH 会话）。
@@ -75,17 +144,17 @@ export function apply(ctx) {
   let cfg = loadConfig()
   let mods = null
   let bridge = null
-  // 主动发言出站策略服务（docs/OUTBOUND-POLICY-DESIGN.md），装配在模块之前
-  let outbound = null
-  // 已注册的策略源实例（name → policy），给 deliver 的 enginePolicy 解析用
-  const enginePolicies = new Map()
   // 备份与云备份推送的任务状态声明在顶部：setConfig 里改云备份设置时要提前排定时器
   let backupJob = null // { running, done, total, error, result }
   let pushJob = null // { running, ok, error, result, at }
   let pushTimer = null // 云备份每日定时
+  // 主动发言出站策略服务（docs/OUTBOUND-POLICY-DESIGN.md），装配在模块之前
+  let outbound = null
+  // 已注册的策略源实例（name → policy），给 deliver 的 enginePolicy 解析用
+  const enginePolicies = new Map()
   const getConfig = () => cfg
   setSsrpMode(() => (getConfig().security && getConfig().security.ssrfMode === 'loose' ? 'loose' : 'strict'))
-  const secrets = () => { for (const k of ['webuiPassword', 'httpToken', 'wsToken']) registerSecret(cfg.snowluma[k]); registerSecret(cfg.imageGen.apiKey); registerSecret(cfg.bridge.token) }
+  const secrets = () => { for (const k of ['webuiPassword', 'httpToken', 'wsToken']) registerSecret(cfg.snowluma[k]); registerSecret(cfg.imageGen.apiKey); registerSecret(cfg.bridge.token); registerSecret(cfg.backup?.remote?.token); registerSecret(cfg.backup?.remote?.webdav?.password) } // backup 令牌/WebDAV 密码也按密钥脱敏（云备份）
   const setConfig = (next) => {
     const before = cfg
     cfg = saveConfig(next)
@@ -95,7 +164,7 @@ export function apply(ctx) {
       if (onebotState === 'connected') onebot.restart()
     }
     secrets()
-    if (bridge && before.bridge.dshTools !== cfg.bridge.dshTools) bridge.refresh()
+    if (bridge && (before.bridge.dshTools !== cfg.bridge.dshTools || before.persona.current !== cfg.persona.current)) bridge.refresh()
     if (mods && (JSON.stringify(before.modules) !== JSON.stringify(cfg.modules) || before.safeMode !== cfg.safeMode)) mods.sync().catch(() => {})
     mods?.emit('config', cfg, before)
     if (JSON.stringify(before.backup?.remote) !== JSON.stringify(cfg.backup?.remote)) scheduleRemoteBackup()
@@ -103,6 +172,8 @@ export function apply(ctx) {
   }
   secrets()
   seedPersonas()
+  // token 用量与花费（面板「概览」）：价格表可以在 config.usage.pricing 里覆盖
+  initUsage(cfg.usage?.pricing, cfg.cost?.offPeakHolidays)
 
   // ---------- 人格与规则：通过提示词变量注入到 Aurabot 的两个 preset ----------
   const variable = (n, fn) => ctx.effect(() => ctx.systemPrompt.variable(n, (...args) => captureSystemPrompt(n, cleanText(fn(...args)))), `aurabot: 变量 ${n}`)
@@ -151,6 +222,7 @@ export function apply(ctx) {
   let hub = null
   let dangerGuard = null // 危险命令确认（security.dangerConfirm 开着才生效）
   let approvalRelay = null // DSH 要授权时在 QQ 私聊问主人（approvalViaQQ 开着才生效）
+  let noticeRelay = null // DSH 要授权 / 要选选项时通知到主人私聊（config.notice，按工作区开关）
   async function checkLogin() {
     verifying = true
     pendingEvents = []
@@ -211,14 +283,32 @@ export function apply(ctx) {
       hub.onNotice(ev).catch((error) => log.debug('处理通知出错：', error.message))
     }
   }
+  // 网关未就绪时先攒着：只有「确定没发出去」的消息才入队，连接后按 TTL 补发。
+  const outbox = createOutbox({ log: logger.child('outbox') })
+  // 网关预热：从第一次 connecting 到 connected 之间的时间，用于面板显示「已等 N 秒」而不是干等
+  let gatewayWarmSince = 0
+  let gatewayLastLogAt = 0
+  // 预热阶段：QQ 没开 / 正在登录 / 已登录未接入 / 已接入等 OneBot / OneBot 已监听
+  let warmupPhase = { phase: '', label: '' }
+  let warmupProbing = false
   const onebot = createOneBotClient({
     endpoint,
     log: logger.child('onebot'),
     onState: (s, d) => {
       onebotState = s
+      if (s === 'connected' || s === 'stopped' || s === 'unconfigured') { gatewayWarmSince = 0; warmupPhase = { phase: '', label: '' } }
+      else if (!gatewayWarmSince && cfg.enabled) gatewayWarmSince = Date.now()
       if (s !== 'connected') { loginOk = false; pendingEvents = [] }
-      else checkLogin().catch((error) => log.warn('核对登录号出错：', error.message))
-      logger.child('onebot').info(`QQ 网关：${s}${d ? '（' + d + '）' : ''}`)
+      else checkLogin().then(() => { if (loginOk) flushOutbox() }).catch((error) => log.warn('核对登录号出错：', error.message))
+      // 预热阶段 connecting/disconnected 会每 3 秒来回刷：首次和每 20 秒记一条 info，其余进 debug
+      const line = `QQ 网关：${s}${d ? '（' + d + '）' : ''}`
+      const now = Date.now()
+      if (s === 'connected' || s === 'stopped' || s === 'unconfigured' || now - gatewayLastLogAt > 20_000) {
+        logger.child('onebot').info(line)
+        gatewayLastLogAt = now
+      } else {
+        logger.child('onebot').debug(line)
+      }
       mods?.emit('onebot/state', s)
     },
     onEvent: (ev) => {
@@ -233,6 +323,55 @@ export function apply(ctx) {
       handleEvent(ev)
     },
   })
+  async function flushOutbox () {
+    if (onebotState !== 'connected' || !loginOk) return
+    try {
+      const r = await outbox.flush((action, params, opts) => onebot.call(action, params, { ...opts, retries: 0 }))
+      if (r.sent || r.dropped || r.left) log.info(`补发队列：成功 ${r.sent}，丢弃 ${r.dropped}，剩余 ${r.left}`)
+    } catch (error) {
+      logger.child('onebot').warn('补发队列出错：', error.message)
+    }
+  }
+  // 连接后漏掉的、或补发中途又断网的，定时再试；没连接时直接返回。
+  ctx.effect(() => ctx.interval(() => { flushOutbox().catch(() => {}) }, 10_000), 'aurabot: 补发队列')
+
+  /** 预热阶段变化时记一条 info（同一阶段不重复刷）。 */
+  function setWarmupPhase (phase, label) {
+    if (warmupPhase.phase === phase) return
+    warmupPhase = { phase, label }
+    if (gatewayWarmSince) logger.child('onebot').info(`网关预热：${label}`)
+  }
+  /**
+   * 每 2 秒看一次卡在哪一步：QQ 没开 → QQ 在登录 → 已登录没接入 → 已接入等 OneBot 会话 → OneBot 已监听。
+   * 只在预热期跑；连上/关掉/超过 5 分钟就停。
+   */
+  async function probeWarmup () {
+    if (warmupProbing || !gatewayWarmSince || onebotState === 'connected') return
+    if (!cfg.enabled || cfg.gateway !== 'snowluma') return
+    if (Date.now() - gatewayWarmSince > 300_000) return
+    warmupProbing = true
+    try {
+      const inst = snowluma.detect()
+      if (!inst.installed) return setWarmupPhase('no-snowluma', 'SnowLuma 还没装好')
+      const ep = endpoint()
+      let wsPort = 0
+      try { wsPort = Number(new URL(ep.wsUrl).port) || 0 } catch (error) {}
+      if (wsPort && await tcpOpen(wsPort)) return setWarmupPhase('onebot-ready', `OneBot 已经在 ${wsPort} 端口监听，正在握手`)
+      let list
+      try { list = await snowluma.processes() } catch (error) { return setWarmupPhase('snowluma-wait', 'SnowLuma 还没起来或控制台没响应') }
+      const bots = list.filter((p) => p.isBot)
+      if (!bots.length) return setWarmupPhase('no-qq', '没看到机器人号的 QQ 进程：先把机器人号 QQ 登录上')
+      const logged = bots.find((p) => p.loggedIn)
+      if (!logged) return setWarmupPhase('qq-logging-in', '看到 QQ 进程了，等它登录完成')
+      if (!logged.injected) return setWarmupPhase('not-attached', 'QQ 已登录，还没接入机器人号（点「接入机器人号」）')
+      return setWarmupPhase('session-starting', 'QQ 已登录且已接入，等 OneBot 会话启动')
+    } catch (error) {
+      setWarmupPhase('unknown', '正在等网关（' + error.message + '）')
+    } finally {
+      warmupProbing = false
+    }
+  }
+  ctx.effect(() => ctx.interval(() => { probeWarmup().catch(() => {}) }, 2000), 'aurabot: 网关预热探测')
   const groupRoles = createGroupRoles({ onebot, getConfig, log: logger.child('chat') })
   const local = createLocal({ getConfig, log: logger })
   const mutes = createMutes()
@@ -285,6 +424,7 @@ export function apply(ctx) {
     getConfig,
     log: logger.child('chat'),
     onebot,
+    outbox,
     stickers,
     tts,
     buildTools: (where) => mods.buildTools(where),
@@ -320,16 +460,22 @@ export function apply(ctx) {
       send: (message, info) => mods.filter('send', message, info),
       model: (sel, chat) => mods.filterSync('model', sel, chat),
       poke: (ev) => mods.claim('poke', ev),
+      journal: (row) => mods?.emit('chat/log', row),
     },
   })
 
   // ---------- 面板接口的小工具 ----------
-  const send = (res, code, body, type = 'application/json; charset=utf-8') => {
+  const send = (res, code, body, type = 'application/json; charset=utf-8', req = null) => {
     try {
+      const { payload, encoding } = encodeResponse(body, type, req?.headers?.['accept-encoding'] || '')
       res.statusCode = code
       res.setHeader?.('content-type', type)
       res.setHeader?.('cache-control', 'no-store')
-      res.end?.(typeof body === 'string' || Buffer.isBuffer(body) ? body : JSON.stringify(body))
+      if (encoding) {
+        res.setHeader?.('content-encoding', encoding)
+        res.setHeader?.('vary', 'accept-encoding')
+      }
+      res.end?.(payload)
     } catch (error) {}
   }
   const readBody = async (req) => {
@@ -354,12 +500,12 @@ export function apply(ctx) {
   }
   // 核心自己的接口登记成精确路径；模块的接口都走一个前缀路由，请求进来再查表
   // （模块随时开关、重新加载；关着的模块的接口回「模块没开」，面板不会白屏）
-  const answer = async (res, fn) => {
+  const answer = async (req, res, fn) => {
     try {
       const r = await fn()
-      if (r !== undefined) send(res, 200, r)
+      if (r !== undefined) send(res, 200, r, 'application/json; charset=utf-8', req)
     } catch (error) {
-      send(res, 200, { ok: false, message: redact(String(error && error.message ? error.message : error)) })
+      send(res, 200, { ok: false, message: redact(String(error && error.message ? error.message : error)) }, 'application/json; charset=utf-8', req)
     }
   }
   // ---------- 面板级访问闸（安全基线，2026-11-02） ----------
@@ -412,53 +558,63 @@ export function apply(ctx) {
    *  【复审 P1-2】/open/* 是给外部程序（curl / 脚本）用的开放接口，有自己的
    *  `Authorization: Bearer 密钥` 鉴权（bridge.authorized），跨机带正确密钥必须放行——
    *  它不是浏览器面板的一部分，不该被本机闸拦。 */
-  const panelBlocked = (req, res) => {
+  const panelBlocked = (req, res, force = false) => {
     let path = ''
     try { path = new URL(req.url, 'http://x').pathname } catch { return false }
     if (!path.startsWith(PREFIX + '/') && path !== PREFIX) return false
-    if (ADMIN_EXEMPT_PREFIXES.some((p) => path.startsWith(p))) return false
+    if (!force && ADMIN_EXEMPT_PREFIXES.some((p) => path.startsWith(p))) return false
     if (!panelNeedsLocal()) return false
     if (requestIsLocal(req)) return false
     log.warn(`管理接口拒绝远端访问：${path}（来源不是回环；如需远端管理请开 security.panelRemoteAccess 并在反代加认证）`)
     send(res, 403, { ok: false, message: '管理接口只允许本机访问。远端管理需在配置里显式开启 security.panelRemoteAccess，并务必在反向代理层再加一道认证' })
     return true
   }
-  /** 面板对外主机名（security.publicHostname，反代部署时填面板对外域名；空 = 只有回环算同源）。 */
-  const panelPublicHost = () => String(getConfig().security?.publicHostname || '').trim().toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '')
-  /** Origin 主机名是否算「同源」：回环 / localhost / 已配置的面板对外域名。 */
+  /** 主机名归一化：去首尾空白、转小写、去 IPv6 方括号、去结尾点（Host 与 Origin 共用同一口径）。 */
+  const normalizeHost = (raw) => String(raw || '').trim().toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '')
+  /** 剥端口：必须在归一化之前剥——IPv6 Host 是 `[::1]:5099`，先去方括号的话结尾是数字、`]` 剥不掉，剩个 `::1]` 就再也匹配不上。 */
+  const stripHostPort = (raw) => String(raw || '').replace(/:\d+$/, '')
+  /**
+   * 面板对外主机名列表（security.publicHostname，反代部署时填面板对外域名；空 = 只有回环算同源）。
+   * 可填多个，用逗号分隔；中文逗号、分号、空白也当分隔符（手写配置时不至于因为多按了个空格就失配）——
+   * 反代部署常见「对外域名 + 内网直连地址」两个入口同时开面板，只认一个值的话另一个入口一保存配置就被 403。
+   * 列表项与请求 Host 走同一口径（先剥端口再归一化）：内网直连地址平时都带端口，照直填进来也不会永不匹配。
+   */
+  const panelPublicHosts = () => String(getConfig().security?.publicHostname || '')
+    .split(/[\s,，;；]+/)
+    .map((item) => normalizeHost(stripHostPort(item)))
+    .filter(Boolean)
+  /** Origin 主机名是否算「同源」：回环 / localhost / 任一已配置的面板对外域名。 */
   const originAllowed = (hostname) => {
-    const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '')
+    const h = normalizeHost(hostname)
     if (!h) return false
     if (h === 'localhost' || h.endsWith('.localhost') || isLoopbackAddr(h)) return true
-    const ph = panelPublicHost()
-    return Boolean(ph) && h === ph
+    return panelPublicHosts().includes(h)
   }
   /**
    * 【复审 2·P1-1】管理面 Host 允许名单（防 DNS rebinding）。
    * 攻击：恶意页面把 evil.example 的 DNS rebind 到 127.0.0.1，然后 `fetch('http://evil.example:port/state')`
    * ——socket 是本机回环（本机闸放行）、方法是 GET（不过 CSRF）→ 管理面被「同源可读」：
    * /state、/logs、/bridge/token（返回 bearer）、client-package（含令牌）全部外泄。
-   * 修法：管理面请求的 Host 头必须在白名单内（回环 / localhost / publicHostname）。
+   * 修法：管理面请求的 Host 头必须在白名单内（回环 / localhost / publicHostname 列表任一项）。
    * Host 头虽是请求方可控的，但浏览器同源策略保证「页面 JS 发出的请求 Host = 页面所在的源」——
    * rebinding 页面发出的 Host 就是 evil.example 本身，进不了白名单；同源面板请求 Host 必然是
-   * 127.0.0.1 / localhost / publicHostname 之一。非浏览器客户端（curl/脚本）不受浏览器防护，
+   * 127.0.0.1 / localhost / publicHostname 列表里任一项。非浏览器客户端（curl/脚本）不受浏览器防护，
    * 但它们也不是 rebinding 载体，且有各自的鉴权层。
    */
   const hostAllowedForAdmin = (hostRaw) => {
     // 复审 3·小建议：先剥端口再剥方括号。IPv6 回环 Host 是 `[::1]:5099`——
     // 若先剥 `[` 再剥 `]`，结尾已是数字，`]` 剥不掉，端口剥完剩 `::1]`，会被 403。
-    const h = String(hostRaw || '').toLowerCase().replace(/:\d+$/, '').replace(/^\[|\]$/g, '').replace(/\.$/, '')
+    const h = normalizeHost(stripHostPort(hostRaw))
     if (!h) return false
     if (h === 'localhost' || h.endsWith('.localhost')) return true
     if (isLoopbackAddr(h)) return true
-    const ph = panelPublicHost()
-    return Boolean(ph) && h === ph
+    return panelPublicHosts().includes(h)
   }
   /** Host 校验 + 失败响应。只用于管理面（模块路由的 Host 另有 Host 闸策略）。 */
   const adminHostBlocked = (req, res) => {
     const hostHeader = String(req.headers?.host || '')
     if (hostAllowedForAdmin(hostHeader)) return false
-    log.warn(`管理接口拒绝异常 Host：${hostHeader}（疑似 DNS rebinding；白名单：回环/localhost/security.publicHostname）`)
+    log.warn(`管理接口拒绝异常 Host：${hostHeader}（疑似 DNS rebinding；白名单：回环/localhost/security.publicHostname 任一项）`)
     send(res, 403, { ok: false, message: '管理接口拒绝该 Host（只接受本机回环、localhost 或已配置的面板对外域名）' })
     return true
   }
@@ -499,7 +655,7 @@ export function apply(ctx) {
   const route = (path, handler, opts = {}) => ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
     path: PREFIX + path,
-    handler: (req, res) => answer(res, () => {
+    handler: (req, res) => answer(req, res, () => {
       if (panelBlocked(req, res)) return undefined
       if (!opts.skipHostCheck && adminHostBlocked(req, res)) return undefined // DNS rebinding 防护（含 GET）
       if (csrfBlocked(req, res)) return undefined
@@ -509,7 +665,7 @@ export function apply(ctx) {
   ctx.effect(() => ctx.webServer.register({
     kind: 'prefix',
     path: PREFIX, // DSH 按「路径 = 前缀 或 以 前缀/ 开头」匹配，前缀本身不带结尾的 /
-    handler: (req, res) => answer(res, () => {
+    handler: (req, res) => answer(req, res, () => {
       let path = ''
       try { path = new URL(req.url, 'http://x').pathname } catch (error) {}
       // 【复审 2·P1-2】模块 prefix 路由也过 CSRF：实测本机 socket + 恶意 Origin 能跨站打
@@ -517,6 +673,7 @@ export function apply(ctx) {
       // 模块路由有自己的 Host 闸与鉴权，但同样缺跨站防护；桌宠 native 客户端不带 Origin，
       // 不受影响；桌面面板的 fetch 是同源，也不受影响。
       if (csrfBlocked(req, res)) return undefined
+      if (mods.routeAccess(path) === 'panel' && (panelBlocked(req, res, true) || adminHostBlocked(req, res))) return undefined
       return mods.handle(path, req, res)
     }),
   }), 'aurabot: 模块接口')
@@ -580,6 +737,7 @@ export function apply(ctx) {
     listModels,
     defaultModel: () => defaultModel(ctx, { model: {} }),
     http: { body: readBody, raw: readRaw, query, send },
+    media: createMediaAccess({ root: ROOT, use, config: getConfig }),
     personas: { list: listPersonas, read: readPersona, current: () => currentPersonaText(cfg.persona.current) },
     getConfig, setConfig,
   }
@@ -617,7 +775,7 @@ export function apply(ctx) {
 
   /**
    * 按当前配置装配策略源：purpose / speakup 各自启用时才注册（未启用的不注册，
-   * 服务据此判定 managed 与 deny 语义，设计稿 §8.1 要求故障不得静默 pass）。
+   * 服务据此判定 managed 与 deny 语义，设计稿要求故障不得静默 pass）。
    *
    * 策略源要拿到 speakup / purpose 模块的实例面（use('speakup').state() 等），
    * 而模块是异步启动的，所以这里做成可重复调用的懒装配：模块起来之后再调一次即可，
@@ -631,7 +789,7 @@ export function apply(ctx) {
     const budget = createSharedBudget({ ownerQQ: cfg.ownerQQ, dataDir: dir, log: say })
     try {
       // 目的引擎（默认关）：模块在跑且配置开着才注册。引擎未启用 / 未 ready 时不注册，
-      // 服务自己会处理 managed=false 与 deny 语义（CONTRACT §3 故障语义：不得静默 pass）。
+      // 服务自己会处理 managed=false 与 deny 语义（设计稿故障语义：不得静默 pass）。
       const pu = use('purpose')
       if (cfg.ext?.purpose?.enabled === true && pu) {
         const policy = createPurposePolicy({
@@ -666,13 +824,13 @@ export function apply(ctx) {
         outbound.unregisterPolicySource('speakup')
         enginePolicies.delete('speakup')
       }
-      // 主人换号：旧 pending 一律作废（设计稿 §6.1「接收人固定」）
+      // 主人换号：旧 pending 一律作废（设计稿「接收人固定」）
       outbound.syncOwnerQQ?.(cfg.ownerQQ)
       // 面板存过的 activePolicy 要在重启后重新生效（否则配置写了却只有服务实例的默认值在跑）
       const active = (cfg.ext?.outboundPolicy && cfg.ext.outboundPolicy.activePolicy) || 'auto'
       outbound.setActivePolicy?.(active)
     } catch (error) {
-      // 装配失败不能拖垮宿主启动：服务会因「无 ready 策略源」按 §8.1 拒绝并显示原因
+      // 装配失败不能拖垮宿主启动：服务会因「无 ready 策略源」拒绝并显示原因
       logger.child('出站策略').warn('策略源装配失败：', error && error.message)
     }
   }
@@ -760,6 +918,7 @@ export function apply(ctx) {
   const community = createCommunity({ mods, getConfig, setConfig, log, version: VERSION, alive: () => !unloaded })
   const booted = mods.boot()
   booted.then(() => injectPetPort()).catch(() => {})
+  booted.then(() => { if (getConfig().debug) hub.ensureDebugSession().catch((error) => log.warn('建调试会话失败：', error.message)) }).catch(() => {})
   // 模块起来之后再把策略源接上（此时 use('speakup') / use('purpose') 才拿得到实例）
   booted.then(() => wirePolicySources()).catch((error) => logger.child('出站策略').warn('策略源接线上失败：', error && error.message))
   booted.then(() => (unloaded ? [] : community.migrate())).catch((error) => log.warn('搬到社区库的模块处理失败：', error.message))
@@ -775,48 +934,118 @@ export function apply(ctx) {
     }).catch((error) => log.warn('恢复模块失败：', error.message))
   booted.then(() => { if (!unloaded) bridge.refresh() })
 
-  // ---------- 审批请求：DSH 要授权时把请求发到 QQ ----------
-  // 说明：DSH 的批准动作只能由界面回答（host 拿不到应答通道），所以这里只做通知。
-  const approvalSeen = new Map()
-  // 授权通知只看 Aurabot · QQ 工作区：既包括 hub 映射的聊天会话，也包括同一工作区里
-  // 主人手动打开 / 调试 / 新建的会话。别的 DSH 项目的会话一律不转到 QQ。
-  function isAurabotWorkspaceSession(session) {
-    if (!session?.id) return false
-    try { if (hub?.chatOfSession?.(session.id)) return true } catch (error) {}
+  // ---------- 审批 / 提问：DSH 要人处理时把请求说到 QQ ----------
+  // 只上报，不代答：DSH 界面照常弹，谁在电脑前谁点。按工作区分别开关（config.notice）。
+  function workspaceList() {
     try {
       const reg = ctx.workspaceRegistry || ctx.get?.('workspaceRegistry')
-      const norm = (p) => String(p || '').replace(/[\\/]+$/, '').toLowerCase()
-      const ws = (reg?.list?.() || []).find((w) => norm(w.path) === norm(workspaceDirOf(getConfig())))
-      return Boolean(ws?.sessionIds?.some((sid) => String(sid) === String(session.id)))
+      return reg?.list?.() || []
+    } catch (error) { return [] }
+  }
+  function workspaceOfSession(sessionId) {
+    const sid = String(sessionId || '')
+    if (!sid) return ''
+    const hit = workspaceList().find((w) => (w?.sessionIds || []).some((x) => String(x) === sid))
+    return hit ? String(hit.path || '') : ''
+  }
+  // 上一次往私人会话推提醒的时间：10 秒内不再推，避免连着进来几批时刷屏
+  let lastNoticePush = 0
+  /**
+   * 把攒下来的几件事，推进主人的私聊会话让她自己说。
+   * 走的是完整人格 + 私聊上下文，不再拼独立提示词；推不进去（会话坏了、还没恢复）就整批不发。
+   */
+  async function noticeText(items) {
+    const list = Array.isArray(items) ? items : []
+    if (!list.length) return false
+    if (Date.now() - lastNoticePush < 10000) return false
+    const now = getConfig()
+    const owner = String(now.ownerName || '主人').slice(0, 12)
+    // 精确到秒：同一分钟里连着来的两件也能分开，不会被当成同一件
+    const clock = (t) => {
+      const d = new Date(Number(t) || Date.now())
+      const p = (n) => String(n).padStart(2, '0')
+      return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+    }
+    const lines = list.map((it, i) => {
+      const title = String(it.title || '未命名').slice(0, 40)
+      const at = clock(it.at)
+      if (it.kind === 'approval') return `${i + 1}. [${at}] 有个会话卡在 ${it.tool || '某个工具'} 上，等他点批准（会话：${title}）`
+      const q = (it.questions || []).map((x) => x?.question).filter(Boolean)[0] || '有个问题'
+      return `${i + 1}. [${at}] 有个会话在等他选方案：${String(q).slice(0, 60)}（会话：${title}）`
+    })
+    try {
+      const prompt = `（这是一条提示信息，通知你的主人：他电脑上有活卡住了，需要他去 DSH 界面处理。现在是 ${clock(Date.now())}。\n下面每一条都是一次单独的审批或选择请求，编号或时间不重复就是不同的事。\n${lines.join('\n')}\n用你自己的性格和语气随口跟他提一句，就当聊天里顺口提一嘴；别念条目、别像发通知。）`
+      // 把真正推给会话的内容也记下来：排查「模型为什么说没带编号」时，先看它到底收到了什么
+      log.info(`推送提示：${prompt.replace(/\n/g, ' | ').slice(0, 600)}`)
+      await hub.pushToSession(
+        { chatId: `private:${now.ownerQQ}`, kind: 'private', userId: now.ownerQQ, nickname: owner },
+        [{ type: 'text', text: prompt }],
+        ''
+      )
+      lastNoticePush = Date.now()
+      return true
     } catch (error) {
+      log.warn?.('上报推送失败：', error.message)
       return false
     }
   }
+  noticeRelay = createNoticeRelay({
+    getConfig,
+    workspaceOf: workspaceOfSession,
+    compose: noticeText,
+    log,
+  })
   async function notifyApproval(session, event) {
     try {
-      if (!cfg.enabled || cfg.dryRun || cfg.approvalNotify === false) return
-      if (!isAurabotWorkspaceSession(session)) return
+      if (!cfg.enabled || cfg.dryRun) return
       const d = event.data || {}
       const id = String(d.id || '')
-      if (!id || approvalSeen.has(id)) return
-      approvalSeen.set(id, Date.now())
+      if (!id) return
       // 等一下看 QQ 有没有问：问了就不用再通知；没问（比如审批没走到插件）照常通知，主人不会什么都收不到
       if (approvalRelay?.handles(session?.id)) {
         await new Promise((r) => setTimeout(r, 1500))
         if (approvalRelay.askedRecently()) return
       }
-      if (approvalSeen.size > 200) { for (const [k, t] of approvalSeen) if (Date.now() - t > 6 * 3600_000) approvalSeen.delete(k) }
       let title = ''
-      try { title = String(session?.title || session?.id || '') } catch (error) {}
-      const lines = ['【要授权】' + (d.toolName || '未知工具')]
-      if (d.reason) lines.push('原因：' + String(d.reason).slice(0, 300))
-      if (title) lines.push('会话：' + title.slice(0, 60))
-      lines.push('这个会话的授权要在 DSH 界面里点「批准」。')
-      await hub.sendText(`private:${cfg.ownerQQ}`, lines.join('\n'))
+      try { title = String(session?.title || '').trim() } catch (error) {}
+      // 和提问一样：会话事件里的 session 常常没带标题，用 id 后 8 位兜底（完整 id 太长，模型认不出是编号）
+      if (!title) title = String(session?.id || '').slice(-8)
+      const queued = noticeRelay.announce('approval', { id, sessionId: session?.id, title, tool: d.toolName, reason: d.reason })
+      // 留一行痕迹：排查「为什么这个会话的审批没推到 QQ」时，至少能看出是没收到、被开关挡掉，还是已入队
+      log.info(`审批上报：${d.toolName || '?'}（会话 ${String(session?.id || '').slice(-8) || '?'}）→ ${queued ? '已入队' : (noticeRelay.enabled('approval', session?.id) ? '重复/已在队列' : '被开关挡掉')}`)
     } catch (error) {
       log.debug?.('审批通知失败：', error.message)
     }
   }
+
+  // 她要向人提问时从会话事件里认（tool/call）：user-questions/request 是 agent-scoped
+  // waterfall，插件挂在根 scope 上收不到；而工具调用事件是全局的，能拿到完整问题。
+  function noticeQuestion(session, event) {
+    try {
+      const d = event?.data || {}
+      const sid = String(session?.id || '')
+      const callId = String(d.callId || '')
+      if (!sid || !callId) return
+      if (event.type === 'tool/call' && d.name === 'ask_user_question') {
+        let qs = []
+        try { qs = JSON.parse(String(d.arguments || '{}')).questions || [] } catch (error) {}
+        if (!Array.isArray(qs) || !qs.length) return
+        let title = ''
+        try { title = String(session?.title || '').trim() } catch (error) {}
+        // 会话事件里的 session 常常没带标题：用 id 后 8 位兜底，不然模型分不清是哪两个会话
+        if (!title) title = sid.slice(-8)
+        const id = `q:${sid}:${callId}`
+        const queued = noticeRelay?.announce('question', { id, sessionId: sid, title, questions: qs })
+        log.info(`提问上报：${qs.length} 个问题（${title}）→ ${queued ? '已入队' : (noticeRelay?.enabled('question', sid) ? '重复/已在队列' : '被开关挡掉')}`)
+      } else if (event.type === 'tool/result' && d.toolCallId) {
+        // 问题答完 / 超时跳过：把还没推出去的那条撤掉
+        noticeRelay?.cancel(`q:${sid}:${d.toolCallId}`)
+      }
+    } catch (error) {
+      log.debug?.('提问上报失败：', error.message)
+    }
+  }
+
 
   // ---------- 盯会话：一轮结束就发回 QQ ----------
   ctx.effect(() => {
@@ -835,6 +1064,10 @@ export function apply(ctx) {
       } catch (error) { log.debug?.('桌宠状态联动出错：', error.message) }
       // 审批请求顺手通知到主人私聊（只通知，不代答）
       if (event && event.type === 'approval/asked') notifyApproval(session, event)
+      // 主人已经点过了：把还在缓冲里的那条撤掉，别等人点完才提醒
+      if (event && event.type === 'approval/decided') { try { noticeRelay?.cancel(String(event.data?.id || '')) } catch (error) {} }
+      // 她弹选择（ask_user_question）：从工具调用事件里认，答完再撤
+      if (event && (event.type === 'tool/call' || event.type === 'tool/result')) noticeQuestion(session, event)
     })
     return () => { try { if (typeof off === 'function') off() } catch (error) {} }
   }, 'aurabot: 盯会话')
@@ -869,6 +1102,7 @@ export function apply(ctx) {
   ctx.effect(() => () => {
     unloaded = true
     clearTimeout(firstWatch)
+    if (pushTimer) { clearTimeout(pushTimer); pushTimer = null } // 云备份的每日定时也要收尾，别留悬空回调
     dangerGuard?.dispose()
     approvalRelay?.dispose()
     hub.dispose()
@@ -901,16 +1135,20 @@ export function apply(ctx) {
     }
     const diary = use('diary')
     const memory = use('memory')
+    const moodState = use('mood')?.state?.() ?? { value: 0, label: '心情模块关着', reason: '', history: [] }
+    const { history: _moodHistory, ...moodSummary } = moodState
     return {
       ok: true,
       version: VERSION,
+      startedAt: STARTED_AT,
       apiVersion: API_VERSION,
       config: publicConfig(cfg),
-      onebot: { state: onebotState, login, endpoint: { httpUrl: endpoint().httpUrl, wsUrl: endpoint().wsUrl }, problem: onebotState === 'connected' && loginOk ? '' : await connectionProblem() },
-      snowluma: { ...inst, running, consented: await consented(running), owns: snowluma.ownsProcess, lastAttach: snowluma.lastAttach, downloadPage: DOWNLOAD_PAGE, webui: snowluma.webuiUrl() },
+      onebot: { state: onebotState, login, endpoint: { httpUrl: endpoint().httpUrl, wsUrl: endpoint().wsUrl }, problem: onebotState === 'connected' && loginOk ? '' : await connectionProblem(), warmup: gatewayWarmSince ? { since: gatewayWarmSince, seconds: Math.max(0, Math.round((Date.now() - gatewayWarmSince) / 1000)), phase: warmupPhase.phase || '', label: warmupPhase.label || '' } : null },
+      outbox: outbox.status(),
+      snowluma: { ...inst, compat: snowluma.compat(), running, consented: await consented(running), owns: snowluma.ownsProcess, lastAttach: snowluma.lastAttach, downloadPage: DOWNLOAD_PAGE, webui: snowluma.webuiUrl() },
       stats: hub.stats(),
       // 模块关着时给个空壳，面板照常显示
-      mood: use('mood')?.state?.() ?? { value: 0, label: '心情模块关着', reason: '', history: [] },
+      mood: moodSummary,
       stickers: { count: stickers.library().items.length },
       diary: diary ? { next: diary.nextTime(), last: diary.history()[0] || null } : { next: 0, last: null },
       qzoneSocial: use('qzone-social')?.state?.() ?? null,
@@ -922,6 +1160,7 @@ export function apply(ctx) {
       voice: { edgeInstalled: use('voice')?.edgeInstalled?.() ?? false },
       song: use('song')?.status?.() ?? null,
       sessions: hub.sessions(),
+      sessionHealth: hub.sessionHealth(),
       workspaceDir: workspaceDirOf(cfg),
       workspaceReal: realWorkspace(workspaceDirOf(cfg)),
       personas: listPersonas(),
@@ -971,6 +1210,9 @@ export function apply(ctx) {
   const petStatus = () => redactTokens(use('pet')?.status?.() ?? null)
 
   route('/state', async () => overview())
+  // token 用量与花费：今日 / 昨日 / 近 7 天 / 近 30 天，各带模块明细
+  // ?range=today|yesterday|7|30|all —— 面板点哪张指标卡就按哪个区间出明细
+  route('/usage', async (req) => ({ ok: true, ...usageReport({ range: query(req).range || '7' }) }))
 
   route('/save', async (req) => {
     const body = await readBody(req)
@@ -989,10 +1231,38 @@ export function apply(ctx) {
     if (changedConn && onebot.state !== 'stopped') onebot.restart()
     if (!before.enabled && cfg.enabled) setTimeout(safe(watchdog, '看门狗'), 100)
     if (before.enabled && !cfg.enabled) onebot.stop()
-    log.info(`设置已保存｜总开关 ${cfg.enabled ? '开' : '关'}｜试运行 ${cfg.dryRun ? '开' : '关'}`)
+    log.info(`设置已保存｜总开关 ${cfg.enabled ? '开' : '关'}｜试运行 ${cfg.dryRun && !cfg.debug ? '开' : '关'}｜调试 ${cfg.debug ? '开' : '关'}`)
     await mods.sync().catch(() => {})
+    // 模块启停 / 生图开关变化后工具清单可能变了：已挂载的会话重新挂一遍
+    try { hub.remountAll?.('设置已保存') } catch (error) { log.debug('重挂工具失败：', error.message) }
     if (pw && !pw.ok) return { ...(await overview()), ok: false, message: '其他设置保存了，但控制台密码没改：' + pw.message }
-    return { ...(await overview()), message: '保存好了' + (pw ? '，' + pw.message : '') }
+    let debugNote = ''
+    if (cfg.debug) {
+      try {
+        const d = await hub.ensureDebugSession()
+        debugNote = d.created ? '，调试会话已建好' : ''
+      } catch (error) {
+        log.debug('建调试会话失败：', error.message)
+      }
+    }
+    return { ...(await overview()), message: '保存好了' + (pw ? '，' + pw.message : '') + debugNote }
+  })
+
+  route('/debug/session', async () => {
+    try {
+      return await hub.ensureDebugSession()
+    } catch (error) {
+      return { ok: false, message: error.message }
+    }
+  })
+
+  route('/debug/say', async (req) => {
+    const b = await readBody(req)
+    try {
+      return await hub.debugSay(String(b.text || ''))
+    } catch (error) {
+      return { ok: false, message: error.message }
+    }
   })
 
   // ---------- 面板代理：目的引擎 / 桌宠 ----------
@@ -1016,6 +1286,43 @@ export function apply(ctx) {
     const msg = r && { sent: '已经去找你了', silent: '她这轮想了想，决定不说（不硬发）', muted: '主人在私聊里让她闭嘴了', disabled: '目的引擎开关是关的' }[r.outcome]
     return { ok: !r || r.outcome !== 'disabled', message: msg || (r ? `这轮结束：${r.outcome}` : '没有结果'), result: redactTokens(r) }
   })
+  // 上报开关：按工作区分别控制「审批」「提问」要不要发到 QQ
+  route('/notice/state', async () => {
+    const c = loadConfig()
+    const n = c.notice || {}
+    const workspaces = workspaceList().map((w) => {
+      const path = String(w?.path || '')
+      const key = normalizeWorkspace(path)
+      const o = n.workspaces?.[key] || {}
+      return {
+        path,
+        name: String(w?.name || path.split(/[\\/]/).filter(Boolean).pop() || path),
+        sessions: Array.isArray(w?.sessionIds) ? w.sessionIds.length : 0,
+        approval: typeof o.approval === 'boolean' ? o.approval : n.approval !== false,
+        question: typeof o.question === 'boolean' ? o.question : n.question !== false,
+      }
+    })
+    return { ok: true, enabled: n.enabled !== false, approval: n.approval !== false, question: n.question !== false, workspaces }
+  })
+  route('/notice/toggle', async (req) => {
+    const b = await readBody(req)
+    const kind = b.kind === 'question' ? 'question' : 'approval'
+    const value = b.value !== false
+    const c = loadConfig()
+    const notice = { ...(c.notice || {}) }
+    notice.workspaces = { ...(notice.workspaces || {}) }
+    const ws = String(b.workspace || '').trim()
+    if (ws) {
+      // 只接受绝对路径：相对路径（../x、foo/bar）写进配置只会变成永远对不上的键
+      if (!/^([a-zA-Z]:[\\/]|\/)/.test(ws)) return { ok: false, message: 'workspace 必须是绝对路径' }
+      const key = normalizeWorkspace(ws)
+      notice.workspaces[key] = { ...(notice.workspaces[key] || {}), [kind]: value }
+    } else {
+      notice[kind] = value
+    }
+    setConfig({ notice })
+    return { ok: true, notice }
+  })
   route('/panel/purpose/config', async (req) => {
     const b = await readBody(req)
     const patch = {}
@@ -1036,7 +1343,7 @@ export function apply(ctx) {
     return { ok: true, purpose: purposeOverview() }
   })
   route('/panel/pet/status', async () => ({ ok: true, pet: petStatus() }))
-  // ---------- 面板：主动发言出站策略（CONTRACT §6） ----------
+  // ---------- 面板：主动发言出站策略 ----------
   // 契约要求的两个精确路径：GET /panel/outbound-policy（读）与 POST /panel/outbound-policy（写）。
   // route 是精确路径匹配（AGENTS.md §4-4），所以读写各注册一条，不做前缀/通配。
   //
@@ -1047,7 +1354,7 @@ export function apply(ctx) {
     return outboundView()
   })
   // 写：档位（pass/gate/broker）与活跃策略源选择（auto/purpose/speakup）。
-  // 注意 §8.2：面板只暴露当前真实能力，档位切换不改写已有账本条目。
+  // 注意 ：面板只暴露当前真实能力，档位切换不改写已有账本条目。
   function saveOutboundPolicy(req) {
     return readBody(req).then((b) => {
       const patch = {}
@@ -1098,7 +1405,7 @@ export function apply(ctx) {
       }
     }
     const tierInfo = TIER_VIEW[status.tier] || TIER_VIEW.pass
-    // 三种总体状态：未纳管 / 正常纳管 / 纳管出问题（§8.1：故障不得静默当作没开）
+    // 三种总体状态：未纳管 / 正常纳管 / 纳管出问题
     const sources = Object.entries(status.sources || {}).map(([name, s]) => {
       const st = SOURCE_STATE_VIEW[s.state] || { label: String(s.state || '未知'), tone: 'warn' }
       return {
@@ -1180,6 +1487,22 @@ export function apply(ctx) {
     if (Number.isFinite(b.petScale)) patch.petScale = Math.min(2, Math.max(0.5, Math.round(b.petScale * 20) / 20))
     // 松手后落地：布尔透传（模块侧缺省当开，别让老面板把抛掷关没）
     if (typeof b.petReleaseLand === 'boolean') patch.petReleaseLand = b.petReleaseLand
+    // ---------- 物理三参数 + 余额开关 + 抓鼠标两开关（pet 1.0.14 起在模块库） ----------
+    // 【教训 · 三处必须同步】模块 settings 里新增一个键 → 必须同时补
+    //   ① 本白名单（否则保存被「没有可保存的字段」挡回）
+    //   ② client/client.js 里的控件（面板是硬编码 React，不会按 settings 渲染）
+    //   ③ 模块自己的 defaults/settings 声明
+    // 三处缺一即「假控件」：面板上看得见、点了存不进去，而且因为写不进 ext.pet，
+    // 8 秒轮询还会把刚拖好的值弹回原处。桌宠是内置模块，它的 settings 同样不渲染成表单。
+    // 取值口径与模块那边一致：坏值/非有限值一律忽略（不写进 patch，保持原值），
+    // 越界按模块 settings 的 min/max 夹边界；步进与取整的整形在前端做（面板已 round）。
+    if (Number.isFinite(b.petGravity)) patch.petGravity = Math.min(4000, Math.max(200, b.petGravity))
+    if (Number.isFinite(b.petRestitution)) patch.petRestitution = Math.min(0.95, Math.max(0.3, b.petRestitution))
+    if (Number.isFinite(b.petAnimRate)) patch.petAnimRate = Math.min(2, Math.max(0.5, b.petAnimRate))
+    // 三个开关：布尔直接透传（余额默认开 = 模块侧 `!== false`；抓鼠标默认关 = `=== true`）
+    for (const k of ['petShowBalance', 'petClickChase', 'petTeaseChase']) {
+      if (typeof b[k] === 'boolean') patch[k] = b[k]
+    }
     // 对话框（pet 1.0.5 起在模块库，模块自己的 settings 同样不渲染成表单；这里仍是唯一写入通道）
     for (const k of ['petChatEnabled', 'petChatBlurHide']) {
       if (typeof b[k] === 'boolean') patch[k] = b[k]
@@ -1396,7 +1719,7 @@ export function apply(ctx) {
   ctx.effect(() => ctx.webServer.register({
     kind: 'exact',
     path: PREFIX + '/panel/pet/client-package',
-    handler: (req, res) => answer(res, async () => {
+    handler: (req, res) => answer(req, res, async () => {
       // 【安全】这一条不走 route()，必须自己过面板闸：包内嵌 host.json（含 bearer 令牌），
       // 公网上谁都能无鉴权下到就等于把桌宠令牌送出去。CSRF 闸也要过（一致性；GET 本身不受影响）。
       // 复审 3·P1-1：还必须过 Host 校验——此前手动注册路由漏了 adminHostBlocked，
@@ -1507,13 +1830,54 @@ export function apply(ctx) {
     wrongAccount = ''
     snowluma.clearRejected()
     const r = await snowluma.attachBot()
-    if (cfg.enabled && onebot.state === 'stopped') onebot.start()
+    // 刚注入完 OneBot 会话可能还没起：立刻再试一次 WS，比等 3 秒轮询更快
+    if (cfg.enabled && r.ok && onebotState !== 'connected') {
+      if (onebot.state === 'stopped') onebot.start()
+      else onebot.restart()
+    }
     return r
   })
   route('/commands', async () => ({ ok: true, list: commandList(mods.commands()) }))
   // 更新：检查 GitHub 上有没有新版本；这次更新了什么
   const checkUpdate = createUpdateChecker({ pkg: PKG, log, unstable: () => getConfig().update.unstable })
-  route('/update/check', async (req) => checkUpdate({ force: query(req).force === '1' }))
+  // 宿主环境（Windows/macOS/Linux + 桌面版/网页版）决定更新命令怎么写、发布页指向哪
+  const updateEnv = hostEnv()
+  const updatePlanOf = (result) => updatePlan({ repo: result.repo || repoOf(PKG), channel: result.channel || 'main', latest: result.latest || '', tag: result.tag || '', env: updateEnv })
+  route('/update/check', async (req) => {
+    const r = await checkUpdate({ force: query(req).force === '1' })
+    if (!r || !r.ok) return { ...r, env: updateEnv }
+    const plan = updatePlanOf(r)
+    return { ...r, ...plan, env: updateEnv, plan }
+  })
+  let applyingUpdate = false
+  route('/update/apply', async () => {
+    if (applyingUpdate) return { ok: false, message: '正在更新，稍等一下' }
+    const repo = repoOf(PKG)
+    if (!repo) return { ok: false, message: '不知道插件从哪安装的，没法自动更新' }
+    const checked = await checkUpdate({ force: true })
+    if (!checked || !checked.ok || !checked.tag) return { ok: false, message: checked?.message || '还没有发布过可安装的版本，等作者发 Release 后再试' }
+    if (!checked.newer) return { ok: false, message: '当前没有比已安装版本更新的 Release' }
+    const channel = checked.channel === 'beta' ? 'beta' : 'main'
+    const plan = updatePlan({ repo, channel, latest: checked.latest, tag: checked.tag, env: updateEnv })
+    // 本地 link 安装（开发模式）不能被 CLI 覆盖，否则会把链接换成仓库副本
+    try {
+      const pkgFile = join(process.env.DSH_PROFILE_DIR || '', 'package.json')
+      const dep = JSON.parse(readFileSync(pkgFile, 'utf8'))?.dependencies?.[String(PKG.name)]
+      if (dep && String(dep).startsWith('link:')) {
+        return { ok: false, message: '当前是本地链接安装（开发模式），自动更新会把它换成仓库副本；请用 git 更新，或手动执行下面这条命令。', command: plan.command }
+      }
+    } catch (error) {}
+    applyingUpdate = true
+    try {
+      const arg = `github:${repo}#${checked.tag}`
+      const args = ['plugin', '--profile', updateEnv.profile, 'add', arg]
+      const exec = updateExec(updateEnv, args)
+      const r = await runUpdate(exec.cmd, exec.cmdArgs, exec.env, exec.shell)
+      return { ...r, command: plan.command, env: updateEnv }
+    } finally {
+      applyingUpdate = false
+    }
+  })
   route('/changelog', async () => {
     let text = ''
     try { text = readFileSync(join(ROOT, 'CHANGELOG.md'), 'utf8') } catch (error) {}
@@ -1550,7 +1914,57 @@ export function apply(ctx) {
     return { ...(await overview()), message: '设置完成，大肥鱼可以上线啦' }
   })
   route('/snowluma/processes', async () => {
-    try { return { ok: true, list: await snowluma.processes() } } catch (error) { return { ok: false, message: error.message, list: [] } }
+    try {
+      const list = await snowluma.processes()
+      let others = []
+      try { others = (await snowluma.oldQqProcesses()).filter((p) => !list.some((x) => x.pid === p.pid)) } catch (error) {}
+      return { ok: true, list, others }
+    } catch (error) { return { ok: false, message: error.message, list: [], others: [] } }
+  })
+  /** 一键诊断：把「连不上 QQ」卡在哪一步逐项列出来，用户发截图就能定位。 */
+  route('/snowluma/diagnose', async () => {
+    const items = []
+    const add = (id, label, ok, detail, hint = '') => items.push({ id, label, ok: Boolean(ok), detail: String(detail || ''), hint })
+    /** 橙色提示项：不计入整体 ok（软提示，不拦操作） */
+    const addWarn = (id, label, detail, hint = '') => items.push({ id, label, ok: true, warn: true, detail: String(detail || ''), hint })
+    const inst = snowluma.detect()
+    add('installed', 'SnowLuma 目录', inst.installed, inst.installed ? `${inst.dir}${inst.version ? '（v' + inst.version + '）' : ''}` : inst.reason, '在向导第 2 步填解压目录：纯英文路径，目录里能直接看到 index.mjs')
+    if (inst.installed) {
+      const compat = snowluma.compat()
+      add('version', 'SnowLuma 版本', compat.status === 'ok', `v${inst.version || '?'}（${compat.label}）`, compat.status === 'ok' ? '' : `${compat.message} 下载页：${DOWNLOAD_PAGE}`)
+    }
+    const running = await snowluma.running()
+    add('running', 'SnowLuma 运行状态', running, running ? '控制台有响应：' + snowluma.webuiUrl() : '控制台没有响应', '点「启动 SnowLuma」；仍然起不来就看「日志」页的 snowluma 段')
+    let consoleState = { ok: false, message: '控制台没在跑，跳过' }
+    if (running) consoleState = await snowluma.canLogin()
+    add('console', '控制台登录', consoleState.ok, consoleState.ok ? '用插件保存的密码登录成功' : consoleState.message, '在「连接」页点「重置控制台密码」；端口不一致时把 webuiPort 对齐（默认 15099）')
+    const ep = endpoint()
+    const hasOneBot = Boolean(ep.httpUrl || ep.wsUrl)
+    add('onebot-config', 'OneBot 网络', hasOneBot, hasOneBot ? `HTTP ${ep.httpUrl || '—'} / WS ${ep.wsUrl || '—'}` : 'SnowLuma 里还没启用 OneBot', '打开 SnowLuma 控制台 → OneBot → 启用 HTTP（13000）和 WebSocket（13001），保存后重启 SnowLuma')
+    for (const [kind, url, label] of [['http', ep.httpUrl, 'OneBot HTTP'], ['ws', ep.wsUrl, 'OneBot WebSocket']]) {
+      if (!url) continue
+      let port = 0
+      try { port = Number(new URL(url).port || 80) } catch (error) {}
+      if (!port) continue
+      const open = await tcpOpen(port)
+      add(`${kind}-port`, `${label} 端口 ${port}`, open, open ? '端口正在监听' : '端口没有监听', '先重启 SnowLuma 让它重新监听；端口被别的程序占用时去 SnowLuma 控制台改端口')
+    }
+    let procs = []
+    if (consoleState.ok) {
+      try { procs = await snowluma.processes() } catch (error) {}
+    }
+    const bots = procs.filter((p) => p.isBot)
+    add('processes', 'QQ 进程', procs.length > 0, procs.length ? `看到 ${procs.length} 个 QQ，其中机器人号 ${bots.length} 个${bots.length ? '（pid ' + bots.map((p) => p.pid).join('/') + '）' : ''}` : consoleState.ok ? 'SnowLuma 没看到 QQ 进程' : '控制台没登录，没查', '先把机器人号的 QQ 登录上（别用管理员运行），再点「接入机器人号」。SnowLuma 只能注入 QQ NT 版（9.9 及以上）；老版 QQ 注入不了，先升级 QQ')
+    const oldBots = bots.filter((p) => p.nt === false)
+    if (oldBots.length) add('qq-version', 'QQ 版本', false, `检测到 QQ ${oldBots.map((p) => p.qqVersion || '版本未知').join('/')}（${oldBots[0].versionLabel || '老版'}）`, 'SnowLuma 只能注入 QQ NT 版（9.9 及以上）；请升级 QQ 后再接入（仍可点「接入机器人号」尝试，不会拦）')
+    let otherOld = []
+    try { otherOld = (await snowluma.oldQqProcesses()).filter((p) => !procs.some((x) => x.pid === p.pid)) } catch (error) {}
+    if (otherOld.length) addWarn('old-qq', '老版 QQ 进程', `另外看到 ${otherOld.length} 个老版 QQ（${otherOld.map((p) => p.qqVersion || '版本未知').join('/')}）`, 'SnowLuma 只能注入 QQ NT 版（9.9 及以上）；老版 QQ 只能当普通客户端，别用它登录机器人号')
+    if (snowluma.lowIntegrity) add('integrity', 'SnowLuma 完整性级别', false, 'SnowLuma 以「低完整性」运行，看不到 QQ 进程', '把 SnowLuma 重新解压到普通目录（例如 D:\\SnowLuma），在「连接」页改好目录再启动')
+    const connected = onebotState === 'connected'
+    add('gateway', '插件 ↔ OneBot 网关', connected, connected ? '已连接' : String(onebotState || '未连接'), '连不上时看上面几项，或者点「接入机器人号」重试')
+    const problem = connected ? '' : await connectionProblem()
+    return { ok: items.every((item) => item.ok), items, problem }
   })
   /** 连不上 QQ 网关时，按顺序找卡在哪一步，给一句人话。 */
   async function connectionProblem() {
@@ -1567,10 +1981,19 @@ export function apply(ctx) {
     if (inst.installed && !(await snowluma.running())) return 'SnowLuma 没在运行：点上面的「启动」'
     if (snowluma.lowIntegrity) return 'SnowLuma 以「低完整性」运行，看不到 QQ 进程（多半是解压在了下载目录这类带安全标签的地方）：把它重新解压到一个普通目录（比如 D:\SnowLuma），在「连接」页改好目录再启动'
     const ep = endpoint()
-    if (!ep.wsUrl && !ep.httpUrl) return 'SnowLuma 还没给机器人号开 OneBot 端口，也就是机器人号还没接入：确认机器人号的 QQ 已经登录，再点「接入机器人号」'
-    if (wrongAccount) return `连上的是 ${wrongAccount}，不是机器人号 ${cfg.botQQ}，已经断开：只登着机器人号那个 QQ，再点「接入机器人号」`
     const la = snowluma.lastAttach
+    if (!ep.wsUrl && !ep.httpUrl) {
+      if (la && la.at && la.ok) return '机器人号已经接入，但 SnowLuma 里没启用 OneBot 网络：打开 SnowLuma 控制台 → OneBot → 启用 HTTP（13000）和 WebSocket（13001），保存后重启 SnowLuma，再点一次「接入机器人号」'
+      return 'SnowLuma 还没给机器人号开 OneBot 端口，也就是机器人号还没接入：确认机器人号的 QQ 已经登录（别用管理员运行），再点「接入机器人号」；如果 QQ 已经登着，去 SnowLuma 控制台 → OneBot 启用 HTTP（13000）/ WebSocket（13001）'
+    }
+    if (wrongAccount) return `连上的是 ${wrongAccount}，不是机器人号 ${cfg.botQQ}，已经断开：只登着机器人号那个 QQ，再点「接入机器人号」`
     if (la && la.at && !la.ok && la.message) return '接入机器人号没成功：' + la.message
+    // 预热期（SnowLuma 已起、OneBot 会话还没就绪）别说成「连不上」，把正在等什么说清楚
+    if (gatewayWarmSince && Date.now() - gatewayWarmSince < 300_000) {
+      const sec = Math.max(1, Math.round((Date.now() - gatewayWarmSince) / 1000))
+      const label = warmupPhase.label || '正在等 SnowLuma 的 OneBot 会话'
+      return `网关预热中（已等 ${sec} 秒）：${label}。QQ 登录完成后会自动连上；想看每一步点「一键诊断」`
+    }
     return `连 ${ep.wsUrl || ep.httpUrl} 没连上：确认机器人号的 QQ 开着、已经登录，并且 SnowLuma 控制台里这个号显示已接入`
   }
   route('/onebot/reconnect', async () => {
@@ -1612,6 +2035,7 @@ export function apply(ctx) {
   route('/persona/save', async (req) => {
     const b = await readBody(req)
     const p = savePersona(b.id, b)
+    bridge.refresh()
     return { ok: true, persona: p, message: '人格已保存，下一轮起生效' }
   })
   route('/persona/delete', async (req) => {
@@ -1645,7 +2069,7 @@ export function apply(ctx) {
       text.trim() ? `原文：\n${text}` : '',
     ].filter(Boolean).join('\n')
     try {
-      const out = String(await askModel(ctx, { cfg: getConfig(), system, text: ask, maxTokens: 1500, temperature: 0.6 }) || '')
+      const out = String(await askModel(ctx, { cfg: getConfig(), module: 'persona', system, text: ask, maxTokens: 1500, temperature: 0.6 }) || '')
         .replace(/^```[a-z]*\n?|\n?```$/g, '').replace(new RegExp('^【' + title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '】\\s*'), '').trim()
       return out ? { ok: true, text: out } : { ok: false, message: '模型没给出内容，再试一次' }
     } catch (error) {
@@ -1711,14 +2135,29 @@ export function apply(ctx) {
     if (next.getTime() <= Date.now()) next.setDate(next.getDate() + 1)
     return next.toISOString()
   }
-  const remoteView = (r = cfg.backup?.remote || {}) => ({ enabled: !!r.enabled, owner: r.owner, repo: r.repo, branch: r.branch, time: r.time, keep: r.keep, autoCreate: r.autoCreate !== false, hasToken: Boolean(r.token) })
+  const remoteView = (r = cfg.backup?.remote || {}) => ({
+    enabled: !!r.enabled,
+    provider: r.provider === 'webdav' ? 'webdav' : 'gitee',
+    owner: r.owner,
+    repo: r.repo,
+    branch: r.branch,
+    time: r.time,
+    keep: r.keep,
+    autoCreate: r.autoCreate !== false,
+    forceOverwrite: !!r.forceOverwrite,
+    hasToken: Boolean(r.token),
+    configOnly: r.webdav?.configOnly === true,
+    webdav: { url: r.webdav?.url || '', username: r.webdav?.username || '', hasPassword: Boolean(r.webdav?.password), configOnly: r.webdav?.configOnly === true },
+  })
   route('/backup/remote/state', async () => ({ ok: true, remote: remoteView(), job: pushJob, nextAt: nextRemoteAt() }))
   route('/backup/remote/config', backupAction(async (req) => {
     const patch = { ...(await readBody(req)) }
     if (!patch.token) delete patch.token // 令牌留空 = 沿用旧值，别把配好的抹掉
+    if (patch.webdav && !patch.webdav.password) delete patch.webdav.password // WebDAV 密码同理
     setConfig(mergeFromPanel(cfg, { backup: { remote: patch } })) // setConfig 里会重排定时器
     const r = cfg.backup.remote
-    log.info(`云备份设置已更新｜${r.enabled ? `每天 ${r.time} 推 ${r.owner}/${r.repo}，留 ${r.keep} 份` : '关'}`)
+    const where = r.provider === 'webdav' ? (r.webdav?.url || 'WebDAV') : `${r.owner}/${r.repo}`
+    log.info(`云备份设置已更新｜${r.enabled ? `每天 ${r.time} 推 ${where}，留 ${r.keep} 份` : '关'}`)
     return { ok: true, message: '存好了', remote: remoteView() }
   }))
   const doPush = async (pack) => {
@@ -1726,11 +2165,15 @@ export function apply(ctx) {
     if (backupJob?.running) return { ok: false, message: '正在打包，等这轮打包完再推' }
     pushJob = { running: true, pack: !!pack, at: Date.now() }
     try {
-      if (pack) {
-        const result = await createBackup({ version: VERSION, workspaceDir: workspaceDirOf(getConfig()) })
-        log.info(`云备份自动打包完成：${result.name}，${result.files} 个文件`)
+      const remote = getConfig().backup?.remote || {}
+      const configOnly = remote.provider === 'webdav' && remote.webdav?.configOnly === true
+      let sourceName = ''
+      if (pack || configOnly) {
+        const result = await createBackup({ version: VERSION, workspaceDir: workspaceDirOf(getConfig()), configOnly })
+        sourceName = result.name
+        log.info(`${configOnly ? '仅配置' : ''}云备份打包完成：${result.name}，${result.files} 个文件`)
       }
-      const r = await pushBackup(getConfig().backup?.remote, { version: VERSION })
+      const r = await pushBackup(remote, { version: VERSION, sourceName })
       pushJob = { running: false, ok: true, result: r, at: Date.now() }
       log.info(`云备份推送完成：${r.message}`)
     } catch (error) {
@@ -1742,6 +2185,28 @@ export function apply(ctx) {
     return { ok: true, message: '推送流程跑完了，结果看状态' }
   }
   route('/backup/push', backupAction(async () => doPush(false)))
+  route('/backup/remote/list', backupAction(async () => {
+    const r = getConfig().backup?.remote || {}
+    if (r.provider !== 'webdav') return { ok: false, message: '先把云备份方式切到 WebDAV' }
+    try { return await listWebdavBackups(r) } catch (error) { return { ok: false, message: error.message } }
+  }))
+  route('/backup/remote/restore', backupAction(async (req) => {
+    const r = getConfig().backup?.remote || {}
+    if (r.provider !== 'webdav') return { ok: false, message: '先把云备份方式切到 WebDAV' }
+    const name = String((await readBody(req)).name || '')
+    if (!/^aurabot-(?:backup|config)-\d{8}-\d{4}\.zip$/.test(name)) return { ok: false, message: '备份文件名不对' }
+    try {
+      const got = await downloadWebdavBackup(r, name)
+      const dir = dataDir('backups')
+      mkdirSync(dir, { recursive: true })
+      const target = join(dir, name)
+      writeFileSync(target, got.buffer)
+      log.info(`已从 WebDAV 拉回备份：${name}（${got.buffer.length} 字节）`)
+      return await stageRestore(target)
+    } catch (error) {
+      return { ok: false, message: error.message }
+    }
+  }))
   const scheduleRemoteBackup = () => {
     if (pushTimer) { clearTimeout(pushTimer); pushTimer = null }
     const r = cfg.backup?.remote
@@ -1778,6 +2243,30 @@ export function apply(ctx) {
     }
   })
 
+  // 「关于」页的贡献者名单：GitHub contributors（有 token 就用，1 小时缓存）；读不到就让前端回退到内置名单
+  let aboutContribAt = 0
+  let aboutContribValue = null
+  route('/about/contributors', async () => {
+    if (aboutContribValue && Date.now() - aboutContribAt < 3600_000) return { ok: true, ...aboutContribValue }
+    try {
+      const token = String(process.env.AURABOT_GITHUB_TOKEN || process.env.GITHUB_TOKEN || '').trim()
+      const r = await fetch('https://api.github.com/repos/aureth-labs/dsh-aurabot-qq/contributors?per_page=100&anon=0', {
+        headers: { accept: 'application/vnd.github+json', 'user-agent': 'aurabot-qq-panel', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+        signal: AbortSignal.timeout(8000),
+      })
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      const list = (await r.json())
+        .filter((x) => x && x.login)
+        .map((x) => ({ login: x.login, contributions: Number(x.contributions) || 0 }))
+      aboutContribValue = { list, source: 'github', repo: 'aureth-labs/dsh-aurabot-qq', at: Date.now() }
+      aboutContribAt = Date.now()
+      return { ok: true, ...aboutContribValue }
+    } catch (error) {
+      log.debug?.('读不到贡献者名单：', error.message)
+      return { ok: false, message: error.message, list: [] }
+    }
+  })
+
   // 模块（面板「扩展」页）
   route('/modules', async () => ({ ok: true, dir: mods.dir(), safeMode: cfg.safeMode, apiVersion: API_VERSION, list: mods.status(), prompt: mods.promptFor('') }))
   route('/modules/community', async (req) => {
@@ -1807,7 +2296,16 @@ export function apply(ctx) {
       log.info(`面板已保存模块市场地址｜${u || '（留空，回到内置 GitHub 索引）'}`)
       return { ok: true, registryUrl: community.registryUrl(), message: u ? '已换成自定义模块市场地址' : '已恢复内置 GitHub 索引地址' }
     }
-    return { ok: true, registryUrl: community.registryUrl(), default: REGISTRY_URL }
+    return {
+      ok: true,
+      registryUrl: community.registryUrl(),
+      default: REGISTRY_URL,
+      sources: [
+        { id: 'github', label: 'GitHub 官方源', url: REGISTRY_URL, note: '默认；海外直连，国内偶尔慢' },
+        { id: 'gitee', label: 'Gitee 官方镜像', url: GITEE_MIRROR, note: '国内直连更稳；每天跟 GitHub 的 registry 分支同步一次' },
+        { id: 'custom', label: '自定义', url: '', note: '自建索引 / ghproxy 中转 / 内网部署' },
+      ],
+    }
   })
   route('/modules/reload', async (req) => {
     const id = String((await readBody(req)).id || '')
@@ -1868,7 +2366,7 @@ export function apply(ctx) {
         const items = await hub.deliver(chat.chatId, String(b.reply), { simulate: true })
         steps.push(items ? `她的回复经过模块改写后拆成 ${items.length} 条` : '她的回复被模块拦下了，不发')
       }
-    })
+    }, { simulate: true })
     return { ok: true, steps, sent: sentLines(sent) }
   })
   route('/modules/tools', async (req) => {
@@ -1884,7 +2382,7 @@ export function apply(ctx) {
     const tool = mods.buildTools({ chat, level, sessionId: 'sim' }).find((t) => t.name === b.name)
     if (!tool) return { ok: false, message: `这个场合没有 ${b.name} 这个工具` }
     hub.simulateTurn('sim', [userId])
-    const { result, sent } = await hub.capture(() => tool.execute(b.args && typeof b.args === 'object' ? b.args : {}, {}))
+    const { result, sent } = await hub.capture(() => tool.execute(b.args && typeof b.args === 'object' ? b.args : {}, {}), { simulate: true })
     return { ok: true, result, sent: sentLines(sent) }
   })
   route('/modules/panel', async (req, res) => {
@@ -1956,7 +2454,7 @@ export function apply(ctx) {
     const b = await readBody(req)
     const t = Date.now()
     try {
-      const text = await askModel(ctx, { cfg: { model: { provider: b.provider, model: b.model } }, system: '只回复两个字：在呢', text: '在吗', maxTokens: 800 })
+      const text = await askModel(ctx, { cfg: { model: { provider: b.provider, model: b.model } }, module: 'model-ping', system: '只回复两个字：在呢', text: '在吗', maxTokens: 800 })
       return { ok: true, ms: Date.now() - t, text: text.slice(0, 40) }
     } catch (error) {
       return { ok: false, ms: Date.now() - t, message: error.message }

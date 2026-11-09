@@ -147,7 +147,7 @@ export default {
 | `api.command({ name, aliases, desc, run(arg, msg) })` | 主人在 QQ 里发 `/name 参数` 时调用，`run` 返回的文字直接回到**发命令的那个聊天**（群里发就回群里）。名字可以是中文（`name: '天气'`），中文命令后面可以不加空格（`/天气北京`）；`arg` 是命令名后面剩下的全部文字，已经去掉首尾空格。**只认主人**：别人发 `/xxx` 当普通消息处理。和内置命令同名时你的优先 |
 | `api.every(毫秒, fn, 名字?)` | 定时任务（名字用在出错日志里） |
 | `api.later(毫秒, fn)` | 过一会儿做一次 |
-| `api.route('/路径', async (req, res) => 返回值)` | 加一个网页接口：地址是 `/aurabot/api/ext/<id>/路径`；返回对象就当 JSON 回；要自己回（比如图片）就用 `api.core.http.send(res, 200, buf, 'image/png')` |
+| `api.route('/路径', async (req, res) => 返回值, options?)` | 加一个网页接口：地址是 `/aurabot/api/ext/<id>/路径`；返回对象就当 JSON 回；要自己回（比如图片）就用 `api.core.http.send(res, 200, buf, 'image/png')`。1.3.0 起管理接口可传 `{ access: 'panel' }`，复用宿主回环/可信代理、Host 与 CSRF 闸；不传时保持现有行为，由模块验证客户端凭据 |
 | `api.onDispose(fn)` | 模块停下时要做的收尾 |
 
 **别的模块和插件内部**（全开放）
@@ -165,7 +165,8 @@ export default {
 
 | | |
 |---|---|
-| `hub` | 聊天中枢：`deliver(chatId, text)` `sendText` `sendVoice(chatId, 文字)` `sendVoiceFile(chatId, 音频文件)` `sendImage` `sendSticker(chatId, 名字)` `sendSegments` `runSystemTurn(名字, 标题, 提示词)` `pushToSession(...)` `resetChat(chatId)` `groupName(群号)` `turnHasOwner(sessionId)`（只表示本轮有人是主人，别拿它做权限门，用下面的 `turnSendersAllOwner`） `turnSendersAllOwner(sessionId)` `referenceImage(chat, 'last' 或 'quote')`（取当前聊天最近收到 / 引用的图，返回 Buffer，沿用短期缓存） `chatOfSession(sessionId)` `stats()` `sessions()` `chatLogOf(日期)` `lastChatAt` `lastOwnerChatAt` …… |
+| `hub` | 聊天中枢：`deliver(chatId, text)` `sendText` `sendVoice(chatId, 文字)` `sendVoiceFile(chatId, 音频文件)` `sendImage` `sendSticker(chatId, 名字)` `sendSegments` `runSystemTurn(名字, 标题, 提示词)` `pushToSession(...)` `resetChat(chatId)` `groupName(群号)` `turnHasOwner(sessionId)`（只表示本轮有人是主人，别拿它做权限门，用下面的 `turnSendersAllOwner`） `turnSendersAllOwner(sessionId)` `referenceImage(chat, 'last' 或 'quote')`（取当前聊天最近收到 / 引用的图，返回 Buffer，沿用短期缓存） `chatOfSession(sessionId)` `stats()` `sessions()` `chatLogOf(日期)` `recentMessagesOf(chatId, limit)`（原话档案开启后，当前人物同一聊天的近期消息，默认 32、最多 256 条） `lastChatAt` `lastOwnerChatAt` …… |
+| `media` | 通用媒体读取与转换辅助：`mimeOf(bytes)`、`avatar()`、`sticker(md5)`、`ffmpegPath()`、`parseWav(bytes)`、`toMono16k(bytes)`，详见下文（1.3.0 起） |
 | `onebot` | QQ 网关：`call(action, params, { timeoutMs })`、`state` |
 | `snowluma` | SnowLuma 管理：`running()` `start()` `stop()` `detect()` …… |
 | `local` | 本地接口（「本地接口」页那四项）：`active(slot)` `call(slot, 参数)` |
@@ -179,6 +180,16 @@ export default {
 | `getConfig()` / `setConfig(cfg)` | 同 `api.config` / 整份替换配置 |
 | `logger` | 插件的日志器（`logger.child('名字')` 拿一个分类） |
 | `root` | 插件自己的安装目录 |
+
+### 已有聊天的外部主人入口（1.3.0 起）
+
+`api.core.hub.sessions()` 返回现有聊天映射（含 `sessionId/title`）；`chatLogDays()` 返回已有流水日期，按 `YYYY-MM-DD` 升序排列；`chatLogOf(day)` 返回当天流水。这些查询复用原数据，不创建平台专用的会话或历史副本。流水可能含系统、已忘记的条目；模块展示时必须过滤 `forgottenAt`、系统与记忆提示，不把管理视角给未验证身份的人。
+
+`await api.core.hub.receiveOwnerMessage(chatId, { text?, image?, wav?, via?, originId?, assertAuthorized? })` 用于**模块已经验证为主人**的输入。它不是公开匿名接口；模块必须保护自己的网络边界和设备凭据。只接受 `sessions()` 已存在的 private/group 会话，遵守总开关、聊天白名单和暂停状态；不会新建其他聊天。`image` 为图片 Buffer，`wav` 为 PCM WAV Buffer，沿用本体缩图、模型视觉降级及本地/云端/DSH 转写。来源 `via` 默认 `external`，最多 40 字，用于提示与原流水来源；`originId` 是不透明的来源端标记，仅进入实时事件，不落盘。转写文本仍进入原有即时记忆、流水、原话档案及原会话；群会话保留 social 权限，回复仍经原 QQ 出口。
+
+`assertAuthorized` 是同步函数，凭据被撤销时抛错。在入口、媒体准备完成和模型投递前均会再次检查，同时重新检查主人身份及聊天是否仍然开放。模块停止后应让此函数拒绝仍在途的请求。`pushToSession` 也接受此检查作为可选参数；未提供时保持原行为。输入被其他模块的 `prompt` 拦截时沿用其原语义，不保证模型会回复。
+
+`api.core.media.avatar()` 返回当前自定义头像，缺省用插件默认头像；`sticker(md5)` 从**当前运行**的 `stickers` 模块读取精确匹配素材。返回 `{ bytes: Buffer, type: string }`，缺失或非图片返回 `null`，不暴露数据目录或素材路径。`api.use('stickers')?.library()` 继续提供素材列表与名称。`mimeOf(bytes)` 按文件头识别类型；`ffmpegPath()` 复用现有 ffmpeg 配置和本机探测；`parseWav(bytes)` 返回 `{ rate, channels, data }`，`toMono16k(bytes)` 转为单声道 16 kHz WAV。解码进程、时长与上传限制由调用模块负责。
 
 ## 事件
 
@@ -195,7 +206,7 @@ export default {
 | 事件 | 参数 | 改的是什么 |
 |---|---|---|
 | `group/decide` | `decision, { msg, policy, recentTexts, memScore }` | 群里这条消息（没被 `message` 接管的）她**回不回、怎么回**。返回 `null` 在这里无效（等于不改）。`decision` 是 `{ reply, mode, reason }`，mode 是 `must`（被叫到）/ `engaged`（正在参与话题）/ `interject`（插话）。返回 `{ reply: true, mode: 'must' }` 就让她必回，`{ reply: false }` 就让她不理。想整套换掉插话策略就在这里写 |
-| `prompt` | `content, { chat, senderId, queryText }` | **交给她的内容**：`[{ type: 'text', text }, { type: 'image', … }]`。可以加背景信息、改格式、去掉图片；返回 `null` 这次不交给她 |
+| `prompt` | `content, { chat, senderId, queryText, sessionId, prevText, recentMessages }` | **交给她的内容**：`[{ type: 'text', text }, { type: 'image', … }]`。可以加背景信息、改格式、去掉图片；返回 `null` 这次不交给她 |
 | `reply/items` | `items, { chatId, text, userText }` | 她的回复**拆好之后**（哪条发语音、配不配表情都已经决定了）：每条 `{ kind: 'text' \| 'voice' \| 'sticker' \| 'poke' \| 'image', value, replyTo }`。可以改顺序、全部变语音、去掉表情、加图片 |
 | `send` | `message, { chatId, note, force }` | **最终发给 QQ 的消息段**（OneBot 格式）。所有发出去的消息都经过这里：她的回复、命令回复、模块发的。加签名、过滤词、抄送到别处都在这里 |
 | `model` | `selection, chat` | **这个聊天用哪个模型**（同步，不能 async）：返回 `{ provider, model, reasoningEffort }`。比如群里用便宜的、私聊用好的。`selection` 是面板选的（没选时是 DSH 默认，拿不到时是 `null`），主人在面板里「按聊天选模型」设过的话，已经按那个聊天算好了；模块在它之后还可以再改。换了之后从这个聊天的下一条消息起生效 |
@@ -214,6 +225,7 @@ api.on('reply/items', (items) => [...items, { kind: 'text', value: '—— 大�
 
 | 事件 | 参数 | 说明 |
 |---|---|---|
+| `chat/log` | `{ t, chatId, who, text, uid?, via?, interaction?, forgottenAt?, originId? }` | 1.3.0 起，每条流水成功落盘后的只读快照，包括经 `deliver` 记账的回复 / 模块发送及已确认身份的外部输入。文字沿用原流水的脱敏和 500 字上限；`originId` 只在通知中存在。调试模式不写流水，也不产生通知。监听失败不影响消息与落盘，不是发送前的拦截器 |
 | `activity` | `{ kind: 'in' \| 'out', chatId, userId, nickname, text, reply, direct, owner }` | 收到的消息 / 她发出去的话（只看不拦） |
 | `onebot` | 原始 OneBot 事件 | **所有**事件：消息、加群、退群、撤回、好友申请、戳一戳……（只看不拦；不管白名单） |
 | `onebot/state` | `'connected'` 等 | QQ 网关连上 / 断开 |
@@ -221,6 +233,8 @@ api.on('reply/items', (items) => [...items, { kind: 'text', value: '—— 大�
 | `module/start` / `module/stop` | 模块 id | 有模块启动 / 停下 |
 | `song/sung` | `{ title, chatId }` | 翻唱模块唱完一首 |
 | 你自己 `api.emit` 的 | 随你 | 模块之间互相通知 |
+
+`chat/log` 跟随原流水的记账边界：正常模型回复和 `api.send()` 由 `hub.deliver()` 统一记账；底层 `sendText()` / `sendSegments()` 仅负责发送，不自动新增流水或此事件。分条、语音等出口不另行重复记账。验证回复通知时，应走 `deliver()` 并核对实际发送与落盘记录。
 
 `msg` 长这样（`text` 是纯文字：@ 她的那段去掉了，@ 别人的写成「@昵称」，图片 / 表情 / 文件写成「[图片]」这类占位；引用的那条消息的文字**不在**里面，要的话用 `replyId` 去 `api.onebot('get_msg', { message_id })` 拿）：
 
@@ -310,7 +324,7 @@ return function Panel({ settings, save, toast }) {
 | `stickers` | 表情包 | `library()` `match(名字)` `pickForReply(文字)` `collect(消息段, chatId)` `addFromBuffer(buf, { name, tags })` `rename(md5, 名字, 标签)` `remove(md5)` `segmentFor(item)` |
 | `voice` | 语音 | `speak(文字) → { file, engine }` |
 | `mood` | 心情 | `state()` `label()` `nudge(变化量, 原因)` `effects()` `contextLine()` |
-| `memory` | 记忆 | `add({ text, about, aboutName, importance, tags, source })` `addEvent({ text, about, tags, importance, kind, meta })` `recall(查询, { about, limit })` `list(查询)` `remove(id)` `update(id, 改动)` `contextFor(chat, sessionId)` `noteVia({ via, qq, who, text, at })` `contextVia({ qq, query })` `topicScore(文字)` `profiles()` `consolidate()` …… |
+| `memory` | 记忆 | `add({ text, about, aboutName, importance, tags, source })` `addEvent({ text, about, tags, importance, kind, meta })` `recall(查询, { about, limit })` `vectorHits(查询)` `vectorStatus()` `vectorTest(文字)` `vectorReset()` `vectorSync()` `rerankStatus()` `rerankTest(文字)` `list(查询)` `remove(id)` `update(id, 改动)` `contextFor(chat, sessionId)` `noteVia({ via, qq, who, text, at })` `contextVia({ qq, query })` `topicScore(文字)` `profiles()` `consolidate()` …… |
 | `qq-tools` | 基础 QQ 工具 | （只有工具：`qq_chat_history`、`qq_send_message`、`qq_send_file`） |
 | `imagegen` | 生图 | `enabled()` `generate(描述) → Buffer` |
 | `diary` | 空间日记 | `writeDiary()` `post(正文, { images, visibility })` `remove(tid)` `history()` `nextTime()` |
@@ -319,13 +333,50 @@ return function Panel({ settings, save, toast }) {
 | `bili` | B 站 | `watch(链接)` `comment(链接, 文字)` `run()` `checkReplies()` `account()` `state()` |
 | `song` | 翻唱 | `request({ song, pitch, chatId })` `search(关键词)` `status()` `install()` |
 
+人物记忆统一使用 `features/memory-store.js` 的 `load/save`，不另建名单或记忆文件。`memory.deletePerson(qq, { keepNoMemory?: boolean })` 删除画像、关于该人的事实及跟进、相关事实引用、涉及他的关系、个人梗概、相处经验、说话习惯、短期摘要和标签，并用 `hub.forgetChatLog(qq)` 把旧流水标为已忘；只提到他名字的别人的事实保留。主人不能删除。`forgetChatLog(qq, query?)` 省略 query 表示整个人，传关键词仍是原来的局部遗忘。
+
+`memory.setNoMemory(qq, enabled, { deleteExisting?: false })` 设置画像上的 `profiles[qq].noMemory`；开启时可调用人物删除并保留该标记，撤销后恢复后续记忆。主人不能设置。各写入和注入路径统一调用 `memory.remembers(qq)`，不要在模块里重复判断标记。停止记忆仍然允许 `noteVia` 和 QQ 流水记录当前对话，但不会提炼个人事实、画像、关系、相处经验、说话习惯、短期摘要或跟进；已有的个人记忆也不参与上下文和召回。`讨厌` 标签仅影响是否愿意回复，与停止记忆分别设置。
+
+`memory.isAcquainted(qq)` 统一识别私聊过、在群里 @ 她或回复她、被她回复过的人，以及 QQ 好友、私聊/主动搭话白名单和主人。证据来自现有流水的 `interaction: string[]`（这条消息直接互动的 QQ；旧私聊流水不需要该字段），好友列表由 hub 在内存里缓存。`memory.profileOnlyAcquainted` 默认开，自动提炼个人事实（主人在本人私聊确认的事实仍可保存，但不作为第三人的交集或画像依据）、聊天的 `remember` 工具、`saveImpressions`、`buildProfile`、个人相处经验/说话习惯与关系均受它控制；群公共事实沿用原规则，旧画像保留。面板可以手动编辑已有画像；新建画像同样检查有无交集，所有编辑都不能绕过不再记住。模块若自动形成聊天中的个人事实，使用 `add({ ..., acquaintedOnly: true })` 复用同一检查；面板手动添加和导入不受自动提炼范围限制，但始终遵守 `remembers`。人物墙按主人、互动次数与最近互动加权排序，`lastActive` 仍用于原有的活跃筛选，不作为亲疏依据。
+
+面板接口：`POST /persona/person/delete { qq }`；`POST /persona/person/no-memory { qq, enabled, deleteExisting? }`。前端删除有两次确认，开启不再记住时询问是否同时删除旧记忆。所有遗忘操作沿用 `forgetVersion`，在途提炼、摘要、画像、压缩和异步召回不能把旧结果写回或重新注入。
+
 平台是工具，同一个人只有一套记忆。模块确认平台账号对应的 QQ 后，可以用 `noteVia` 把双方对话写进同一份私聊流水（`who` 为 `user` 或 `bot`，`at` 是可选的毫秒时间戳），用 `contextVia` 取得这位 QQ 用户的私聊记忆上下文。模块用 `noteVia` 写入流水后，开启的短期状态会自动生效。核对不了身份的账号不要写入，也不要读取记忆。
 
-接 B 站、抖音、帖子、网页等外部内容平台时，看见或分享的内容用 `memory.addEvent({ kind: 'seen', text, meta: { title, author, url, platform, id } })`。它表示「她看过的内容」，不是作者对她说的话，不参与人物事实、画像、相处经验或长期印象的提炼。仍存于 `memories.json` 的 `items`，`source` 仍为 `event`。不要再把内容里的 `remember` 结果另存成普通事实或经历。
+接 B 站、抖音、帖子、网页等外部内容平台时，看见或分享的内容用 `memory.addEvent({ kind: 'seen', text, meta: { title, author, url, platform, id } })`。它表示「她看过的内容」，不是作者对她说的话，不参与人物事实、画像、相处经验或长期印象的提炼。仍存于同一记忆库的 `items`（`features/memory-store.js` 统一 `load/save`），`source` 仍为 `event`。不要再把内容里的 `remember` 结果另存成普通事实或经历。
 
 `addEvent` 的 `kind` 可省略（原有「做过的事」），或传 `'seen'`。`meta` 可省略，只保留 title / author / url / platform / id 五个可选字符串，分别最多 160 / 80 / 500 / 40 / 100 字符，其他字段丢弃；`id` 也接受数字并转成字符串。`seen` 不挂到某个人名下；`text` 可记感受，省略时用标题。时间轴平台选项从 `meta.platform` 和聊天梗概保留的 `via` 自动汇总，不要求固定平台名。写入真实聊天平台的双方对话则用上面的 `noteVia`，不要用 `seen` 代替聊天流水。
 
+事实档位由 `features/memory-rules.js` 统一定义，`add({ ..., tier })` / `update(id, { tier })` 接受以下编号。为保证升级不缩短旧记忆的期限，旧编号不重排；面板按保留期排列，模块不要用编号大小比较重要性。
+
+| 编号 | 名称 | 默认天数 | 旧数据兼容 |
+|---|---|---|---|
+| 4 | 短暂 | 1 | 新增 |
+| 1 | 琐碎 | 7 | 原编号、配置与时间不变 |
+| 5 | 小事 | 15 | 新增 |
+| 2 | 一般 | 30 | 原编号、配置与时间不变 |
+| 3 | 重要 | 90 | 原编号、配置与时间不变 |
+| 0 | 永久 | 不过期 | 原编号不变 |
+
+有限档天数继续使用 `memory.tierDays[编号]`，面板可调；0 天表示下次整理即可尝试压缩，只有 `tier: 0` 表示永久。旧自定义天数保留，没有 `tier` 的老记录继续沿用遗忘曲线；`tier: 'core'` 仍是已有的长期印象。到期事实先压成梗概，模型失败、预算不足或关闭梗概压缩时保留原事实。自动去重/修订按配置的实际保留期提升档位，永久和长期印象不会被自动降级；面板明确改档可自行选择期限。面板的 `factTiers`（`stats()` 和人物详情返回）、`tierLabel`、`tierDays` 均为派生显示值，不再存一份。
+
+`memory.recallMinRelevance` 为 0～1 的召回最低相关度，默认 0；0 表示关闭新增门槛，保留升级前的召回能力，原来的 BM25 最低分和向量 0.55 下限继续生效。关键词取原始 BM25 的 `s / (1 + s)` 与「命中查询词数 / 查询词数」中的较高值，向量用余弦相似度，任一路达到门槛即可；命中比例托底，避免常见话题随库增大、BM25 下降后被误杀。这是检索启发分，不是概率，不能和重排模型的分数混用。先按来源/人物过滤，再检查相关度，之后才计算人物匹配、重要性和新近程度加分；重排只看过线候选。上一句和 `related` 补充的相关度按 0.6 折算后也要过线，未整理原话同样复用该门槛。面板检索和只读推荐不受聊天召回门槛限制。
+
+面板只读接口：
+
+- `GET /persona/graph` → `{ ok, nodes, links }`。`memory.personaGraph()` 从现有人物墙与 `relations` 派生；节点含 `qq/name/closeness/interactions/isOwner`，边含 `id/source/target/label/text/chatId`。亲疏沿用人物墙的互动证据，不用发言数代替互动。旧关系无 QQ 时只在名字唯一匹配时连线，未识别的人不凭空建画像，不再记住的人不显示。前端 SVG 每页最多 48 人，只展示本页节点之间的边，支持搜索与键盘打开详情。
+- `GET /memory/related?id=...&kind=...` → `{ ok, list }`。`kind` 可省略，或为 `gist/seen`；人物事实、梗概和看过的内容均可作为入口。`memory.recommendations({ id, kind?, chat? })` 优先已有 `related`，再用同话题检索、同人物补充，最多六条，排除自身、已删除、已过时、未来才生效和停记内容。没有 `chat` 时仅供管理面板；其他模块必须传真实聊天 `chat`，复用召回的来源/主人隐私规则，不能给聊天工具直接暴露管理视角。梗概始终只来自锚点所在聊天（传 `chat` 时是当前聊天）。推荐返回 `reason/displayText/validityText`，不写命中数、召回日志或关联引用。
+- `GET /memory/platforms` → `{ ok, list }`。`memory.platformStats()` 按平台返回 `platform/episodes/gists/seen`：原话含现存双方聊天流水，梗概含两级梗概/印象，看过内容只计当前有效 `seen`。忽略已忘、系统流水和停记人物。优先读 `meta.platform` / `via`，兼容单字符串和数组；无标签的 QQ 私聊/群聊算 `qq`，无法辨认的算 `unknown`。标签去重，多来源梗概在每个来源各计一次，不能把各平台计数相加当作总条数。时间轴筛选与统计复用 `memoryPlatforms()`，QQ 与其他平台混聊压缩后仍保留各自来源标签；记忆归属、会话与权限不按平台拆分。
+
+这些接口的视图、计数和推荐均即时计算，不新增存储文件或关系索引表。普通事实的写前相似去重也只在同一 `chatId` 中进行，避免相同说法跨聊天合并后丢失出处。注入出处会标明私聊 QQ、实际存在的 `via` 标签，转述还会保留原说话人的 QQ。
+
 事实 `add` / `update` 支持可选 `validFrom`、`validUntil`（毫秒时间戳或明确年月日），开始时间默认取 `saidAt`。老记录只有 `invalidAt` 时，按它作为结束时间读取；新事实使旧事实过时时，保留 `supersededBy`，结束时间取新事实的 `saidAt`。`related` 是最多 6 个事实 id 的双向引用，由记忆库维护。面板返回的 `validityText`、`displayText`、`relatedItems` 是显示用的派生值，不重复存储。`timeline({ kind?, platform?, chatId?, level?, about? })` 汇总聊天梗概和 `seen`，其中 `kind` 为 `gist` 或 `seen`，平台来自每条返回值的 `platforms`。
+
+悬而未决的重要事直接使用事实上的可选字段 `followUp = { at, tries, question }`：`at` 为下次该问的毫秒时间戳，`tries` 从 0 开始，`question` 为一句自然的问题。没有独立跟进表或文件；存储仍由 `features/memory-store.js` 的 `load/save` 负责。`memory.followUp` 默认开，只跟进主人和 `speakUp.allow` 中朋友在本人私聊里亲口说的、`status: 'fact'`、`tier: 2 / 3` 的个人事实，群聊与外部内容不跟进；已核对 QQ 的跨平台私聊仍使用同一份事实。
+
+提炼输出用 `follow_up: { at: 'YYYY-MM-DD HH:mm', question }`，本地明确日期保留原时间，只有日期则安排晚上 20 点；日期拿不准按原话后 3 天。`update` / `outdated` 用旧事实 id，有结果写 `follow_up: null`，尚无结果省略字段以保留次数和排程。沿用事实去重，重复提炼不重置次数；过时、忘掉、删除时连带清理，未完成的跟进暂不参与细节压缩。面板取消沿用 `memory.update(id, { followUp: null })`，该接口不接受创建跟进。
+
+主动模块共用 `memory.dueFollowUp(qq, now?)`（只返回最早到期的一件，检查记忆开关、本人来源、白名单、有效期和喜恶）与 `memory.markFollowUpAsked(id, now?)`（只在实际发出后调用；问后延期 3 天、7 天，第三次清掉）。主动搭话用 `hub.pushToSession` 的可选 `onDelivered` 回执，在实际发出文字或语音后记数；沉默、试运行、拦截、失败不记数。目的引擎只在模块开启时收集同一件到期素材，权重由 `purpose/engine.js` 的 `FOLLOW_UP_WEIGHT` 定义，不复制进目的目标或待续清单。两条路径都沿用各自的清醒时段、次数与间隔闸门，禁言和讨厌的人跳过。
 
 聊天中枢需要的时候会去找 `stickers`（发表情、偷表情）、`voice`（发语音）、`mood`（心情影响表情 / 语音频率）、`memory`（群聊插话判断）。
 这几个被关掉，对应的事就不做（想发语音时改发文字）；被替换，就用你的——所以替换时**导出的函数名要和上表一样**。
@@ -377,3 +428,5 @@ return function Panel({ settings, save, toast }) {
 - 面板「日志」页：模块的日志按模块 id 分类
 - **安全模式**：「已安装」页打开后，你写的模块一个都不加载，内置的全部恢复。用来判断「是我的模块的问题还是插件的问题」
 - 不会写？在「已安装」页点「复制给 DSH 的话」，粘给 DSH，写上你想要什么，它会读这份说明帮你写
+
+原话档案通过 `conversationContext.enabled` 显式开启，默认关闭。`prompt` 的 `recentMessages` 是当前输入之前的同一人物/聊天记录；关闭时为空。具体保留范围、微信历史资料接入和模块权限边界见 [对话上下文说明](../../docs/MEMORY-CONTEXT.md)。

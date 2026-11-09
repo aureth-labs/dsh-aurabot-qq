@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import { copyFileSync, mkdtempSync, writeFileSync, mkdirSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { gunzipSync } from 'node:zlib'
 import { startMockOneBot } from './helpers/mock-onebot.js'
 import { createFakeDsh } from './helpers/fake-dsh.js'
 
@@ -30,22 +31,30 @@ function fakePng(w, h, salt = 0) {
 
 // 「模型」脚本
 async function brain({ preset, text, images, callTool }) {
+  // 脚本按聊天内容匹配分支；时间/记忆/心情等上下文提示由独立回归检查，不当作用户新说的话。
+  text = text.split('\n').filter(line => !line.startsWith('【当前本机时间】') && !line.startsWith('（你现在')).join('\n')
+  // 记忆等上下文可能整段挂在用户消息前面：从聊天正文那行截断
+  const chatLine = text.match(/【(?:私聊|群聊)[\s\S]*$/)
+  if (chatLine) text = chatLine[0]
+  if (text.includes('这是一条提示信息')) return '老大，pwsh 那个会话卡住了，等你点批准'
   if (text.includes('at+表情测试')) return '<at:10000001> 看这个<sticker:开心>'
   if (text.includes('热重载探针')) { const r = await callTool('probe73', {}); return r ? '探针:' + r.message : '没有探针工具' }
   if (text.includes('慢工具测试')) { const r = await callTool('slow74', {}); return r ? '慢工具好了' : '没有慢工具' }
   if (text.includes('排队权限测试0') || text.includes('排队权限测试2')) { const r = await callTool('permprobe90', {}); return r ? String(r.message || '') : '没有探针' }
   if (text.includes('排队权限测试1')) { await sleep(1200); return '第一轮好了' }
   if (text.includes('【空间互动')) { qzonePrompts.push(text); return '哈哈好看' }
-  if (/^【(私聊|群聊)/.test(text) && text.includes('戳了戳你')) return '干嘛戳我<poke>'
-  if (/^【私聊/.test(text) && text.includes('表情改名测试')) { const m = text.match(/把「(.+?)」/); const r = await callTool('qq_edit_sticker', { sticker: m[1], new_name: '改过的名字', tags: ['开心'] }); return r.message }
-  if (/^【私聊/.test(text) && text.includes('表情删除测试')) { const r = await callTool('qq_edit_sticker', { sticker: '改过的名字', delete: true }); return r.message }
-  if (/^【私聊/.test(text) && text.includes('翻聊天记录')) { const r = await callTool('qq_chat_history', { count: 5 }); return r.message.split('\n')[0] }
+  if (/【(私聊|群聊)/.test(text) && text.includes('戳了戳你')) return '干嘛戳我<poke>'
+  if (/【私聊/.test(text) && text.includes('表情改名测试')) { const m = text.match(/把「(.+?)」/); const r = await callTool('qq_edit_sticker', { sticker: m[1], new_name: '改过的名字', tags: ['开心'] }); return r.message }
+  if (/【私聊/.test(text) && text.includes('表情删除测试')) { const r = await callTool('qq_edit_sticker', { sticker: '改过的名字', delete: true }); return r.message }
+  if (/【私聊/.test(text) && text.includes('翻聊天记录')) { const r = await callTool('qq_chat_history', { count: 5 }); return r.message.split('\n')[0] }
   if (text.includes('查看QQ资料测试')) { const r = await callTool('qq_get_profile', {}); return r?.ok ? '资料查到了' : r ? r.message : '没这个工具' }
   if (text.includes('改昵称测试')) { const r = await callTool('qq_set_nickname', { name: '小鲸鱼' }); return r ? r.message : '没这个工具' }
   if (text.includes('改签名测试')) { const r = await callTool('qq_set_signature', { text: '今天也要开心' }); return r ? r.message : '没这个工具' }
   if (text.includes('刚才那张换头像测试')) { const r = await callTool('qq_set_avatar', { image: 'last' }); return r ? r.message : '没这个工具' }
   if (text.includes('画作换头像测试')) { const r = await callTool('qq_set_avatar', { image: '#1' }); return r ? r.message : '没这个工具' }
-  if (text.includes('存画作表情测试')) { const r = await callTool('qq_save_sticker', { painting: '#1', name: '自画像' }); return r ? r.message : '没这个工具' }
+  if (text.includes('收画作表情测试')) { const r = await callTool('qq_collect_sticker', { painting: '#1', name: '自画像', tags: ['画画'] }); return r ? r.message : '没这个工具' }
+  if (text.includes('存画作表情测试')) { const r = await callTool('qq_save_sticker', { painting: '#1', name: '自画像', tags: ['画画'] }); return r ? r.message : '没这个工具' }
+  if (text.includes('不存在画作表情测试')) { const r = await callTool('qq_save_sticker', { painting: '#99', name: '不存在的画' }); return r ? r.message : '没这个工具' }
   if (text.includes('换头像测试')) { const r = await callTool('qq_set_avatar', { image: 'https://example.com/a.png' }); return r ? r.message : '没这个工具' }
   if (text.includes('本地头像测试')) { const r = await callTool('qq_set_avatar', { image: 'C:/Users/a/secret.png' }); return r ? r.message : '没这个工具' }
   if (text.includes('慢慢想') && !text.includes('补充')) { await sleep(2500); return '想好了' }
@@ -125,7 +134,7 @@ before(async () => {
     titleFilter: { enabled: true, groups: ['556'], title: '大肥鱼' },
     snowluma: { autoStart: false, autoAttach: false, httpUrl: mock.httpUrl, wsUrl: mock.wsUrl, httpToken: mock.token, wsToken: mock.token, dir: join(dataDir, 'no-snowluma') },
     voice: { engine: 'windows', autoChance: 0 },
-    stickers: { autoChance: 0 },
+    stickers: { autoChance: 0, collectMode: 'auto' },
     // 大多数用例要的是「每次都回」，刹车放宽；558/559 专门测一段一回和刹车
     group: { interjectChance: 0, burstMax: 50, overrides: { 557: { interjectChance: 1, minRelevance: 0, minRecentMessages: 0, cooldownSec: 0, quietHours: [0, 0] }, 559: { burstMax: 2 } } },
     diary: { enabled: true },
@@ -481,11 +490,18 @@ test('群聊刹车：主动接话才歇着，群友 @ / 叫名字 / 追问都能
   for (let i = 0; i < 20 && quiet !== mock.calls.length; i++) { quiet = mock.calls.length; await sleep(200) }
   // 刚说完被人追问「人呢」：也算在叫
   turns = fake.turns.length
+  sends = sentTo('group', '559').length
+  mock.push(grp('559', '714', text('人呢')))
+  await until(() => fake.turns.length > turns, 5000)
+  await until(() => sentTo('group', '559').length > sends, 5000)
+  await sleep(600)
+  turns = fake.turns.length
   mock.push(grp('559', '713', text('你们先聊')))
   await sleep(1200)
   assert.equal(fake.turns.length, turns, '没人叫她的普通消息不回')
   mock.push(grp('559', '714', text('人呢')))
-  await until(() => fake.turns.length > turns, 5000)
+  await sleep(1200)
+  assert.equal(fake.turns.length, turns, '群友互相追问不抢答')
   // 主人 @ 照常能叫动
   turns = fake.turns.length
   mock.push(grp('559', OWNER, at('在吗 主人来了'), 'xiaoming'))
@@ -540,6 +556,26 @@ test('引用 + 语音：语音条单独一条发，不和引用/@ 拼在同一�
   }
 })
 
+test('试听用当前页面草稿：换地址/模型后不用先保存也会变', async () => {
+  const http = await import('node:http')
+  const wavA = Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(1000, 1)])
+  const wavB = Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(1000, 2)])
+  const srv = http.createServer((req, res) => { res.setHeader('content-type', 'audio/wav'); res.end(req.url.includes('/b') ? wavB : wavA) })
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r))
+  try {
+    const post = async (voice) => (await fake.call('/voice/test', { text: '试听', voice })).json()
+    const a = await post({ engine: 'http', http: { urlTemplate: `http://127.0.0.1:${srv.address().port}/a?text={text}` } })
+    const b = await post({ engine: 'http', http: { urlTemplate: `http://127.0.0.1:${srv.address().port}/b?text={text}` } })
+    assert.equal(a.ok, true)
+    assert.equal(b.ok, true)
+    assert.equal(a.engine, 'http')
+    assert.equal(b.engine, 'http')
+    assert.notEqual(a.data, b.data, '草稿换了服务地址，音频必须跟着换')
+  } finally {
+    srv.close()
+  }
+})
+
 test('语音条不把 QQ 表情/emoji 念出来（face 标签和 emoji 在 TTS 前去掉）', async () => {
   const http = await import('node:http')
   let spoken = ''
@@ -561,6 +597,15 @@ test('语音条不把 QQ 表情/emoji 念出来（face 标签和 emoji 在 TTS �
 test('听语音：收到语音先转文字再交给她', async () => {
   mock.push(priv(OWNER, [{ type: 'record', data: { file: 'abc.amr' } }]))
   await until(() => fake.turns.at(-1)?.userText.includes('[语音] 今天想吃白米饭'))
+})
+
+test('群语音：没 @ 也先转写，后面 @ 时上下文能看到（#197）', async () => {
+  const at = (t) => [{ type: 'at', data: { qq: BOT } }, { type: 'text', data: { text: ' ' + t } }]
+  mock.push(grp('555', '999', [{ type: 'record', data: { file: 'group.amr' } }], '小明'))
+  mock.push(grp('555', '999', at('刚才那条语音说了什么'), '小明'))
+  await until(() => fake.turns.some((t) => String(t.userText).includes('今天想吃白米饭')), 20000)
+  const turn = fake.turns.findLast((t) => String(t.userText).includes('今天想吃白米饭'))
+  assert.match(String(turn.userText), /\[语音\] 今天想吃白米饭/, '没 @ 的群语音也要出现在后面的群聊上下文里')
 })
 
 test('引用消息：私聊能看到被引用的内容；引用她自己时标「你」', async () => {
@@ -731,6 +776,88 @@ test('面板接口：概览、人格切换', async () => {
   await fake.call('/persona/use', { id: 'dafeiyu' })
 })
 
+test('面板接口：token 用量（今日 / 昨日 / 近 7 天 / 近 30 天 + 模块 / 聊天 / 模型明细）', async () => {
+  const u = (await fake.call('/usage')).json()
+  assert.equal(u.ok, true)
+  assert.ok(u.currency, '要带币种')
+  for (const key of ['today', 'yesterday', 'last7', 'last30']) {
+    const r = u.ranges[key]
+    assert.equal(typeof r.runs, 'number', key + ' 要有调用次数')
+    assert.equal(typeof r.totalTokens, 'number', key + ' 要有合计 token')
+    assert.equal(typeof r.promptTokens, 'number', key + ' 要有输入 token')
+    assert.equal(typeof r.cachedTokens, 'number', key + ' 要有缓存命中 token')
+    assert.equal(typeof r.cost, 'number', key + ' 要有花费')
+  }
+  assert.equal(u.ranges.last30.runs >= u.ranges.last7.runs, true, '近 30 天不会比近 7 天少')
+  assert.ok(u.current, '要带所选区间的明细')
+  for (const dim of ['byModule', 'byChat', 'byModel']) assert.ok(Array.isArray(u.current[dim]), dim + ' 要是个列表')
+  assert.equal(typeof u.current.cacheHitRate, 'number')
+  assert.equal(typeof u.current.peakRatio, 'number')
+  // ?range= 决定 current 是哪个区间（面板点指标卡就是切这个）
+  const today = (await fake.call('/usage?range=today')).json()
+  assert.equal(today.range, 'today')
+  assert.equal(today.current.runs, today.ranges.today.runs, 'range=today 时 current 就是今日')
+  const d30 = (await fake.call('/usage?range=30')).json()
+  assert.equal(d30.range, '30')
+  assert.equal(d30.current.runs, d30.ranges.last30.runs, 'range=30 时 current 就是近 30 天')
+})
+
+test('用量归属：聊天里让她刷 B 站，处理工具结果那次调用算「刷 B 站」而不是「聊天」', async () => {
+  let sid = api.hub.sessions()['private:10000001']?.sessionId
+  if (!sid) {
+    const n = fake.turns.length
+    mock.push(priv(OWNER, text('建个会话测用量归属')))
+    await until(() => fake.turns.length > n, 8000)
+    sid = api.hub.sessions()['private:10000001']?.sessionId
+  }
+  assert.ok(sid, '主人私聊会话已建好')
+  const sess = { id: sid, title: '测试会话' }
+  const read = async () => (await fake.call('/usage?range=today')).json()
+  const runsOf = (u, key) => (u.current.byModule.find((m) => m.key === key) || { runs: 0 }).runs
+
+  const before = await read()
+  const chatBefore = runsOf(before, '聊天')
+  const biliBefore = runsOf(before, '刷 B 站')
+
+  // 这一轮：她调 bili_watch（step 1），然后处理看回来的内容（step 2，带 usage）
+  fake.emit('session/event', sess, { type: 'tool/call', data: { turn: 9001, step: 1, callId: 'c1', name: 'bili_watch', arguments: '{"link":"BV1xx"}' } })
+  fake.emit('session/event', sess, {
+    type: 'assistant/message',
+    time: Date.now(),
+    data: {
+      turn: 9001,
+      step: 2,
+      usage: { inputTokens: 3000, outputTokens: 20, cacheReadTokens: 0 },
+      message: { role: 'assistant', content: [{ type: 'text', text: '这视频挺好笑' }] },
+    },
+  })
+  await sleep(200)
+
+  const after = await read()
+  assert.equal(runsOf(after, '刷 B 站') - biliBefore, 1, '刷 B 站那次调用要算到「刷 B 站」名下')
+  assert.equal(runsOf(after, '聊天') - chatBefore, 0, '这一步不该再算一笔「聊天」')
+
+  // 普通工具（发消息这类）不改变归属，仍记「聊天」
+  const mid = await read()
+  const chat2 = runsOf(mid, '聊天')
+  const bili2 = runsOf(mid, '刷 B 站')
+  fake.emit('session/event', sess, { type: 'tool/call', data: { turn: 9002, step: 1, callId: 'c2', name: 'qq_send_message', arguments: '{}' } })
+  fake.emit('session/event', sess, {
+    type: 'assistant/message',
+    time: Date.now(),
+    data: {
+      turn: 9002,
+      step: 2,
+      usage: { inputTokens: 500, outputTokens: 10, cacheReadTokens: 0 },
+      message: { role: 'assistant', content: [{ type: 'text', text: '嗯' }] },
+    },
+  })
+  await sleep(200)
+  const after2 = await read()
+  assert.equal(runsOf(after2, '聊天') - chat2, 1, '聊天自己的工具仍算「聊天」')
+  assert.equal(runsOf(after2, '刷 B 站') - bili2, 0)
+})
+
 test('头像：上传自定义头像、同步成 QQ 头像、恢复默认', async () => {
   const before = (await fake.call('/avatar')).raw()
   assert.ok(before.length > 1000, '默认头像是插件自带的那张')
@@ -835,7 +962,7 @@ test('生图：主人让她画图，调生图服务并把图发出去', async ()
 
 test('生图工具结果：能看图时带 image 块，纯文本模型只给文字（#37）', async () => {
   const http = await import('node:http')
-  // 用带尺寸的 PNG：这张画之后还会被「存成表情」，表情库会校验宽高
+  // 用带尺寸的 PNG：画作之后还要被「收成表情」，表情库会校验宽高
   const png = fakePng(240, 240, 7)
   const srv = http.createServer(async (req, res) => {
     for await (const _ of req) { /* 读完请求体 */ }
@@ -857,14 +984,18 @@ test('生图工具结果：能看图时带 image 块，纯文本模型只给文�
     return drawTurn().toolCalls.find((c) => c.name === 'qq_draw_image').result
   }
 
-  // 面板里声明「支持」：工具结果里要有图，而且是登记过的附件块
+  // 手动声明「支持」：工具结果里要有图，而且是登记过的附件块
   // （直接塞 base64 会让下一轮请求整轮失败，见 imageToolBlock 的注释）
   const withImg = await draw('on')
   assert.ok(withImg.image, '能看图的模型应拿到 image')
   assert.equal(withImg.image.type, 'image')
   assert.ok(withImg.image.attachment?.attachmentId, '要登记成附件块')
   assert.equal(withImg.image.data, undefined, '不要裸 base64')
-  assert.match(withImg.message || '', /画作编号 #1/, '画完给一个画作编号，换头像 / 收表情时用')
+  const blocks = (await import('../src/features/imagegen.js')).drawResultBlocks({}, withImg)
+  assert.equal(blocks.length, 2)
+  assert.equal(blocks[1].type, 'image')
+  assert.doesNotMatch(withImg.message, /你自己看到的画面/, '不再额外调模型写描述')
+  assert.match(withImg.message || '', /画作编号 #1/, '画完给一个画作编号，换头像／收表情时用')
   // #59：能看图的模型要拿到本地保存路径，方便她收录表情包 / 存素材
   assert.ok(withImg.path && /\.png$/.test(withImg.path), '能看图时要返回本地路径：' + JSON.stringify(withImg.path))
   assert.match(withImg.message || '', /已保存到本机：/, '路径写进工具结果文字里')
@@ -873,40 +1004,110 @@ test('生图工具结果：能看图时带 image 块，纯文本模型只给文�
   assert.equal(withImg.prompt, '一只蓝色小鲸鱼', '带上原始提示词')
   assert.ok(Number(withImg.bytes) > 0 && Number(withImg.elapsedMs) >= 0, '带字节数和耗时')
 
-  // 「让她画完自己看一眼」关掉：不传图、不给路径，但编号照给（还能换头像 / 存表情）
+  // 关掉「让她画完自己看一眼」= 不传图：不给图、不给路径，但画作编号仍然给（还能换头像／收表情）
   const noLook = await draw('on', false)
-  assert.equal(noLook.image, undefined, '关掉开关就不该塞图')
+  assert.equal(noLook.image, undefined, '关掉看一眼就不该塞图')
   assert.match(noLook.message || '', /没把图给你看/)
   assert.match(noLook.message || '', /画作编号 #1/)
   assert.doesNotMatch(noLook.message || '', /已保存到本机/, '开关关着时也不给路径')
 
-  // 声明「不支持」：纯文本模型，绝不能塞 image 块
+  // 手动声明「不支持」：纯文本模型，绝不能塞 image 块，而且要如实说
   const noImg = await draw('off')
   assert.equal(noImg.image, undefined, '纯文本模型不应该拿到 image 块')
   assert.match(noImg.message || '', /没能把图片交给你看/, '看不了图时要如实说，别让她编画面')
   assert.doesNotMatch(noImg.message || '', /存在\s*[A-Za-z]:[\\/]|\.png|已保存到本机/, '看不了图的模型不给文件路径')
 
-  // 恢复默认
+  // 恢复默认：auto + 看一眼
   await fake.call('/save', { model: { vision: 'auto' }, imageGen: { seeOwn: true } })
   srv.close()
 })
 
-test('画作编号：换头像 / 存表情都能用，而且不靠文件路径', async () => {
+test('画作编号：换头像 / 收表情都能用，而且不靠文件路径', async () => {
   // 上一条用例在这个聊天里画过图，画作编号已经登记
   mock.push(priv(OWNER, text('画作换头像测试')))
   const a = await lastCall('画作换头像测试')
   assert.equal(a.result.ok, true, JSON.stringify(a.result))
   const call = mock.sent('set_qq_avatar').at(-1)
-  const file = String(call.params.file)
-  assert.match(file, /^base64:\/\/|avatar-/i, '用画作换头像：交的是图片数据，不是模型给的路径')
+  // 网关拿到的要么是 base64（网关不在同一台机器也能用），要么是画作目录里的真实文件
+  assert.match(String(call.params.file), /^base64:\/\/|avatar-/i, '用画作换头像：交的是图片数据或专用临时文件')
 
   const before = (await fake.call('/stickers')).json().items.length
-  mock.push(priv(OWNER, text('存画作表情测试')))
-  const b = await lastCall('存画作表情测试')
+  mock.push(priv(OWNER, text('收画作表情测试')))
+  const b = await lastCall('收画作表情测试')
   assert.equal(b.result.ok, true, JSON.stringify(b.result))
   const items = (await fake.call('/stickers')).json().items
   assert.equal(items.length, before + 1, '自己画的图能收进表情库')
   assert.ok(items.some((i) => i.name === '自画像'), '名字用她给的那个')
+  mock.push(priv(OWNER, text('存画作表情测试')))
+  const saved = await lastCall('存画作表情测试')
+  assert.equal(saved.result.ok, true, JSON.stringify(saved.result))
+  assert.ok(saved.args.painting, '上游 save 工具也支持显式画作参数')
+  mock.push(priv(OWNER, text('不存在画作表情测试')))
+  const missing = await lastCall('不存在画作表情测试')
+  assert.equal(missing.result.ok, false, '编号不存在时不能退回最近收到的图片')
+  assert.match(missing.result.message, /找不到画作/)
+})
+
+test('试运行/调试下生图仍算画好了：存盘、有编号，只是没真发到 QQ', async () => {
+  const http = await import('node:http')
+  const { existsSync } = await import('node:fs')
+  const png = fakePng(240, 240, 9)
+  const srv = http.createServer(async (req, res) => {
+    for await (const _ of req) { /* 读完请求体 */ }
+    res.setHeader('content-type', 'application/json')
+    res.end(JSON.stringify({ data: [{ b64_json: png.toString('base64') }] }))
+  })
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r))
+  const baseUrl = `http://127.0.0.1:${srv.address().port}/v1`
+  const drawTurn = () => [...fake.turns].reverse().find((t) => (t.toolCalls || []).some((c) => c.name === 'qq_draw_image'))
+  try {
+    await fake.call('/save', { dryRun: true, imageGen: { enabled: true, baseUrl, model: 'test-model', apiKey: 'img-key-123456' } })
+    const before = drawTurn()
+    mock.push(priv(OWNER, text('画一只鲸鱼')))
+    await until(() => drawTurn() && drawTurn() !== before, 15000)
+    const r = drawTurn().toolCalls.find((c) => c.name === 'qq_draw_image').result
+    assert.equal(r.ok, true, '试运行下生图不该判失败：' + JSON.stringify(r))
+    assert.ok(r.path && existsSync(r.path), '画作仍要存盘')
+    assert.match(String(r.message), /画作编号 #1/, '仍要给她画作编号')
+    assert.match(String(r.message), /没真发到 QQ/, '如实说明没真发')
+  } finally {
+    await fake.call('/save', { dryRun: false })
+    srv.close()
+  }
+})
+
+test('生图工具常驻：Codex 未登录时工具仍在，执行时提示去登录', async () => {
+  // 上一次生图那一轮的会话
+  const turn = [...fake.turns].reverse().find((t) => (t.toolCalls || []).some((c) => c.name === 'qq_draw_image'))
+  const agent = turn && fake.agents.get(turn.sessionId)
+  assert.ok(agent, '应该有已挂载的会话')
+  const prevProvider = (await fake.call('/state')).json().config.imageGen.provider || 'openai'
+  try {
+    await fake.call('/save', { imageGen: { enabled: true, provider: 'codex' } })
+    assert.ok(agent.tools.has('qq_draw_image'), 'Codex 没登录也要先挂上工具，不能报 unknown tool')
+    const before = fake.turns.length
+    mock.push(priv(OWNER, text('画一只鲸鱼')))
+    await until(() => fake.turns.slice(before).some((t) => (t.toolCalls || []).some((c) => c.name === 'qq_draw_image')), 15000)
+    const t = fake.turns.slice(before).find((x) => (x.toolCalls || []).some((c) => c.name === 'qq_draw_image'))
+    const call = t.toolCalls.find((c) => c.name === 'qq_draw_image')
+    assert.equal(call.result.ok, false, '没登录时调用应失败')
+    assert.match(String(call.result.message), /登录/, '要告诉她是去登录，而不是工具不存在')
+  } finally {
+    await fake.call('/save', { imageGen: { provider: prevProvider, enabled: true } })
+  }
+})
+
+test('面板保存设置后，已挂载会话的工具清单立即刷新（不用等新消息）', async () => {
+  const turn = [...fake.turns].reverse().find((t) => (t.toolCalls || []).some((c) => c.name === 'qq_draw_image'))
+  const agent = fake.agents.get(turn.sessionId)
+  try {
+    await fake.call('/save', { imageGen: { enabled: false } })
+    assert.ok(!agent.tools.has('qq_draw_image'), '关掉生图后，已挂会话里的工具应该立刻消失')
+    await fake.call('/save', { imageGen: { enabled: true } })
+    assert.ok(agent.tools.has('qq_draw_image'), '再打开后应该立刻回来，不用等新消息')
+  } finally {
+    await fake.call('/save', { imageGen: { enabled: true } })
+  }
 })
 
 test('换头像：主人发来的图也能用，不能被「她的画作」抢走', async () => {
@@ -918,11 +1119,13 @@ test('换头像：主人发来的图也能用，不能被「她的画作」抢�
   const n = mock.sent('set_qq_avatar').length
   mock.push(priv(OWNER, text('刚才那张换头像测试')))
   const c = await lastCall('刚才那张换头像测试')
-  assert.equal(c.result.ok, true, JSON.stringify(c.result))
+  assert.equal(c.result.ok, true)
   assert.equal(mock.sent('set_qq_avatar').length, n + 1, '真的调了换头像')
   const call = mock.sent('set_qq_avatar').at(-1)
   const file = String(call.params.file)
+  // 用图片字节（base64）或临时文件，不再把 QQ 图片链接直接丢给网关
   assert.match(file, /^base64:\/\/|avatar-/i, '应该交图片数据，而不是链接')
+  // 必须是主人发的那张：'last' 不能被画作别名顶替
   const sent = file.startsWith('base64://')
     ? Buffer.from(file.slice('base64://'.length), 'base64')
     : readFileSync(file)
@@ -941,7 +1144,7 @@ test('每日整理：往日的临时流水整理后清空，今天的保留；�
   const today = new Date()
   const key = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`
   assert.equal(existsSync(join(dir, key + '.jsonl')), true, '今天的流水保留')
-  const mem = (await fake.call('/memories')).json()
+  const mem = (await fake.call('/memories?limit=200')).json()
   assert.ok(mem.items.some((m) => m.source === 'diary' && m.text.includes('白米饭')), '空间日记进了记忆库')
 })
 
@@ -971,12 +1174,12 @@ test('翻聊天记录：读当前聊天更早的消息', async () => {
   assert.match(fake.turns.at(-1).toolCalls[0].result.message, /老张：上周说好去吃火锅/)
 })
 
-const lastCall = (word) => until(() => { const t = fake.turns.at(-1); return t?.userText.includes(word) && t.toolCalls.length ? t.toolCalls[0] : null })
+const lastCall = (word) => until(() => { const t = fake.turns.at(-1); return t && String(t.userText || t.inputText || '').includes(word) && t.toolCalls.length ? t.toolCalls[0] : null })
 
 test('#6 改资料：默认仅主人私聊，昵称 / 签名 / 头像走 SnowLuma 对应动作', async () => {
   mock.push(priv(OWNER, text('改昵称测试')))
   let c = await lastCall('改昵称测试')
-  assert.equal(c.result.ok, true)
+  assert.equal(c.result.ok, true, c.result.message)
   assert.deepEqual(mock.sent('set_qq_profile').at(-1).params, { nickname: '小鲸鱼' })
   mock.push(priv(OWNER, text('改签名测试')))
   c = await lastCall('改签名测试')
@@ -1124,13 +1327,16 @@ test('#58 在 DSH 会话窗口里直接打字：这一轮按主人说的算（�
   const n = fake.turns.length
   mock.push(priv(OWNER, text('在吗')))
   await until(() => fake.turns.length > n)
-  const sid = fake.workspaces[0].sessionIds.at(-1)
+  // 后台任务也会创建会话；用 QQ 映射定位，不能假定最后一个会话就是主人私聊。
+  const sid = api.hub.sessions()['private:' + OWNER]?.sessionId
   assert.ok(sid, '新会话建出来了')
   // 模拟主人在 DSH 会话窗口里直接打字（DSH 会发 user/message，source.kind = 'user'）
   api.hub.onSessionEvent({ id: sid }, { type: 'user/message', data: { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '帮我把 B 站头像改一下' }] } })
   assert.equal(api.hub.turnSendersAllOwner(sid), true, '面板里直接打字也算主人')
   assert.equal(api.hub.turnHasOwner(sid), true)
   // 权限真的通了：改昵称工具（默认仅主人）能执行
+  // 工具是在这一轮开始后异步挂到 agent 上的，全量跑时别抢跑
+  await until(() => { const a = fake.agents.get(sid); return Boolean(a && a.tools.get('qq_set_nickname')) }, 10000)
   const agent = fake.agents.get(sid)
   const tool = agent && agent.tools.get('qq_set_nickname')
   assert.ok(tool, '会话里有改资料工具')
@@ -1231,7 +1437,7 @@ test('来源章标明说话人：主人 owner，别人 guest，后台任务 none
   assert.deepEqual((await last(() => api.hub.runSystemTurn('source-test', '来源章', '后台任务', { timeoutMs: 5000 }).catch(() => {}))).speaker, { role: 'none' })
 })
 
-test('DSH 要授权时只通知 Aurabot · QQ 会话，别的项目不转到 QQ（#136）', async () => {
+test('DSH 要授权时合并成一条通知到主人 QQ（整个 DSH，不只 Aurabot 工作区）（#136）', async () => {
   let sid = api.hub.sessions()['private:10000001']?.sessionId
   if (!sid) {
     const n = fake.turns.length
@@ -1245,16 +1451,13 @@ test('DSH 要授权时只通知 Aurabot · QQ 会话，别的项目不转到 QQ�
   const ask = { type: 'approval/asked', data: { id: 'approval-1', toolName: 'pwsh', reason: '要跑命令' } }
   fake.emit('session/event', { id: sid, title: '测试会话' }, ask)
   fake.emit('session/event', { id: sid, title: '测试会话' }, ask)
-  await until(() => mock.calls.slice(before).some((c) => c.action === 'send_private_msg'))
-  await sleep(100)
-  const sent = mock.calls.slice(before).filter((c) => c.action === 'send_private_msg' && String(c.params.user_id) === OWNER)
-  assert.equal(sent.length, 1)
-  assert.match(JSON.stringify(sent[0].params.message), /要授权.*pwsh.*DSH 界面/)
-
-  const afterFirst = mock.calls.length
   fake.emit('session/event', { id: 'external-workspace-session', title: '另一个项目' }, { type: 'approval/asked', data: { id: 'approval-external', toolName: 'pwsh', reason: '别的项目' } })
-  await sleep(150)
-  assert.equal(mock.calls.slice(afterFirst).filter((c) => c.action === 'send_private_msg').length, 0, '非 Aurabot 工作区不能发 QQ 通知')
+  // 合并窗口是 8 秒，等它吐出来
+  await until(() => mock.calls.slice(before).some((c) => c.action === 'send_private_msg'), 15000)
+  await sleep(200)
+  const sent = mock.calls.slice(before).filter((c) => c.action === 'send_private_msg' && String(c.params.user_id) === OWNER)
+  assert.equal(sent.length, 1, '窗口内的几条合并成一条，重复的按 id 去重')
+  assert.match(JSON.stringify(sent[0].params.message), /pwsh/, '消息里要能看到是哪个工具')
 })
 
 test('主人私聊里这一轮的说话人记录丢了，也按主人算（#90 兜底）', async () => {
@@ -1393,4 +1596,13 @@ test('群聊：同一段里群友发的图也能看到（限 5 分钟、最多 2
   } finally {
     await fake.call('/save', { model: { vision: 'auto' } })
   }
+})
+
+test('大 JSON 接口按 Accept-Encoding 压缩', async () => {
+  const r = await fake.call('/state', null, { 'accept-encoding': 'gzip' })
+  assert.equal(r.status, 200)
+  const j = JSON.parse(gunzipSync(r.raw()).toString('utf8'))
+  assert.equal(j.ok, true)
+  assert.ok(j.config, '解压后还是完整的 state')
+  assert.equal('history' in j.mood, false, '心情历史已移出 /state')
 })

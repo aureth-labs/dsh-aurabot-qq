@@ -45,7 +45,7 @@ function setup(t, answer = () => '[]', patch = {}) {
   return { cfg, hub, logs, calls, make, state, putState }
 }
 
-const row = (chatId, uid, text, t = Date.now() - 3600_000) => ({ chatId, uid, who: uid === BOT ? 'bot' : '小明', text, t })
+const row = (chatId, uid, text, t = Date.now() - 3600_000) => ({ chatId, uid, who: uid === BOT ? 'bot' : '小明', text, t, interaction: uid === BOT ? [] : [uid] })
 const extractCalls = (s) => s.calls.filter((x) => x.system.includes('整理长期记忆'))
 const reflectCalls = (s) => s.calls.filter((x) => x.system.includes('回顾自己和'))
 
@@ -231,6 +231,44 @@ test('主人说别人的事实可保留 fact，群聊和非主人不能把它挂
   const item = mem.list('').find((m) => m.about === A)
   assert.equal(item.speaker, OWNER)
   assert.equal(item.status, 'fact')
+})
+
+test('主人确认第三人事实不形成直接交集，停记、猜测和聊天隔离仍生效', async (t) => {
+  const C = '30000003'
+  const s = setup(t, ({ system }) => system.includes('整理长期记忆') ? JSON.stringify([
+    ...['小明喜欢咖啡', '小明住在杭州', '小明学习钢琴'].map((text) => ({ text, about: '小明', about_qq: A, speaker: OWNER, status: 'fact' })),
+    { text: '已停记的人喜欢喝茶', about_qq: B, speaker: OWNER, status: 'fact' },
+    { text: '陌生人可能去上海', about_qq: C, speaker: OWNER, status: 'guess' },
+  ]) : '{"insights":[],"style":[]}' )
+  const mem = s.make()
+  mem.setNoMemory(B, true)
+  s.logs.set(dayKey(), [row(`private:${OWNER}`, OWNER, '小明喜欢咖啡，住在杭州，学习钢琴')])
+  assert.equal((await mem.consolidate({ includeToday: true })).ok, true)
+  assert.equal(mem.list('').filter((m) => m.about === A).length, 3)
+  assert.ok(mem.list('').every((m) => m.about === A && m.status === 'fact' && m.speaker === OWNER && m.chatId === `private:${OWNER}`))
+  assert.equal(mem.isAcquainted(A), false)
+  assert.equal(await mem.buildProfile(A), false, '事实足够也不能给没有交集的人建画像')
+  assert.equal(s.state().profiles[A], undefined)
+  assert.equal(s.state().items.some((m) => m.about === B || m.about === C), false)
+  assert.equal(mem.recallHint(privateChat(A), '小明喜欢咖啡'), '')
+  assert.equal(mem.recallHint(groupChat('777'), '小明喜欢咖啡', '', '', [A]), '')
+  assert.match(mem.recallHint(privateChat(OWNER), '小明喜欢咖啡'), /小明喜欢咖啡/)
+})
+
+test('主人私聊可修订第三人事实，不需要先与第三人互动', async (t) => {
+  let id
+  const s = setup(t, ({ system }) => system.includes('整理长期记忆') ? JSON.stringify([
+    { op: 'outdated', id, text: '小明住在上海', about: '小明', about_qq: A, speaker: OWNER, status: 'fact' },
+  ]) : '{"insights":[],"style":[]}' )
+  const mem = s.make()
+  id = mem.add({ text: '小明住在北京', about: A, speaker: OWNER, status: 'fact', source: 'auto', chatId: `private:${OWNER}` }).id
+  s.logs.set(dayKey(), [row(`private:${OWNER}`, OWNER, '小明搬到上海了')])
+  assert.equal((await mem.consolidate({ includeToday: true })).ok, true)
+  assert.ok(mem.list('').find((m) => m.id === id).invalidAt)
+  const current = mem.list('').find((m) => m.text === '小明住在上海')
+  assert.ok(current && !current.invalidAt)
+  assert.equal(current.chatId, `private:${OWNER}`)
+  assert.equal(mem.isAcquainted(A), false)
 })
 
 test('容量按来源单独淘汰低重要度、旧条目，手动来源不受限', (t) => {

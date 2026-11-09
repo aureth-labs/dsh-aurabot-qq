@@ -11,6 +11,9 @@
 
 import { dataDir, readJson, writeJson } from '../core/store.js'
 import { cleanOutboundText } from '../chat/reply.js'
+import { isSessionBackoff } from '../chat/session-backoff.js'
+import { followUpHint } from '../features/memory.js'
+import { selfName, selfNames } from '../persona/personas.js'
 import { normalizeSelection } from '../chat/chat-model.js'
 import {
   DEFAULT_PURPOSE_CONFIG, PURPOSE_NEEDS, NEED_LABELS, EMOTION_LABELS, EMOTION_PROFILES,
@@ -23,8 +26,6 @@ import {
 } from './engine.js'
 
 const MINUTE = 60_000
-// 她的自称：用于聊天流水标注与「名字：」前缀清洗（与 Aurabot 的桌宠形象同名）。
-const ROLE = '大肥鱼'
 // mood 模块靠 userText 的「【系统提醒」前缀把主动回合判成 origin='speak-up'（mood/index.js 的判定），
 // deliver 路径本身没有 userText，这里补一个同款前缀，保住心情判定链路。
 const MOOD_PREFIX = '【系统提醒，不是主人说的话】（她主动找你）'
@@ -78,13 +79,17 @@ export function purposeConfig(cfg = {}) {
   }
 }
 
-/** 模型回包清洗：去掉备忘段、引号、「大肥鱼：」前缀；空/沉默返回 ''。 */
-export function cleanReply(raw, options) {
+/** 模型回包清洗：去掉备忘段、引号、自称前缀；空/沉默返回 ''。 */
+export function cleanReply(raw, options, cfg) {
   let s = String(raw ?? '')
   const cut = /(^|\n)\s*(?:[【\[]\s*(?:目的|需求|情绪|类型|状态|待续)\s*[】\]]|[【\[]?\s*内部备忘)/.exec(s)
   if (cut) s = s.slice(0, cut.index) // 内部备忘不发到 QQ
   s = s.replace(/^[「“"'']+/, '').replace(/[」”"'']+$/, '')
-  s = s.replace(new RegExp(`^${ROLE}\\s*[:：]\\s*`), '')
+  for (const name of selfNames(cfg)) {
+    if (s.slice(0, name.length).toLowerCase() !== name.toLowerCase()) continue
+    const tail = s.slice(name.length)
+    if (/^\s*[:：]/.test(tail)) { s = tail.replace(/^\s*[:：]\s*/, ''); break }
+  }
   s = cleanOutboundText(s, options).trim()
   if (!s || s.replace(/\s/g, '').startsWith(SILENCE)) return ''
   return s
@@ -124,7 +129,7 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     try {
       const items = memoryOf()?.list?.('') || []
       return items
-        .filter((m) => m && !m.invalidAt && m.text && !['hearsay', 'guess'].includes(m.status) && (!friend || (m.scope !== 'group' && String(m.about) === friend)))
+        .filter((m) => m && !m.invalidAt && !m.followUp && m.text && !['hearsay', 'guess'].includes(m.status) && (!friend || (m.scope !== 'group' && String(m.about) === friend)))
         .map((m) => {
           // 自驱引擎的沉淀（反思/做梦，带「自驱」标签）加权：那是她自己想明白的事，
           // 比聊天流水里的一句闲话更值得成为搭话话题（autotelic 联动，2026-11-05）
@@ -166,7 +171,7 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
             time: Number(e.t) || 0,
             isSelf: e.who === 'bot',
             isOwner: e.chatId === ownerKey && e.who !== 'bot',
-            sender: e.who === 'bot' ? ROLE : String(e.uid || '群友'),
+            sender: e.who === 'bot' ? selfName(cfg) : String(e.uid || '群友'),
           })
         }
       }
@@ -255,13 +260,16 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
 
   // ①~④ 收素材 → 驱动 → 目标假设 → 候选（不落盘；打分配了模型才有一次额外回合）
   async function prepare(cfg, config, state, now = Date.now(), friend = '') {
+    const followUp = memoryOf()?.dueFollowUp?.(friend || cfg.ownerQQ, now) || null
     const materials = collectMaterials({
       now, config,
       ownerUin: friend || cfg.ownerQQ,
-      roleName: ROLE,
+      roleName: selfName(cfg),
+      roleAliases: selfNames(cfg),
       conversations: conversations(cfg, now, friend),
       biliEntries: rssEntries(friend), // 浏览型模块的素材口（rss-reader「自主上网」等）；空数组=与从前一致
       memoryRecords: memoryRecords(friend),
+      followUpRecords: followUp ? [followUp] : [],
     })
     await scoreMaterials(config, materials.items, now)
     // 人格卡只作用于主人这条线：朋友的排程不吃主人人格卡里的黏人/话痨等覆写，
@@ -275,14 +283,15 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
       connectFloor: persona?.overrides?.connectFloor,
     })
     const { goals, observations, needFeedback } = formGoalHypotheses({
-      materials: materials.items, goals: state.goals, observations: state.observations,
-      drives, now, lastMasterAt, config, roleName: ROLE, persona,
+      // 跟进的排程和次数只属于事实，不再生成另一份目标或观察账本。
+      materials: materials.items.filter((m) => m.kind !== 'memory-follow-up'), goals: state.goals, observations: state.observations,
+      drives, now, lastMasterAt, config, roleName: selfName(cfg), persona,
     })
     const seeds = minePurposeSeeds({
-      materials: materials.items, now, roleName: ROLE, config,
+      materials: materials.items, now, roleName: selfName(cfg), config,
       drives, history: state.history, lastMasterAt,
     })
-    return { materials, persona, lastMasterAt, drives, goals, observations, seeds, needFeedback }
+    return { materials, persona, lastMasterAt, drives, goals, observations, seeds, needFeedback, followUp }
   }
 
   const friendName = (friend) => {
@@ -304,7 +313,8 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
       stats: ctx.materials.stats,
       drives: ctx.drives,
     }) + `\n6) 这一轮不能用任何工具：直接输出你要发的那句话即可（会自动转发给${name}）。不想说就整段只输出 ${SILENCE}。`
-    return friend ? prompt.replaceAll('主人', name) : prompt // 引擎的提示词是写给主人的，朋友不是她的主人
+    const body = friend ? prompt.replaceAll('主人', name) : prompt // 朋友不是她的主人
+    return [`你是「${selfName(cfg)}」。`, body, selected?.kind === 'memory-follow-up' ? followUpHint(ctx.followUp) : ''].filter(Boolean).join('\n')
   }
 
   // ---------- 载体分发（互斥铁律：一轮只发一处，永不双发） ----------
@@ -359,6 +369,8 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
 
   // ---------- 生成 + 投递 + 回执（hub.deliver 内部吞错，成功判定看返回值） ----------
   async function runOnce({ reason = '定时', config, state, force = false, friend = '' } = {}) {
+    const cooldown = hub.systemSessionCooldown?.('purpose', { key: friend })
+    if (cooldown) return { outcome: 'skipped-cooldown', retryAt: cooldown.retryAt }
     const cfg = getConfig()
     const now = Date.now()
     ensurePurposeDay(state, now)
@@ -372,9 +384,9 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     mergeNeedFeedback(state, ctx.needFeedback)
 
     // 朋友没聊过就别凭人设硬找：没有素材时她只能瞎编由头
-    const hasEnough = friend
+    const hasEnough = Boolean(ctx.followUp) || (friend
       ? ctx.materials.items.length >= Math.max(1, config.minMaterials)
-      : ctx.materials.items.length >= config.minMaterials || state.pending.length > 0 || ctx.persona.hasText
+      : ctx.materials.items.length >= config.minMaterials || state.pending.length > 0 || ctx.persona.hasText)
     if (!hasEnough) {
       markPurposeSkip(state, { now, reason: 'materials', nextFireAt: planNextFire({ now, config, lastRunAt: state.lastRunAt, countToday: state.countToday, replyHours: state.replyHours, replyWeekday: state.replyWeekday }) })
       saveState(state, friend)
@@ -397,6 +409,7 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
 
     const prompt = promptFor(cfg, config, picked.purpose, { ...ctx, candidates: picked.candidates }, state, now, friend)
     // 投递即占今日次数（模型回合已经花钱了）；引擎随后按真结局结算
+    const beforeAttempt = { ...state }
     markPurposeDelivered(state, { now, planned: picked.purpose })
     saveState(state, friend)
 
@@ -406,11 +419,17 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
       log.info?.(`目的（${reason}）：${picked.purpose.text}`)
       raw = await hub.runSystemTurn('purpose', 'QQ · 主动搭话（目的回合）', prompt, { timeoutMs: 180000, noTools: true, key: friend })
     } catch (error) {
+      if (isSessionBackoff(error)) {
+        // 查询与真正调用之间也可能进入冷却；这一轮没启动，不占次数或失败账。
+        Object.assign(state, beforeAttempt)
+        saveState(state, friend)
+        return { outcome: 'skipped-cooldown', retryAt: error.retryAt }
+      }
       genError = error
       log.warn?.('目的：生成出错：', error?.message)
     }
     const memo = parsePurposeMemo(raw)
-    const text = cleanReply(raw, { warn: (message) => log.warn?.(`目的：${message}`) })
+    const text = cleanReply(raw, { warn: (message) => log.warn?.(`目的：${message}`) }, getConfig())
     let outcome
     if (!text) {
       outcome = genError ? 'failed' : 'silent' // 模型有权跳过（【状态】跳过 / [沉默]），silent 不硬发
@@ -430,10 +449,10 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
           // hub 的 enginePolicy 路径自己向策略源 reserve/commit（sent/failed/uncertain），
           // 同时仍照旧走总开关 / 试运行 / 禁言。
           const cred = friend ? null : engineCredential() // 朋友各有各的账本，仍走引擎自己直投
-          const deliverOpts = { userText: MOOD_PREFIX }
-          if (cred) { deliverOpts.enginePolicy = cred; deliverOpts.enginePolicyName = 'purpose' }
           // 不带 own:true：这条是别处（目的回合）发的，hub 只把「实际成功发出」的文本记进 saidElsewhere，
           // 主人在 QQ 私聊回复时补进她的上下文（#133 同款桥接；#211 review 后改为按真发出结果记）。
+          const deliverOpts = { userText: MOOD_PREFIX }
+          if (cred) { deliverOpts.enginePolicy = cred; deliverOpts.enginePolicyName = 'purpose' }
           const r = await hub.deliver(chatIdOf(cfg, friend), text, deliverOpts)
           // 真发出去过才算 sent：deliver 返回 {sent, failed}，sent 空 = 一条都没发出去（吞错/拦截/dry-run）
           outcome = r && typeof r === 'object' && String(r.sent || '').trim() ? 'sent' : 'silent'
@@ -443,11 +462,29 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
         }
       }
     }
-    applyPurposeOutcome(state, { now: Date.now(), config, outcome, text, memo, planned: picked.purpose })
-    if (!friend) nudgeMood(picked.purpose, outcome)
+    const following = picked.purpose.kind === 'memory-follow-up'
+    if (following && outcome === 'sent') memoryOf()?.markFollowUpAsked?.(ctx.followUp.id)
+    // 模型的「待续」不能把事实跟进再复制进 purpose.pending。
+    applyPurposeOutcome(state, { now: Date.now(), config, outcome, text, memo: following ? null : memo, planned: picked.purpose })
+    if (!friend) nudgeMood(picked.purpose, outcome, memo)
     saveState(state, friend)
     log.info?.(`目的：回合结束 ${outcome}（今天第 ${state.countToday} 次）`)
     return { outcome, text, memo }
+  }
+
+  // 把 formGoalHypotheses 刚结算的反馈计数并进长期账本（状态文件按 normalize 洗字段）。
+  function mergeNeedFeedback(state, stats) {
+    if (!stats || typeof stats !== 'object') return
+    const cur = state.needFeedback && typeof state.needFeedback === 'object' ? state.needFeedback : {}
+    for (const need of PURPOSE_NEEDS) {
+      const s = stats[need]
+      if (!s || typeof s !== 'object') continue
+      const slot = cur[need] || (cur[need] = { positive: 0, negative: 0, neutral: 0 })
+      slot.positive = clampInt((Number(slot.positive) || 0) + (Number(s.positive) || 0), 0, 0, 9999)
+      slot.negative = clampInt((Number(slot.negative) || 0) + (Number(s.negative) || 0), 0, 0, 9999)
+      slot.neutral = clampInt((Number(slot.neutral) || 0) + (Number(s.neutral) || 0), 0, 0, 9999)
+    }
+    state.needFeedback = cur
   }
 
   // ---------- 代发决断（broker 档：模块经 api.proactive.submit 提交的内容先给引擎过目） ----------
@@ -472,7 +509,7 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     const srcModule = String(moduleId || '模块')
     const ownerName = cfg.ownerName || '主人'
     // ---- 审查上下文：人格 + 心情 + 相关记忆 + 人物档案 + 最近来往 ----
-    // 刻意不给引擎排程/额度（少爷定的口径：代发审查不参考她自己的说话剩余时间）。
+    // 刻意不给引擎排程/额度：代发审查不参考她自己的说话剩余时间。
     // 决断要「像不像她会说的话」，就必须让她看见自己是谁、现在什么心情、记着主人什么。
     const persona = (() => {
       try {
@@ -651,30 +688,18 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     }
   }
 
-  // 把 formGoalHypotheses 刚结算的反馈计数并进长期账本（状态文件按 normalize 洗字段）。
-  function mergeNeedFeedback(state, stats) {
-    if (!stats || typeof stats !== 'object') return
-    const cur = state.needFeedback && typeof state.needFeedback === 'object' ? state.needFeedback : {}
-    for (const need of PURPOSE_NEEDS) {
-      const s = stats[need]
-      if (!s || typeof s !== 'object') continue
-      const slot = cur[need] || (cur[need] = { positive: 0, negative: 0, neutral: 0 })
-      slot.positive = clampInt((Number(slot.positive) || 0) + (Number(s.positive) || 0), 0, 0, 9999)
-      slot.negative = clampInt((Number(slot.negative) || 0) + (Number(s.negative) || 0), 0, 0, 9999)
-      slot.neutral = clampInt((Number(slot.neutral) || 0) + (Number(s.neutral) || 0), 0, 0, 9999)
-    }
-    state.needFeedback = cur
-  }
-
   // 9 维驱动 → mood 单标量。mood 关闭时 nudge 自静默。
-  function nudgeMood(purpose, outcome) {
+  // memo 里的【感受】喜/−喜（feelings.moodDelta ±10）会叠加在情绪表之上。
+  function nudgeMood(purpose, outcome, memo = null) {
     if (outcome !== 'sent') return
     const m = moodOf()
     if (!m?.nudge) return
     const table = { affectionate: 5, excited: 5, proud: 4, amused: 4, lonely: -3, bored: -2, worried: -2, envious: -2, content: 0 }
-    const delta = table[purpose?.emotion]
-    if (!delta) return
-    try { m.nudge(delta, `主动搭话：${String(purpose?.text || '').slice(0, 20)}`) } catch {}
+    const delta = table[purpose?.emotion] || 0
+    const feel = Math.max(-10, Math.min(10, Number(memo?.feelings?.moodDelta) || 0))
+    const total = delta + feel
+    if (!total) return
+    try { m.nudge(total, `主动搭话：${String(purpose?.text || '').slice(0, 20)}`) } catch {}
   }
 
   // ---------- 追问（沿用旧 speakup 的「轻轻追一句」，不占今日次数） ----------
@@ -688,6 +713,7 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     if (flag.nudgedFor === lb.at) return false
     if (!/[？?]|吗|呢|嘛|没$/.test(String(lb.text || '').trim())) return false
     if (!(quietMs > 15 * MINUTE && quietMs < 40 * MINUTE)) return false
+    if (hub.systemSessionCooldown?.('purpose-nudge')) return false
     writeJson(nudgeFile(), { nudgedFor: lb.at }) // 引擎状态文件会被 normalize 洗字段，追问标记单独存
     if (Math.random() >= 0.5) return true
     const idle = Math.round(quietMs / MINUTE)
@@ -695,9 +721,13 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     const prompt = `【系统提醒，不是${owner}说的话】你刚才跟${owner}说「${String(lb.text || '').slice(-60)}」，${owner}已经 ${idle} 分钟没回了。可以轻轻追一句（比如「人呢」「睡着啦？」，或者换个话题），别催、别抱怨；觉得${owner}在忙就只回 ${SILENCE}。这一轮不能用工具，直接输出那句话。`
     try {
       const raw = await hub.runSystemTurn('purpose-nudge', 'QQ · 主动搭话（追问）', prompt, { timeoutMs: 120000, noTools: true })
-      const text = cleanReply(raw, { warn: (message) => log.warn?.(`目的：${message}`) })
+      const text = cleanReply(raw, { warn: (message) => log.warn?.(`目的：${message}`) }, getConfig())
       if (text) await hub.deliver(chatIdOf(cfg), text, { userText: MOOD_PREFIX }) // 不带 own:true，同上：hub 桥接进下次对话
     } catch (error) {
+      if (isSessionBackoff(error)) {
+        writeJson(nudgeFile(), flag)
+        return false
+      }
       log.warn?.('目的：追问出错：', error?.message)
     }
     return true
@@ -719,6 +749,7 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     const now = Date.now()
     const state = loadState(config, now, friend)
     if (!friend && await maybeNudge(cfg, state, now)) return true
+    if (hub.systemSessionCooldown?.('purpose', { key: friend })) return false
     const env = {
       enabled: true, modeOk: true, dshReady: true, paused: false, ownerAllowed: true,
       busy: false, friendOk: true, budgetBlocked: false, // Aurabot 无 token 预算/好友探测服务，恒可用（留 env 位）
@@ -741,7 +772,7 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     const config = purposeConfig(cfg)
     if (!config.enabled || !cfg.ownerQQ) return
     const ownerConfig = applyPersonaOverrides(config, personaOf(cfg))
-    if (!isMuted?.(chatIdOf(cfg)) && await tickOne(cfg, ownerConfig)) return
+    if (!isMuted?.(chatIdOf(cfg)) && !memoryOf()?.dislikes?.(cfg.ownerQQ) && await tickOne(cfg, ownerConfig)) return
     for (const qq of cfg.speakUp?.allow || []) {
       if (String(qq) === String(cfg.ownerQQ) || isMuted?.(chatIdOf(cfg, qq)) || memoryOf()?.dislikes?.(qq)) continue
       if (await tickOne(cfg, config, String(qq))) return
@@ -754,6 +785,7 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     const config = applyPersonaOverrides(purposeConfig(cfg), personaOf(cfg))
     if (!config.enabled) return { outcome: 'disabled' }
     if (isMuted?.(chatIdOf(cfg))) return { outcome: 'muted' }
+    if (memoryOf()?.dislikes?.(cfg.ownerQQ)) return { outcome: 'disliked' }
     if (!cfg.ownerQQ) return { outcome: 'no-owner' }
     const state = loadState(config)
     return runOnce({ reason, config, state, force: true })

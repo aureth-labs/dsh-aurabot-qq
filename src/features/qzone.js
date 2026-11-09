@@ -225,6 +225,9 @@ export function createQzone({ getConfig, onebot, hub, log, onDiary, pickImage, c
     }
   }
 
+  // 日记没写成（网络抖动 / 模型报错）不能把这一档直接吞掉：2/5/15 分钟后各重试一次，连续 3 次才放弃
+  const RETRY_DELAY_MIN = [2, 5, 15]
+
   /** 每分钟调一次。 */
   async function tick() {
     const cfg = getConfig()
@@ -232,7 +235,7 @@ export function createQzone({ getConfig, onebot, hub, log, onDiary, pickImage, c
     const s = state()
     const today = dayKey()
     if (s.plan.day !== today) {
-      s.plan = { day: today, times: planDiaryTimes(cfg.diary), done: [] }
+      s.plan = { day: today, times: planDiaryTimes(cfg.diary), done: [], retry: {} }
       save(s)
       log.info(`今天的日记时间：${s.plan.times.map((m) => `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`).join('、') || '（不写）'}`)
     }
@@ -240,10 +243,29 @@ export function createQzone({ getConfig, onebot, hub, log, onDiary, pickImage, c
     const nowMin = now.getHours() * 60 + now.getMinutes()
     const due = s.plan.times.find((m) => m <= nowMin && !s.plan.done.includes(m))
     if (due === undefined) return
-    s.plan.done.push(due)
+    const retry = s.plan.retry && s.plan.retry[due]
+    if (retry && retry.at > Date.now()) return
+    log.info(retry ? `写日记没成功，再试一次（第 ${retry.count + 1} 次）` : '到点了，写一篇空间日记')
+    const r = await writeDiary()
+    if (r && (r.ok || r.preview)) {
+      s.plan.done.push(due)
+      if (s.plan.retry) delete s.plan.retry[due]
+      save(s)
+      return
+    }
+    // writeDiary 内部已经记过 warn；这里只负责重试节奏
+    const count = (retry && retry.count || 0) + 1
+    const delayMin = RETRY_DELAY_MIN[count - 1]
+    if (!delayMin) {
+      s.plan.done.push(due)
+      if (s.plan.retry) delete s.plan.retry[due]
+      save(s)
+      log.warn(`写日记连续失败 ${count} 次，今天这一篇先跳过`)
+      return
+    }
+    s.plan.retry = { ...(s.plan.retry || {}), [due]: { at: Date.now() + delayMin * 60_000, count } }
     save(s)
-    log.info('到点了，写一篇空间日记')
-    await writeDiary()
+    log.warn(`写日记失败，${delayMin} 分钟后再试（${r && r.message ? r.message : '未知错误'}）`)
   }
 
   function nextTime() {

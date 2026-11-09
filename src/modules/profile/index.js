@@ -51,13 +51,6 @@ export default {
     const reader = createQqProfile({ getConfig: api.config, onebot, dsh: api.dsh, log: api.log, fetchAvatar, ask })
     api.onDispose(reader.dispose)
     api.rule((kind) => kind === 'private' ? '主人谈到你自己的 QQ 昵称、个性签名或头像时，可以主动用 qq_get_profile 查看当前资料，不必等主人明确说“查询”。例如“你现在叫什么”“签名是什么”“喜欢这个头像吗”。问头像画面时传 view_avatar=true，依据本次头像附件和描述回答；查不到就如实说明，不凭旧聊天记录猜。主人明确说“把现在头像发出来”“发你的头像给我”时，用 qq_send_avatar 直接发送，不必先识图；只有工具报告 sent=true 才能说发出去了，成功后不要再用链接或 Markdown 重复发图。查询不会发送图片或修改资料；普通无关聊天无需查询。' : '')
-    // 统一套路：dryRun 只说不做；执行前再按最新配置查一遍权限
-    const guarded = (key, chat, sessionId, run) => async (args) => {
-      const cfg = api.config()
-      const p = profilePermits(cfg, key, chat, hub.turnSendersAllOwner(sessionId))
-      if (!p.ok) return p
-      return run(args, cfg)
-    }
 
     /** 真正换头像：图先压到 QQ 能收下，再依次试 base64、临时文件（网关可能不在同一台机器）。 */
     const applyAvatar = async (buf, c, okMessage) => {
@@ -84,6 +77,14 @@ export default {
         try { unlinkSync(tmp) } catch (error) {}
       }
       return { ok: false, message: '换头像失败：网关不接受这张图（' + (lastError && lastError.message ? lastError.message : '未知错误') + '）' }
+    }
+
+    // 统一套路：dryRun 只说不做；执行前再按最新配置查一遍权限
+    const guarded = (key, chat, sessionId, run) => async (args) => {
+      const cfg = api.config()
+      const p = profilePermits(cfg, key, chat, hub.turnSendersAllOwner(sessionId))
+      if (!p.ok) return p
+      return run(args, cfg)
     }
 
     api.tool(({ chat, sessionId }) => {

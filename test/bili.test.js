@@ -257,9 +257,20 @@ test('#6 换 B 站头像：先下载图片再 multipart 上传到 face/update；
   assert.equal(api.sniffImageType(new Uint8Array([0x52,0x49,0x46,0x46,0,0,0,0,0x57,0x45,0x42,0x50])), 'image/webp')
   await assert.rejects(api.createBiliApi({ getCookie: () => '', log: {} }).setFace('https://img.example/a.png'), /没登录/)
 
+  // 直接给图片字节（她画的图 / 聊天里收到的图）：不下载，直接 multipart 上传
+  reqs.length = 0
+  await real.setFace(Buffer.from(png))
+  assert.equal(reqs.length, 1, '图片字节不用再下载')
+  assert.equal(reqs[0].url, 'https://api.bilibili.com/x/member/web/face/update?csrf=tok')
+  assert.equal(reqs[0].body.get('face').size, png.length)
+  assert.equal(reqs[0].body.get('face').type, 'image/png')
+  await assert.rejects(real.setFace(Buffer.alloc(2 * 1024 * 1024 + 1, 1)), /2MB/)
+  await assert.rejects(real.setFace(Buffer.from('hello')), /不是图片/)
+
   const sent = []
   const mkDuty = (cfg) => duty.createBili({ getConfig: () => cfg, hub: {}, log: { info() {}, warn() {}, debug() {} }, api: { setFace: async (f) => sent.push(f) } })
   assert.match((await mkDuty(normalize({ dryRun: true, bili: { enabled: true, cookie: 'bili_jct=y' } })).setAvatar('https://x/a.png')).message, /试运行/)
+  assert.match((await mkDuty(normalize({ dryRun: true, bili: { enabled: true, cookie: 'bili_jct=y' } })).setAvatar(Buffer.alloc(2048, 1))).message, /试运行.*KB/)
   assert.equal((await mkDuty(normalize({ dryRun: false, bili: { enabled: true, cookie: '' } })).setAvatar('https://x/a.png')).ok, false)
   assert.equal((await mkDuty(normalize({ dryRun: false, bili: { enabled: true, cookie: 'bili_jct=y' } })).setAvatar('C:\\a.png')).ok, false)
   assert.equal(sent.length, 0)

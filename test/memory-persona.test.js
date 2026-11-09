@@ -17,7 +17,7 @@ const log = { info() {}, warn() {}, debug() {} }
 const dayKey = (date = new Date()) => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
 const privateChat = (qq) => ({ kind: 'private', userId: qq, chatId: `private:${qq}` })
 const groupChat = (id) => ({ kind: 'group', groupId: id, chatId: `group:${id}` })
-const row = (chatId, uid, text, t = Date.now() - DAY) => ({ chatId, uid, who: uid === OWNER ? '主人' : `用户${uid}`, text, t })
+const row = (chatId, uid, text, t = Date.now() - DAY) => ({ chatId, uid, who: uid === OWNER ? '主人' : `用户${uid}`, text, t, interaction: [uid] })
 
 function setup(t, answer = () => '[]', memory = {}, fetchImpl) {
   const dir = mkdtempSync(join(tmpdir(), 'aurabot-persona-'))
@@ -67,7 +67,7 @@ test('新配置有默认值，可配置且会校验类型和范围', () => {
   assert.equal(m.gistDays, 180)
   assert.equal(m.impressionDays, 365)
   assert.equal(m.gistDailyBatches, 6)
-  assert.deepEqual(m.tierDays, { 1: 7, 2: 30, 3: 90 })
+  assert.deepEqual(m.tierDays, { 1: 7, 2: 30, 3: 90, 4: 1, 5: 15 })
   assert.equal(m.recallMode, 'always')
   assert.ok(m.recallTriggers.includes('上次'))
   const n = normalize({ memory: { profilePeople: -3, profileChars: -1, gistDailyBatches: -5, chatImpression: 'false', gistEnabled: false, recallMode: 'other', recallTriggers: '当年,以前', tierDays: { 1: -1, 3: 'bad' } } }).memory
@@ -78,7 +78,7 @@ test('新配置有默认值，可配置且会校验类型和范围', () => {
   assert.equal(n.gistEnabled, false)
   assert.equal(n.recallMode, 'always')
   assert.deepEqual(n.recallTriggers, ['当年', '以前'])
-  assert.deepEqual(n.tierDays, { 1: 0, 2: 30, 3: 90 })
+  assert.deepEqual(n.tierDays, { 1: 0, 2: 30, 3: 90, 4: 1, 5: 15 })
 })
 
 test('画像只接受本批发言人，本人或主人说的才写', async (t) => {
@@ -341,6 +341,7 @@ test('旧梗概压成感受与结论，印象到期后清除；失败时保留�
 
 test('触发式自动回忆不影响常驻画像和主动查记忆', (t) => {
   const s = setup(t, () => '[]', { recallMode: 'trigger', recallTriggers: ['上次', '以前'] })
+  s.cfg.allow.private = [A]
   const mem = s.make()
   mem.setProfile(A, '朋友喜欢画画')
   mem.add({ text: '朋友喜欢喝红茶', about: A, chatId: `private:${A}`, source: 'tool' })

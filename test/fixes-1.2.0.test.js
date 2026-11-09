@@ -113,7 +113,7 @@ test('常驻记忆：超过 900 字截断并加省略号，恰好 900 字保留�
     rmSync(dir, { recursive: true, force: true })
   })
 
-  const mem = createMemoryStore({ dsh: {}, getConfig: () => ({ memory: { enabled: true } }), hub: {}, log })
+  const mem = createMemoryStore({ dsh: {}, getConfig: () => ({ memory: { enabled: true, residentMaxChars: 900, profileOnlyAcquainted: false } }), hub: {}, log })
   const chat = { kind: 'private', userId: 'fictional-person', chatId: 'private:fictional-person' }
   const key = 'qq:fictional-person'
   mem.setProfile(chat.userId, '档'.repeat(190))

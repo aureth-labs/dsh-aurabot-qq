@@ -133,3 +133,25 @@ test('市场模块只记名字，会话带上并放回工作区目录，已有�
   assert.deepEqual(api.pendingModules(), [])
   delete process.env.DSH_HOME
 })
+
+test('仅配置备份：只带配置/人格，排除画作、表情、截图、聊天流水', async () => {
+  const prev = process.env.AURABOT_DATA_DIR
+  const dir = mkdtempSync(join(tmpdir(), 'aurabot-config-only-'))
+  try {
+    process.env.AURABOT_DATA_DIR = dir
+    const w = (rel, text) => { const f = join(dir, rel); mkdirSync(dirname(f), { recursive: true }); writeFileSync(f, text) }
+    w('config.json', '{"ownerQQ":"1"}')
+    w('personas/鱼.md', '人设')
+    w('imagegen/a.png', 'p')
+    w('stickers/a.png', 'p')
+    w('bili-shots/a.jpg', 'p')
+    w('chatlog/2026-11-07.jsonl', 'p')
+    const b = await api.createBackup({ version: 'x', configOnly: true })
+    assert.match(b.name, /^aurabot-config-\d{8}-\d{4}\.zip$/)
+    assert.equal(b.configOnly, true)
+    assert.equal(b.files, 3, '只打包 config、人格和轻量聊天流水')
+  } finally {
+    process.env.AURABOT_DATA_DIR = prev
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

@@ -78,4 +78,3 @@ test('人格规则：改说「一条消息里可以有两三句」，不再要�
   assert.match(rules, /一条消息里可以有两三句/)
   assert.doesNotMatch(rules, /一句一行，每一行会单独发成一条消息/)
 })
-

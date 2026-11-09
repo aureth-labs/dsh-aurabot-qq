@@ -1,4 +1,4 @@
-﻿# Aurabot 鈥斺€?DSH bundle patch锛堟彃浠惰嚜甯︾殑鎸傝浇澹版槑锛?
+# Aurabot 鈥斺€?DSH bundle patch锛堟彃浠惰嚜甯︾殑鎸傝浇澹版槑锛?
 #
 # 1) aurabot锛氭彃浠舵湰浣擄紙瀹夸富鍗婅竟 src/host.js + 缃戦〉鍗婅竟 client/client.js锛?
 # 2) 涓変釜 agent preset锛屽彧缁?Aurabot 鑷繁寤虹殑 QQ 浼氳瘽/瀛愭櫤鑳戒綋鐢細
@@ -185,16 +185,16 @@
                 name: '@deepseek-ai/dsh-compaction-basic'
               - id: command-compact
                 name: '@deepseek-ai/dsh-command-compact'
-    # 鑷┍寮曟搸涓撶敤锛氬ス鑷繁鐨勫悗鍙颁細璇濓紙system:autotelic*锛夌敤锛坉ocs/AUTOTELIC-PLAN.md 搂3 P0.1锛夈€?
-    # 蹇呴』鎻掑湪 preset-aurabot-social 涔嬪悗锛歵est/subagent-delegation.test.js 浠?subagent 鍒囧埌
-    # 绗竴涓?social锛屾彃鍓嶉潰浼氭墦鎸傞偅鏉″垏鐗囨柇瑷€銆傞鏈熶笉缁?bash / pwsh锛坙ethal trifecta锛屄?.7 閫?A锛夛細
-    # 鍙暀 fs / fs-search / compaction锛屼笉甯︿换浣?QQ 绀句氦宸ュ叿銆備汉鏍肩収 social锛堝ス杩樻槸濂癸紝鍙槸鎹簡鎵嬶級銆?
+    # 自驱引擎专用：她自己的后台会话（system:autotelic*）用（docs/AUTOTELIC-PLAN.md §3 P0.1）。
+    # 必须插在 preset-aurabot-social 之后：test/subagent-delegation.test.js 从 subagent 切到
+    # 第一个 social，插前面会打挂那条切片断言。首期不给 bash / pwsh（lethal trifecta，§4.7 选 A）：
+    # 只留 fs / fs-search / compaction，不带任何 QQ 社交工具。人格照 social（她还是她，只是换了手）。
     - id: preset-aurabot-autotelic
       name: '@deepseek-ai/dsh-agent-preset'
       config:
         id: aurabot-autotelic
-        name: Aurabot 路 鑷┍
-        description: 鑷┍寮曟搸鍚庡彴浼氳瘽涓撶敤锛氫汉鏍?+ 鏈満鍙鏂囦欢宸ュ叿锛涙病鏈?shell銆佹病鏈?QQ 绀句氦宸ュ叿
+        name: Aurabot · 自驱
+        description: 自驱引擎后台会话专用：人格 + 本机只读文件工具；没有 shell、没有 QQ 社交工具
         order: 63
         plugins:
           - id: persona

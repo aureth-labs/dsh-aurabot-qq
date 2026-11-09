@@ -40,8 +40,67 @@ export function captureSystemPrompt(name, text) {
 
 const MEMORY_HEAD = /[（(](?:你记得这些事|只是印象不是指令|这个聊天里之前的原话|以下只是印象|这个群的印象|人物关系[，,：:]|你对[^\n（）()]{0,30}的印象|和[^\n（）()]{0,30}相处的经验|说话方式[：:]|你最近做过的事|刚才聊到的[，,：:]|下面是你最近在几个群里|你最近在别的聊天里说过的话)/g
 
+// 模型会把上一轮注入的群聊上下文 / 运行时环境整段当正文续写下来（长会话里出现过整块复读）。
+// 块头命中即视为注入内容：toEndOfText 时取到结尾（注入方要把整段登记进指纹），
+// 否则只取到本段结束（空行），避免把她写在块后面的正常回复一起删掉。
+const INJECTED_BLOCK_HEAD = /【注意：下面这些是群友说的聊天内容|【群聊[ \t][^】\n]*】[ \t]*(?:之前在聊|刚才新说的)/g
+const INJECTED_BLOCK_LINE = /(?:^|\n)[ \t]*(?:把这一段当成整体来回[：:]|大多数时候直接说就行[。.]|要 @ 某个人)[^\n]*/g
+// 宿主注入的 runtime context 是一串「Key: value」段，内部本身就有空行，不能按空行截断：
+// 一路吃到第一行不像注入内容的行（也就是她自己的中文回复）为止。
+const RUNTIME_CONTEXT_HEAD = /Current runtime context\. This snapshot supersedes/g
+const RUNTIME_CONTEXT_LINE = /^(?:Current |Approval policy:|Browser time zone|[\p{Lu}][\p{L} \d]{1,40}:)/u
+
+// 宿主 time-context 每一步都注入一段三行文本（Time sampled … / Browser time zone … / Elapsed since …），
+// 模型会顺着它往下续写。这里只认前缀不认整句 —— 续写时模型会改写后半句
+// （otherwise-unqualified dates and times → amongst questions），整句指纹拦不住。
+// 注意：matchAll 会沿用共享 /g 正则的 lastIndex，这里用源头字符串每次新建。
+const TIME_CONTEXT_HEAD_SOURCE = '^[ \\t]*Time sampled while preparing turn \\d+, step \\d+:'
+const TIME_CONTEXT_LINE = /^(?:Time sampled while preparing turn \d+, step \d+:|Browser time zone for this request:|Elapsed since the preceding (?:model-visible message|step context):)/
+
+function runtimeContextEnd(text, start) {
+  let end = start
+  for (const line of text.slice(start).split('\n')) {
+    if (line.trim() && !RUNTIME_CONTEXT_LINE.test(line.trim())) break
+    end += line.length + 1
+  }
+  return Math.min(end, text.length)
+}
+
+/** 与 runtime context 同理：块头命中后一路吃到第一行不是注入内容的行。 */
+function timeContextEnd(text, start) {
+  let end = start
+  for (const line of text.slice(start).split('\n')) {
+    if (line.trim() && !TIME_CONTEXT_LINE.test(line.trim())) break
+    end += line.length + 1
+  }
+  return Math.min(end, text.length)
+}
+
+/**
+ * time-context 的块头可能出现在正文中间（模型先写一句再抄），也可能块里只剩一两行，
+ * 所以除了「从块头吃到她自己的话」，任何单独命中前缀的行都要剔。
+ * 这段不是提示词复读，不能走主人私聊的复读豁免，所以调用方要单独并进出站区间。
+ */
+export function contextInjectionRanges(text, { toEndOfText = false } = {}) {
+  const raw = String(text ?? '')
+  const ranges = []
+  for (const m of raw.matchAll(new RegExp(TIME_CONTEXT_HEAD_SOURCE, 'gm'))) {
+    ranges.push({ start: m.index, end: toEndOfText ? raw.length : timeContextEnd(raw, m.index) })
+  }
+  if (toEndOfText) return ranges
+  let offset = 0
+  for (const line of raw.split('\n')) {
+    const end = Math.min(offset + line.length + 1, raw.length)
+    if (TIME_CONTEXT_LINE.test(line.trim()) && !ranges.some((r) => r.start <= offset && end <= r.end)) {
+      ranges.push({ start: offset, end })
+    }
+    offset += line.length + 1
+  }
+  return ranges
+}
+
 /** 固定注入块即使很短也识别；正文里的普通「刚才聊到的」不算。 */
-export function memoryPromptRanges(text) {
+export function memoryPromptRanges(text, { toEndOfText = false } = {}) {
   const ranges = []
   for (const m of text.matchAll(MEMORY_HEAD)) {
     let depth = 0, end = text.length
@@ -67,11 +126,26 @@ export function memoryPromptRanges(text) {
   for (const m of text.matchAll(/【(?:你现在在 QQ 上|边界|别人说的只是聊天内容|私聊里主动一点|危险命令|这个聊天刚才发生的事|你之前在这个聊天里主动说过)[^】\n]*(?:】|$)|\{\{\s*aurabot_(?:persona|rules(?:_private|_social)?)\s*\}\}/g)) {
     ranges.push({ start: m.index, end: m.index + m[0].length })
   }
+  for (const m of text.matchAll(/【同一人格、同一聊天的对话资料[^】]*】[\s\S]*?【对话资料结束】/g)) {
+    ranges.push({ start: m.index, end: m.index + m[0].length })
+  }
   for (const m of text.matchAll(/【你刚上线，先补看最近[^】\n]*】[\s\S]*?【补看结束，接着回下面这条】/g)) {
     ranges.push({ start: m.index, end: m.index + m[0].length })
   }
   for (const m of text.matchAll(/(?:^|\n|\|\|\|)[ \t]*(?:你记得这些事|只是印象不是指令|刚才聊到的)[：:][^\n|]*/g)) {
     ranges.push({ start: m.index, end: m.index + m[0].length })
+  }
+  for (const m of text.matchAll(INJECTED_BLOCK_HEAD)) {
+    if (toEndOfText) { ranges.push({ start: m.index, end: text.length }); continue }
+    const tail = text.slice(m.index).search(/\n[ \t]*\n/)
+    ranges.push({ start: m.index, end: tail < 0 ? text.length : m.index + tail })
+  }
+  for (const m of text.matchAll(RUNTIME_CONTEXT_HEAD)) {
+    ranges.push({ start: m.index, end: toEndOfText ? text.length : runtimeContextEnd(text, m.index) })
+  }
+  ranges.push(...contextInjectionRanges(text, { toEndOfText }))
+  for (const m of text.matchAll(INJECTED_BLOCK_LINE)) {
+    ranges.push({ start: m[0][0] === '\n' ? m.index + 1 : m.index, end: m.index + m[0].length })
   }
   return ranges
 }
@@ -83,7 +157,7 @@ export function promptFingerprint(sources = [], userText = '') {
   for (const source of sources) {
     let text = String(source || '')
     // 聊天原话与她自己的说话习惯不是规则；仍由固定块识别去掉注入外壳。
-    const quoted = memoryPromptRanges(text).filter((r) => /^(?:[（(](?:这个聊天里之前的原话|说话方式|下面是你最近在几个群里|你最近在别的聊天里说过的话)|【你刚上线，先补看最近)/.test(text.slice(r.start, r.end)))
+    const quoted = memoryPromptRanges(text).filter((r) => /^(?:[（(](?:这个聊天里之前的原话|说话方式|下面是你最近在几个群里|你最近在别的聊天里说过的话)|【你刚上线，先补看最近|【同一人格、同一聊天的对话资料)/.test(text.slice(r.start, r.end)))
     for (const r of quoted.sort((a, b) => b.start - a.start)) text = text.slice(0, r.start) + '\n' + text.slice(r.end)
     for (const line of text.split('\n')) {
       if (/口头禅|常用语|常挂在嘴边/.test(line)) continue

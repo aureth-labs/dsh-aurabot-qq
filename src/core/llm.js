@@ -2,6 +2,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { cleanText } from './text.js'
+import { recordUsage, moduleLabel } from './usage.js'
 
 export function defaultModel(dsh, cfg) {
   if (cfg?.model?.provider && cfg?.model?.model) return { provider: cfg.model.provider, model: cfg.model.model }
@@ -68,12 +69,27 @@ export async function canSeeImages (dsh, cfg, target) {
 const REASONING_TTL = 10 * 60_000
 const reasoningCache = new Map() // `provider::model` → { at, value }
 
+// 部分 OpenAI 兼容模型不接受 temperature（例如推理模型直接报 Unsupported parameter）。
+// 只记录「明确被拒过」的模型；没被拒过的模型仍照常带默认温度，不改变原行为。
+const temperatureCache = new Map() // `provider::model` → { at }
+
 export function clearReasoningCache () {
   reasoningCache.clear()
+  temperatureCache.clear()
 }
 
 function cacheReasoning (provider, model, value) {
   reasoningCache.set(`${provider}::${model}`, { at: Date.now(), value })
+}
+
+function temperatureUnsupported (provider, model) {
+  const hit = temperatureCache.get(`${provider}::${model}`)
+  if (!hit) return false
+  if (Date.now() - hit.at > REASONING_TTL) {
+    temperatureCache.delete(`${provider}::${model}`)
+    return false
+  }
+  return true
 }
 
 /**
@@ -126,25 +142,38 @@ const isUnsupportedEffort = (error) => {
   return /UNSUPPORTED_REASONING_EFFORT|does not support reasoning effort|reasoning effort/i.test(msg)
 }
 
+const isUnsupportedTemperature = (error) => {
+  const msg = String((error && (error.message || error.code)) || '')
+  return /unsupported parameter[^\n]*temperature|temperature[^\n]*(?:not supported|unsupported|does not support)/i.test(msg)
+}
+
 /** 最近一次模型一个字没写时流里有什么：排查「模型没返回内容」用。 */
 let lastEmpty = ''
 export const lastEmptyInfo = () => lastEmpty
 
-async function runStream (llm, params) {
+async function runStream (llm, params, onUsage) {
   let out = ''
   const types = {}
   let finish = ''
-  for await (const chunk of llm.stream(params)) {
-    if (!chunk) continue
-    types[chunk.type] = (types[chunk.type] || 0) + 1
-    if (chunk.type === 'finish') finish = JSON.stringify(chunk.reason || {}).slice(0, 120)
-    if (chunk.type === 'text-delta') out += chunk.text
-    if (chunk.type === 'finish' && chunk.reason && chunk.reason.kind === 'error') {
-      const f = chunk.reason.failure || {}
-      const error = new Error('模型报错：' + (f.message || f.code || '未知'))
-      if (f.code) error.code = f.code
-      throw error
+  let usage = null
+  try {
+    for await (const chunk of llm.stream(params)) {
+      if (!chunk) continue
+      types[chunk.type] = (types[chunk.type] || 0) + 1
+      // 有的适配器会分片上报用量：只留最后一次，保证「一次调用只记一行」，不会重复计费
+      if (chunk.type === 'usage') usage = chunk.usage
+      if (chunk.type === 'finish') finish = JSON.stringify(chunk.reason || {}).slice(0, 120)
+      if (chunk.type === 'text-delta') out += chunk.text
+      if (chunk.type === 'finish' && chunk.reason && chunk.reason.kind === 'error') {
+        const f = chunk.reason.failure || {}
+        const error = new Error('模型报错：' + (f.message || f.code || '未知'))
+        if (f.code) error.code = f.code
+        throw error
+      }
     }
+  } finally {
+    // 报错也已经计费了，所以在 finally 里记，且一次调用最多一行；记的是数字，不含聊天内容
+    if (usage && onUsage) { try { onUsage(usage) } catch (error) {} }
   }
   if (!out.trim()) lastEmpty = `结束原因 ${finish || '无'}，数据块 ${JSON.stringify(types)}`
   return out.trim()
@@ -176,19 +205,37 @@ export async function askModel (dsh, o) {
     system: cleanText(o.system || ''),
     messages,
     maxTokens: o.maxTokens || 600,
-    temperature: o.temperature ?? 0.3,
+    // 后台调用没有聊天会话，得自己带一个会话标识：opencode 那条路由要求请求头
+    // x-opencode-session（DSH 的 opencode-headers.js 从 options.sessionId 取），
+    // 不带就整轮 400 MissingSessionID —— 表现是「更新短期状态 / 补写人物小档案 /
+    // 空闲提炼」每分钟失败一次，聊天不受影响（聊天走的是真会话）。
+    // 固定值即可：它只用来让上游把同一来源的请求归到一条路由上。
+    sessionId: o.sessionId || 'aurabot-background',
   }
+  let temperature = o.temperature ?? 0.3
   let effort = await pickReasoningEffort(dsh, t.provider, t.model, o.reasoningEffort === undefined ? 'low' : o.reasoningEffort)
   let widened = false
+  let temperatureTried = false
+  // 记用量：模块名由调用方给（模块 API 会自动带上自己的 id），没给就算后台任务
+  const onUsage = (usage) => recordUsage({ module: moduleLabel(o.module || 'background'), model: t.model, usage })
   for (let attempt = 0; ; attempt++) {
+    const params = { ...base }
+    if (temperature !== undefined && !temperatureUnsupported(t.provider, t.model)) params.temperature = temperature
+    if (effort) params.reasoningEffort = effort
     try {
-      const out = await runStream(llm, effort ? { ...base, reasoningEffort: effort } : base)
+      const out = await runStream(llm, params, onUsage)
       // 推理模型可能把输出预算全花在思考上，一个字没写：放宽预算再试一次
       if (out || widened) return out
       widened = true
       base.maxTokens = Math.max(base.maxTokens, Math.min(4000, base.maxTokens * 3))
     } catch (error) {
       // 能力探测没查到 / 模型临时不认：去掉思考强度再来一次
+      if (!temperatureTried && temperature !== undefined && isUnsupportedTemperature(error)) {
+        temperatureTried = true
+        temperatureCache.set(`${t.provider}::${t.model}`, { at: Date.now() })
+        temperature = undefined
+        continue
+      }
       if (attempt === 0 && effort && isUnsupportedEffort(error)) {
         cacheReasoning(t.provider, t.model, null)
         effort = undefined

@@ -17,23 +17,29 @@ export default {
   setup(api) {
     const { hub, local } = api.core
     const memory = api.lazy('memory')
-    const gen = createImageGen({ getConfig: api.config, log: api.log, local })
+    const gen = createImageGen({ getConfig: api.config, log: api.log, local, dsh: api.dsh })
     const auth = gen.codexAuth
     api.onDispose?.(() => gen.dispose())
     const accountAction = (fn) => async (req) => {
       if (req?.method !== 'POST' || !/^application\/json(?:\s*;|$)/i.test(String(req.headers?.['content-type'] || ''))) return { ok: false, message: '账号操作需要 POST JSON 请求' }
       return fn(req)
     }
-    api.route('/image/codex/status', async () => ({ ok: true, ...auth.status(), login: auth.loginStatus() }))
+    api.route('/image/codex/status', async () => ({ ok: true, ...auth.status(), login: auth.loginStatus(), callback: { port: auth.callbackPort?.() || 1455, available: await auth.callbackPortUsable?.() } }))
     api.route('/image/codex/login', accountAction(async () => ({ ok: true, ...(await auth.startLogin()), ...auth.loginStatus() })))
     api.route('/image/codex/login/status', async () => ({ ok: true, ...auth.loginStatus(), ...auth.status() }))
     api.route('/image/codex/complete', accountAction(async (req) => {
       const body = await api.core.http.body(req)
       const credential = await auth.completeLogin(String(body?.input || ''))
+      // 登录状态变了：已经挂好的会话要重挂一次，工具里才能立刻用（面板直输不经过 mount）
+      try { hub.remountAll?.('ChatGPT 订阅已登录') } catch (error) { api.log.debug('重挂工具失败：', error.message) }
       return { ok: true, email: credential.email || '', accountId: credential.accountId || '' }
     }))
     api.route('/image/codex/cancel', accountAction(async () => ({ ok: true, ...auth.cancelLogin('已取消') })))
-    api.route('/image/codex/logout', accountAction(async () => ({ ok: true, ...auth.logout() })))
+    api.route('/image/codex/logout', accountAction(async () => {
+      const r = auth.logout()
+      try { hub.remountAll?.('ChatGPT 订阅已登出') } catch (error) { api.log.debug('重挂工具失败：', error.message) }
+      return { ok: true, ...r }
+    }))
 
     // 她的画作：面板底下的图库（直接读存图目录，可以单张删、开文件夹）
     api.route('/image/gallery', async (req) => {
@@ -53,7 +59,9 @@ export default {
     })
     api.route('/image/open-folder', async () => openPaintFolder())
 
-    api.tool(({ chat, sessionId }) => (gen.enabled() && chat.kind !== 'system' ? defineTool({
+    // 生图模块开着就把工具挂上；「没开启 / 没填地址 / Codex 没登录」在执行时再如实提示。
+    // 不能按登录状态决定挂不挂：Codex 订阅常是「先开会话、后登录」，那样工具会缺失（unknown tool）。
+    api.tool(({ chat, sessionId }) => ((api.config().imageGen.enabled && chat.kind !== 'system') ? defineTool({
       name: 'qq_draw_image',
       description: '画一张图并发到当前 QQ 聊天里。prompt 详细描述画面；可以用 image 参考当前聊天最近收到的图（last）、引用消息里的图（quote）或自己画作的文件名来改画；shape 可按用途选择方图、竖图、横图或宽幅；不填就沿用面板默认构图 / 图片尺寸。画好会直接发出去，并给你一个画作编号（换头像、收成表情时用这个编号）。回复里简单说一句就行。',
       properties: {
@@ -66,13 +74,20 @@ export default {
       // 能看图时把原图放进工具结果（image 块），她当轮就能看见自己画了什么
       render: drawResultBlocks,
       execute: async ({ prompt, shape, image }) => {
-        if (api.config().imageGen.ownerOnly && !hub.turnSendersAllOwner(sessionId)) return { ok: false, message: '画图只给主人画哦' }
-        if (image && api.config().imageGen.img2img === false) return { ok: false, message: '参考图功能已关闭' }
+        const cfg = api.config()
+        if (cfg.imageGen.ownerOnly && !hub.turnSendersAllOwner(sessionId)) return { ok: false, message: '画图只给主人画哦' }
+        // 工具常驻，真正能不能画在执行时判断（Codex 登录状态可能刚变过）
+        if (!gen.enabled()) return { ok: false, message: gen.notReadyReason() || '生图还没配置好' }
+        if (image && cfg.imageGen.img2img === false) return { ok: false, message: '参考图功能已关闭' }
         const startedAt = Date.now()
         const reference = await resolveDrawImage(image, { hub, chat })
         const buf = await gen.generate(String(prompt || ''), { shape, image: reference })
         const sent = await hub.sendSegments(chat.chatId, [{ type: 'image', data: { file: 'base64://' + buf.toString('base64') } }], `[生图] ${String(prompt).slice(0, 30)}`)
-        if (!sent) return { ok: false, message: '画好了，但没有发到 QQ（请检查试运行和网关）' }
+        // 调试 / 试运行下本来就不真发（sendSegments 只记日志、返回 null）：
+        // 这一轮仍算画好了 —— 存盘、给编号、能看图，只是 QQ 里收不到；不能当失败。
+        // 只有 null 才是“试运行/调试拦下”；明确的 false 仍按发送失败处理。
+        const simulated = sent === null && Boolean(cfg.debug || cfg.dryRun)
+        if (!sent && !simulated) return { ok: false, message: '画好了，但没有发到 QQ（请检查网关）' }
         const saved = savePainting(buf, String(prompt || ''))
         if (saved) api.log.debug(`生图已存盘：${saved}`)
         try { memory.addEvent?.({ text: reference ? `参考了一张图画了：${String(prompt).slice(0, 120)}（提示词不一定等于实际画面）` : `按提示词画了一张图（不一定等于实际画面）：${String(prompt).slice(0, 120)}`, about: chat.kind === 'private' ? chat.userId : '', tags: ['画画'], importance: 0.4 }) }
@@ -109,6 +124,7 @@ export default {
         }
         if (img) out.image = img
         if (index && saved) out.message += `\n画作编号 #${index}（想换头像、收成表情时用这个编号）`
+        if (simulated) out.message += '\n（试运行/调试：这张图没真发到 QQ，只在本地存下了）'
         // 只有**图真的交给模型了**才把本地路径告诉她（#59）：收录表情包 / 存素材 / qq_add_sticker 用；
         // 看不了图或开关关着时不给路径，免得她知道路径就去读图，绕开「不给看」的判断。
         if (shown && saved) out.message += `\n已保存到本机：${saved}（要收录表情包、存素材时可以用这个路径）`

@@ -186,3 +186,39 @@ test('syncHistory：并发调用共用同一次对账', async () => {
   await Promise.all([a, b])
   assert.equal(calls.length, 1)
 })
+
+test('tick：日记失败不吞档，先重试、成功后才记 done', async () => {
+  const d = new Date()
+  const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+  writeJson(dataDir('diary.json'), { plan: { day, times: [0], done: [] }, history: [] })
+  let calls = 0
+  const hub = {
+    chatLogOf: () => [],
+    async runSystemTurn() {
+      calls++
+      if (calls === 1) throw new Error('这一轮没正常结束：error')
+      return '今天吃了白米饭，很开心。'
+    },
+  }
+  const cfg = { enabled: true, dryRun: false, diary: { enabled: true, visibility: 'all', minChars: 8, maxChars: 60, attachImage: false } }
+  const onebot = mockOnebot([{ tid: 't1' }])
+  const qzone = createQzone({ getConfig: () => cfg, onebot, hub, log: noopLog })
+
+  await qzone.tick()
+  let saved = readJson(dataDir('diary.json'), () => ({}))
+  assert.deepEqual(saved.plan.done, [], '失败不能把这一档标记成已完成')
+  assert.equal(saved.plan.retry[0].count, 1, '安排了一次重试')
+
+  // 还没到重试时间：不应该再调模型
+  await qzone.tick()
+  assert.equal(calls, 1)
+
+  // 模拟 2 分钟到了
+  saved.plan.retry[0].at = Date.now() - 1000
+  writeJson(dataDir('diary.json'), saved)
+  await qzone.tick()
+  saved = readJson(dataDir('diary.json'), () => ({}))
+  assert.deepEqual(saved.plan.done, [0], '成功后才记 done')
+  assert.equal(saved.plan.retry[0], undefined)
+  assert.equal(calls, 2)
+})

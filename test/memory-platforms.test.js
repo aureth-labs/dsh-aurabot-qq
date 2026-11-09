@@ -16,7 +16,7 @@ function setup(t) {
   const dir = mkdtempSync(join(tmpdir(), 'aurabot-platform-memory-'))
   const previous = process.env.AURABOT_DATA_DIR
   process.env.AURABOT_DATA_DIR = dir
-  const cfg = normalize({ ownerQQ: OWNER, ownerName: '主人', model: { provider: 'p', model: 'm' }, memory: { keepChatlogDays: 0, keepChatlogSet: true } })
+  const cfg = normalize({ ownerQQ: OWNER, ownerName: '主人', allow: { private: [OTHER] }, model: { provider: 'p', model: 'm' }, memory: { keepChatlogDays: 0, keepChatlogSet: true } })
   const calls = []
   const dsh = { get: () => null, llm: { async *stream({ system, messages }) {
     calls.push({ system, text: messages[0].content[0].text })

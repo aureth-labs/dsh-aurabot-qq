@@ -38,17 +38,23 @@
   "files": [
     "src",
     "client",
+    "models",
     "personas",
     "assets",
     "cordis.patch.yml",
     "README.md",
     "docs/USER-MANUAL.md",
     "docs/MODULE-TUTORIAL.md",
+    "docs/EMBEDDING.md",
+    "docs/SILICONFLOW.md",
     "LICENSE",
     "CHANGELOG.md",
     "README_EN.md",
     "docs/DESIGN.md"
   ],
+  "optionalDependencies": {
+    "onnxruntime-node": "^1.20.0"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/aureth-labs/dsh-aurabot-qq.git"

@@ -23,6 +23,21 @@ test('clockOf：秒数转 mm:ss', () => {
   assert.equal(clockOf(-3), '0:00')
 })
 
+test('panelPage：limit/offset 不重不漏，默认一页 25', () => {
+  freshDir()
+  const store = createShotStore()
+  for (let i = 0; i < 3; i++) store.put(Buffer.from('shot-' + i), { title: 'T' + i, sec: i })
+  const p1 = store.panelPage({ limit: 2, offset: 0 })
+  const p2 = store.panelPage({ limit: 2, offset: 2 })
+  assert.equal(p1.total, 3)
+  assert.equal(p1.items.length, 2)
+  assert.equal(p1.hasMore, true)
+  assert.equal(p2.items.length, 1)
+  assert.equal(p2.hasMore, false)
+  assert.deepEqual([...p1.items, ...p2.items].map((x) => x.file), store.list('').map((x) => x.file))
+  assert.equal(store.panelPage().items.length, 3, '默认 limit 25 能装下 3 张')
+})
+
 test('pickShot：空库返回 null，空查询给最近一张', () => {
   assert.equal(pickShot([], ''), null)
   const items = [

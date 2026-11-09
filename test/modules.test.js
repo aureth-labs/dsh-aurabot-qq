@@ -229,6 +229,21 @@ test('复制 B 站模块：抽帧 / 截图库文件一起复制，用户模块�
     const shots = (await fake.call('/bili/shots')).json()
     assert.equal(shots.ok, true)
     assert.deepEqual(shots.items, [])
+    // 旧用户模块和内置模块共用同一图库索引；切换来源不能删除旧源码或截图。
+    const shotDir = join(dataDir, 'bili-shots')
+    mkdirSync(shotDir, { recursive: true })
+    const legacyShot = { file: '0123456789ab.jpg', md5: '0123456789ab', at: Date.now(), sec: 12, title: '旧截图', bvid: 'BV1aaaaaaaaa', bytes: 3 }
+    writeFileSync(join(shotDir, legacyShot.file), 'old')
+    writeFileSync(join(shotDir, 'index.json'), JSON.stringify({ items: [legacyShot] }))
+    await fake.call('/save', { modules: { bili: { useBuiltin: true } } })
+    await until(async () => (await mod('bili')).running === 'builtin')
+    assert.equal(existsSync(join(modDir('bili'), 'index.mjs')), true, '旧用户模块保留为回退入口')
+    const migrated = (await fake.call('/bili/shots')).json()
+    assert.equal(migrated.items[0].file, legacyShot.file)
+    assert.equal(readFileSync(join(shotDir, legacyShot.file), 'utf8'), 'old')
+    const preview = await fake.call('/bili/shot/image?file=' + legacyShot.file)
+    assert.equal(preview.status, 200)
+    assert.equal(preview.raw().toString(), 'old')
   } finally {
     await fake.call('/save', { modules: { bili: { enabled: false } } })
   }
@@ -358,6 +373,19 @@ test('模拟测试：消息、命令、她的回复都走一遍模块，但不�
   assert.equal(t.result.ok, true)
   assert.equal(mock.calls.filter((x) => /^send_/.test(x.action)).length, mock.calls.slice(0, before).filter((x) => /^send_/.test(x.action)).length, '没有真的发消息')
   assert.ok(existsSync(join(dataDir, 'modules', 'aurabot.d.ts')), '类型提示放好了')
+})
+
+test('模拟测试不写真实聊天流水：不会凭空产生 10001 人物记忆', async () => {
+  const rows = () => {
+    const dir = join(dataDir, 'chatlog')
+    if (!existsSync(dir)) return []
+    return readdirSync(dir).filter((name) => name.endsWith('.jsonl')).flatMap((name) =>
+      readFileSync(join(dir, name), 'utf8').split('\n').filter((line) => line.includes('private:10001')))
+  }
+  assert.deepEqual(rows(), [], '测试开始前不应有 10001 流水')
+  await fake.call('/modules/simulate', { as: 'other', kind: 'private', text: 'ping', reply: '在呢' })
+  await sleep(80)
+  assert.deepEqual(rows(), [], '模拟测试不能写进真实聊天流水')
 })
 
 test('只看 API.md 从零写出来的模块（查天气）能直接加载：命令、工具、设置都挂上了', async () => {

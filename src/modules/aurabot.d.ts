@@ -99,6 +99,67 @@ export interface Logger {
 
 export type Off = () => void
 
+/** 同一人物、同一聊天的原话；assistant 不是用户事实。 */
+export interface ConversationMessage {
+  id: string
+  role: 'user' | 'assistant'
+  text: string
+  speakerId: string
+  /** Unix milliseconds */
+  at: number
+  /** 原文进入本轮的时间；忘记请求也过滤仍在生成的旧上下文回复。 */
+  contextAt?: number
+}
+
+/** 已落盘的聊天流水；与现有每日 JSONL 使用同一结构。 */
+export interface ChatLogRow {
+  t: number
+  chatId: string
+  who: string
+  text: string
+  uid?: string
+  via?: string
+  interaction?: string[]
+  forgottenAt?: number
+  /** 仅实时通知携带，不写入流水，用于来源端去重。 */
+  originId?: string
+  [key: string]: any
+}
+
+export interface OwnerMessageOptions {
+  text?: string
+  image?: Buffer
+  /** PCM WAV；按现有 ASR 配置识别。 */
+  wav?: Buffer
+  /** 外部来源标签，最多 40 字；不改变聊天与记忆归属。 */
+  via?: string
+  /** 来源端的不透明标记，只进入实时通知。 */
+  originId?: string
+  /** 同步鉴权检查；入口、媒体准备完成、模型投递前都会调用，撤销时应抛错。 */
+  assertAuthorized?: () => unknown
+}
+
+export interface ChatHub {
+  [key: string]: any
+  sessions(): Record<string, { sessionId: string; title?: string; [key: string]: any }>
+  chatLogDays(): string[]
+  chatLogOf(day: string): ChatLogRow[]
+  /** 仅供已经验证主人身份的模块使用；仅接收已有且开放的 private/group 会话。 */
+  receiveOwnerMessage(chatId: string, options?: OwnerMessageOptions): Promise<{ ok: true }>
+}
+
+export interface MediaAccess {
+  mimeOf(bytes: Buffer): string
+  /** 当前自定义头像，缺省使用插件默认头像；不返回文件路径。 */
+  avatar(): { bytes: Buffer; type: string } | null
+  /** 按当前运行的表情库精确匹配 md5；不存在或不是图片时返回 null。 */
+  sticker(md5: string): { bytes: Buffer; type: string } | null
+  /** 使用现有 ffmpeg 配置和本机探测；无可用程序时为空。 */
+  ffmpegPath(): string
+  parseWav(bytes: Buffer): { rate: number; channels: number; data: Buffer }
+  toMono16k(bytes: Buffer): Buffer
+}
+
 /** 事件 → 监听函数的样子。返回值的意义见 API.md「事件」。 */
 export interface Events {
   /** 返回 true = 接管这条消息，她不再处理 */
@@ -112,7 +173,7 @@ export interface Events {
   /** 群里这条消息她回不回：返回对象覆盖决定，比如 { reply: true, mode: 'must' }（返回 null 无效，等于不改） */
   'group/decide': (decision: GroupDecision, info: { msg: Message; policy: any; recentTexts: string[]; memScore: number }) => Partial<GroupDecision> | void | Promise<Partial<GroupDecision> | void>
   /** 交给她的内容（[{ type: 'text', text }, { type: 'image', ... }]）：返回新数组改写，null 这次不交给她 */
-  prompt: (content: any[], info: { chat: Chat; senderId: string; queryText?: string }) => any[] | null | void | Promise<any[] | null | void>
+  prompt: (content: any[], info: { chat: Chat; senderId: string; queryText?: string; sessionId: string; prevText: string; recentMessages: ConversationMessage[] }) => any[] | null | void | Promise<any[] | null | void>
   /** 这个聊天用哪个模型（同步）：返回 { provider, model, reasoningEffort } */
   model: (selection: ModelSelection | null, chat: Chat) => ModelSelection | void
   /** 她的人格全文（同步）：返回新文字改写 */
@@ -123,6 +184,8 @@ export interface Events {
   poke: (event: any) => boolean | void | Promise<boolean | void>
   /** 收到的消息 / 她发出去的话（只看） */
   activity: (a: { kind: 'in' | 'out'; chatId: ChatId; userId?: string; nickname?: string; text?: string; reply?: string; direct?: boolean; owner?: boolean }) => void
+  /** 每条成功落盘后的流水快照；只看不改，调试模式不产生此事件。 */
+  'chat/log': (row: ChatLogRow) => void
   /** 所有原始 OneBot 事件（只看，不管白名单） */
   onebot: (event: any) => void
   'onebot/state': (state: string) => void
@@ -136,6 +199,12 @@ export interface Events {
 /** 平台是工具；确认平台账号对应的 QQ 后，才能写入和读取同一份私聊记忆。 */
 export interface MemoryModule {
   [key: string]: any
+  /** 不再记住由 profiles[qq].noMemory 控制；主人始终返回 true。 */
+  remembers(qq: string | number): boolean
+  /** 从直接互动流水、QQ 好友和个人白名单识别是否有交集。 */
+  isAcquainted(qq: string | number): boolean
+  deletePerson(qq: string | number, options?: { keepNoMemory?: boolean }): { ok: boolean; message: string; marked?: number }
+  setNoMemory(qq: string | number, enabled: boolean, options?: { deleteExisting?: boolean }): { ok: boolean; message: string }
   /** 外部视频、帖子、网页用 seen；省略 kind 仍是原有做过的事。source 固定 event，仍存 items。
    * seen 不作为事实、画像或相处经验来源，也不挂到 about 人物名下。 */
   addEvent(args: {
@@ -199,7 +268,8 @@ export interface Api {
   command(c: Command): Off
   every(ms: number, fn: () => any, label?: string): Off
   later(ms: number, fn: () => any): Off
-  route(path: string, handler: (req: any, res: any) => any): Off
+  /** access: panel 使模块管理路由复用宿主回环/可信代理、Host 与 CSRF 闸。 */
+  route(path: string, handler: (req: any, res: any) => any, options?: { access?: 'panel' }): Off
   onDispose(fn: () => void): Off
 
   // ---- 别的模块和插件内部 ----
@@ -208,7 +278,8 @@ export interface Api {
   lazy<T = any>(id: string): Partial<T>
   has(id: string): boolean
   core: {
-    hub: any
+    hub: ChatHub
+    media: MediaAccess
     onebot: { call(action: string, params?: any, opts?: any): Promise<any>; state: string }
     snowluma: any
     local: any

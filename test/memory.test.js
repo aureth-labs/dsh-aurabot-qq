@@ -53,7 +53,7 @@ before(async () => {
   process.env.AURABOT_DATA_DIR = mkdtempSync(join(tmpdir(), 'aurabot-mem-'))
   ;({ createMemoryStore } = await import('../src/features/memory.js'))
   ;({ normalize } = await import('../src/core/config.js'))
-  cfg = normalize({ model: { provider: 'p', model: 'm' }, ownerQQ: '10000001', ownerName: '主人', memory: { keepChatlogDays: 0, keepChatlogSet: true } })
+  cfg = normalize({ model: { provider: 'p', model: 'm' }, ownerQQ: '10000001', ownerName: '主人', allow: { private: ['30000003'] }, memory: { keepChatlogDays: 0, keepChatlogSet: true } })
   mem = createMemoryStore({ dsh, getConfig: () => cfg, hub, log: { info() {}, warn() {}, debug() {} } })
 })
 
@@ -161,7 +161,8 @@ test('想起来的记忆带时间；最近想起了什么有记录（含想不�
   mem.add({ text: '阿花最近爱晒太阳', about: '30000003', aboutName: '阿花', importance: 0.6, source: 'tool', chatId: 'private:30000003' })
   hubState.text = '阿花最近怎么样'
   const hint = mem.recallHint({ kind: 'private', userId: '30000003', chatId: 'private:30000003' }, '阿花最近怎么样')
-  assert.ok(hint.includes('[今天 私聊] [阿花(30000003)] 阿花'), hint)
+  // 来源现在带私聊 QQ，继续检查日期、来源和人物，避免混淆不同聊天。
+  assert.ok(hint.includes('[今天 私聊30000003] [阿花(30000003)] 阿花'), hint)
   const log = mem.recalls()[0]
   assert.equal(log.where, 'private:30000003')
   assert.ok(log.hits.length && log.hits[0].why.length)
@@ -254,7 +255,14 @@ test('相关记忆提示有长度上限（#79：上下文增长优化）', () =>
   for (let i = 0; i < 20; i++) mem.add({ text: '测试记忆第' + i + '条，内容是阿花喜欢的东西和周末计划', about: '30000003', aboutName: '阿花', importance: 0.5, source: 'tool', chatId: 'group:555' })
   hubState.speakers = ['30000003']
   const hint = mem.recallHint({ kind: 'group', groupId: '555', chatId: 'group:555' }, '阿花喜欢什么 周末计划')
-  assert.ok(hint.length > 0 && hint.length <= 350, 'hint 长度 ' + hint.length)
+  // 上限是**动态预算**：条数 × 75 字（+40 余量），夹在 280~600 字之间，外加 56 字引导语
+  // 和 50 字余量。默认「直接 6 + 联想 3」时最坏约 600+56+50 字。
+  // 关键意图不变：**必须有上限**，不能因为条数可调就无限制撑爆上下文。
+  const bodyCap = 600
+  assert.ok(hint.length > 0 && hint.length <= bodyCap + 120, 'hint 长度 ' + hint.length)
+  // 真的按条数增长，而不是永远只有 4 条
+  const body = hint.slice(hint.indexOf('：') + 1, hint.lastIndexOf('）'))
+  assert.ok(body.split('；').length >= 2, '至少给出多条')
   hubState.speakers = []
 })
 
@@ -265,7 +273,7 @@ test('主人私聊群聊摘要：默认关，不会把群聊流水补进私聊',
   logs.set(day(new Date()), [groupLog('777', '小明', '今晚开黑打本', Date.now() - 60_000)])
   cfg.ownerQQ = '10000001'
   cfg.group.ownerBrief.enabled = false
-  assert.equal(normalize({}).group.ownerBrief.enabled, false, '配置默认关')
+  assert.equal(normalize({}).group.ownerBrief.enabled, true, '本地默认开'); assert.equal(normalize({}).group.ownerBrief.lines, 24, '本地默认 24 行')
   const hint = mem.recallHint({ kind: 'private', userId: '10000001', chatId: 'private:10000001' }, '群里今晚在聊什么')
   assert.doesNotMatch(hint, /群「测试群」/)
 })
@@ -341,5 +349,30 @@ test('提炼：带每句话的时间，说话时间进记忆，去重不改它',
   mem.add({ text: m.text + '了', about: m.about, source: 'tool' })
   assert.equal(mem.list('').find((x) => x.id === m.id).saidAt, yesterday.getTime())
   mem.remove(m.id)
+})
+
+test('memory page: limit/offset 不重不漏，total/hasMore 正确', () => {
+  const all = mem.list('')
+  assert.ok(all.length >= 3, '前置数据够分页')
+  const p1 = mem.page('', { limit: 2, offset: 0 })
+  const p2 = mem.page('', { limit: 2, offset: 2 })
+  assert.equal(p1.total, all.length)
+  assert.equal(p1.items.length, 2)
+  assert.equal(p1.hasMore, true)
+  assert.deepEqual([...p1.items, ...p2.items].map((x) => x.id), all.slice(0, 4).map((x) => x.id))
+  const last = mem.page('', { limit: 2, offset: all.length - 1 })
+  assert.equal(last.items.length, 1)
+  assert.equal(last.hasMore, false)
+})
+
+test('persona notes 分页：首屏最多 20，offset 能接着取', () => {
+  const person = mem.personaOverview().find((p) => mem.personaNotes(p.qq, { limit: 1, offset: 0 })?.total > 1)
+  if (!person) return
+  const first = mem.personaPerson(person.qq)
+  assert.ok(first.notes.length <= 20)
+  assert.equal(first.notesTotal, mem.personaNotes(person.qq, { limit: 100, offset: 0 }).total)
+  const next = mem.personaNotes(person.qq, { limit: 1, offset: 1 })
+  assert.equal(next.list.length, 1)
+  assert.equal(next.total, first.notesTotal)
 })
 

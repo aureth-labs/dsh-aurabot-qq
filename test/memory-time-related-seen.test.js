@@ -305,5 +305,5 @@ test('面板脚本可解析，人物详情显示时间段和相关事实，时�
   assert.match(source, /m\.relatedItems/)
   assert.match(source, /筛选经历类型/)
   assert.match(source, /筛选平台/)
-  assert.match(source, /get\('\/memory\/timeline'\)/)
+  assert.match(source, /getCached\('\/memory\/timeline\?/)
 })
