@@ -23,17 +23,38 @@ export function checkAllowed(cfg, msg) {
     : { allowed: false, reason: '不在群白名单' }
 }
 
-/** 这个会话用哪一档权限。群聊永远不超过 social。 */
+/** 群聊里给不给本机工具：off = 不给；owner = 只有主人说话那一轮给。
+ * 没有「谁问都给」这一档——群里任何人都能驱动本机读写，权限面太大，明确不做。 */
+export const GROUP_OWNER_TOOLS = ['off', 'owner']
+
+/**
+ * 这个群当前该给哪一档。ownerToolsGroups 非空时只在列出的群里生效（留空 = 所有群）。
+ * @returns {'off'|'owner'}
+ */
+export function groupOwnerTools(cfg, chat) {
+  if (!chat || chat.kind !== 'group') return 'off'
+  const mode = cfg?.group?.ownerTools
+  if (mode !== 'owner') return 'off'
+  const list = (cfg?.group?.ownerToolsGroups || []).map(String).filter(Boolean)
+  if (list.length && !list.includes(String(chat.groupId || ''))) return 'off'
+  return mode
+}
+
+/** 这个会话用哪一档权限。群聊默认不超过 social，除非主人给这个群开了本机工具。 */
 export function levelFor(cfg, chat) {
   const owner = String(cfg.ownerQQ || '')
   if (chat.kind === 'private' && chat.userId === owner) {
     return LEVELS.includes(cfg.ownerLevel) ? cfg.ownerLevel : 'full'
   }
+  // group-full 不叫 full：插件自己的工具还要按 social 语义挂（模块里到处是 level === 'full' 判主人私聊），
+  // 真正的开关由 hub 按这一轮说话的人做（tools.restrict 收走核心工具）。
+  if (chat.kind === 'group' && groupOwnerTools(cfg, chat) !== 'off') return 'group-full'
   return 'social'
 }
 
 /** 档位 → agent preset id。 */
 export function presetFor(level, cfg) {
+  if (level === 'group-full') return 'aurabot-group-owner'
   if (level !== 'full') return 'aurabot-social'
   return cfg && cfg.longTasks ? 'aurabot-private-long' : 'aurabot-private'
 }

@@ -229,6 +229,10 @@ QQ 交流群：安装踩坑、用法讨论、想法都在这（提问尽量带�
   </picture>
 </a>
 
+## 💖 赞助
+
+Aurabot 完全开源免费。如果她陪你聊得开心，可以在 [爱发电](https://afdian.com/a/aureth_lab) 支持一下，赞助会用在模型调用、测试设备和服务器上。
+
 ## 📄 License & 致谢
 
 [MIT](LICENSE)

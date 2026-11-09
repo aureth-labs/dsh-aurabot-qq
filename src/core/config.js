@@ -90,7 +90,7 @@ export const DEFAULTS = {
   },
   persona: { current: 'dafeiyu' },
   // 主人私聊里问起群里的事：把最近 24 小时的群聊流水补进这一轮（默认关，开启前先把群加进白名单）
-  group: { ...DEFAULT_GROUP_POLICY, overrides: {}, ownerBrief: { enabled: true, lines: 24, groups: [] } },
+  group: { ...DEFAULT_GROUP_POLICY, overrides: {}, ownerTools: 'off', ownerToolsGroups: [], ownerBrief: { enabled: true, lines: 24, groups: [] } },
   // 按群头衔不回：勾选的群里，专属头衔正好是 title 的成员（一般是别的机器人）说话、戳她都不理。没勾群就不起作用
   titleFilter: { enabled: true, groups: [], title: '大肥鱼' },
   voice: {
@@ -515,6 +515,9 @@ export function normalize(raw) {
   g.ownerBrief.enabled = bool(g.ownerBrief.enabled, true)
   g.ownerBrief.lines = num(g.ownerBrief.lines, 24, 1, 30)
   g.ownerBrief.groups = qqList(g.ownerBrief.groups)
+  // 群聊里的本机工具：默认关；只有明确写了 owner 才开（all 已移除，写 all 也按 off 处理）
+  g.ownerTools = g.ownerTools === 'owner' ? 'owner' : 'off'
+  g.ownerToolsGroups = qqList(g.ownerToolsGroups)
   c.voice.autoChance = num(c.voice.autoChance, 0.15, 0, 1)
   c.voice.autoMaxChars = num(c.voice.autoMaxChars, 80, 1, BIG)
   c.voice.emojiSeparate = c.voice.emojiSeparate !== false
