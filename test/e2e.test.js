@@ -175,7 +175,7 @@ test('主人私聊「在吗」：建会话（完整权限 preset）、按 ||| �
   const turn = fake.turns.at(-1)
   assert.equal(turn.preset, 'aurabot-private-long')
   assert.ok(mock.sent('set_input_status').some((c) => c.params.user_id === Number(OWNER) && c.params.event_type === 1), '等回复时显示正在输入')
-  assert.match(turn.userText, /^【私聊】xiaoming\(10000001\)：在吗/)
+  assert.match(turn.userText, /^【私聊】(\[\d{2}:\d{2}\] |昨天 \d{2}:\d{2} |\d{2}-\d{2} \d{2}:\d{2} )?xiaoming\(10000001\)：在吗/)
   const ws = fake.workspaces[0]
   assert.ok(ws && ws.sessionIds.length === 1, '会话放进了 Aurabot 工作区')
   // 主人私聊的会话里有完整工具

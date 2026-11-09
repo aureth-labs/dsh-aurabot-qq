@@ -2,6 +2,7 @@
 
 import { readFileSync } from 'node:fs'
 import { createBili } from '../../bili/duty.js'
+import { createGroupShare } from '../../bili/group-share.js'
 import { defineTool, str } from '../../tools/tools.js'
 import { permOf, profileToolVisible, profilePermits } from '../../chat/access.js'
 import { avatarSource } from '../profile/index.js'
@@ -17,19 +18,28 @@ export default {
   version: '1.1.0',
   description: '看别人发的 B 站视频；定时自己刷、评论、回评论；可选发弹幕；抽帧看画面、发截图；按权限改自己的头像 / 签名（bili_watch / bili_comment / bili_danmaku / qq_send_shot / bili_set_avatar / bili_set_sign）',
   tab: 'bili',
-  files: ['bili/duty.js', 'bili/api.js', 'bili/vision.js', 'bili/shots.js', 'bili/danmaku.js', 'bili/login-pause.js', 'bili/qr-login.js'],
+  files: ['bili/duty.js', 'bili/group-share.js', 'bili/api.js', 'bili/vision.js', 'bili/shots.js', 'bili/danmaku.js', 'bili/login-pause.js', 'bili/qr-login.js'],
   setup(api) {
     const { hub } = api.core
     const lastImage = new Map() // chatId → 最近一张图的网址（给 bili_set_avatar 的 last 用）
+    // 想发到群里的视频先攒成待批，主人在私聊里回「发 1」才真发
+    const groupShare = createGroupShare({
+      getConfig: api.config, hub, log: api.log,
+      // 截图库和「补一张」都在 createBili 里：用闭包延迟取，建完之后才真的被调用
+      shotPathOf: (name) => bili.shotFileOf(name),
+      captureShot: (bvid) => bili.captureShot(bvid),
+      // 群名：缓存命中直接用，没命中由 hub 走一次 get_group_info（拿不到就退回群号）
+      groupNameOf: (gid) => hub.groupName(gid),
+    })
     api.on('message', (msg) => {
       const url = (msg.images || []).slice(-1)[0]?.data?.url
       if (url && /^https?:\/\//i.test(url)) lastImage.set(msg.chatId, url)
-      return false
+      return groupShare.handleReply(msg.chatId, msg.userId, msg.text)
     })
     const danmaku = createDanmaku(api)
     const bili = createBili({
       getConfig: api.config, hub, memory: api.lazy('memory'), log: api.log, dsh: api.dsh,
-      afterBrowse: danmaku.afterBrowse,
+      afterBrowse: danmaku.afterBrowse, groupShare,
     })
     api.every(60_000, () => (api.core.onebot?.state && api.core.onebot.state !== 'connected' ? undefined : bili.tick()), '刷B站')
 

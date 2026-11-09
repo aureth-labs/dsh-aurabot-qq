@@ -235,6 +235,7 @@ api.on('reply/items', (items) => [...items, { kind: 'text', value: '—— 大�
 | 你自己 `api.emit` 的 | 随你 | 模块之间互相通知 |
 
 `chat/log` 跟随原流水的记账边界：正常模型回复和 `api.send()` 由 `hub.deliver()` 统一记账；底层 `sendText()` / `sendSegments()` 仅负责发送，不自动新增流水或此事件。分条、语音等出口不另行重复记账。验证回复通知时，应走 `deliver()` 并核对实际发送与落盘记录。
+唯一的显式例外：`sendText()` / `sendImage()` 传 `opts.proactive = true`（可带 `proactiveCause` 标明来路）时，**真发出去之后**补一条带 `proactive` 标记的流水，用于「别处说过」桥接和重启后回捞。这是调用方主动要求记流水，不是底层自动记账；不发、试运行、补发队列里都不记。
 
 `msg` 长这样（`text` 是纯文字：@ 她的那段去掉了，@ 别人的写成「@昵称」，图片 / 表情 / 文件写成「[图片]」这类占位；引用的那条消息的文字**不在**里面，要的话用 `replyId` 去 `api.onebot('get_msg', { message_id })` 拿）：
 

@@ -14,6 +14,32 @@ import { stripHtmlFragments } from './html-fragments.js'
 
 export const SILENCE = '[沉默]'
 
+// 提示词里每条消息前挂的时刻，统一按东八区。
+// 拼进正文是为了让她判断「多久以前」——提示词里只有每轮开头的「当前时间」，
+// 消息体本身原来不带时刻，跨几轮就容易把十几分钟前的事说成「昨天」。
+// 只给 HH:MM 跨天会失真（23:50 与次日 00:10 看起来像同一段时间倒着走），
+// 所以 clockLabel 在跨天时补上日期：当天 `21:34`、前一天 `昨天 21:34`、更早 `11-07 21:34`。
+const CLOCK = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hour12: false })
+// 用完整日期再裁出 MM-DD，比单取月/日稳妥：sv-SE 单独取月日会给出 06/11（日在前）
+const DAY = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' })
+
+export function clockAt(at = Date.now()) {
+  const t = Number(at)
+  return CLOCK.format(new Date(Number.isFinite(t) && t > 0 ? t : Date.now()))
+}
+
+/** 当天只给时刻，跨天补日期：`21:34` / `昨天 21:34` / `11-06 21:34` / `2025-12-31 23:59`。 */
+export function clockLabel(at, now = Date.now()) {
+  const t = Number(at)
+  const then = new Date(Number.isFinite(t) && t > 0 ? t : now)
+  const cur = new Date(now)
+  const day = DAY.format(then)
+  if (day === DAY.format(cur)) return clockAt(then.getTime())
+  if (day === DAY.format(new Date(cur.getTime() - 86400000))) return `昨天 ${clockAt(then.getTime())}`
+  const sameYear = day.slice(0, 4) === DAY.format(cur).slice(0, 4)
+  return `${sameYear ? '' : day.slice(0, 4) + '-'}${day.slice(5)} ${clockAt(then.getTime())}`
+}
+
 /** 去掉 Markdown 痕迹，保留文字本身。 */
 export function stripMarkdown(text) {
   return String(text || '')
