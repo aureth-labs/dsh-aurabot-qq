@@ -10,13 +10,17 @@ import { FACE_EXAMPLES } from '../chat/faces.js'
 
 const BUNDLED = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'personas')
 const dir = () => dataDir('personas')
+/** 种过一次就不再种：用户在面板里删掉的自带人格不该被悄悄放回来。 */
+const seededFile = () => join(dir(), '.seeded')
 
 export function seedPersonas() {
   try {
     mkdirSync(dir(), { recursive: true })
+    if (existsSync(seededFile())) return
     for (const n of readdirSync(BUNDLED)) {
       if (n.endsWith('.md') && !existsSync(join(dir(), n))) copyFileSync(join(BUNDLED, n), join(dir(), n))
     }
+    writeFileSync(seededFile(), new Date().toISOString(), 'utf8')
   } catch (error) {
     // 数据目录可能是只读的（例如 DSH 的 ACL 沙盒）：继续用插件自带人格，不能因此让整个插件挂载失败。
   }
@@ -86,10 +90,38 @@ export function currentPersonaText(currentId) {
 
 /** Aurabot 自己的规则（输出格式、安全边界），拼在人格后面。 */
 /**
+ * 表情包在提示词里的那几行（面板「常驻提示」的四档）。
+ * skill = 只教怎么写（最省）；hint = 再加一句「什么时候该发」；index = 再列一份精简清单；
+ * off = 一个字都不写（工具还在，需要时她自己会调）。
+ * stickers 传进来的是 store.usable()（已经按黑名单 / 停用过滤过的），没传就只给前两档。
+ */
+export function stickerRuleLines(cfg, off = new Set(), stickers = null) {
+  const s = cfg.stickers || {}
+  if (off.has('stickers') || s.enabled === false) return []
+  const mode = ['skill', 'hint', 'index', 'off'].includes(s.promptMode) ? s.promptMode : 'skill'
+  if (mode === 'off') return []
+  const lines = ['- 想发表情包，写 <sticker:标签>（标签可以是 开心、卖萌、生气、委屈、无语、嘲讽、疑惑、早晚安，或你记得的表情名字；也可以直接写一句用在什么时候的话）。']
+  if (mode === 'hint' || mode === 'index') {
+    lines.push('- 表情是加分项不是标点：一句话说完、对方情绪到了、或者你想撒个娇吐槽一下的时候配一张，别每句都配。')
+  }
+  if (mode === 'index') {
+    const limit = Math.max(0, Math.round(Number(s.indexLimit) || 0))
+    const list = Array.isArray(stickers) ? stickers : []
+    if (limit > 0 && list.length) {
+      const pickList = list.slice(0, limit)
+      lines.push(`- 现在能发的表情（名｜标签）：\n${pickList.map((it) => `${it.name || '未命名'}${(it.tags || []).length ? '｜' + (it.tags || []).slice(0, 3).join('/') : ''}`).join('\n')}`)
+      if (list.length > limit) lines.push(`- 上面只列了 ${limit} 张（一共 ${list.length} 张能用），想要别的用 sticker_find 按意思找。`)
+    }
+  }
+  return lines
+}
+
+/**
  * opts.off：没在运行的内置模块（关了或被替换了），对应的本事就不告诉她
  * opts.extra：扩展模块补充的规则（每条一行）
+ * opts.stickers：能用的表情清单（index 模式列出来用）
  */
-export function rulesText(kind, cfg, { off = new Set(), extra = [] } = {}) {
+export function rulesText(kind, cfg, { off = new Set(), extra = [], stickers = null } = {}) {
   const owner = cfg.ownerName || '主人'
   const common = [
     '【你现在在 QQ 上】',
@@ -102,7 +134,8 @@ export function rulesText(kind, cfg, { off = new Set(), extra = [] } = {}) {
     '- 像真人打字一样，一句一行，每一行会单独发成一条消息（也可以用 ||| 隔开）；一般两三条就够，别刷屏。',
     '- 对方明确让你发语音时，一定要把要说的话放进 <voice></voice>。平时想发语音也这样写。',
     // 表情包关着就不教她发（#31：以前关了照样写 <sticker:…>）
-    ...(off.has('stickers') || cfg.stickers?.enabled === false ? [] : ['- 想发表情包，写 <sticker:标签>（标签可以是 开心、卖萌、生气、委屈、无语、嘲讽、疑惑、早晚安，或你记得的表情名字）。']),
+    // 常驻提示的预算由面板「表情包 → 常驻提示」决定：skill 只教写法，hint 加一句，index 再列清单，off 什么都不写
+    ...stickerRuleLines(cfg, off, stickers),
     '- 在群里要真 @ 某人（对方会收到提醒），写 <at:QQ号>；不知道 QQ 号就写 @群名片，能对上群里唯一一个人才会变成真 @。',
     // QQ 自带的小黄脸：夹在文字里发
     ...(cfg.stickers?.faces === false ? [] : [`- 想在文字里夹 QQ 自带的小黄脸表情，写 <face:名字>，比如 ${FACE_EXAMPLES.map((n) => `<face:${n}>`).join(' ')}；只能用 QQ 系统表情里有的名字，别每句都加。别人发来的小黄脸会写成「[名字]」。`]),

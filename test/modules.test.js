@@ -215,20 +215,18 @@ test('新建模块：从模板建，能直接跑', async () => {
   assert.equal((await fake.call('/modules/create', { id: 'Bad Id' })).json().ok, false)
 })
 
-test('复制 B 站模块：抽帧 / 截图库文件一起复制，用户模块能启动并提供图库路由', async () => {
+test('复制 B 站模块：抽帧文件一起复制，用户模块能启动并提供路由', async () => {
   await fake.call('/save', { modules: { bili: { enabled: true } } })
   try {
     const r = (await fake.call('/modules/fork', { id: 'bili' })).json()
     assert.equal(r.ok, true, r.message)
     assert.ok(existsSync(join(modDir('bili'), 'vision.js')))
-    assert.ok(existsSync(join(modDir('bili'), 'shots.js')))
+    // 抽帧改用 B 站故事板（storyboard.js），不再有本地截图库 shots.js
+    assert.ok(existsSync(join(modDir('bili'), 'storyboard.js')))
     const m = await mod('bili')
     assert.equal(m.running, 'user', m.error)
-    assert.ok(m.tools.includes('qq_send_shot'))
-    assert.ok(m.tools.includes('qq_list_shots'))
-    const shots = (await fake.call('/bili/shots')).json()
-    assert.equal(shots.ok, true)
-    assert.deepEqual(shots.items, [])
+    const st = (await fake.call('/bili/state')).json()
+    assert.equal(st.ok, true)
   } finally {
     await fake.call('/save', { modules: { bili: { enabled: false } } })
   }

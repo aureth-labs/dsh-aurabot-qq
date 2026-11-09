@@ -25,8 +25,8 @@ export default {
         // 表情包关着就不挂「发表情」（整理表情库的工具照样留着）
         ...(api.config().stickers.enabled ? [defineTool({
           name: 'qq_send_sticker',
-          description: '在当前 QQ 聊天里发一张表情包。name 写表情的名字或情绪（如「委屈」「开心」「早晚安」），会在表情库里模糊匹配。一般直接在回复里写 <sticker:名字> 就行，这个工具用于回复之外单独补发。',
-          properties: { name: str('表情名字或情绪关键词') },
+          description: '在当前 QQ 聊天里发一张表情包。name 写表情的名字、情绪（如「委屈」「开心」「早晚安」）或使用场合（如「等他回消息」「被夸了不好意思」），会在表情库里按名字、标签、用途模糊匹配。一般直接在回复里写 <sticker:名字> 就行，这个工具用于回复之外单独补发。',
+          properties: { name: str('表情名字、情绪关键词，或使用场合的一句话') },
           required: ['name'],
           execute: async ({ name }) => {
             const ok = await hub.sendSticker(current, String(name || ''))
@@ -35,14 +35,15 @@ export default {
         })] : []),
         defineTool({
           name: 'qq_list_stickers',
-          description: '看看表情库里有哪些表情（名字和标签），挑表情前可以先看。非主人只能看到数量，名字和标签只给主人看。',
-          properties: { query: str('可选，按名字/标签筛选') },
+          description: '看看表情库里有哪些表情（名字、标签、用途）。挑表情前可以先看。黑名单 / 停用的不会列出来（那些也发不出去）。非主人只能看到数量，名字和标签只给主人看。',
+          properties: { query: str('可选，按名字/标签/用途筛选') },
           execute: async ({ query }) => {
-            const items = store.library().items
-            if (!hub.turnSendersAllOwner(sessionId)) return { ok: true, count: items.length, message: `表情库里有 ${items.length} 张表情；名字和标签只给主人看` }
+            const items = store.usable()
+            if (!hub.turnSendersAllOwner(sessionId)) return { ok: true, count: items.length, message: `表情库里有 ${items.length} 张表情能用；名字和标签只给主人看` }
             const q = String(query || '').trim()
-            const hit = (q ? items.filter((i) => (i.name || '').includes(q) || (i.tags || []).some((t) => t.includes(q))) : items).slice(-60)
-            return { ok: true, count: items.length, message: hit.length ? hit.map((i) => `${i.name || '未命名'}${i.tags?.length ? '（' + i.tags.join('/') + '）' : ''}`).join('、') : '没有符合的表情', items: hit.map((i) => ({ name: i.name, tags: i.tags })) }
+            const has = (i) => [i.name || '', ...(i.tags || []), i.use || '', i.summary || ''].some((h) => h && h.includes(q))
+            const hit = (q ? items.filter(has) : items).slice(-60)
+            return { ok: true, count: items.length, message: hit.length ? hit.map((i) => `${i.name || '未命名'}${i.tags?.length ? '（' + i.tags.join('/') + '）' : ''}${i.use ? ' · ' + i.use : ''}`).join('、') : '没有符合的表情', items: hit.map((i) => ({ name: i.name, tags: i.tags, use: i.use || i.summary || '' })) }
           },
         }),
         defineTool({
@@ -183,7 +184,31 @@ export default {
       return tools
     })
 
-    api.route('/stickers', async () => ({ ok: true, items: store.library().items.slice().reverse() }))
+    // 面板用的全量库：每张带 usable / why（能不能用、为什么不能用），库本身不裁剪
+    api.route('/stickers', async () => ({ ok: true, items: store.libraryWithState(), rules: store.rules() }))
+    // 分页 + 搜索（库大了以后一次性全渲染会卡）：q 按名字/标签/用途筛，only 可以是 usable / unusable
+    api.route('/stickers/page', async (req) => {
+      const q = http.query(req)
+      const all = store.libraryWithState()
+      const key = String(q.q || '').trim().toLowerCase()
+      const hit = key
+        ? all.filter((i) => [i.name || '', ...(i.tags || []), i.use || '', i.summary || ''].some((h) => String(h || '').toLowerCase().includes(key)))
+        : all
+      const only = String(q.only || '')
+      const list = only === 'usable' ? hit.filter((i) => i.usable) : only === 'unusable' ? hit.filter((i) => !i.usable) : hit
+      const size = Math.max(1, Math.min(200, Number(q.size) || 60))
+      const off = Math.max(0, Number(q.offset) || 0)
+      return { ok: true, total: list.length, all: all.length, offset: off, size, items: list.slice(off, off + size) }
+    })
+    // 单张 / 批量启用停用（7）：enabled=false 是停用，true 是启用（allowlist 模式下就是加进允许名单）
+    api.route('/sticker/enable', async (req) => {
+      const b = await http.body(req)
+      const list = Array.isArray(b.md5s) ? b.md5s : b.md5 ? [b.md5] : []
+      if (b.reset === true) return store.resetEnabled()
+      return store.setEnabledMany(list, b.enabled !== false)
+    })
+    // 一条规则现在会命中几张：面板上写完就能看到「这条规则管用吗」
+    api.route('/sticker/rule-preview', async (req) => ({ ok: true, ...store.rulePreview(http.query(req).rule) }))
     api.route('/sticker/image', async (req, res) => {
       const it = store.library().items.find((i) => i.md5 === http.query(req).md5)
       if (!it || !existsSync(stickerPath(it))) return http.send(res, 404, '')

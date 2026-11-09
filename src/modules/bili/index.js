@@ -1,6 +1,5 @@
 // 内置模块：B 站。别人发来链接时她能「看」视频（标题、简介、字幕、热评）；定时自己去刷、评论、回评论，看到好玩的分享给主人。
 
-import { readFileSync } from 'node:fs'
 import { createBili } from '../../bili/duty.js'
 import { defineTool, str } from '../../tools/tools.js'
 import { permOf, profileToolVisible, profilePermits } from '../../chat/access.js'
@@ -10,12 +9,12 @@ import { createDanmaku, danmakuPanelRequest } from './danmaku.js'
 export default {
   id: 'bili',
   name: 'B站',
-  version: '1.1.0',
-  description: '看别人发的 B 站视频；定时自己刷、评论、回评论；可选发弹幕；抽帧看画面、发截图；按权限改自己的头像 / 签名（bili_watch / bili_comment / bili_danmaku / qq_send_shot / bili_set_avatar / bili_set_sign）',
+  version: '1.2.0',
+  description: '看别人发的 B 站视频；定时自己刷、评论、回评论；可选发弹幕；抽帧看画面；按权限改自己的头像 / 签名（bili_watch / bili_comment / bili_danmaku / bili_set_avatar / bili_set_sign）',
   tab: 'bili',
-  files: ['bili/duty.js', 'bili/api.js', 'bili/vision.js', 'bili/shots.js', 'bili/danmaku.js', 'bili/login-pause.js'],
+  files: ['bili/duty.js', 'bili/api.js', 'bili/vision.js', 'bili/danmaku.js', 'bili/login-pause.js', 'bili/style-guard.js', 'bili/storyboard.js', 'bili/verify.js', 'bili/history.js'],
   setup(api) {
-    const { hub } = api.core
+    const { hub, http } = api.core
     const lastImage = new Map() // chatId → 最近一张图的网址（给 bili_set_avatar 的 last 用）
     api.on('message', (msg) => {
       const url = (msg.images || []).slice(-1)[0]?.data?.url
@@ -28,6 +27,9 @@ export default {
       afterBrowse: danmaku.afterBrowse,
     })
     api.every(60_000, () => bili.tick(), '刷B站')
+    // 私信单独一条定时器：不跟刷视频 / 看回复抢时间，也不受作息窗口限制。
+    // 每分钟跳一次，里面再按 dmPollMinutes 决定这次要不要真去查（查一次就是两个 B 站请求）。
+    api.every(60_000, () => bili.dmTick(), 'B站私信')
 
     // 看视频谁发的链接都能看，评论要主人开口
     api.tool(({ chat, sessionId }) => {
@@ -51,27 +53,6 @@ export default {
             if (perm === 'off') return { ok: false, message: '这个操作在面板里关掉了' }
             if (perm === 'owner' && !hub.turnSendersAllOwner(sessionId)) return { ok: false, message: '只有主人能让我去发评论' }
             return bili.comment(String(link || ''), String(text || ''))
-          },
-        }),
-        // 截图：刷 B 站看画面时截下来的那些帧，存在本机，随时能挑一张发出来
-        defineTool({
-          name: 'qq_send_shot',
-          description: '把你在 B 站视频里截到的画面发到当前聊天。主人说「发张截图」「给我看看你刷到的」「刚才那个视频长啥样」这类话时用。query 填视频标题里的词或想看的内容，不填就挑最近的一张。',
-          properties: { query: str('可选：视频标题关键词，或想看的内容') },
-          required: [],
-          execute: async ({ query }) => {
-            if (!hub.turnSendersAllOwner(sessionId)) return { ok: false, message: '截图只给主人看' }
-            return bili.sendShot({ chatId: chat.chatId, query: String(query || '') })
-          },
-        }),
-        defineTool({
-          name: 'qq_list_shots',
-          description: '看看你手上还有哪些 B 站截图（来自哪个视频、第几秒）。挑截图之前可以先看一眼。',
-          properties: { query: str('可选，按视频标题筛选') },
-          required: [],
-          execute: async ({ query }) => {
-            if (!hub.turnSendersAllOwner(sessionId)) return { ok: false, message: '截图只给主人看' }
-            return bili.listShots(String(query || ''))
           },
         }),
       ]
@@ -126,7 +107,7 @@ export default {
     for (const action of ['inspect', 'send']) {
       api.route('/bili/danmaku/' + action, async (req) => {
         if (!danmakuPanelRequest(req)) return { ok: false, message: '请从 B 站面板发起弹幕操作' }
-        return danmaku[action](await api.core.http.body(req))
+        return danmaku[action](await http.body(req))
       })
     }
     api.tool(({ chat, level, sessionId }) => {
@@ -148,14 +129,94 @@ export default {
         },
       })
     })
-    // 截图库（面板里看全部、手动删）
-    api.route('/bili/shots', async () => ({ ...bili.libraryShots(), limit: api.config().bili.shotLibrary }))
-    api.route('/bili/shot/image', async (req, res) => {
-      const p = bili.shotFileOf(api.core.http.query(req).file)
-      if (!p) return api.core.http.send(res, 404, '')
-      return api.core.http.send(res, 200, readFileSync(p), 'image/jpeg')
+    // ---- 私信：面板上看状态 / 查互关 / 手动查一次 / 手动发一条 ----
+    api.route('/bili/dm/state', async () => {
+      const c = api.config().bili
+      return {
+        ok: true,
+        enabled: c.dmEnabled, onlyOwner: c.dmOnlyOwner, ownerMid: String(c.ownerMid || ''),
+        pollMinutes: c.dmPollMinutes, maxPerDay: c.dmMaxPerDay, gapSec: c.dmGapSec,
+        ...(bili.state().dm || {}),
+      }
     })
-    api.route('/bili/shot/delete', async (req) => bili.deleteShot(String((await api.core.http.body(req)).file || '')))
+    api.route('/bili/dm/relation', async () => {
+      const c = api.config().bili
+      const mid = String(c.ownerMid || '').trim()
+      if (!mid) return { ok: false, message: '还没填主人的 B 站 mid' }
+      try {
+        const rel = await bili.relation(mid)
+        return { ok: true, mid, mutual: rel.attribute === 6, attribute: rel.attribute, beAttribute: rel.beAttribute }
+      } catch (error) { return { ok: false, message: error.message } }
+    })
+    api.route('/bili/dm/check', async () => bili.checkDm())
+    api.route('/bili/dm/send', async (req) => {
+      const b = await http.body(req)
+      return bili.sendDm(String(b.text || ''), { classify: false })
+    })
+    // ---- 评论区 @ 我：面板上看待回列表 / 手动回一次 ----
+    api.route('/bili/at/state', async () => {
+      const c = api.config().bili
+      const s = bili.state()
+      return {
+        ok: true,
+        replyEnabled: c.reply !== false,
+        ownerMid: String(c.ownerMid || ''),
+        ownerName: String(c.ownerName || ''),
+        lastCheck: s.lastAtCheck || 0,
+        replied: (s.atReplied || []).length,
+        repliesToday: s.replies || 0,
+        maxRepliesPerDay: c.maxRepliesPerDay,
+      }
+    })
+    // 列出「@ 了我的评论」（只读，不回复）—— 面板上给她看现在有哪些待回
+    api.route('/bili/at/list', async () => {
+      const ownerMid = String(api.config().bili.ownerMid || '').trim()
+      try {
+        const feed = await bili.atFeed()
+        const done = new Set(bili.state().atReplied || [])
+        // 她自己的 mid：以前这里写死了一串数字，换号 / 换机器就对不上了，改成问一次 nav
+        const me = String((await bili.account().catch(() => null))?.mid || '')
+        const list = feed
+          .filter((x) => x.business === '评论')
+          .map((x) => ({
+            id: x.id, time: x.time, name: x.name, mid: String(x.mid),
+            text: x.text, title: x.title, uri: x.uri,
+            mine: String(x.mid) === ownerMid,
+            // 去重口径跟 checkAts 一致：消息流 id 或「视频 aid + 评论 rpid」任一对上就算回过
+            replied: done.has(x.id) || done.has(`a${x.aid}r${x.rpid}`),
+            atMe: me ? (x.ats || []).some((a) => String(a.mid) === me) : (x.ats || []).length > 0,
+          }))
+        return { ok: true, items: list.slice(0, 20), ownerMid }
+      } catch (error) { return { ok: false, message: error.message } }
+    })
+    api.route('/bili/at/check', async () => bili.checkAts())
+    // ---- 点赞 / 收藏 ----
+    api.route('/bili/likes', async () => ({ ok: true, ...bili.likes(), coolUntil: bili.likeCooldown() }))
+    api.route('/bili/like/undo', async (req) => {
+      const b = await http.body(req)
+      return bili.undoLike(String(b.kind || 'like'), String(b.bvid || ''))
+    })
+    // ---- 圈地自萌 ----
+    api.route('/bili/circle/scan', async (req) => {
+      const b = await http.body(req)
+      return bili.circleScan(String(b.bvid || ''))
+    })
+    api.route('/bili/circle/check', async () => bili.checkCircle())
+    // ---- 历史 / 日报 / 封面墙 / 鱼日记 ----
+    api.route('/bili/history', async (req) => {
+      const q = http.query(req)
+      return bili.historyView({ limitDays: Number(q.days) || 14 })
+    })
+    api.route('/bili/report', async (req) => {
+      const q = http.query(req)
+      const day = String(q.day || '').trim()
+      const md = bili.readReport(day)
+      return md ? { ok: true, day, markdown: md } : { ok: false, message: '这天还没有日报' }
+    })
+    api.route('/bili/report/rebuild', async (req) => {
+      const b = await http.body(req)
+      return bili.rebuildReport(String(b.day || '').trim() || undefined)
+    })
     return bili
   },
 }
