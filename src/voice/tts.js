@@ -472,6 +472,70 @@ export async function volcanoSynth(text, c) {
   return saveAudio(buf, 24000)
 }
 
+// MiniMax 语音：`POST /v1/t2a_v2`（Bearer Key），音频是 hex 编码的 mp3。
+// 音色 ID 在开放平台「音色库」试听后复制，也可以填声音设计 / 快速复刻出来的自定义 id。
+
+function minimaxHint(code, message) {
+  const n = Number(code) || 0
+  const m = String(message || '')
+  if (n === 1004 || /login fail|authorization/i.test(m)) return 'MiniMax API Key 没被认出来：去开放平台「接口密钥」重新复制（sk-api- 开头），注意别带多余空格'
+  if (n === 1008 || /insufficient|balance/i.test(m)) return 'MiniMax 余额不足：去开放平台充值，或者先换回 edge-tts'
+  if (n === 1002 || n === 1039) return '撞到 MiniMax 的频率限制了：过几秒再试'
+  if (n === 2013) return 'MiniMax 参数不对：多半是 Voice ID 写错了（音色库右侧「复制 Voice ID」），也可能是这个音色不支持选中的情绪'
+  if (n === 1042) return '这段文字里不可见字符 / 非法字符太多，MiniMax 念不了：把表情或乱七八糟的符号去掉再发'
+  if (n === 1000 || n === 1001 || n === 1013 || n === 1024) return 'MiniMax 服务端出错了：过一会儿再试'
+  return ''
+}
+
+export async function minimaxSynth(text, c = {}) {
+  const apiKey = String(c.apiKey || '').trim()
+  if (!apiKey) throw new Error('MiniMax：还没填 API Key')
+  const base = String(c.baseUrl || 'https://api.minimax.cn').replace(/\/+$/, '')
+
+  const voiceSetting = {
+    voice_id: String(c.voiceId || '').trim() || 'Chinese (Mandarin)_Soft_Girl',
+    speed: Number(c.speed) || 1,
+    vol: 1,
+    pitch: Number.isFinite(Number(c.pitch)) ? Number(c.pitch) : 0,
+  }
+  // auto = 不传，交给 MiniMax 按文字自己匹配；填了具体值才当硬条件
+  const emotion = String(c.emotion || 'auto').trim()
+  if (emotion && emotion !== 'auto') voiceSetting.emotion = emotion
+
+  const r = await fetch(`${base}/v1/t2a_v2`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: 'Bearer ' + apiKey,
+    },
+    body: JSON.stringify({
+      model: String(c.model || 'speech-2.8-turbo'),
+      text,
+      stream: false,
+      voice_setting: voiceSetting,
+      audio_setting: { sample_rate: 32000, bitrate: 128000, format: 'mp3', channel: 1 },
+      output_format: 'hex',
+      // 她只讲中文：指定中文能提高多音字读对的概率；要念外语多的话这里改成 'auto'
+      language_boost: 'Chinese',
+    }),
+    signal: AbortSignal.timeout(120000),
+  })
+
+  const raw = await r.text()
+  let j = null
+  try { j = JSON.parse(raw) } catch (e) {}
+  const code = j && j.base_resp ? j.base_resp.status_code : undefined
+  if (code === undefined) throw new Error(`MiniMax HTTP ${r.status}：${raw.slice(0, 160)}`)
+  if (Number(code) !== 0) throw new Error(minimaxHint(code, j.base_resp.status_msg) || `MiniMax ${code}：${j.base_resp.status_msg || '未知错误'}`)
+
+  const hex = String((j.data && j.data.audio) || '')
+  // 正常是 hex；万一哪天回 base64，这里能拦住，别写出坏文件
+  if (!/^[0-9a-fA-F]+$/.test(hex) || hex.length < 800) throw new Error('MiniMax 没返回音频：' + raw.slice(0, 160))
+  const buf = Buffer.from(hex, 'hex')
+  if (buf.length < 400) throw new Error('MiniMax 返回的音频太短：' + buf.length + ' 字节')
+  return saveAudio(buf, 32000)
+}
+
 /** 说话语音的后处理：目前原样返回（RVC 换音色只用在翻唱上，语音条直接用 TTS 的声音）。 */
 export const voiceConverters = []
 
@@ -483,7 +547,7 @@ export async function textToSpeech(text, opt = {}, log) {
   if (!clean) throw new Error('没有要念的文字')
   let file = ''
   let engine = ''
-  const local = { cosyvoice: cosyvoiceSynth, gptsovits: gptsovitsSynth, http: httpSynth, volcano: volcanoSynth, breeze: breezeSynth }[opt.engine]
+  const local = { cosyvoice: cosyvoiceSynth, gptsovits: gptsovitsSynth, http: httpSynth, volcano: volcanoSynth, breeze: breezeSynth, minimax: minimaxSynth }[opt.engine]
   if (local) {
     try {
       file = await local(clean, opt[opt.engine] || {})

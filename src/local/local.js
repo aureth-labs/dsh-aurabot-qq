@@ -71,7 +71,9 @@ export function createLocal({ getConfig, log }) {
       return result
     } catch (error) {
       last[slot] = { ok: false, at: Date.now(), message: String(error.message || error).slice(0, 300) }
-      log.warn(`本地接口「${spec.title}」出错：`, last[slot].message)
+      // 传进来的可能是根 logger（只有 child，没有 warn），直接调会把真实错误盖成 TypeError
+      const say = typeof log.warn === 'function' ? log : log.child('local')
+      say.warn(`本地接口「${spec.title}」出错：`, last[slot].message)
       throw error
     }
   }

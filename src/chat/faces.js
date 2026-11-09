@@ -90,11 +90,15 @@ const SYMBOL_RUN = /[^\p{L}\p{N}\s]{2,}/gu
 // 颜文字专用字符：这些字符几乎只出现在颜文字里，单独一个也一并去掉（单个「▽」实测念得出来，
 // 但清掉更省事，而且它们不承担语义）。ω 和 Ω 都是希腊字母，不在上面那条的符号范围（\p{L}）里，得单列。
 // 括号也收进来：颜文字被擦掉之后剩下的半个括号 / 空括号，念出来只有「左括号」，没有意义。
-const KAOMOJI_CHAR = /[￣▽△▲･´｀＾﹏Ωﾟω()（）]/gu
+const KAOMOJI_CHAR = /[￣▽△▲･´｀＾﹏Ωﾟω()（）و✧☆★]/gu
 
 /** 念之前把符号串擦掉；擦完只剩标点（比如一条语音只有颜文字）就返回空串，由调用方改发文字。 */
 function stripUnspeakable (s) {
-  const out = String(s).replace(SYMBOL_RUN, ' ').replace(KAOMOJI_CHAR, ' ')
+  // 括号里成段的东西整块摘掉：只擦括号符号的话，TTS 会把「鳍耳竖起来」这类动作描写照念出来。
+  const out = String(s)
+    .replace(/[（(][^（）()]{0,40}[）)]/gu, ' ')
+    .replace(SYMBOL_RUN, ' ')
+    .replace(KAOMOJI_CHAR, ' ')
   return /[\p{L}\p{N}]/u.test(out) ? out : ''
 }
 

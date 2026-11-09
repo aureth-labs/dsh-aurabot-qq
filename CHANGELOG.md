@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- **说话新增「MiniMax 语音」**：面板「语音」页多一个引擎，填 MiniMax 开放平台（platform.minimax.cn）的 API Key 和音色库里的 Voice ID 就能用，默认音色 `Chinese (Mandarin)_Soft_Girl`，也支持声音设计 / 快速复刻出来的自定义音色 id；请求体、音频格式（hex → mp3）都由插件凑好。可选情绪（happy / sad / angry …）会作为参数传给模型，留「自动」就不传、交给它按文字匹配；Key 加密存宿主、不回显，保存时留空等于不改。报错会把 1004 / 1008 / 1042 / 2013 翻成人话（Key 不对、余额不足、字符不合法、Voice ID 或情绪不对）。新增 `test/voice-minimax.test.js` 15 条。
 - 模块新增通用聊天接入接口：成功落盘后的 `chat/log` 通知、按已有会话接收已鉴权主人文字/图片/WAV 的 `hub.receiveOwnerMessage`（异步准备后重查身份）、头像/表情字节及音频辅助 `core.media`；模块管理路由可用 `api.route(..., { access: 'panel' })` 复用本体访问闸。会话、流水、记忆与回复仍走原链路，不增加平台专属入口。
 - **说话新增「Breeze 语音」**：面板「语音」页多一个引擎，填服务地址（默认 `https://api.breeze.blue`，也能填自建）、`brz_` 开头的 API Key、音色 id（`voc_…`）就能用，请求头 / 路径 / body 都由插件凑好；可选用中文写「语气说明」和「指令遵循强度」。Key 加密存宿主、不回显，保存时留空等于不改。两种模式：**云端**走 BreezeBlue 的 `POST /v1/text-to-speech/{音色id}`（`xi-api-key`），**本地自建**走自己跑的 `breeze_infer`（`POST /v1/audio/speech` 的 multipart 表单，不需要 Key / 音色 id）。另外把**云端额度**也接上了：面板直接显示「云端在线（额度 N）」，填了邮箱密码就每小时醒一次自动领每日额度（一天最多一次，discord 档被拒自动降级 standard，Cookie 过期自动重登），也能点「领取今日额度」手动领；密码同样是加密存宿主、不回显。新增 `test/voice-breeze.test.js` 11 条（合成 7 条 + 额度 4 条：余额、登录存 Cookie、401 重登与降级、自动领取的各道门槛）。
 

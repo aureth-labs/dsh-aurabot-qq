@@ -94,7 +94,7 @@ export const DEFAULTS = {
   titleFilter: { enabled: true, groups: [], title: '大肥鱼' },
   voice: {
     enabled: true,
-    // auto = 先 edge-tts，不行用 Windows 语音；edge / windows / cosyvoice / gptsovits / http = 指定引擎（失败都会退回 Windows 语音）
+    // auto = 先 edge-tts，不行用 Windows 语音；edge / windows / cosyvoice / gptsovits / volcano / breeze / minimax / http = 指定引擎（失败都会退回 Windows 语音）
     engine: 'auto',
     cosyvoice: { url: 'http://127.0.0.1:50000', mode: 'sft', spkId: '中文女', instruct: '', sampleRate: 22050 },
     gptsovits: { url: 'http://127.0.0.1:9880', refAudio: '', promptText: '', promptLang: 'zh', textLang: 'zh' },
@@ -123,6 +123,9 @@ export const DEFAULTS = {
       guidanceScale: 0,
       timeoutMs: 60000,
     },
+    // MiniMax 语音：开放平台「接口密钥」+ 音色库里的 Voice ID（也能填声音设计 / 复刻的自定义 id）；
+    // emotion 留 auto 就不传，交给模型按文字自己匹配
+    minimax: { apiKey: '', baseUrl: 'https://api.minimax.cn', voiceId: 'Chinese (Mandarin)_Soft_Girl', model: 'speech-2.8-turbo', emotion: 'auto', speed: 1, pitch: 0 },
     voice: 'zh-CN-XiaoyiNeural',
     rate: '+0%',
     pitch: '+0Hz',
@@ -549,6 +552,19 @@ export function normalize(raw) {
   bz.outputFormat = String(bz.outputFormat ?? '').trim().slice(0, 60) || DEFAULTS.voice.breeze.outputFormat
   bz.guidanceScale = num(bz.guidanceScale, 0, 0, 20)
   bz.timeoutMs = num(bz.timeoutMs, 60000, 5000, 600000)
+  // MiniMax 语音：地址 / 音色 id / 模型 / 情绪；Key 不回显（publicConfig 里换成 apiKeySet）
+  if (!isObj(c.voice.minimax)) c.voice.minimax = structuredClone(DEFAULTS.voice.minimax)
+  c.voice.minimax.apiKey = String(c.voice.minimax.apiKey ?? '').trim().slice(0, 400)
+  c.voice.minimax.baseUrl = String(c.voice.minimax.baseUrl ?? '').trim().slice(0, 400) || DEFAULTS.voice.minimax.baseUrl
+  c.voice.minimax.voiceId = String(c.voice.minimax.voiceId ?? '').trim().slice(0, 200) || DEFAULTS.voice.minimax.voiceId
+  c.voice.minimax.model = ['speech-2.8-turbo', 'speech-2.8-hd', 'speech-2.6-turbo', 'speech-2.6-hd'].includes(String(c.voice.minimax.model))
+    ? String(c.voice.minimax.model)
+    : DEFAULTS.voice.minimax.model
+  c.voice.minimax.emotion = ['auto', 'happy', 'sad', 'angry', 'fearful', 'disgusted', 'surprised', 'calm'].includes(String(c.voice.minimax.emotion))
+    ? String(c.voice.minimax.emotion)
+    : 'auto'
+  c.voice.minimax.speed = num(c.voice.minimax.speed, 1, 0.5, 2)
+  c.voice.minimax.pitch = num(c.voice.minimax.pitch, 0, -12, 12)
   // 云端语音识别：provider 只认内置两项和 custom；地址/模型留空时由 asr.js 用预置默认值
   if (!isObj(c.voice.asrApi)) c.voice.asrApi = structuredClone(DEFAULTS.voice.asrApi)
   const asrApi = c.voice.asrApi
@@ -812,7 +828,7 @@ export function normalize(raw) {
   g.burstMax = num(g.burstMax, 8, 1, BIG)
   g.engagedMax = num(g.engagedMax, 6, 0, BIG)
   g.burstWindowSec = num(g.burstWindowSec, 120, 1, BIG)
-  if (!['auto', 'edge', 'windows', 'cosyvoice', 'gptsovits', 'http', 'volcano', 'breeze'].includes(c.voice.engine)) c.voice.engine = 'auto'
+  if (!['auto', 'edge', 'windows', 'cosyvoice', 'gptsovits', 'http', 'volcano', 'breeze', 'minimax'].includes(c.voice.engine)) c.voice.engine = 'auto'
   c.voice.songVoice = String(c.voice.songVoice || '').slice(0, 120)
   c.voice.songPitch = Math.max(-24, Math.min(24, Math.round(Number(c.voice.songPitch) || 0)))
   c.voice.cosyvoice.sampleRate = num(c.voice.cosyvoice.sampleRate, 22050, 8000, 48000)
@@ -897,7 +913,7 @@ export function normalize(raw) {
 }
 
 // 面板里不回传原文的字段：路径（几层都行）
-const SECRETS = [['snowluma', 'webuiPassword'], ['snowluma', 'httpToken'], ['snowluma', 'wsToken'], ['imageGen', 'apiKey'], ['voice', 'asrApi', 'apiKey'], ['memory', 'vector', 'apiKey'], ['memory', 'rerank', 'apiKey'], ['song', 'neteaseCookie'], ['bili', 'cookie'], ['bili', 'sessdata'], ['bili', 'biliJct'], ['heybox', 'cookie'], ['bridge', 'token'], ['voice', 'volcano', 'apiKey'], ['voice', 'breeze', 'key'], ['voice', 'breeze', 'password'], ['backup', 'remote', 'token'], ['backup', 'remote', 'webdav', 'password']]
+const SECRETS = [['snowluma', 'webuiPassword'], ['snowluma', 'httpToken'], ['snowluma', 'wsToken'], ['imageGen', 'apiKey'], ['voice', 'asrApi', 'apiKey'], ['memory', 'vector', 'apiKey'], ['memory', 'rerank', 'apiKey'], ['song', 'neteaseCookie'], ['bili', 'cookie'], ['bili', 'sessdata'], ['bili', 'biliJct'], ['heybox', 'cookie'], ['bridge', 'token'], ['voice', 'volcano', 'apiKey'], ['voice', 'breeze', 'key'], ['voice', 'breeze', 'password'], ['voice', 'minimax', 'apiKey'], ['backup', 'remote', 'token'], ['backup', 'remote', 'webdav', 'password']]
 // 扩展模块设置里的密码类字段（模块加载时登记）：['ext', 模块id, 字段]
 const extraSecrets = new Map()
 export function registerSecretField(path) { extraSecrets.set(path.join('\u0000'), path) }

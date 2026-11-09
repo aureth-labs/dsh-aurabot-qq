@@ -86,3 +86,13 @@ test('语音文本拆分：颜文字和连着堆的符号不念（TTS 会把它�
   assert.deepEqual(splitSpeakable('<face:捂脸>……'), { spoken: '', extras: '<face:捂脸>' }, '表情照常补发')
   assert.equal(speakableText('等等……我还没说完'), '等等 我还没说完', 'speakableText 是 splitSpeakable 的薄封装，清洗对它一样生效')
 })
+
+test('语音文本拆分：括号里的动作描写整段不念（TTS 会把「鳍耳竖起来」念出来）', () => {
+  assert.deepEqual(splitSpeakable('（鳍耳竖起来）好啦好啦，我这就去'), { spoken: '好啦好啦，我这就去', extras: '' }, '括号动作摘掉，正文一个字不少')
+  assert.deepEqual(splitSpeakable('晚安😁（尾巴啪地拍了下地面）'), { spoken: '晚安', extras: '😁' }, '括号里的动作和括号外的 emoji 各归各的')
+  assert.deepEqual(splitSpeakable('(๑•̀ㅂ•́)و✧冲了'), { spoken: '冲了', extras: '' }, '括号摘掉后剩下的颜文字尾巴也擦干净')
+  assert.deepEqual(splitSpeakable('（笑）好'), { spoken: '好', extras: '' })
+  assert.deepEqual(splitSpeakable('（未闭合括号 好'), { spoken: '未闭合括号 好', extras: '' }, '没有右括号时不整段摘，只擦括号符号，别吞正文')
+  assert.deepEqual(splitSpeakable('这是 3.5 秒的音频'), { spoken: '这是 3.5 秒的音频', extras: '' }, '没有括号时一个字不动')
+  assert.deepEqual(splitSpeakable('（' + '很长的说明'.repeat(10) + '）好'), { spoken: '很长的说明'.repeat(10) + ' 好', extras: '' }, '超过 40 字的括号不整段摘，只擦括号符号（防止误伤正文）')
+})

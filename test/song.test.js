@@ -1,9 +1,9 @@
 // 翻唱：截取位置、音色列表、网易云加密和 Cookie 解析、点歌的前置检查、/sing 命令。
 import { test, before } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 let studio
 let netease
@@ -75,6 +75,38 @@ test('点歌前置检查：没打开、没装好、没说歌名', () => {
   assert.equal(st.ready, false)
   assert.equal(st.parts.python, false)
   assert.match(st.message, /导入/)
+})
+
+// env/Scripts/python.exe 在 Linux 上只是一行「转给真解释器」的脚本；venv 被删了文件还在，
+// 只判存在就会报「装好了」，一点就 127。这里造一个 shim 转发给不存在的路径。
+function makeShim(root, body) {
+  const dir = join(root, 'env', 'Scripts')
+  mkdirSync(dir, { recursive: true })
+  const shim = join(dir, 'python.exe')
+  writeFileSync(shim, body)
+  chmodSync(shim, 0o755)
+  return shim
+}
+
+test('翻唱环境：shim 在、转发到的解释器没了，不能算装好', { skip: process.platform === 'win32' }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'rvc-'))
+  const shim = makeShim(root, '#!/bin/bash\nexec /nonexistent/sep-venv/bin/python "$@"\n')
+  const cfg = normalize({ song: { enabled: true, root } })
+  const s = studio.createSongStudio({ getConfig: () => cfg, log: { info() {}, warn() {}, debug() {} }, sendVoiceFile: async () => {} })
+  const st = s.status()
+  assert.equal(st.parts.python, false, `${dirname(shim)} 里的 shim 转发到的解释器不存在，不能报就绪`)
+  assert.equal(st.ready, false)
+})
+
+test('翻唱环境：解释器真能跑才算 python 就绪，包缺了分离器仍不算', { skip: process.platform === 'win32' }, () => {
+  const root = mkdtempSync(join(tmpdir(), 'rvc-'))
+  makeShim(root, '#!/bin/bash\necho 1\n')
+  const cfg = normalize({ song: { enabled: true, root } })
+  const s = studio.createSongStudio({ getConfig: () => cfg, log: { info() {}, warn() {}, debug() {} }, sendVoiceFile: async () => {} })
+  const st = s.status()
+  assert.equal(st.parts.python, true)
+  assert.equal(st.parts.separator, false, '没放 audio-separator.exe，分离器不能报就绪')
+  assert.equal(st.ready, false)
 })
 
 test('/sing：歌名和变调', async () => {

@@ -2209,6 +2209,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             { value: 'gptsovits', label: '本地 GPT-SoVITS', desc: 'GPT-SoVITS api_v2，用参考音频定音色' },
             { value: 'volcano', label: '豆包语音（火山）', desc: '只填 API Key，选个音色就行' },
             { value: 'breeze', label: 'Breeze 语音', desc: 'BreezeBlue 云端或自建，填 Key + 音色 id' },
+            { value: 'minimax', label: 'MiniMax 语音', desc: '在线，音色多，支持自定义音色和情绪' },
             { value: 'http', label: '其他 HTTP 接口', desc: '任意返回音频的地址' },
             { value: 'windows', label: 'Windows 自带', desc: '离线可用，机械感重一些' },
           ])),
@@ -2284,6 +2285,32 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             draft.voice.breeze?.mode === 'local' ? null : h(Row, { key: 'pw', label: '账号密码', hint: '存在本机 config.json（和别的密钥一样，面板里不回显）；留空 = 用已保存的' }, f.text('voice.breeze.password', { type: 'password', placeholder: draft.voice.breeze?.passwordSet ? '已保存' : '不填就不自动领额度' })),
             draft.voice.breeze?.mode === 'local' ? null : h(Row, { key: 'ac', label: '自动领每日额度', hint: '每小时醒一次，一天最多领一次；失败只记日志' }, f.sw('voice.breeze.autoClaim')),
             draft.voice.breeze?.mode === 'local' ? null : h(BreezeQuota, { key: 'quota', b: draft.voice.breeze }),
+          ] : null,
+          draft.voice.engine === 'minimax' ? [
+            (() => {
+              // 缺东西时先提示（不拦保存）：不然只有点「试听」才报错，还看不懂缺哪个
+              const m = draft.voice.minimax || {}
+              const miss = [
+                !String(m.apiKey || '').trim() && !m.apiKeySet ? 'API Key' : '',
+                !String(m.voiceId || '').trim() ? 'Voice ID' : '',
+              ].filter(Boolean)
+              return miss.length
+                ? h('div', { className: 'ab-note warn', style: { marginBottom: 8 } },
+                  '还差：' + miss.join('、') + '。不填的话说话会退回 Windows 语音（照常发声，只是不是 MiniMax 的音色）。')
+                : null
+            })(),
+            h(Row, { key: 'k', label: 'API Key', hint: 'MiniMax 开放平台「接口密钥」里创建；只存在本机' }, f.text('voice.minimax.apiKey', { size: 'wide', type: 'password', placeholder: draft.voice.minimax?.apiKeySet ? '已保存（不改就留空）' : 'sk-api-…' })),
+            h(Row, { key: 'l', label: '开放平台', hint: '还没注册就先注册；拿 Key 在「接口密钥」页' },
+              h('div', { className: 'ab-flex' },
+                h('a', { href: 'https://platform.minimax.cn/console/home', target: '_blank', rel: 'noreferrer' }, '注册 / 登录开放平台 ↗'),
+                h('span', { className: 'ab-muted' }, '·'),
+                h('a', { href: 'https://platform.minimax.cn/audio/voices', target: '_blank', rel: 'noreferrer' }, '音色库（试听后复制 Voice ID）↗'))),
+            h(Row, { key: 'v', label: 'Voice ID', hint: '音色库右侧「复制 Voice ID」；声音设计 / 复刻拿到的自定义 id 也填这里' }, f.text('voice.minimax.voiceId', { size: 'wide', placeholder: 'Chinese (Mandarin)_Soft_Girl' })),
+            h(Row, { key: 'm', label: '模型' }, f.select('voice.minimax.model', [{ value: 'speech-2.8-turbo', label: '2.8 Turbo（快、便宜）' }, { value: 'speech-2.8-hd', label: '2.8 HD（更细腻）' }, { value: 'speech-2.6-turbo', label: '2.6 Turbo（没有语气词）' }, { value: 'speech-2.6-hd', label: '2.6 HD（没有语气词）' }], { width: 220 })),
+            h(Row, { key: 'e', label: '情绪', hint: '自动 = 不传，交给模型按文字匹配' }, f.select('voice.minimax.emotion', [{ value: 'auto', label: '自动' }, { value: 'happy', label: '高兴' }, { value: 'sad', label: '难过' }, { value: 'angry', label: '生气' }, { value: 'fearful', label: '害怕' }, { value: 'disgusted', label: '嫌弃' }, { value: 'surprised', label: '惊讶' }, { value: 'calm', label: '平静' }], { width: 160 })),
+            h(Row, { key: 's', label: '语速' }, f.range('voice.minimax.speed', 0.5, 2, 0.05, (v) => (Number(v) || 1).toFixed(2) + '×')),
+            h(Row, { key: 'p', label: '语调' }, f.range('voice.minimax.pitch', -12, 12, 1, (v) => (Number(v) > 0 ? '+' : '') + (Number(v) || 0))),
+            h(Row, { key: 'b', label: '服务地址', hint: '国内用 api.minimax.cn；海外账号改 api.minimax.io' }, f.text('voice.minimax.baseUrl', { size: 'wide', placeholder: 'https://api.minimax.cn' })),
           ] : null,
           draft.voice.engine === 'http' ? [
             h(Row, { key: 'u', label: '接口地址', hint: 'GET：地址里带 {text}；POST：填接口地址就行' }, f.text('voice.http.urlTemplate', { size: 'wide', placeholder: 'https://openspeech.bytedance.com/api/v1/tts' })),
