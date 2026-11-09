@@ -73,6 +73,7 @@ export const DEFAULTS = {
     enabled: false,
     provider: 'openai', // openai / custom；codex = 实验性订阅接法（需单独登录）
     baseUrl: '',
+    baseUrlOptions: [], // 面板「服务地址」下拉里用户自己添加的常用地址（官方推荐的赞助商地址固定第一项，不存这里）
     apiKey: '',
     model: '',
     size: '1024x1024',
@@ -851,6 +852,14 @@ export function normalize(raw) {
 
   // provider：custom = 自己填接口（GET/POST + 自定义参数），其它按 OpenAI 兼容
   c.imageGen.provider = ['custom', 'codex'].includes(c.imageGen.provider) ? c.imageGen.provider : 'openai'
+  // 「服务地址」下拉的用户自添地址：{ name, url }；只要 http(s) 链接，按地址去重，最多 20 条
+  // （官方推荐的赞助商地址固定第一项，不存这里；旧版只存字符串的自动用域名当名字）
+  c.imageGen.baseUrlOptions = (Array.isArray(c.imageGen.baseUrlOptions) ? c.imageGen.baseUrlOptions : [])
+    .map((o) => typeof o === 'string' ? { name: '', url: o } : { name: String((o && o.name) || '').trim().slice(0, 60), url: String((o && o.url) || '').trim().slice(0, 500) })
+    .filter((o) => /^https?:\/\//.test(o.url) && o.url !== 'https://ntmd.cn/v1')
+    .map((o) => { if (o.name) return o; try { return { ...o, name: new URL(o.url).hostname } } catch { return { ...o, name: o.url } } })
+    .filter((o, i, a) => a.findIndex((x) => x.url === o.url) === i)
+    .slice(0, 20)
   if (!isObj(c.imageGen.codex)) c.imageGen.codex = { ...DEFAULTS.imageGen.codex }
   const igx = c.imageGen.codex
   igx.model = ['gpt-image-2', 'gpt-image-2.5-flare', 'gpt-image-2.5-sunburst'].includes(igx.model) ? igx.model : 'gpt-image-2'

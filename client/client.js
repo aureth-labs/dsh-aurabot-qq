@@ -7514,6 +7514,10 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       )
     }
 
+    // 官方推荐（赞助商）地址：固定第一项，面板里不可删；官网从这里跳
+    const SPONSOR_BASE = 'https://ntmd.cn/v1'
+    const SPONSOR_SITE = 'https://ntmd.cn'
+
     function ImageGen({ draft, setDraft, toast }) {
       const f = useField(draft, setDraft)
       const c = draft.imageGen
@@ -7524,14 +7528,52 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const params = Array.isArray(custom.params) ? custom.params : []
       const setParams = (next) => setDraft(setPath(draft, 'imageGen.custom.params', next))
       const setP = (i, k, v) => setParams(params.map((p, j) => (j === i ? { ...p, [k]: v } : p)))
+      // 「服务地址」下拉：官方推荐固定第一项（不可删）+ 用户自添地址（config.imageGen.baseUrlOptions，{ name, url }，可删）
+      // 添加只能走「＋ 添加」弹窗；切换只能通过下拉框
+      const baseUrlOptions = Array.isArray(c.baseUrlOptions) ? c.baseUrlOptions : []
+      const baseUrlKnown = Boolean(c.baseUrl) && (c.baseUrl === SPONSOR_BASE || baseUrlOptions.some((o) => o.url === c.baseUrl))
+      const [showSponsor, setShowSponsor] = useState(false) // 「官方推荐地址」展开面板
+      // 「＋ 添加」弹窗：名字 + 地址
+      const [addOpen, setAddOpen] = useState(false)
+      const [addName, setAddName] = useState('')
+      const [addUrl, setAddUrl] = useState('')
+      const baseOptions = [
+        { value: SPONSOR_BASE, label: '官方推荐 · ntmd.cn · 0.04/张（赞助商）' },
+        ...baseUrlOptions.map((o) => ({ value: o.url, label: o.name, desc: o.url })),
+      ]
+      const pickBase = (v) => setDraft(setPath(draft, 'imageGen.baseUrl', v))
+      const saveAdd = () => {
+        const url = addUrl.trim()
+        const name = addName.trim()
+        if (!/^https?:\/\//.test(url)) { toast('地址要以 http(s):// 开头'); return }
+        if (url === SPONSOR_BASE) { toast('官方推荐地址已内置在下拉里'); setAddOpen(false); return }
+        if (baseUrlOptions.some((o) => o.url === url)) { toast('这个地址已经加过了'); setAddOpen(false); return }
+        let label = name
+        if (!label) { try { label = new URL(url).hostname } catch { label = url } }
+        setDraft({ ...draft, imageGen: { ...draft.imageGen, baseUrlOptions: [...baseUrlOptions, { name: label.slice(0, 60), url }], baseUrl: url } })
+        setAddOpen(false); setAddName(''); setAddUrl('')
+        toast('已添加并选为服务地址，记得保存')
+      }
+      const delBaseUrl = (url) => setDraft({ ...draft, imageGen: { ...draft.imageGen, baseUrlOptions: baseUrlOptions.filter((o) => o.url !== url), baseUrl: c.baseUrl === url ? '' : c.baseUrl } })
+      const useSponsor = () => {
+        setDraft({ ...draft, imageGen: { ...draft.imageGen, provider: 'openai', baseUrl: SPONSOR_BASE } })
+        toast('已选官方推荐地址，记得保存')
+      }
       return h('div', { className: 'ab-grid' },
         h(Card, { title: '让ta画图', right: f.sw('imageGen.enabled'), desc: '接上生图服务后，让ta「画一张……」就会画好发出来。可选 OpenAI 兼容接口、自定义接口，或登录 ChatGPT 使用实验性 Codex 订阅接法。本机 SD WebUI / ComfyUI 可在「本地接口」页接「生图」。也可以让ta照着最近发的图、引用消息里的图或自己的画作来改；服务不支持参考图时会明确告诉你。' },
           h(Row, { label: '接口格式', hint: '第二个适合 pollinations 这类「GET 一个地址就出图」的服务' },
             h(Seg, {
               value: isCodex ? 'codex' : isCustom ? 'custom' : 'openai',
-              onChange: (v) => setDraft(setPath(draft, 'imageGen.provider', v)),
-              options: [{ value: 'openai', label: 'OpenAI 格式' }, { value: 'custom', label: '自定义接口' }, { value: 'codex', label: 'Codex 订阅（实验性）' }],
+              onChange: (v) => { if (v === 'sponsor') setShowSponsor((s) => !s); else { setShowSponsor(false); setDraft(setPath(draft, 'imageGen.provider', v)) } },
+              options: [{ value: 'openai', label: 'OpenAI 格式' }, { value: 'custom', label: '自定义接口' }, { value: 'codex', label: 'Codex 订阅（实验性）' }, { value: 'sponsor', label: '官方推荐地址' }],
             })),
+          showSponsor ? h('div', { className: 'ab-note', style: { margin: '8px 0' } },
+            h('div', null, '国粹（官方推荐赞助商）：官网地址 ',
+              h('a', { href: SPONSOR_SITE, target: '_blank', rel: 'noreferrer' }, 'ntmd.cn'),
+              '，接口地址 ' + SPONSOR_BASE + ' —— 0.04/张 超快出图'),
+            h('div', { className: 'ab-flex', style: { marginTop: 6 } },
+              h(Btn, { small: true, onClick: useSponsor }, '使用这个地址'),
+              h(Btn, { small: true, kind: 'ghost', onClick: () => setShowSponsor(false) }, '收起'))) : null,
           isCodex ? h(CodexSub, { draft, setDraft, toast }) : isCustom ? h('div', null,
             h(Row, { label: '请求方式', hint: 'GET 把参数都拼在地址上；POST 放进请求体' },
               h(Seg, {
@@ -7563,7 +7605,15 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             h(Row, { label: '取值路径', hint: '接口直接回图片就留空；回 JSON 时填地址字段' },
               f.text('imageGen.custom.responsePath', { size: 'wide', placeholder: '如 data.0.url（留空自动找）' })),
           ) : h('div', null,
-            h(Row, { label: '服务地址', hint: '一般以 /v1 结尾' }, f.text('imageGen.baseUrl', { size: 'wide', placeholder: 'https://api.siliconflow.cn/v1' })),
+            h(Row, { label: '服务地址', hint: '官方推荐固定内置不可删；点「＋ 添加」弹窗加自己的常用地址，下拉切换使用' },
+              h('div', null,
+                h('div', { className: 'ab-flex' },
+                  h(Select, { value: baseUrlKnown ? c.baseUrl : '', options: baseOptions, width: 280, ariaLabel: '服务地址', placeholder: '选择服务地址', onChange: pickBase }),
+                  h(Btn, { small: true, title: '添加常用服务地址（名字 + 地址）', onClick: () => { setAddName(''); setAddUrl(''); setAddOpen(true) } }, '＋ 添加')),
+                baseUrlOptions.length ? h('div', { className: 'ab-flex', style: { gap: 6, marginTop: 6, flexWrap: 'wrap' } },
+                  baseUrlOptions.map((o) => h('span', { key: o.url, className: 'ab-small', title: o.url, style: { border: '1px solid rgba(127,127,127,.25)', borderRadius: 10, padding: '1px 8px' } },
+                    o.name + ' · ' + o.url,
+                    h('button', { type: 'button', className: 'ab-btn sm danger x', title: '从下拉里删掉这个地址', style: { marginLeft: 4 }, onClick: () => delBaseUrl(o.url) }, '✕')))) : null)),
             h(Row, { label: 'API Key', hint: '只存在本机，不会显示出来' }, f.text('imageGen.apiKey', { type: 'password', placeholder: c.apiKeySet ? '已保存（不改就留空）' : '没有就留空' })),
             h(Row, { label: '模型' }, f.text('imageGen.model', { size: 'wide', placeholder: '例如 Kwai-Kolors/Kolors' })),
           ),
@@ -7585,6 +7635,22 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           !c.enabled ? h('div', { className: 'ab-note', style: { marginTop: 10 } }, '还没开启。填好接口信息、打开右上角开关并保存后，ta就会多一个「画图」能力。') : null,
         ),
         h(PaintGallery, { draft, setDraft, toast }),
+        // 「＋ 添加服务地址」弹窗：名字 + 地址；点遮罩关闭，内容区阻止冒泡
+        addOpen ? h('div', { style: { position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(12,28,38,.45)', zIndex: 80, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24 }, onClick: () => setAddOpen(false) },
+          h('div', { style: { background: 'var(--ab-card)', border: '1px solid var(--ab-line)', borderRadius: 14, padding: '16px 18px', width: 420, maxWidth: '92%', boxShadow: 'var(--ab-shadow)' }, onClick: (e) => e.stopPropagation() },
+            h('div', { className: 'ab-flex', style: { marginBottom: 12 } },
+              h('b', null, '添加服务地址'),
+              h('div', { className: 'ab-spacer' }),
+              h('button', { type: 'button', className: 'ab-btn sm ghost', title: '关闭', onClick: () => setAddOpen(false) }, '✕')),
+            h('div', { style: { marginBottom: 10 } },
+              h('div', { className: 'ab-label' }, h('b', null, '名字'), h('small', null, '显示在下拉列表里；留空就用地址的域名')),
+              h('input', { className: 'ab-input', style: { width: '100%' }, value: addName, placeholder: '例如：硅基流动', onChange: (e) => setAddName(e.target.value) })),
+            h('div', { style: { marginBottom: 14 } },
+              h('div', { className: 'ab-label' }, h('b', null, '地址'), h('small', null, 'OpenAI 兼容接口，一般以 /v1 结尾')),
+              h('input', { className: 'ab-input', style: { width: '100%' }, value: addUrl, placeholder: 'https://api.siliconflow.cn/v1', onChange: (e) => setAddUrl(e.target.value) })),
+            h('div', { className: 'ab-flex', style: { justifyContent: 'flex-end', gap: 8 } },
+              h(Btn, { small: true, kind: 'ghost', onClick: () => setAddOpen(false) }, '取消'),
+              h(Btn, { small: true, onClick: saveAdd }, '添加并使用')))) : null,
       )
     }
 
