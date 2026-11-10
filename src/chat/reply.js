@@ -479,6 +479,27 @@ export function splitLines(text) {
   return lines
 }
 
+/**
+ * 把这一轮真发出去的东西写成一行（聊天流水、记忆、下次交给她时「我说过什么」都看这行）。
+ * 表情必须留名字：只写 `[sticker]` 的话，她事后认不出自己发的是哪一张——
+ * 被说「乱贴表情」时连自查都做不到。
+ */
+export function itemsToLine(items, resolveSticker = () => null) {
+  return (items || [])
+    .map((i) => {
+      if (!i) return ''
+      if (i.kind === 'text' || i.kind === 'voice') return String(i.value ?? '')
+      if (i.kind === 'sticker') {
+        const item = i.value && typeof i.value === 'object' ? i.value : resolveSticker(i.value)
+        const name = item?.name || (item?.md5 ? String(item.md5).slice(0, 8) : '')
+        return name ? `[表情：${name}]` : '[表情]'
+      }
+      return `[${i.kind}]`
+    })
+    .filter((s) => s !== '')
+    .join(' ')
+}
+
 function pushText(items, s) {
   const t = stripMarkdown(String(s || '').replace(/<\/?reply[^>]*>/g, '')) // 写坏的引用标签直接去掉
   if (!t || isSilence(t)) return
