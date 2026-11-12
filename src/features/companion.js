@@ -1,5 +1,6 @@
 // 陪伴类小功能：心情、主动搭话。
 
+import { randomUUID } from 'node:crypto'
 import { dataDir, readJson, writeJson } from '../core/store.js'
 import { askModel } from '../core/llm.js'
 import { cleanText, clipText } from '../core/text.js'
@@ -175,6 +176,163 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory }) {
   const load = () => readJson(file(), () => ({ day: '', count: 0, nextAt: 0, last: 0 }))
   const save = (s) => writeJson(file(), s)
 
+  // ---------------- 她的小闹钟 ----------------
+  // 每条提醒都是她自己在对话里设的一次性闹钟；到点只负责把她叫醒，不直接替她发消息。
+  const REMINDER_FILE = 'speakup-reminders.json'
+  const REMINDER_GRACE_MS = 15 * 60_000
+  const REMINDER_RETRY_MS = 5 * 60_000
+  const REMINDER_WAIT_MS = 4 * 60_000
+  let reminderBusy = false
+
+  const reminderFile = () => dataDir(REMINDER_FILE)
+  const two = (n) => String(n).padStart(2, '0')
+  const reminderText = (at) => {
+    const d = new Date(at)
+    return `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}`
+  }
+  function parseReminderTime(value) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})$/.exec(String(value || '').trim())
+    if (!m) return 0
+    const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), 0, 0)
+    if (d.getFullYear() !== Number(m[1]) || d.getMonth() !== Number(m[2]) - 1 || d.getDate() !== Number(m[3])
+      || d.getHours() !== Number(m[4]) || d.getMinutes() !== Number(m[5])) return 0
+    return d.getTime()
+  }
+  function normalizeReminder(raw) {
+    if (!raw || typeof raw !== 'object') return null
+    const id = String(raw.id || '').trim()
+    const at = Number(raw.at)
+    const note = String(raw.note || '').trim().slice(0, 500)
+    if (!id || !Number.isFinite(at) || !note) return null
+    return {
+      id,
+      at,
+      atText: String(raw.atText || '').trim() || reminderText(at),
+      note,
+      createdAt: Number(raw.createdAt) || at,
+      attempts: Math.max(0, Math.round(Number(raw.attempts) || 0)),
+      nextAt: Number(raw.nextAt) || at,
+      expiresAt: Number(raw.expiresAt) || at + REMINDER_GRACE_MS,
+      lastError: String(raw.lastError || '').slice(0, 180),
+    }
+  }
+  function loadReminders() {
+    const raw = readJson(reminderFile(), () => [])
+    return (Array.isArray(raw) ? raw : []).map(normalizeReminder).filter(Boolean)
+  }
+  function saveReminders(list) { writeJson(reminderFile(), list) }
+  function pruneReminders(now = Date.now()) {
+    const raw = loadReminders()
+    const live = raw.filter((r) => r.expiresAt > now)
+    if (live.length !== raw.length) saveReminders(live)
+    return live
+  }
+  function reminderList(now = Date.now()) {
+    return pruneReminders(now).sort((a, b) => a.at - b.at)
+  }
+  function addReminder(value, noteText) {
+    const cfg = getConfig()
+    if (!cfg.enabled || cfg.speakUp?.enabled === false) return { ok: false, message: '主动搭话没开启' }
+    if (!cfg.speakUp?.reminderEnabled) return { ok: false, message: '小闹钟没开启' }
+    const at = parseReminderTime(value)
+    if (!at) return { ok: false, message: '时间格式不对，要用 yyyy-mm-dd HH:MM，例如 2026-11-12 17:30' }
+    const now = Date.now()
+    if (at <= now) return { ok: false, message: '这个时间已经过去了，请设一个将来的时间' }
+    const note = String(noteText || '').trim().slice(0, 500)
+    if (!note) return { ok: false, message: '要提醒自己什么？把想说的话写进 note' }
+    const live = pruneReminders(now)
+    if (live.length >= (cfg.speakUp.reminderLimit ?? 5)) return { ok: false, message: '你设定的提醒太多了' }
+    const reminder = {
+      id: randomUUID(),
+      at,
+      atText: reminderText(at),
+      note,
+      createdAt: now,
+      attempts: 0,
+      nextAt: at,
+      expiresAt: at + REMINDER_GRACE_MS,
+      lastError: '',
+    }
+    saveReminders([...live, reminder])
+    log.info(`小闹钟：${reminder.atText} ${note}`)
+    return { ok: true, id: reminder.id, at: reminder.atText, message: `已记下，${reminder.atText} 叫醒你` }
+  }
+  function closeReminder(id) {
+    const key = String(id || '').trim()
+    const live = pruneReminders()
+    if (!key || !live.some((r) => r.id === key)) return { ok: false, message: '没找到这个提醒，可能已经过期或关闭了' }
+    saveReminders(live.filter((r) => r.id !== key))
+    return { ok: true, message: '这个小闹钟已关闭' }
+  }
+  function reminderPrompt(reminder, owner) {
+    return `【系统提醒，不是${owner}说的话】你之前给自己定的小闹钟到时间了：${reminder.atText}「${reminder.note}」。现在可以主动找${owner}说这件事；如果你觉得现在不适合打扰，就只回 [沉默]。`
+  }
+  async function attemptReminder(reminder, now = Date.now()) {
+    const cfg = getConfig()
+    const owner = String(cfg.ownerQQ || '')
+    if (!owner || !cfg.enabled || cfg.speakUp?.enabled === false || !cfg.speakUp?.reminderEnabled) return
+    const chatId = `private:${owner}`
+    const outcome = await new Promise((resolve) => {
+      let settled = false
+      const timer = setTimeout(() => finish({ ok: false, error: '等回复超时' }), REMINDER_WAIT_MS)
+      timer.unref?.()
+      const finish = (result) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve(result || { ok: false, error: '没有结果' })
+      }
+      try {
+        const waiting = hub.pushToSession(
+          { chatId, kind: 'private', userId: owner, nickname: cfg.ownerName || '主人' },
+          [{ type: 'text', text: reminderPrompt(reminder, cfg.ownerName || '主人') }],
+          '',
+          { onTurnEnd: finish },
+        )
+        Promise.resolve(waiting).catch((error) => finish({ ok: false, error: error?.message || String(error) }))
+      } catch (error) {
+        finish({ ok: false, error: error?.message || String(error) })
+      }
+    })
+    const live = loadReminders()
+    const current = live.find((r) => r.id === reminder.id)
+    if (!current) return
+    if (outcome.ok) {
+      saveReminders(live.filter((r) => r.id !== reminder.id))
+      log.info(`小闹钟触发：${reminder.atText} ${reminder.note}`)
+      return
+    }
+    const retry = cfg.speakUp?.reminderRetry !== false
+    const at = Date.now()
+    if (!retry) {
+      saveReminders(live.filter((r) => r.id !== reminder.id))
+      log.warn(`小闹钟放弃：${reminder.atText} ${outcome.error || '触发失败'}`)
+      return
+    }
+    // 第一次失败后从现在起保留 15 分钟；之后每 5 分钟再试。
+    if (current.attempts === 0) current.expiresAt = at + REMINDER_GRACE_MS
+    if (at + REMINDER_RETRY_MS >= current.expiresAt) {
+      saveReminders(live.filter((r) => r.id !== reminder.id))
+      log.warn(`小闹钟放弃：${reminder.atText} ${outcome.error || '触发失败'}`)
+      return
+    }
+    current.attempts += 1
+    current.nextAt = at + REMINDER_RETRY_MS
+    current.lastError = String(outcome.error || '触发失败').slice(0, 180)
+    saveReminders(live)
+    log.warn(`小闹钟触发失败，5 分钟后重试：${reminder.atText}（${current.lastError}）`)
+  }
+  async function tickReminders(now = Date.now()) {
+    if (reminderBusy) return false
+    const cfg = getConfig()
+    if (!cfg.enabled || cfg.speakUp?.enabled === false || !cfg.speakUp?.reminderEnabled) return false
+    const due = reminderList(now).find((r) => r.nextAt <= now)
+    if (!due) return false
+    reminderBusy = true
+    try { await attemptReminder(due, now) } finally { reminderBusy = false }
+    return true
+  }
+
   function schedule(s, cfg) {
     const min = cfg.minIntervalMinutes
     const max = cfg.maxIntervalMinutes
@@ -257,6 +415,7 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory }) {
     const cfg = getConfig()
     const c = cfg.speakUp
     if (!cfg.enabled || !c.enabled) return
+    if (await tickReminders()) return
     if (cfg.ext?.purpose?.enabled === true) return // 目的引擎开着时由它主动找人，两套都跑同一个人会被找两次
     if (isMuted?.(`private:${cfg.ownerQQ}`) || memory?.()?.dislikes?.(cfg.ownerQQ)) { // 主人在私聊里让她闭嘴了：只管主人这边，白名单照旧
       const s = load()
@@ -290,5 +449,12 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory }) {
     if (!(await tickFriends(cfg, s))) save(s)
   }
 
-  return { tick, fire, state: load }
+  return {
+    tick,
+    fire,
+    state: () => ({ ...load(), reminders: reminderList() }),
+    reminders: reminderList,
+    addReminder,
+    closeReminder,
+  }
 }

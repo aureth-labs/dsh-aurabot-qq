@@ -1516,6 +1516,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       groupEngagedRun.delete(gid)
       groupInterjects.set(gid, [...(groupInterjects.get(gid) || []), Date.now()].slice(-60))
     }
+    return { silent: true }
   }
 
   /**
@@ -1890,6 +1891,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       const onDelivered = st.onDelivered
       st.onDelivered = st.pendingOnDelivered || null
       st.pendingOnDelivered = null
+      const onTurnEnd = st.onTurnEnd
+      st.onTurnEnd = st.pendingOnTurnEnd || null
+      st.pendingOnTurnEnd = null
       st.autoReply = null
       st.text = ''
       st.markerRetried = false
@@ -1910,16 +1914,33 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       if (!completed) {
         const detail = String(d.reason?.error?.message || d.reason?.failure?.message || '').replace(/\s+/g, ' ').slice(0, 180)
         log.warn(`${chatId} 这一轮没正常结束（${d.reason?.kind || '?'}${detail ? '：' + redact(detail) : ''}），不发`)
+        try { onTurnEnd?.({ ok: false, error: detail || String(d.reason?.kind || '这一轮没正常结束') }) } catch (error) { log.debug('本轮失败回执出错：', error.message) }
         release(chatId, turnToken)
         return
       }
       if (chatId.startsWith('system:')) return // 已超时的后台轮次不能误发到 QQ
-      if (!text) return release(chatId, turnToken)
+      if (!text) {
+        try { onTurnEnd?.({ ok: true, silent: true }) } catch (error) { log.debug('本轮结束回执出错：', error.message) }
+        return release(chatId, turnToken)
+      }
       // 发完再放开：发送期间来的消息也攒到下一段。
       // 没有中间段在发的时候就走原来的路径（同步开始、release 跟着这一条走），时序和以前一模一样；
       // 只有前面真有中间段没发完时才排队，保证最后一段一定是最后一条（#214 review）。
       const sendLast = () => deliver(chatId, text, { wantVoice, autoReply, userText: st.lastText || '', own: true, onDelivered, fromThinking })
-        .catch((error) => log.warn('发送出错：', error.message))
+        .then((result) => {
+          try {
+            onTurnEnd?.({
+              ok: Boolean(result?.silent || (result && !result.failed && result.sent)),
+              silent: Boolean(result?.silent),
+              error: result?.errors?.[0] || '',
+              result,
+            })
+          } catch (error) { log.debug('本轮投递回执出错：', error.message) }
+        })
+        .catch((error) => {
+          log.warn('发送出错：', error.message)
+          try { onTurnEnd?.({ ok: false, error: error.message }) } catch (e) { log.debug('本轮失败回执出错：', e.message) }
+        })
         .finally(() => release(chatId, turnToken))
       const pending = sendChain.get(chatId)
       if (pending) {
@@ -3031,6 +3052,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   async function pushToSession(chat, content, senderId, opts = {}) {
     assertActive(); opts.assertAuthorized?.()
     const turnToken = opts.turnToken
+    const onTurnEnd = typeof opts.onTurnEnd === 'function' ? opts.onTurnEnd : null
     checkTurn(chat.chatId, turnToken)
     const cutoff = chat.kind === 'private' ? memoryResetAt(chat.userId) : 0
     const assertMemoryCurrent = () => {
@@ -3148,6 +3170,15 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       // 回执跟着它所属的轮次走；排队的主动搭话不能算到上一轮。
       if (queuedNextTurn) st.pendingOnDelivered = opts.onDelivered || null
       else st.onDelivered = opts.onDelivered || null
+    }
+    // 给调用方一个「这一轮真的结束了」的回执（小闹钟失败重试用）；不改没有回执的旧路径。
+    if (onTurnEnd) {
+      const slot = queuedNextTurn ? 'pendingOnTurnEnd' : 'onTurnEnd'
+      const previous = st[slot]
+      st[slot] = (result) => {
+        try { previous?.(result) } catch (error) { log.debug('上一轮回执出错：', error.message) }
+        try { onTurnEnd(result) } catch (error) { log.debug('本轮结束回执出错：', error.message) }
+      }
     }
     turnState.set(key, st)
     outputSources.set(chat.chatId, sources)

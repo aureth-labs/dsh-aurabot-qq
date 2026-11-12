@@ -308,6 +308,9 @@ export const DEFAULTS = {
     maxPerDay: 20, // 每个人每天最多几次；留空就是 20
     allow: [], // 主动搭话白名单：除主人外还会主动找谁（QQ 号）
     nudge: true, // 她问了你一句、你一直没回时，偶尔轻轻追一句
+    reminderEnabled: false, // 允许她在主人私聊里给自己设小闹钟
+    reminderLimit: 5, // 最多同时保留几条未过期的提醒（硬上限 10）
+    reminderRetry: true, // 触发失败后 15 分钟内每 5 分钟重试
     awakeFrom: 8,
     awakeTo: 23,
   },
@@ -672,6 +675,9 @@ export function normalize(raw) {
   c.speakUp.maxIntervalMinutes = Math.max(c.speakUp.minIntervalMinutes, num(c.speakUp.maxIntervalMinutes, 240, 1, BIG))
   // 留空就是 20，上限不封顶
   c.speakUp.maxPerDay = c.speakUp.maxPerDay === '' || c.speakUp.maxPerDay == null ? 20 : num(c.speakUp.maxPerDay, 20, 0, BIG)
+  c.speakUp.reminderEnabled = bool(c.speakUp.reminderEnabled, false)
+  c.speakUp.reminderLimit = Math.min(10, Math.max(1, Math.round(num(c.speakUp.reminderLimit, 5, 1, 10))))
+  c.speakUp.reminderRetry = bool(c.speakUp.reminderRetry, true)
   c.speakUp.allow = [...new Set((Array.isArray(c.speakUp.allow) ? c.speakUp.allow : []).map((q) => String(q).trim()).filter((q) => /^\d{5,}$/.test(q)))]
   const q = c.qzoneSocial
   q.enabled = bool(q.enabled, true)
