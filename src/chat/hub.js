@@ -1023,10 +1023,12 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         try {
           // 慢工具（生图 / 翻唱……）卡超过 1.5 秒就先发一条提示：不让主人以为她没收到（issue #74）。
           // 包装只加在挂给 agent 的这份工具上；面板里直接调工具（host 路由）照旧。
+          // slow 是字符串时沿用固定提示；slow === true 时优先发她这一轮自己写的话，
+          // 没写就不硬塞，避免所有工具都冒出同一句模板。
           let reg = tool
           if (tool.slow) {
             const { slow, ...base } = tool
-            const notice = typeof slow === 'string' ? slow : '好，我这就去做，做完跟你说一声。'
+            const fixedNotice = typeof slow === 'string' ? slow : ''
             reg = {
               ...base,
               async execute(args, exec) {
@@ -1038,8 +1040,12 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
                   fired = true
                   if (!isCurrent()) return
                   if (slowNoticeSent.has(sid)) return
+                  const state = turnState.get(sid)
+                  const said = fixedNotice || String(state?.toolText || state?.text || '').trim()
+                  if (!said) return
                   slowNoticeSent.add(sid)
-                  sendText(chat.chatId, notice, undefined, [], undefined, { isCurrent }).catch((error) => log.debug('慢工具提示没发出去：', error.message))
+                  if (!fixedNotice && state) { state.toolText = ''; state.text = '' } // 已经提前发了，turn/end 不再重复
+                  sendText(chat.chatId, said, undefined, [], undefined, { isCurrent }).catch((error) => log.debug('慢工具提示没发出去：', error.message))
                 }, 1500)
                 slowTimers.set(timer, sid)
                 timer.unref?.()
@@ -1795,7 +1801,13 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       // 顺手记下思考：万一这一轮她一个字正文都没写，turn/end 时还有机会把定稿捞回来
       const th = reasoningOf(d.message)
       if (th) st.thinking = { turn: d.turn, text: th }
+      const hasToolCall = Boolean(d.message?.content?.some((b) => b && (b.type === 'tool-call' || b.type === 'tool_use')))
       const raw = assistantReplyText(d.message)
+      const toolText = hasToolCall
+        ? (d.message?.content || []).filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n').trim()
+        : ''
+      // 工具调用那一轮的正文不会被当成最终回复，但慢工具等待时可以先拿它当提示。
+      st.toolText = toolText
       // 最后一条 assistant 消息才是本轮回复；总是覆盖（空也覆盖），
       // 否则最后一条是空的（或只有工具调用）时会拿上一条过程性文字补发，把思考发出去。
       // 例外是开了 chat.everyStep：那时中间段已经陆续发过，这一步没说话就别把上一段盖掉，
@@ -1877,6 +1889,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         }
       }
       st.thinking = null
+      st.toolText = ''
       if (completed && text && st.archiveNamespace && !chatId.startsWith('system:') && getConfig().conversationContext?.enabled === true) {
         try { conversationArchive(st.archiveNamespace).append(chatId, { role: 'assistant', text, id: key + ':turn:' + d.turn, contextAt: st.archiveContextAt, speakerId: getConfig().botQQ || '' }) }
         catch (error) { log.warn('对话记忆保存失败：', error.message) }

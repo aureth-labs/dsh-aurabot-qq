@@ -72,6 +72,33 @@ for (const stop of ['dispose', 'turn/end']) test(`慢工具在 ${stop} 后不再
   assert.equal(sent.some((x) => x.includes('进度探针')), false)
 })
 
+test('慢工具 slow=true 时优先发她自己写的话', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const work = deferred()
+  t.after(() => work.resolve({ ok: true }))
+  let fake
+  const sent = []
+  const s = setup(t, {
+    brain: async ({ callTool }) => {
+      const agent = [...fake.agents.values()][0]
+      fake.emit('session/event', agent.session, { type: 'assistant/message', data: { turn: 1, message: { content: [
+        { type: 'text', text: '等我一下，我去画' },
+        { type: 'tool-call', id: 'slow-auto-1', name: 'slow-auto', arguments: '{}' },
+      ] } } })
+      await callTool('slow-auto', {})
+      return ''
+    },
+    hooks: { send: async (segments, info) => { sent.push(info.note); return segments } },
+    buildTools: () => [{ name: 'slow-auto', slow: true, execute: () => work.promise }],
+  })
+  fake = s.fake
+  await s.hub.onMessage(event())
+  await settle()
+  t.mock.timers.tick(1501)
+  await settle()
+  assert.equal(sent.some((x) => x.includes('等我一下，我去画')), true)
+})
+
 test('慢工具提示等待发送挂钩时轮次结束，不再投递到 QQ', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] })
   const work = deferred(), sending = deferred()
