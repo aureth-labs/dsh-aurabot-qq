@@ -11,8 +11,25 @@
 // - 整理时先比对旧记忆（Mem0）：新事实是新增、补充旧的，还是说明旧的过时了。
 // - 过时不删（Graphiti）：旧记忆保留成立时间段，问起当时的事才能想起，面板里能恢复。
 // - 常驻的人物小档案（Letta 的 memory block）：每个人一小段印象，聊天时一直带着，不靠关键词碰运气。
+//
+// ── 多平台 I2 · 记忆改认人（PersonId 不透明）────────────────────────────
+// 人不再是「QQ 号」：记忆库的键（profiles[…]、shortTerm[…]、about 字段）存的就是 PersonId，
+// 存量数据里它是 QQ 号，代码不再对它做任何编号形状假设（禁止 /^\d+$/、Number()、比长度）。
+//
+// **注入点（createMemoryStore 的 options）**：
+//   identity.isValid(person)  —— 调用方注入的「合法 personId」判定（contracts.d.ts §2 Identity.isValid）。
+//   identity.isOwner(person)  —— 判断主人（contracts §四.5：只用它，不再直接比 ownerQQ）。
+//   identity.owner()          —— 当前主人的 PersonId。
+// 缺省（未注入，I1 接线前的保守判定）：personId 只认两种形状——存量迁来的纯数字串，
+// 和身份库生成的 `p-` 前缀小写字母数字串。只有下面这一个缺省实现允许出现形状正则，
+// 其余代码一律经过 isPersonId / ownerOf / ownerIs；接线后由 identity.isValid 接管。
+//
+// 地址（ChatId）一律走 src/gateway/address.js 的 normalizeChatId / parseChatId / sameChat，
+// 禁止 split(':')、禁止 === / startsWith 直接比地址（docs/CONTRACTS.md §三）。
+// 存量数据不回写：旧格式的 chatId（private:10001）读的时候规范化，写入侧归 G3 的 logChat。
 
 import { createHash, randomUUID } from 'node:crypto'
+import { normalizeChatId, parseChatId, sameChat } from '../gateway/address.js'
 import { dataDir, readJson, writeJson } from '../core/store.js'
 import { askModel, lastEmptyInfo } from '../core/llm.js'
 import { clipText } from '../core/text.js'
@@ -39,6 +56,14 @@ function isSelfFact(fact, cfg) {
 const NO_ARRAY = '提炼记忆时模型没有返回 JSON 数组'
 const EXTRACT_RETRY_TOKENS = 16000
 const VIA_NAMES = { douyin: '抖音', heybox: '小黑盒' }
+
+/** 缺省 personId 判定（文件头「注入点」）：存量数字串或身份库 p- 串。模块级纯函数（memoryLine / normalizeRelation 等导出函数）只能用它；createMemoryStore 内部一律用注入的 isPersonId。 */
+export const defaultIsPersonId = (v) => typeof v === 'string' && v.length > 0 && (/^\d+$/.test(v) || /^p-[0-9a-z]+$/.test(v))
+
+/** 读侧地址解析：任何形态（含旧 private:10001）→ { instance, kind, id }；认不出返回 null。禁止再写 startsWith / split(':') 判地址。 */
+const addrOf = (chatId) => parseChatId(String(chatId || ''))
+const isPrivateAddr = (chatId) => addrOf(chatId)?.kind === 'private'
+const isGroupAddr = (chatId) => addrOf(chatId)?.kind === 'group'
 export const RELATED_MIN_SCORE = 0.8
 export const RELATED_LIMIT = 6
 // 向量关联（联想）：建边阈值、每条最多几条边、召回时最多带几条、每次点开边涨多少。
@@ -65,11 +90,7 @@ export const validUntilOf = (m) => m.validUntil ?? m.invalidAt
 export const isCurrent = (m, now = Date.now()) => !m.invalidAt && (!validUntilOf(m) || validUntilOf(m) > now) && (!validFromOf(m) || validFromOf(m) <= now)
 
 const FOLLOW_UP_DELAYS = [3, 7] // 问过一次、两次后分别再等几天；第三次放下
-const followUpChatAllowed = (chatId, cfg) => [cfg.ownerQQ, ...(cfg.speakUp?.allow || [])]
-  .some((qq) => qq && chatId === `private:${qq}`)
-const followUpPerson = (m, cfg) => Boolean(m.about && String(m.speaker) === String(m.about)
-  && m.chatId === `private:${m.about}` && m.scope !== 'group' && !m.kind
-  && (m.status || 'fact') === 'fact' && followUpTier(m.tier) && followUpChatAllowed(m.chatId, cfg))
+// （followUpChatAllowed / followUpPerson 挪进了 createMemoryStore：比较主人私聊地址要用注入的 owner，见文件头。）
 
 /** 只解析本地明确日期；没拿准时相对于原话等三天，不按整理时间重排。 */
 export function parseFollowUpAt(value, reference = Date.now()) {
@@ -283,14 +304,14 @@ export function buildIndex(items) {
   return { docs, df, avgLen, N: docs.length }
 }
 
-/** 召回与只读推荐共用的来源/人物可见性；平台标签不参与权限。 */
+/** 召回与只读推荐共用的来源/人物可见性；平台标签不参与权限。chatId 比较（新旧格式等价）一律 sameChat，群/私聊形态一律 parseChatId 判。 */
 export function memoryVisible(item, o = {}) {
   const has = (values, id) => (Array.isArray(values) ? values : values ? [values] : []).map(String).includes(String(id))
-  if (item.kind === 'gist' && (!o.gistChatId || item.chatId !== o.gistChatId)) return false
+  if (item.kind === 'gist' && (!o.gistChatId || !sameChat(item.chatId, o.gistChatId))) return false
   const group = item.scope === 'group'
-  if (group && (!String(item.chatId || '').startsWith('group:') || item.about)) return false
-  if (group && !o.includeGroup && (!o.groupChatId || item.chatId !== o.groupChatId)) return false
-  if (!group && o.ownerScope === false && String(item.chatId || '') !== String(o.scopeChatId || '')) return false
+  if (group && (!isGroupAddr(item.chatId) || item.about)) return false
+  if (group && !o.includeGroup && (!o.groupChatId || !sameChat(item.chatId, o.groupChatId))) return false
+  if (!group && o.ownerScope === false && !sameChat(item.chatId, o.scopeChatId)) return false
   if (!group && item.about && has(o.excludeAbout, item.about)) return false
   if (!group && o.onlyAbout && item.about && !has(o.onlyAbout, item.about)) return false
   if (!group && o.requireAbout && !item.about) return false
@@ -562,12 +583,12 @@ const stamp = (t) => {
 
 /** 想起来的一条记忆怎么写给她：[什么时候] [关于谁] 内容。 */
 export function memoryLine(it, now = Date.now()) {
-  // 名字可能重名，带上 QQ 号才分得清是谁的事（#160）
-  const qq = /^\d+$/.test(String(it.about || '')) && !String(it.aboutName || '').includes(String(it.about)) ? `(${it.about})` : ''
+  // 名字可能重名，带上编号才分得清是谁的事（#160）；编号形状用缺省 personId 判定（文件头注入点）
+  const qq = defaultIsPersonId(String(it.about || '')) && !String(it.aboutName || '').includes(String(it.about)) ? `(${it.about})` : ''
   const status = it.status === 'hearsay' ? '听说' : it.status === 'guess' ? '可能' : ''
-  // 带上出处：哪个群或私聊的事，减少张冠李戴
-  const from = String(it.chatId || '')
-  const where = from.startsWith('group:') ? ` 群${from.slice(6)}` : from.startsWith('private:') ? ` 私聊${from.slice(8)}` : ''
+  // 带上出处：哪个群或私聊的事，减少张冠李戴（地址只解析展示，不拼不拆）
+  const addr = addrOf(it.chatId)
+  const where = addr?.kind === 'group' ? ` 群${addr.id}` : addr?.kind === 'private' ? ` 私聊${addr.id}` : ''
   const platforms = (Array.isArray(it.via) ? it.via : it.via ? [it.via] : it.kind === 'seen' && it.meta?.platform ? [it.meta.platform] : []).filter((v) => v !== 'qq').map((v) => Object.hasOwn(VIA_NAMES, v) ? VIA_NAMES[v] : v)
   const origin = platforms.length ? ` ${platforms.join('/')}` : ''
   const speaker = it.speaker && String(it.speaker) !== String(it.about || '') && it.kind !== 'seen' ? `（原话来自${it.speaker}）` : ''
@@ -736,10 +757,12 @@ export function normalizeRelation(x, { chatId = '', names = new Map(), owner = '
   const pred = word(x?.pred)
   const obj = word(x?.obj)
   if (!subj || !pred || !obj || subj === obj || [subj, pred, obj].some((v) => v.length > 20) || looksLikeRuleMemory(pred)) return null
-  const qqOf = (v) => (/^\d+$/.test(String(v ?? '')) ? String(v) : '')
+  // 编号形状用缺省 personId 判定（文件头注入点），不再假设 QQ 号
+  const qqOf = (v) => (defaultIsPersonId(String(v ?? '')) ? String(v) : '')
   const subjQq = qqOf(x.subj_qq)
   const objQq = qqOf(x.obj_qq)
-  const author = String(x.speaker || (chatId.startsWith('private:') ? chatId.slice(8) : ''))
+  const addr = addrOf(chatId)
+  const author = String(x.speaker || (addr?.kind === 'private' ? addr.id : ''))
   if (!names.has(author)) return null
   const who = names.get(author)
   if (author !== String(owner) && subjQq !== author && objQq !== author && subj !== who && obj !== who) return null
@@ -827,7 +850,21 @@ export function checkAbstractText (text, sourceTexts = []) {
   return { ok: true, text: t }
 }
 
-export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConfig = null }) {
+export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConfig = null, identity = null }) {
+  // ── 身份注入点（I2，见文件头）：PersonId 不透明、主人判定只走注入的 identity ──
+  // 未注入（I1 接线前）的缺省：owner 取 cfg.ownerQQ（全文件唯一一处读它，接线后由 identity.owner() 取代）；
+  // isPersonId 用文件头的保守缺省判定。
+  const isPersonId = identity?.isValid || defaultIsPersonId
+  const ownerOf = () => (identity?.owner ? identity.owner() : String(getConfig().ownerQQ || ''))
+  const ownerIs = (person) => (identity?.isOwner ? identity.isOwner(person) : Boolean(ownerOf()) && String(person) === ownerOf())
+
+  // 主人私聊（或主动发言白名单）才允许挂跟进；地址比较走 sameChat（新旧格式等价）。
+  const followUpChatAllowed = (chatId, cfg) => [ownerOf(), ...(cfg.speakUp?.allow || [])]
+    .some((qq) => qq && sameChat(chatId, `private:${qq}`))
+  const followUpPerson = (m, cfg) => Boolean(m.about && String(m.speaker) === String(m.about)
+    && sameChat(m.chatId, `private:${m.about}`) && m.scope !== 'group' && !m.kind
+    && (m.status || 'fact') === 'fact' && followUpTier(m.tier) && followUpChatAllowed(m.chatId, cfg))
+
   // 用 ByMode：beta 的 createVectorIndex 只会走在线服务，本地 bge-small 模型完全用不上，
   // 「检索方式 = 本地」时联想就永远是 0 条。ByMode 会在本地模型没就绪时返回 null（降级成关键词）。
   const vector = createVectorIndexByMode({ getConfig, log, fetchImpl })
@@ -851,18 +888,19 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     const s = load()
     const cfg = getConfig()
     const gists = cfg.memory.gistEnabled === false ? [] : (s.gists || []).filter((g) => g.kind === 'gist' && safeGistText(g.text, g.chatId))
-    const stamp = JSON.stringify([s.items.length, s.items.at(-1)?.id || '', s.rev || 0, gists.length, cfg.memory.gistEnabled !== false, cfg.ownerQQ, cfg.ownerName])
+    const stamp = JSON.stringify([s.items.length, s.items.at(-1)?.id || '', s.rev || 0, gists.length, cfg.memory.gistEnabled !== false, ownerOf(), cfg.ownerName])
     if (!cache || cache.stamp !== stamp) cache = { stamp, idx: buildIndex([...s.items, ...gists].filter((m) => rememberedItem(m, s))) }
     return cache.idx
   }
 
-  const isOwner = (qq) => Boolean(getConfig().ownerQQ) && String(qq) === String(getConfig().ownerQQ)
+  const isOwner = (qq) => ownerIs(qq)
   // 不再记住只有画像上的这一个标记；主人即使读到旧脏数据也不会被屏蔽。
   function remembers(qq, state = load()) {
     return !qq || isOwner(qq) || state.profiles?.[String(qq)]?.noMemory !== true
   }
   function rememberedItem(item, state = load()) {
-    return remembers(item.about, state) && (!String(item.chatId || '').startsWith('private:') || remembers(String(item.chatId).slice(8), state))
+    const addr = addrOf(item.chatId)
+    return remembers(item.about, state) && (addr?.kind !== 'private' || remembers(addr.id, state))
   }
   function rememberedRow(row, state = load()) {
     const interaction = Array.isArray(row.interaction) ? row.interaction : []
@@ -881,17 +919,18 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     }
     for (const day of hub?.chatLogDays?.() || []) for (const row of hub?.chatLogOf?.(day) || []) {
       if (!row || row.kind === 'seen' || row.forgottenAt || String(row.text || '').startsWith('【系统')) continue
-      const privateId = String(row.chatId || '').startsWith('private:') ? String(row.chatId).slice(8) : ''
+      const rowAddr = addrOf(row.chatId)
+      const privateId = rowAddr?.kind === 'private' ? rowAddr.id : ''
       const uid = String(row.uid || privateId || '')
       const at = Number(row.t) || 0
       if (row.who !== 'bot' && uid) {
         const p = ensure(uid)
         p.at = Math.max(p.at, at)
-        if (String(row.chatId || '').startsWith('group:')) p.groups.add(String(row.chatId).slice(6))
+        if (rowAddr?.kind === 'group') p.groups.add(rowAddr.id)
       }
       const ids = new Set([...(Array.isArray(row.interaction) ? row.interaction.map(String) : []), ...(privateId ? [privateId] : [])])
       for (const qq of ids) {
-        if (!/^\d+$/.test(qq)) continue
+        if (!isPersonId(qq)) continue
         const p = ensure(qq)
         p.interactions++
         p.lastInteraction = Math.max(p.lastInteraction, at)
@@ -901,6 +940,7 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     return people
   }
   function isAcquainted(qq) {
+    // 直接互动（各平台私聊流水）、配置白名单、QQ 好友（hub 没挂 QQ 平台时 isFriend 是 undefined，可选跳过）
     const id = String(qq || '')
     return Boolean(id && (isOwner(id) || (getConfig().allow?.private || []).map(String).includes(id) || (getConfig().speakUp?.allow || []).map(String).includes(id) || hub?.isFriend?.(id) || socialHistory().get(id)?.interactions))
   }
@@ -921,7 +961,8 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     const names = [s.profiles?.[id]?.name, s.profiles?.[id]?.alias].filter(Boolean)
     const noMemory = keepNoMemory && !remembers(id, s)
     const aboutPerson = (entry) => String(entry.about || '') === id
-    const fromPrivateChat = (entry) => entry.chatId === chatId
+    // 同一个私聊地址，新旧 chatId 格式（private:x / qq:private:x）都算
+    const fromPrivateChat = (entry) => sameChat(entry.chatId, chatId)
     const removeItem = (entry) => aboutPerson(entry) || (reset && fromPrivateChat(entry))
     const removeGist = (entry) => aboutPerson(entry) || fromPrivateChat(entry)
     const removedIds = reset ? new Set([...s.items.filter(removeItem), ...(s.gists || []).filter(removeGist)].map((entry) => entry.id)) : null
@@ -946,15 +987,16 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     if (removedIds) {
       for (let i = recallLog.length - 1; i >= 0; i--) {
         const { where, hits = [] } = recallLog[i]
-        if (where === chatId || where?.startsWith(chatId + '（') || hits.some((hit) => removedIds.has(hit.id))) recallLog.splice(i, 1)
+        if (sameChat(String(where).split('（')[0], chatId) || hits.some((hit) => removedIds.has(hit.id))) recallLog.splice(i, 1)
       }
     } else recallLog.length = 0
     saveRecalls()
   }
 
   function deletePerson(qq, { keepNoMemory = false } = {}) {
+    // qq 参数语义已放宽为 personId（兼容旧参数名，见文件头注入点）；存量数据里它就是 QQ 号
     const id = String(qq || '')
-    if (!/^\d+$/.test(id)) return { ok: false, message: 'QQ 号不对' }
+    if (!isPersonId(id)) return { ok: false, message: 'QQ 号不对' }
     if (isOwner(id)) return { ok: false, message: '不能删除主人' }
     clearPersonMemory(id, { keepNoMemory })
     const marked = hub?.forgetChatLog?.(id) || 0
@@ -962,7 +1004,7 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
   }
 
   function resetPerson(qq) {
-    if (typeof qq !== 'string' || !/^\d{5,}$/.test(qq)) return { ok: false, message: '请输入完整的 QQ 号' }
+    if (!isPersonId(String(qq || ''))) return { ok: false, message: '请输入完整的 QQ 号' }
     const result = hub.resetPersonChat(qq)
     if (!result.ok) return result
     clearPersonMemory(qq, { keepNoMemory: true, reset: true })
@@ -970,8 +1012,9 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
   }
 
   function setNoMemory(qq, enabled, { deleteExisting = false } = {}) {
+    // qq 参数语义已放宽为 personId（兼容旧参数名）；存到 profiles 的键不变
     const id = String(qq || '')
-    if (!/^\d+$/.test(id) || typeof enabled !== 'boolean') return { ok: false, message: 'QQ 号或开关不对' }
+    if (!isPersonId(id) || typeof enabled !== 'boolean') return { ok: false, message: 'QQ 号或开关不对' }
     if (isOwner(id)) return { ok: false, message: '不能对主人设置不再记住' }
     forgetVersion++
     const s = load()
@@ -1041,7 +1084,7 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     if (acquaintedOnly && !canProfile(about)) return { ok: false, message: '还没有和这个人直接互动，暂不建立人物记忆' }
     const t = String(text || (kind === 'seen' ? meta?.title : '') || '').trim().slice(0, 200)
     if (!t) return { ok: false, message: '内容是空的' }
-    if (scope === 'group' && (!String(chatId).startsWith('group:') || about)) return { ok: false, message: '群公共记忆必须属于一个群' }
+    if (scope === 'group' && (!isGroupAddr(chatId) || about)) return { ok: false, message: '群公共记忆必须属于一个群' }
     const s = load()
     const spokenAt = Number(saidAt) || Date.now()
     const start = parseValidityDate(validFrom, spokenAt)
@@ -1078,7 +1121,7 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     if (speaker && kind !== 'seen') item.speaker = String(speaker)
     if (status) item.status = status
     if (isFactTier(tier)) item.tier = tier
-    if (scope === 'group' && String(chatId).startsWith('group:')) item.scope = 'group'
+    if (scope === 'group' && isGroupAddr(chatId)) item.scope = 'group'
     setFollowUp(item, followUp, undefined, spokenAt)
     s.items.push(item)
     linkRelated(s, item)
@@ -1444,19 +1487,21 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
       return [...head, ...tail]
     }
     const id = String(where).split('（')[0]
-    const owner = String(getConfig().ownerQQ || '')
-    const ownerPrivate = Boolean(owner && id === `private:${owner}`)
-    const excluded = [...(Array.isArray(excludeAbout) ? excludeAbout : excludeAbout ? [excludeAbout] : []), ...(!ownerPrivate && /^(private|group):/.test(id) && owner ? [owner] : [])]
+    const owner = ownerOf()
+    // 主人私聊按地址判（新旧 chatId 格式等价）；where 不是真实聊天地址的内部调用按主人视角处理（向后兼容）
+    const ownerPrivate = Boolean(owner && sameChat(id, `private:${owner}`))
+    const whereAddr = addrOf(id)
+    const excluded = [...(Array.isArray(excludeAbout) ? excludeAbout : excludeAbout ? [excludeAbout] : []), ...(!ownerPrivate && whereAddr && owner ? [owner] : [])]
     // F1：社交场景（群聊 / 非主人私聊）统一加来源可见性，只保留当前聊天产生的普通记忆；
     // 主人私聊（ownerPrivate）保持可以看全部。where 不是真实聊天 id 的内部调用按主人视角处理（向后兼容）。
-    const socialScope = Boolean(id) && /^(private|group):/.test(id) && !ownerPrivate
+    const socialScope = Boolean(id) && whereAddr && !ownerPrivate
     // assoc 必须显式传进去：只传 assocLimit/assocHops 的话，用户把「记忆联想」关掉
     // （或向量检索关掉）之后，库里已经建好的边照样会被走一遍——开关形同虚设。
     // 库里存着的 assoc 边是「建过边」的历史，不代表现在还想用。
     const memoryCfg = getConfig().memory
     const assocOn = memoryCfg.assoc?.enabled !== false && memoryCfg.vector?.enabled !== false && memoryCfg.enabled !== false
     // beta 侧新增：minRelevance 门槛、preferPersonal 偏好、显式 period（工具/面板定点查时不再猜时间）
-    const options = { minRelevance: getConfig().memory.recallMinRelevance ?? 0, allowAboutOnly: agreementQuery, preferPersonal: prefer, period: period ?? pastWindow(query, Date.now(), memoryCfg.recallTriggers), about, onlyAbout, requireAbout, gistChatId: /^(private|group):/.test(id) && (!id.startsWith('group:') || getConfig().memory.groupMemory !== false) ? id : '', ownerScope: !socialScope, scopeChatId: socialScope ? id : '', groupChatId: getConfig().memory.groupMemory !== false && id === groupChatId && id.startsWith('group:') ? id : '', includeGroup: getConfig().memory.groupMemory !== false && includeGroup && ownerPrivate, excludeAbout: excluded, rrf: getConfig().memory.searchRrf !== false, assoc: assocOn, assocLimit: memoryCfg.assoc?.recall ?? ASSOC_RECALL_LIMIT, assocHops: memoryCfg.assoc?.hops ?? ASSOC_HOPS, assocHopDecay: memoryCfg.assoc?.hopDecay ?? ASSOC_HOP_DECAY, assocMap: assocOn ? (load().assoc || null) : null }
+    const options = { minRelevance: getConfig().memory.recallMinRelevance ?? 0, allowAboutOnly: agreementQuery, preferPersonal: prefer, period: period ?? pastWindow(query, Date.now(), memoryCfg.recallTriggers), about, onlyAbout, requireAbout, gistChatId: whereAddr && (!whereAddr.kind || whereAddr.kind !== 'group' || getConfig().memory.groupMemory !== false) ? id : '', ownerScope: !socialScope, scopeChatId: socialScope ? id : '', groupChatId: getConfig().memory.groupMemory !== false && sameChat(id, groupChatId) && whereAddr?.kind === 'group' ? id : '', includeGroup: getConfig().memory.groupMemory !== false && includeGroup && ownerPrivate, excludeAbout: excluded, rrf: getConfig().memory.searchRrf !== false, assoc: assocOn, assocLimit: memoryCfg.assoc?.recall ?? ASSOC_RECALL_LIMIT, assocHops: memoryCfg.assoc?.hops ?? ASSOC_HOPS, assocHopDecay: memoryCfg.assoc?.hopDecay ?? ASSOC_HOP_DECAY, assocMap: assocOn ? (load().assoc || null) : null }
     const idx = index()
     // 查询结束到真正回忆之间，记忆可能刚被改写、忘掉或关闭向量检索。
     const valid = Array.isArray(vectorHits) && vectorHits.length && vector && typeof vector.validIds === 'function' ? new Set(vector.validIds(idx.docs.map((d) => d.it))) : null
@@ -1659,7 +1704,7 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
 
   function personTags(qq) {
     const tags = (load().profiles || {})[String(qq)]?.tags
-    const owner = String(qq) === String(getConfig().ownerQQ || '')
+    const owner = ownerIs(qq)
     return Array.isArray(tags) ? tags.filter((tag) => typeof tag === 'string' && !(owner && tag === '讨厌')) : []
   }
   function dislikes(qq) { return personTags(qq).includes('讨厌') }
@@ -1672,7 +1717,7 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     const rememberedGroups = new Map()
     const ensure = (qq) => {
       const id = String(qq || '')
-      if (!/^\d+$/.test(id)) return null
+      if (!isPersonId(id)) return null
       if (!people.has(id)) people.set(id, { ...(s.profiles || {})[id], qq: id, notes: 0, lastActive: 0 })
       return people.get(id)
     }
@@ -1692,9 +1737,10 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
       const speaker = String(m.speaker || '')
       if (speaker) {
         spoken.set(speaker, Math.max(spoken.get(speaker) || 0, Number(saidTime(m)) || 0))
-        if (/^group:\d+$/.test(String(m.chatId || ''))) {
+        const mAddr = addrOf(m.chatId)
+        if (mAddr?.kind === 'group') {
           if (!rememberedGroups.has(speaker)) rememberedGroups.set(speaker, new Set())
-          rememberedGroups.get(speaker).add(String(m.chatId).slice(6))
+          rememberedGroups.get(speaker).add(mAddr.id)
         }
       }
       const p = ensure(m.about)
@@ -1714,8 +1760,7 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
       p.lastActive = Math.max(p.lastActive, activity.at)
       for (const id of activity.groups) { if (!rememberedGroups.has(qq)) rememberedGroups.set(qq, new Set()); rememberedGroups.get(qq).add(id) }
     }
-    const owner = String(getConfig().ownerQQ || '')
-    return [...people.values()].map((p) => ({ ...p, tags: personTags(p.qq), groups: [...(rememberedGroups.get(p.qq) || [])].map((id) => ({ id, name: hub?.groupNames?.get?.(id) || id })), hasRelations: (s.relations || []).some((r) => relationHas(r, p.qq, [p.name, p.alias].filter(Boolean))), hasInsights: Boolean((s.insights || {})[`qq:${p.qq}`]?.length), isOwner: Boolean(owner && p.qq === owner) }))
+    return [...people.values()].map((p) => ({ ...p, tags: personTags(p.qq), groups: [...(rememberedGroups.get(p.qq) || [])].map((id) => ({ id, name: hub?.groupNames?.get?.(id) || id })), hasRelations: (s.relations || []).some((r) => relationHas(r, p.qq, [p.name, p.alias].filter(Boolean))), hasInsights: Boolean((s.insights || {})[`qq:${p.qq}`]?.length), isOwner: ownerIs(p.qq) }))
       .sort((a, b) => Number(b.isOwner) - Number(a.isOwner) || (b.closeness || 0) - (a.closeness || 0) || a.qq.localeCompare(b.qq))
   }
 
@@ -1740,7 +1785,7 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
 
   function personaPerson(qq, { notesLimit = 20 } = {}) {
     const id = String(qq || '')
-    if (!/^\d+$/.test(id)) return null
+    if (!isPersonId(id)) return null
     const person = personaOverview().find((p) => p.qq === id)
     if (!person) return null
     const allNotes = list('').filter((m) => String(m.about || '') === id)
@@ -1763,7 +1808,7 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
   /** 人物详情里的 notes 分页：先过滤再切片，不把整份 notes 发给面板。 */
   function personaNotes(qq, { limit = 20, offset = 0 } = {}) {
     const id = String(qq || '')
-    if (!/^\d+$/.test(id)) return null
+    if (!isPersonId(id)) return null
     if (!personaOverview().some((p) => p.qq === id)) return null
     const all = list('').filter((m) => String(m.about || '') === id)
     const start = Math.max(0, Math.trunc(Number(offset) || 0))
@@ -1775,7 +1820,7 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
   /** 只改面板允许编辑的字段，保留旧画像的名字和其他元数据。 */
   function savePersonaPerson(qq, patch = {}) {
     const id = String(qq || '')
-    if (!/^\d+$/.test(id)) return { ok: false, message: 'QQ 号不对' }
+    if (!isPersonId(id)) return { ok: false, message: 'QQ 号不对' }
     const fields = ['alias', 'style', 'persona', 'handle', 'text']
     if (!remembers(id) && fields.some((key) => String(patch?.[key] || '').trim() && patch[key] !== load().profiles?.[id]?.[key])) return { ok: false, message: '先撤销不再记住，才能编辑人物印象' }
     if (!patch || ![...fields, 'tags'].some((key) => Object.hasOwn(patch, key))) return { ok: false, message: '没有要保存的内容' }
@@ -1783,7 +1828,7 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
       if (!Array.isArray(patch.tags) || patch.tags.length > 8 || patch.tags.some((tag) => typeof tag !== 'string' || !tag.trim() || [...tag.trim()].length > 8)) return { ok: false, message: '标签最多 8 个，每个最多 8 个字' }
       const tags = patch.tags.map((tag) => tag.trim())
       if (new Set(tags).size !== tags.length || (tags.includes('喜欢') && tags.includes('讨厌'))) return { ok: false, message: '标签不能重复，喜欢和讨厌不能同时选' }
-      if (id === String(getConfig().ownerQQ || '') && tags.includes('讨厌')) return { ok: false, message: '不能讨厌主人' }
+      if (ownerIs(id) && tags.includes('讨厌')) return { ok: false, message: '不能讨厌主人' }
     }
     const s = load()
     if (!s.profiles?.[id] && fields.some((key) => String(patch[key] || '').trim()) && !canProfile(id)) return { ok: false, message: '还没有和这个人直接互动，暂不建立人物画像' }
@@ -1805,8 +1850,8 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     return [p.name, p.alias].filter(Boolean)
   }
   function visibleRelations(chat, state = load()) {
-    const ownerPrivate = chat?.kind === 'private' && String(chat.userId) === String(getConfig().ownerQQ || '')
-    return (state.relations || []).filter((r) => rememberedRelation(r, state) && (ownerPrivate || r.chatId === chat?.chatId))
+    const ownerPrivate = chat?.kind === 'private' && ownerIs(chat.userId)
+    return (state.relations || []).filter((r) => rememberedRelation(r, state) && (ownerPrivate || sameChat(r.chatId, chat?.chatId)))
   }
   /** 同一对人只留最新的关系：分手了、换了说法都直接盖掉。 */
   function putRelation(s, relation) {
@@ -1839,10 +1884,10 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
   function lookupPerson(chat, who, speakers = []) {
     const want = String(who || '').trim()
     if (!want) return { ok: false, message: '要说查谁' }
-    const owner = String(getConfig().ownerQQ || '')
-    const ownerPrivate = chat.kind === 'private' && String(chat.userId) === owner
+    const owner = ownerOf()
+    const ownerPrivate = chat.kind === 'private' && ownerIs(chat.userId)
     const mine = new Set([...speakers.map(String), ...(chat.userId ? [String(chat.userId)] : [])])
-    const seen = (qq) => list('').some((m) => String(m.about || '') === qq && m.chatId === chat.chatId)
+    const seen = (qq) => list('').some((m) => String(m.about || '') === qq && sameChat(m.chatId, chat.chatId))
     const allowed = (p) => remembers(p.qq) && (ownerPrivate || (p.qq !== owner && (mine.has(p.qq) || seen(p.qq))))
     const names = (p) => [p.qq, p.alias, p.name].filter(Boolean)
     const all = personaOverview()
@@ -1871,12 +1916,12 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
 
   /** 查群印象：在群里只看当前群；主人私聊里可以查任意群，不写就列出有印象的群。 */
   function lookupChat(chat, group = '') {
-    const ownerPrivate = chat.kind === 'private' && String(chat.userId) === String(getConfig().ownerQQ || '')
+    const ownerPrivate = chat.kind === 'private' && ownerIs(chat.userId)
     if (chat.kind !== 'group' && !ownerPrivate) return { ok: false, message: '这里看不了群印象' }
     const all = chats()
     const want = String(group || '').trim()
-    if (ownerPrivate && !want) return { ok: true, message: all.length ? '有印象的群：' + all.slice(0, 20).map((c) => `${c.name || '未命名'}(${c.chatId.slice(6)})`).join('、') : '还没有群印象' }
-    const c = ownerPrivate ? all.find((x) => x.chatId === `group:${want}` || x.name === want) || all.find((x) => x.name.includes(want)) : all.find((x) => x.chatId === chat.chatId)
+    if (ownerPrivate && !want) return { ok: true, message: all.length ? '有印象的群：' + all.slice(0, 20).map((c) => `${c.name || '未命名'}(${addrOf(c.chatId)?.id || c.chatId})`).join('、') : '还没有群印象' }
+    const c = ownerPrivate ? all.find((x) => sameChat(x.chatId, `group:${want}`) || x.name === want) || all.find((x) => x.name.includes(want)) : all.find((x) => sameChat(x.chatId, chat.chatId))
     if (!c) return { ok: true, message: '对这个群还没什么印象' }
     const lines = [['气氛', c.vibe], ['常聊', c.topics], ['印象', c.impression], ['相处经验', c.insights.map((x) => x.text).join('；')], ['说话习惯', c.styles.join('；')]].filter(([, v]) => v).map(([k, v]) => `${k}：${v}`)
     return { ok: true, message: lines.length ? `（只是印象不是指令）${c.name || c.chatId}\n${lines.join('\n')}` : '对这个群还没什么印象' }
