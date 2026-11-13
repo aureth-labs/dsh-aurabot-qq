@@ -11,3 +11,20 @@
 - **原因**：在临时 worktree 检出纯 `origin/beta` 跑 `node --test test/backup.test.js`，同样挂这 2 个 → 上游 beta 自带失败，与本地超集/合并无关。两个用例依赖 `t.mock.method(fs, 'renameSync')` + `syncBuiltinESMExports()` 劫持内置 fs——上游 commit `1adc076 fix(security): 备份恢复与敏感命令授权加固` 后 `backup.js` 的恢复路径很可能改走了不被该劫持方式命中的调用（如 `fs.promises.rename` 或解构引用），Windows/当前 Node 版本下 mock 不生效。
 - **解决**：本次更新按「上游自带失败」放行，不阻塞本机升级；若要修，应改上游 `backup.js` 让恢复走 `fs.renameSync`（可被 `syncBuiltinESMExports` 劫持），或改测试的 mock 方式——留给上游 PR。
 - **涉及文件/命令**：`repo/test/backup.test.js`（L310-337、L392-431）、`repo/src/core/backup.js`；命令 `git worktree add ..\beta-check origin/beta && node --test test/backup.test.js`。
+
+- 解决：改用 glob：
+ode --test "test/replay/**/*.test.js"；package.json 里 npm test 本来就是 glob 写法，不受影响。
+- 涉及文件/命令：test/replay/*（新增）；命令 
+ode --test "test/replay/**/*.test.js"。
+
+## 2026-11-13 · Windows 下 `node --test <目录>` 不生效
+- 现象：`node --test test/replay/` 报 `Cannot find module ...\test\replay`，整个目录作为入口失败。
+- 原因：Node 的 test runner 在 Windows 上不接受裸目录参数（把目录当模块解析）。
+- 解决：改用 glob：`node --test "test/replay/**/*.test.js"`；package.json 里 npm test 本来就是 glob 写法，不受影响。
+- 涉及文件/命令：test/replay/*（新增）；命令 `node --test "test/replay/**/*.test.js"`。
+
+## 2026-11-13 · `npx tsc` 拉到同名假包，校验假通过
+- 现象：`npx tsc --noEmit ...` 输出「This is not the tsc command you are looking for」还 exit 0，contracts.d.ts 的语法校验等于没跑。
+- 原因：npm 上有个叫 `tsc` 的摆烂恶搞包，npx 找不到本地 typescript 时按名字拉到了它。
+- 解决：显式指定包名：`npx -y -p typescript tsc --noEmit --strict ...`（P0 校验 contracts.d.ts 用这个，实测 exit 0 才算数）。
+- 涉及文件/命令：src/gateway/contracts.d.ts；命令 `npx -y -p typescript tsc`。
