@@ -262,6 +262,20 @@ function cardOf(part) {
   return { config: { wide_screen_mode: true }, header: part.title ? { title: { tag: 'plain_text', content: part.title } } : undefined, elements }
 }
 
+/**
+ * 按 ID 前缀决定 receive_id_type（官方约定）：
+ *   ou_ → open_id（用户）  on_ → union_id  oc_ → chat_id（群）
+ * 前缀认不出时退回调用方给的建议值。这样即使网关传进来的 chat.kind 与实际 ID 形态不符，
+ * 也不会用错类型被飞书拒（错误码 230034 receive_id invalid）。
+ */
+export function receiveIdTypeOf(value, fallback) {
+  const v = String(value || '')
+  if (v.startsWith('oc_')) return 'chat_id'
+  if (v.startsWith('on_')) return 'union_id'
+  if (v.startsWith('ou_')) return 'open_id'
+  return fallback
+}
+
 /** 取媒体字节：bytes 直接用；path 读文件；url 下载（飞书的媒体必须先上传换 key） */
 async function loadMediaBytes(media) {
   if (media.bytes) return Buffer.from(media.bytes)
@@ -601,7 +615,8 @@ export function createFeishuAdapter(options = {}) {
           msg_type: item.msgType,
           content: item.content,
         }
-        const q = `receive_id_type=${isGroup ? 'chat_id' : 'open_id'}`
+        const receiveIdType = receiveIdTypeOf(chat.id, isGroup ? 'chat_id' : 'open_id')
+        const q = `receive_id_type=${receiveIdType}`
         let r
         try {
           r = await api('POST', `/open-apis/im/v1/messages?${q}`, payload)

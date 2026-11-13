@@ -11,6 +11,7 @@ import {
   verifySignature,
   toParts,
   fromParts,
+  receiveIdTypeOf,
 } from '../../src/adapters/feishu/index.js'
 
 const APP_ID = 'cli_test'
@@ -348,6 +349,14 @@ test('token：缓存复用', async () => {
   await adapter.send({ chat: { kind: 'private', id: 'ou_a' }, parts: [{ type: 'text', text: 'b' }], kind: 'reply', note: '' })
   assert.equal(tokenCalls(), first, '两次发送应复用缓存 token')
   await adapter.stop()
+})
+
+test('receive_id_type：按 ou_/on_/oc_ 前缀判定，认不出才退回 kind', () => {
+  assert.equal(receiveIdTypeOf('ou_abc', 'chat_id'), 'open_id')
+  assert.equal(receiveIdTypeOf('on_abc', 'open_id'), 'union_id')
+  assert.equal(receiveIdTypeOf('oc_abc', 'open_id'), 'chat_id')
+  assert.equal(receiveIdTypeOf('10001', 'open_id'), 'open_id', '前缀认不出时用调用方的建议值')
+  assert.equal(receiveIdTypeOf('', 'chat_id'), 'chat_id')
 })
 
 test('未配置：没 appId/appSecret 时报 unconfigured，不发请求', async () => {
