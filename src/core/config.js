@@ -37,6 +37,10 @@ export const DEFAULTS = {
   // 用什么接 QQ：snowluma = 插件帮你管 SnowLuma（Windows）；onebot = 接你已有的 OneBot v11 机器人（NapCat、LLOneBot、Lagrange、Docker 里的 SnowLuma……），
   // 这时只按下面 snowluma.httpUrl / wsUrl / token 去连，不启动、不注入任何东西
   gateway: 'snowluma',
+  // 多平台（P0 起预留）：键是实例名（qq、qq#2、feishu……），值见 contracts.d.ts §9 InstanceConfig。
+  // 现在还没有网关消费它——旧字段 gateway + snowluma.* 照常可读、行为不变；
+  // normalize 时会把旧字段换算成 platforms.qq 一份（见下方 normalizePlatforms），G1 接手后以新字段为准。
+  platforms: {},
   workspaceDir: '', // QQ 会话放在哪个文件夹（DSH 里的「Aurabot · QQ」工作区）；留空 = 默认（用户目录下 Aurabot\\qq-chats）
   // 发文件（#52）：默认开但限制很多——她只能把 QQ 工作区（workspaceDir）和 dirs 里列的目录中的文件当文件发出去；
   // 单个文件有大小上限；主人私聊里能触发，群里只在主人开口那一轮能触发（可以发给白名单里的人和群）。日志里会记下发了什么。
@@ -471,8 +475,27 @@ function normalizeNotice(v, legacyNotify) {
   return out
 }
 
-export function normalize(raw) {
-  const c = deepMerge(DEFAULTS, raw)
+// 旧字段 → platforms.qq 的读入换算（P0）：gateway + snowluma.{httpUrl,wsUrl,httpToken,wsToken,dir,…}
+//   → platforms.qq.{enabled, backend, wsUrl, httpUrl, httpToken, wsToken, dir,…}。
+// 只做读入派生：旧字段原样保留、现有代码仍读旧字段，行为不变；G1 起以新字段为准。
+// 用户已手写 platforms.qq 时以用户的为准，不覆盖。
+function normalizePlatforms(raw, gateway) {
+  const out = {}
+  const written = isObj(raw?.platforms) ? raw.platforms : {}
+  // 用户手写的实例原样保留（enabled、caps、behavior、平台设置都不动）
+  for (const [k, v] of Object.entries(written)) if (isObj(v)) out[k] = { ...v }
+  if (!out.qq) {
+    const s = isObj(raw?.snowluma) ? raw.snowluma : {}
+    const qq = { enabled: bool(raw?.enabled, false), backend: gateway === 'onebot' ? 'onebot' : 'snowluma' }
+    for (const key of ['httpUrl', 'wsUrl', 'httpToken', 'wsToken', 'dir', 'webuiPort', 'webuiPassword']) {
+      if (s[key] !== undefined) qq[key] = s[key]
+    }
+    out.qq = qq
+  }
+  return out
+}
+
+export function normalize(raw) {  const c = deepMerge(DEFAULTS, raw)
   c.enabled = bool(c.enabled, false)
   c.dryRun = bool(c.dryRun, true)
   c.debug = bool(c.debug, false)
@@ -486,6 +509,7 @@ export function normalize(raw) {
   c.approvalViaQQ = bool(c.approvalViaQQ, true)
   c.qqApi.enabled = bool(c.qqApi.enabled, true)
   c.gateway = c.gateway === 'onebot' ? 'onebot' : 'snowluma'
+  c.platforms = normalizePlatforms(raw, c.gateway)
   // 只认绝对路径（Windows 的 D:\\… 或 Linux 的 /…），别的当没填
   c.workspaceDir = String(c.workspaceDir || '').trim()
   if (c.workspaceDir && !/^([a-zA-Z]:[\\/]|\/)/.test(c.workspaceDir)) c.workspaceDir = ''
