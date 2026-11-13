@@ -94,14 +94,14 @@ function inboundEvent(over = {}) {
 }
 
 function makeHarness({ encrypted = false } = {}) {
+  const config = { ...CFG, encryptKey: ENCRYPT_KEY }
   return {
+    /** 经 kit 的正式注入口把 settings 交给平台端（不再用 adapter.__config 后门） */
+    config,
     makeAdapter() {
       const client = makeFakeClient()
       const adapter = createFeishuAdapter({ client })
       adapter.__fakeClient = client
-      // 两种模式都配上 encryptKey：飞书里「配了加密策略」就一定会带 X-Lark-Signature，
-      // 明文事件也可以带签名。契约用例 7（验签不过必须拒绝）只有在配了 key 时才有意义。
-      adapter.__feishu.setConfig({ ...CFG, encryptKey: ENCRYPT_KEY })
       return adapter
     },
     async injectInbound(adapter, ctx) {

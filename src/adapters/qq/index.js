@@ -174,22 +174,40 @@ export function createQqAdapter(options = {}) {
 
   // ───────────────────────── 能力探测 ─────────────────────────
 
-  /** caps.json 的完整路径（在实例自己的数据目录里）。 */
+  /**
+   * caps.json 的完整路径（在实例自己的数据目录里）。
+   * 只接受**绝对路径**：ctx.dataDir 缺席、或返回的是相对路径（'caps.json' 这种）时一律不落盘。
+   * 否则会把 caps.json 写进当前工作目录（污染仓库根目录），还会让不同实例/不同测试互相串用能力表。
+   */
   function cacheFilePath() {
-    if (capsFile) return capsFile
+    if (capsFile !== null) return capsFile
     try {
-      capsFile = ctx?.dataDir ? ctx.dataDir('caps.json') : 'caps.json'
+      const p = ctx?.dataDir ? String(ctx.dataDir('caps.json') || '') : ''
+      capsFile = isAbsolutePath(p) ? p : ''
     } catch (error) {
-      capsFile = 'caps.json'
+      capsFile = ''
     }
+    if (!capsFile) log().debug?.('没有可用的数据目录（不是绝对路径），本次不缓存能力表')
     return capsFile
   }
 
-  /** 探测前先读缓存：这一版按「保守」起步，缓存只用来加速 —— 见下方 writeCapsCache 的注释。 */
+  /**
+   * 探测前先读缓存。命中就**立刻**把缓存的能力表装上（这一步不等探测、不等 whoami），
+   * 这样「下次启动先用缓存、连上再后台复探」才是真的：启动瞬间中枢就能按上次的能力表工作。
+   * 缓存只是加速；装错了会被随后的复探纠正（探测完调 capsChanged 让网关重读）。
+   */
   function loadCapsCache() {
     const file = cacheFilePath()
+    if (!file) return null // 没有数据目录：不缓存也不读缓存（保守表起步）
     probeCache = readCapsCache(file, { fs: fsImpl, log: log() })
-    if (probeCache) log().info?.(`读到了能力缓存（${probeCache.gateway?.app || '?'} ${probeCache.gateway?.version || ''}，${probeCache.supported.length} 个动作）`)
+    if (probeCache) {
+      caps = { ...CAPS_CONSERVATIVE, ...probeCache.caps }
+      // 动作白名单也先用缓存里的：native 在复探完成之前就能用上次探到的扩展动作。
+      // probed=true 是这里的语义：缓存就是一份「上次探到的结果」，
+      // 所以别的东西（面板、native 白名单）现在就可以按它工作，等后台复探再纠正。
+      probeState = { probed: true, supported: supportedActions({ supported: probeCache.supported }), entries: {}, unknown: [], unsupported: [], probedAt: probeCache.probedAt, fromCache: true }
+      log().info?.(`读到了能力缓存（${probeCache.gateway?.app || '?'} ${probeCache.gateway?.version || ''}，${probeCache.supported.length} 个动作），先用它；连上后后台复探`)
+    }
     return probeCache
   }
 
@@ -211,7 +229,8 @@ export function createQqAdapter(options = {}) {
       }
       const cacheOk = probeCache && cacheMatchesGateway(probeCache, gateway)
       if (cacheOk && reason === 'connected') {
-        // 缓存命中且网关版本没变：先用缓存，后台再复探一次（用户换了网关也能自己发现）
+        // 缓存命中且网关版本没变：先把缓存报上去（loadCapsCache 已经装过一次，这里补一次 capsChanged
+        // 让网关知道「能力表定了」），然后后台再复探一次（用户换了网关也能自己发现）
         applyProbe({ caps: probeCache.caps, supported: probeCache.supported, entries: {}, unknown: [], unsupported: [], probedAt: probeCache.probedAt, fromCache: true })
         log().info?.('能力缓存命中，先用缓存报能力，后台继续复探')
         // 不 await：后台复探，失败只降级不抛
@@ -229,6 +248,7 @@ export function createQqAdapter(options = {}) {
     const result = await probeGateway((action, params, opts) => call(action, params, opts), {
       log: log(),
       table: options.probeTable,
+      ...(options.probeTimeoutMs ? { timeoutMs: options.probeTimeoutMs } : {}),
     })
     const finalGateway = { ...result.gateway, ...(gateway || {}) }
     const payload = {
@@ -237,7 +257,8 @@ export function createQqAdapter(options = {}) {
       supported: result.supported,
       probedAt: result.probedAt,
     }
-    writeCapsCache(cacheFilePath(), payload, { fs: fsImpl, log: log() })
+    const file = cacheFilePath()
+    if (file) writeCapsCache(file, payload, { fs: fsImpl, log: log() })
     probeCache = { ...payload, actions: result.supported, unknown: result.unknown }
     applyProbe({ ...result, gateway: finalGateway })
     log().info?.(`能力探测完成（${finalGateway.app || '?'} ${finalGateway.version || ''}）：支持 ${result.supported.length} 个动作，不支持 ${result.unsupported.length} 个`)
@@ -248,24 +269,42 @@ export function createQqAdapter(options = {}) {
   }
 
   /** 把探测结果装进 caps，并通知网关重读（capsChanged）。 */
-  function applyProbe({ caps: probedCaps, supported, entries = {}, unknown = [], unsupported = [], probedAt = 0 }) {
+  function applyProbe({ caps: probedCaps, supported, entries = {}, unknown = [], unsupported = [], probedAt = 0, fromCache = false }) {
     caps = { ...CAPS_CONSERVATIVE, ...(probedCaps || {}) }
-    probeState = { probed: true, supported: supportedActions({ supported }), entries, unknown, unsupported, probedAt }
+    probeState = { probed: true, supported: supportedActions({ supported }), entries, unknown, unsupported, probedAt, fromCache }
     // 探测后才敢说「这个网关有哪些扩展动作」：通知网关重新读 caps（契约 §八.1）
     try { ctx?.capsChanged?.() } catch (error) { log().debug?.('capsChanged 回调出错：', error?.message || error) }
   }
 
   // ───────────────────────── 连接后 ─────────────────────────
 
+  /**
+   * 读登录信息（whoami 的实际实现）。放在这里而不是直接调 adapter.whoami()：
+   * afterConnect 拿的是闭包里的函数，adapter 对象还没构造完（下面的对象字面量里才定义 whoami）。
+   * 顺手把 selfId 记下来，@自己 要判定成 mentionedMe。
+   */
+  async function loginInfo() {
+    if (!client) throw makeSendError('not-sent', 'offline', instance, 'QQ 网关未连接')
+    try {
+      const info = await call('get_login_info', {}, { timeoutMs: 10000, retries: 0 })
+      const account = String(info?.user_id ?? info?.uin ?? '')
+      const name = String(info?.nickname ?? info?.name ?? account)
+      if (account) selfId = account
+      return { account, name }
+    } catch (error) {
+      throw toSendError(error, { instance, isDefiniteFailure })
+    }
+  }
+
   async function afterConnect() {
     if (!running) return
     // ① 核对登录的是不是配置里的那个机器人；顺带拿到 selfId（@自己 要用）
     let me = null
     try {
-      me = await whoami()
+      me = await loginInfo()
       selfId = String(me?.account || '')
     } catch (error) {
-      log().warn?.('连上了但 reads 不到登录信息：', error?.message || error)
+      log().warn?.('连上了但读不到登录信息：', error?.message || error)
     }
     if (!running) return
     // ② SnowLuma 场景：核对登录的号（不是机器人号就撤销注入、断开）
@@ -538,16 +577,7 @@ export function createQqAdapter(options = {}) {
     },
 
     async whoami() {
-      if (!client) throw makeSendError('not-sent', 'offline', instance, 'QQ 网关未连接')
-      try {
-        const info = await call('get_login_info', {}, { timeoutMs: 10000, retries: 0 })
-        const account = String(info?.user_id ?? info?.uin ?? '')
-        const name = String(info?.nickname ?? info?.name ?? account)
-        if (account) selfId = account
-        return { account, name }
-      } catch (error) {
-        throw toSendError(error, { instance, isDefiniteFailure })
-      }
+      return loginInfo()
     },
 
     send,
@@ -570,7 +600,9 @@ export function createQqAdapter(options = {}) {
         entries: probeState?.entries || {},
         supported: [...(probeState?.supported || [])],
         unknown: probeState?.unknown || [],
-        fromCache: Boolean(probeCache && probeState?.probedAt === probeCache.probedAt && !probeState?.entries),
+        // 这次的能力表是缓存来的（还没被真探测覆盖）
+        fromCache: Boolean(probeState?.fromCache),
+        probedAt: Number(probeState?.probedAt) || 0,
       }
     },
 
@@ -601,6 +633,12 @@ export function createQqAdapter(options = {}) {
 }
 
 const noopLog = { debug() {}, info() {}, warn() {}, error() {} }
+
+/** 绝对路径判定：Windows 盘符（C:\ / C:/）、UNC（\\）、POSIX（/）。相对路径一律不落盘。 */
+function isAbsolutePath(p) {
+  const s = String(p || '')
+  return /^[a-zA-Z]:[\\/]/.test(s) || /^\\\\/.test(s) || s.startsWith('/')
+}
 
 /** 等客户端连上（连不上就返回 false，由调用方按「未连接」处理）。 */
 function waitConnected(client, timeoutMs) {

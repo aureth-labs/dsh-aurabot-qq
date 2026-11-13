@@ -3,6 +3,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { setTimeout as delay } from 'node:timers/promises'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { runAdapterContract, makeCtx } from '../contract/adapter-kit.js'
 import { createBridgeAdapter } from '../../src/adapters/bridge/index.js'
 
@@ -12,6 +15,12 @@ const TOKEN = 'bridge-test-token'
 
 /** 造一个「宿主已经解析好 body」的假 req */
 const req = (body, token = TOKEN) => ({ headers: { 'x-bridge-token': token }, body })
+/** 造一个 GET 请求（长轮询的另一种形态：参数走 query） */
+const getReq = (path, query, token = TOKEN) => ({
+  method: 'GET',
+  url: `${path}?${new URLSearchParams(query).toString()}`,
+  headers: { 'x-bridge-token': token },
+})
 
 /** 造一个记录型假 res */
 function makeRes() {
@@ -31,6 +40,15 @@ async function call(ctx, path, body, token = TOKEN) {
   assert.ok(handler, `平台端应当挂上 ${path}`)
   const res = makeRes()
   await handler(req(body, token), res)
+  return res
+}
+
+/** 走 GET 形态（长轮询）：参数放 query，不读 body */
+async function callGet(ctx, path, query, token = TOKEN) {
+  const handler = ctx.__routes.get(path)
+  assert.ok(handler, `平台端应当挂上 ${path}`)
+  const res = makeRes()
+  await handler(getReq(path, query, token), res)
   return res
 }
 
@@ -290,4 +308,206 @@ test('toParts：OneBot 风格原生段转契约 parts', () => {
   assert.deepEqual(parts.map((p) => p.type), ['text', 'image', 'mention', 'other'])
   assert.equal(parts[0].text, '嗨')
   assert.equal(parts[2].account, '10002')
+})
+
+// ───────────────────────── 长轮询语义 ─────────────────────────
+
+test('长轮询：GET ?wait=true 有消息立刻返回；没消息到点回 204', async () => {
+  const adapter = createBridgeAdapter({ token: TOKEN, timeoutMs: 2000 })
+  const ctx = makeCtx(adapter)
+  await adapter.start(ctx)
+  await call(ctx, '/hello', { protocol: 1, caps: { proactive: 'free' } })
+
+  const pending = adapter.send({ chat: { kind: 'private', id: 'u' }, parts: [{ type: 'text', text: '长轮询取我' }], kind: 'reply', note: '' })
+  const res = await callGet(ctx, '/outbound', { wait: 'true', timeoutMs: '1000' })
+  assert.equal(res.statusCode, 200, 'GET + query 也要能取件')
+  assert.equal(res.payload.message.parts[0].text, '长轮询取我')
+  await call(ctx, '/ack', { id: res.payload.message.id, ok: true })
+  assert.ok((await pending).messageId)
+
+  // 队列空了：带 wait 也要到点返回 204，而不是永远挂着
+  const started = Date.now()
+  const empty = await callGet(ctx, '/outbound', { wait: 'true', timeoutMs: '80' })
+  assert.equal(empty.statusCode, 204)
+  assert.ok(Date.now() - started >= 60, '确实等了，不是立刻返回')
+  await adapter.stop()
+})
+
+test('长轮询：挂起期间新消息进队列会把请求唤醒（不必等满 timeout）', async () => {
+  const adapter = createBridgeAdapter({ token: TOKEN, timeoutMs: 2000 })
+  const ctx = makeCtx(adapter)
+  await adapter.start(ctx)
+  await call(ctx, '/hello', { protocol: 1, caps: { proactive: 'free' } })
+
+  const started = Date.now()
+  const poll = callGet(ctx, '/outbound', { wait: 'true', timeoutMs: '5000' })
+  await delay(30)
+  const pending = adapter.send({ chat: { kind: 'private', id: 'u' }, parts: [{ type: 'text', text: '晚到的' }], kind: 'reply', note: '' })
+  const res = await poll
+  assert.equal(res.statusCode, 200, '新消息应当唤醒挂起的长轮询')
+  assert.ok(Date.now() - started < 1000, `不该等满 5000ms（实际 ${Date.now() - started}ms）`)
+  await call(ctx, '/ack', { id: res.payload.message.id, ok: true })
+  await pending
+  await adapter.stop()
+})
+
+test('长轮询：stop 会唤醒挂起的请求（不让 HTTP 干等）', async () => {
+  const adapter = createBridgeAdapter({ token: TOKEN, timeoutMs: 5000 })
+  const ctx = makeCtx(adapter)
+  await adapter.start(ctx)
+  await call(ctx, '/hello', { protocol: 1, caps: { proactive: 'free' } })
+  const started = Date.now()
+  const poll = callGet(ctx, '/outbound', { wait: 'true', timeoutMs: '5000' })
+  await delay(30)
+  await adapter.stop()
+  const res = await poll
+  assert.equal(res.statusCode, 204)
+  assert.ok(Date.now() - started < 1000, `stop 应当唤醒挂起请求（实际 ${Date.now() - started}ms）`)
+})
+
+// ───────────────────────── settings / 令牌来自配置 ─────────────────────────
+
+test('settings 由面板配置驱动：ctx.config() 里的 token/timeoutMs/maxBytes 生效', async () => {
+  // 构造时不给 token：只靠面板配置（这正是真实部署的样子）
+  const adapter = createBridgeAdapter({})
+  const ctx = makeCtx(adapter)
+  adapter.__config = { token: 'from-panel', timeoutMs: 50 }
+  await adapter.start(ctx)
+  assert.equal(ctx.states.at(-1)[0], 'connected', '配置里有 token 就该连上，不是 unconfigured')
+
+  // 旧 token 不再有效
+  let res = await call(ctx, '/inbound', { chat: { kind: 'private', id: 'u' }, sender: { account: 'u' }, messageId: 'm', parts: [{ type: 'text', text: 'x' }] }, TOKEN)
+  assert.equal(res.statusCode, 401)
+  // 配置里的 token 有效
+  res = await call(ctx, '/inbound', { chat: { kind: 'private', id: 'u' }, sender: { account: 'u' }, messageId: 'm', parts: [{ type: 'text', text: 'x' }] }, 'from-panel')
+  assert.equal(res.statusCode, 200)
+  assert.equal(ctx.emitted.length, 1)
+
+  // timeoutMs 也从配置来：50ms 内没人取 → not-sent
+  await call(ctx, '/hello', { protocol: 1, caps: { proactive: 'free' } }, 'from-panel')
+  await assert.rejects(
+    () => adapter.send({ chat: { kind: 'private', id: 'u' }, parts: [{ type: 'text', text: 'y' }], kind: 'reply', note: '' }),
+    (e) => e.certainty === 'not-sent' && e.code === 'not-taken',
+  )
+  await adapter.stop()
+})
+
+test('入站也受 maxBytes 限制：超大消息回 413 且不 emit', async () => {
+  const adapter = createBridgeAdapter({ token: TOKEN, maxBytes: 200 })
+  const ctx = makeCtx(adapter)
+  await adapter.start(ctx)
+  const res = await call(ctx, '/inbound', {
+    chat: { kind: 'private', id: 'u' },
+    sender: { account: 'u' },
+    messageId: 'big',
+    parts: [{ type: 'text', text: 'x'.repeat(500) }],
+  })
+  assert.equal(res.statusCode, 413)
+  assert.equal(ctx.emitted.length, 0, '超限消息绝不能 emit')
+  await adapter.stop()
+})
+
+test('协议版本：入站/回执里带了 protocol≠1 一律 400 且不 emit', async () => {
+  const adapter = createBridgeAdapter({ token: TOKEN, timeoutMs: 100 })
+  const ctx = makeCtx(adapter)
+  await adapter.start(ctx)
+  const res = await call(ctx, '/inbound', {
+    protocol: 2,
+    chat: { kind: 'private', id: 'u' },
+    sender: { account: 'u' },
+    messageId: 'm',
+    parts: [{ type: 'text', text: 'x' }],
+  })
+  assert.equal(res.statusCode, 400)
+  assert.equal(res.payload.error, 'protocol-unsupported')
+  assert.equal(ctx.emitted.length, 0)
+  await adapter.stop()
+})
+
+// ───────────────────────── 重启后队列不丢 ─────────────────────────
+
+test('重启后队列不丢：进程重启前没被取走的消息，重启后外部程序还能取到', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bridge-queue-'))
+  try {
+    // 第一段进程：消息进队列，没人取走，然后「进程死掉」
+    const a1 = createBridgeAdapter({ token: TOKEN, timeoutMs: 60_000, dataDir: () => dir })
+    const c1 = makeCtx(a1)
+    await a1.start(c1)
+    await call(c1, '/hello', { protocol: 1, caps: { proactive: 'free' } })
+    const first = a1.send({ chat: { kind: 'private', id: 'u-1' }, parts: [{ type: 'text', text: '重启前没发出去的' }], kind: 'reply', note: '' })
+    first.catch(() => {}) // 进程「死了」，promise 永远不会 settle，忽略
+    await delay(20)
+    assert.equal(a1.__bridge.queueLength(), 1)
+    assert.ok(a1.__bridge.pendingFile(), '给了绝对 dataDir 才落盘')
+    a1.__bridge.crashForTest()
+
+    // 第二段进程：新实例，同一个数据目录 → 队列装回来，外部程序能取到并回执
+    const a2 = createBridgeAdapter({ token: TOKEN, timeoutMs: 60_000, dataDir: () => dir })
+    const c2 = makeCtx(a2)
+    await a2.start(c2)
+    assert.equal(a2.__bridge.queueLength(), 1, '重启后应恢复 1 条未取走的消息')
+    assert.equal(a2.caps().image, false, '跨进程重启 caps 退回最保守，等外部程序重新 hello')
+    await call(c2, '/hello', { protocol: 1, caps: { proactive: 'free' } })
+    const res = await call(c2, '/outbound', {})
+    assert.equal(res.statusCode, 200)
+    assert.equal(res.payload.message.parts[0].text, '重启前没发出去的')
+    assert.equal(res.payload.message.recovered, true, '恢复的消息带 recovered 标记，外部程序据此知道它比预期晚')
+    await call(c2, '/ack', { id: res.payload.message.id, ok: true, messageId: 'ext-restart-1' })
+    assert.equal(a2.__bridge.queueLength(), 0)
+    assert.equal(a2.__bridge.inflightCount(), 0)
+    await a2.stop()
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('重启后队列不丢：已被取走的不落盘（它已经是 unknown，重发就是两条）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bridge-queue2-'))
+  try {
+    const a1 = createBridgeAdapter({ token: TOKEN, timeoutMs: 60_000, dataDir: () => dir })
+    const c1 = makeCtx(a1)
+    await a1.start(c1)
+    await call(c1, '/hello', { protocol: 1, caps: { proactive: 'free' } })
+    const pending = a1.send({ chat: { kind: 'private', id: 'u' }, parts: [{ type: 'text', text: '被取走了' }], kind: 'reply', note: '' })
+    pending.catch(() => {})
+    await delay(20)
+    const res = await call(c1, '/outbound', {}) // 取走，但绝不回执
+    assert.equal(a1.__bridge.queueLength(), 0)
+    assert.equal(a1.__bridge.inflightCount(), 1)
+    a1.__bridge.crashForTest()
+
+    const a2 = createBridgeAdapter({ token: TOKEN, timeoutMs: 60_000, dataDir: () => dir })
+    const c2 = makeCtx(a2)
+    await a2.start(c2)
+    assert.equal(a2.__bridge.queueLength(), 0, '已被取走的消息绝不能恢复——否则会重复发')
+    assert.equal(a2.__bridge.inflightCount(), 0)
+    const empty = await call(c2, '/outbound', {})
+    assert.equal(empty.statusCode, 204)
+    await a2.stop()
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('优雅 stop 会把未取走的消息按 not-sent 还给网关，并清空落盘（不让两层各发一次）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bridge-queue3-'))
+  try {
+    const adapter = createBridgeAdapter({ token: TOKEN, timeoutMs: 60_000, dataDir: () => dir })
+    const ctx = makeCtx(adapter)
+    await adapter.start(ctx)
+    await call(ctx, '/hello', { protocol: 1, caps: { proactive: 'free' } })
+    const pending = adapter.send({ chat: { kind: 'private', id: 'u' }, parts: [{ type: 'text', text: '还没取' }], kind: 'reply', note: '' })
+    await delay(20)
+    await adapter.stop()
+    await assert.rejects(() => pending, (e) => e.certainty === 'not-sent' && e.code === 'stopped', '未被取走 = 确定没发出去 = not-sent（网关补发队列接手）')
+
+    // 落盘清空：重启不会再交一遍
+    const again = createBridgeAdapter({ token: TOKEN, timeoutMs: 60_000, dataDir: () => dir })
+    const c2 = makeCtx(again)
+    await again.start(c2)
+    assert.equal(again.__bridge.queueLength(), 0, '网关已经拿到 not-sent，重启不该再交一遍')
+    await again.stop()
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

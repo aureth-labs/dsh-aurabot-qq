@@ -38,6 +38,9 @@
 //       why = 'timeout'：下一次 send 模拟「一直不返回」，平台端必须按 timeoutMs 超时并抛
 //                        certainty='unknown' 的 SendError。
 //   reconnect(adapter, ctx)?（可选）：模拟断线后重连。不提供就跳过对应条目。
+//   config（可选）：这个实例在 config.platforms 里的那一段，经 makeCtx(adapter, config)
+//       注入给平台端的 ctx.config()。平台端的 settings（token / appId / wsUrl …）靠它生效。
+//       **不要再靠 adapter.__config 后门**（那是 P0 早期的缺陷，现在有正式入口）。
 //
 // kit 对 emit 的计数是精确的（增量必须恰好为 1 或 0），所以 harness 的注入一次只送一条。
 
@@ -93,7 +96,7 @@ export async function runAdapterContract(makeAdapter, harness) {
   {
     const adapter = await makeAdapter()
     assert.equal(adapter.contract, 1, `${adapter.id}：contract 必须是 1`)
-    const ctx = makeCtx(adapter)
+    const ctx = makeCtx(adapter, harness.config)
     await adapter.start(ctx)
     assert.equal(ctx.states.at(-1)?.[0], 'connected', `${adapter.id}：start 后最后一个状态应为 connected（实际：${ctx.states.map((s) => s[0]).join(' → ')}）`)
     const me = await adapter.whoami()
@@ -110,7 +113,7 @@ export async function runAdapterContract(makeAdapter, harness) {
   // ── 用例 2：入站字段齐全 ──
   {
     const adapter = await makeAdapter()
-    const ctx = makeCtx(adapter)
+    const ctx = makeCtx(adapter, harness.config)
     await adapter.start(ctx)
     await harness.injectInbound(adapter, ctx)
     assert.equal(ctx.emitted.length, 1, `${adapter.id}：注入一条合法入站后应恰好 emit 一条（实际 ${ctx.emitted.length} 条）`)
@@ -134,7 +137,7 @@ export async function runAdapterContract(makeAdapter, harness) {
   // inResponseTo，把这次发送变成「被动回复」，才符合「声明支持的 parts 要能发出去」的原意。
   {
     const adapter = await makeAdapter()
-    const ctx = makeCtx(adapter)
+    const ctx = makeCtx(adapter, harness.config)
     await adapter.start(ctx)
     const caps = adapter.caps()
     let inResponseTo
@@ -153,7 +156,7 @@ export async function runAdapterContract(makeAdapter, harness) {
   // 否则会被 proactive 检查先拦下（那是 not-sent，测不出「超时应为 unknown」这一条）。
   {
     const adapter = await makeAdapter()
-    const ctx = makeCtx(adapter)
+    const ctx = makeCtx(adapter, harness.config)
     await adapter.start(ctx)
     const caps = adapter.caps()
     let inResponseTo
@@ -179,7 +182,7 @@ export async function runAdapterContract(makeAdapter, harness) {
   // ── 用例 5：stop 后不再 emit；再 start 能恢复 ──
   {
     const adapter = await makeAdapter()
-    const ctx = makeCtx(adapter)
+    const ctx = makeCtx(adapter, harness.config)
     await adapter.start(ctx)
     await harness.injectInbound(adapter, ctx)
     const before = ctx.emitted.length
@@ -200,7 +203,7 @@ export async function runAdapterContract(makeAdapter, harness) {
   // ── 用例 6：proactive='none' 时，不带 inResponseTo 的发送抛 not-sent ──
   {
     const adapter = await makeAdapter()
-    const ctx = makeCtx(adapter)
+    const ctx = makeCtx(adapter, harness.config)
     await adapter.start(ctx)
     await harness.setProactive(adapter, 'none')
     assert.equal(adapter.caps().proactive, 'none', `${adapter.id}：harness.setProactive 后 caps().proactive 应为 'none'`)
@@ -223,7 +226,7 @@ export async function runAdapterContract(makeAdapter, harness) {
   // ── 用例 7：验签不过不 emit；验签通过恰好 emit 一条 ──
   {
     const adapter = await makeAdapter()
-    const ctx = makeCtx(adapter)
+    const ctx = makeCtx(adapter, harness.config)
     await adapter.start(ctx)
     await harness.injectUnverified(adapter, ctx)
     await delay(20)
@@ -237,7 +240,7 @@ export async function runAdapterContract(makeAdapter, harness) {
   // ── 用例 8（可选）：断线重连 ──
   if (typeof harness.reconnect === 'function') {
     const adapter = await makeAdapter()
-    const ctx = makeCtx(adapter)
+    const ctx = makeCtx(adapter, harness.config)
     await adapter.start(ctx)
     // 同用例 3/4：proactive 不是 'free' 的平台不能主动发，先拿一条入站消息当 inResponseTo
     const caps = adapter.caps()
@@ -254,11 +257,18 @@ export async function runAdapterContract(makeAdapter, harness) {
   }
 }
 
-/** kit 自带的记录型 AdapterContext：状态、emit、事件、路由都有记录，harness 直接用。 */
-export function makeCtx(adapter) {
+/**
+ * kit 自带的记录型 AdapterContext：状态、emit、事件、路由都有记录，harness 直接用。
+ *
+ * @param adapter 平台端
+ * @param configOrNull 这个实例在 config.platforms 里的那一段（可选）。
+ *   平台端的 settings（token / appId / wsUrl …）就靠它注入——不给就是空对象。
+ *   注意：以前只能靠 `adapter.__config` 后门，那是 P0 的缺陷，现在有正式入口了。
+ */
+export function makeCtx(adapter, configOrNull = null) {
   const ctx = {
     instance: adapter.id, // 单实例约定：实例名 = 平台名
-    config: () => adapter.__config || {},
+    config: () => ({ ...(adapter.__config || {}), ...(configOrNull || {}) }),
     emitted: [],   // ctx.emit 收到的 AdapterInbound
     events: [],    // ctx.emitEvent 收到的 AdapterEvent
     states: [],    // [state, detail] 序列

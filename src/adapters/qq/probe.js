@@ -161,6 +161,35 @@ export const PROBE_TABLE = [
   { name: 'group_msg', action: 'get_msg', params: () => ({ message_id: 0 }), label: '取单条消息' },
 ]
 
+/**
+ * 小工具：给一个 promise 套超时。到点不算成功，也绝不拖住整轮探测。
+ * 注意：超时之后原 promise 可能还会 reject（对面的 socket 最终断开），
+ * 所以要顺手 catch 掉，否则会变成没人接的 unhandledRejection 把进程带走。
+ */
+function withTimeout(promise, ms, onTimeout) {
+  let timer
+  const guarded = Promise.resolve(promise).finally(() => clearTimeout(timer))
+  guarded.catch(() => {}) // 超时分支赢下之后，原 promise 的 reject 不许冒泡成未处理异常
+  return Promise.race([
+    guarded,
+    new Promise((_resolve, reject) => {
+      timer = setTimeout(() => {
+        // onTimeout 允许「返回一个错误」或「直接抛一个错误」：两种都收，
+        // 直接抛的必须在这里接住，否则会变成 timer 回调里的未捕获异常把进程带走。
+        let error
+        try {
+          const produced = onTimeout ? onTimeout() : undefined
+          error = produced instanceof Error ? produced : new Error(`超过 ${ms}ms 没有响应`)
+        } catch (thrown) {
+          error = thrown instanceof Error ? thrown : new Error(String(thrown))
+        }
+        reject(error)
+      }, Math.max(1, ms))
+      timer.unref?.()
+    }),
+  ])
+}
+
 /** 探测器至少要有的号：没有群/好友时用 0（让对方以「目标不存在」失败，不影响判定） */
 function firstGroup(bag) {
   const g = bag?.group_list
