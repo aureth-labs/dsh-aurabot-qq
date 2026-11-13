@@ -32,7 +32,9 @@ for (const file of fixtures) {
       t.todo(`已生成基线 baseline/${name}.json，请人工核对后入库`)
       return
     }
-    const expected = readFileSync(baselinePath, 'utf8')
+    // Git checkout 在 Windows 上可能把基线换成 CRLF；比较前统一成 LF。
+    // 回放输出本身永远用 LF，不能因为工作区换行风格把整批 replay 判红。
+    const expected = readFileSync(baselinePath, 'utf8').replace(/\r\n?/g, '\n')
     // 逐字节对比（基线文件以换行结尾，补齐后比较）
     if (a + '\n' !== expected) {
       const diffHint = `预期前 200 字：${expected.slice(0, 200)}\n实际前 200 字：${a.slice(0, 200)}`
