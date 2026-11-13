@@ -1,0 +1,17 @@
+{
+  "name": "private-sticker",
+  "description": "表情包（mface 与 sub_type=1 图片）：文字化成「[表情包]」",
+  "seed": 7,
+  "timeBase": 1700000000000,
+  "selfId": "10000",
+  "ownerId": "10001",
+  "allow": { "private": [], "groups": [] },
+  "events": [
+    { "post_type": "message", "message_type": "private", "sub_type": "friend", "self_id": 10000, "time": 1700000000, "message_id": 701, "user_id": 10001, "sender": { "user_id": 10001, "nickname": "主人" }, "message": [{ "type": "mface", "data": { "emoji_id": "1023", "emoji_package_id": "1", "summary": "[笑哭]" } }] },
+    { "post_type": "message", "message_type": "private", "sub_type": "friend", "self_id": 10000, "time": 1700000060, "message_id": 702, "user_id": 10001, "sender": { "user_id": 10001, "nickname": "主人" }, "message": [{ "type": "image", "data": { "sub_type": "1", "url": "https://example.invalid/fake-sticker.png", "file": "fake-sticker.png" } }] }
+  ],
+  "script": {
+    "701": "哈哈哈这个表情太形象了。",
+    "702": "这张收了，放进我的表情包库。"
+  }
+}

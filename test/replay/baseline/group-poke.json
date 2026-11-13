@@ -1,0 +1,85 @@
+{
+  "chatlog": [
+  {
+  "chatId": "group:20001",
+  "t": 1700000000000,
+  "text": "[戳一戳]",
+  "uid": "10004",
+  "who": "user"
+},
+  {
+  "chatId": "group:20001",
+  "t": 1700000000000,
+  "text": "戳我干嘛，有事直说～",
+  "who": "bot"
+},
+  {
+  "chatId": "group:20001",
+  "t": 1700000030000,
+  "text": "【系统】10005撤回了一条消息",
+  "who": "系统"
+}
+],
+  "description": "戳一戳（消息内 poke 段）+ 群撤回通知（notice 事件）",
+  "inbound": [
+  {
+  "at": 1700000000000,
+  "atOthers": false,
+  "chatId": "group:20001",
+  "files": 0,
+  "forwards": [
+
+],
+  "groupId": "20001",
+  "images": 0,
+  "kind": "group",
+  "mentioned": false,
+  "messageId": "1001",
+  "nickname": "阿杰",
+  "records": 0,
+  "replyId": "",
+  "stickers": 0,
+  "text": "[戳一戳]",
+  "userId": "10004",
+  "wakeText": "[戳一戳]"
+}
+],
+  "notices": [
+  {
+  "at": 1700000030000,
+  "chatId": "group:20001",
+  "text": "10005撤回了一条消息"
+}
+],
+  "outbound": [
+  {
+  "action": "send_group_msg",
+  "at": 1700000000000,
+  "chatId": "group:20001",
+  "messageId": "replay-0001",
+  "note": "戳我干嘛，有事直说～",
+  "params": {
+  "group_id": 20001,
+  "message": [
+  {
+  "data": {
+  "text": "戳我干嘛，有事直说～"
+},
+  "type": "text"
+}
+]
+},
+  "seq": 1
+}
+],
+  "outbox": [
+
+],
+  "ownerId": "10001",
+  "scenario": "group-poke",
+  "seed": 10,
+  "selfId": "10000",
+  "skipped": [
+
+]
+}

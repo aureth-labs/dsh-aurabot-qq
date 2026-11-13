@@ -1,0 +1,100 @@
+{
+  "chatlog": [
+  {
+  "chatId": "private:10001",
+  "t": 1700000000000,
+  "text": "/状态",
+  "uid": "10001",
+  "who": "user"
+},
+  {
+  "chatId": "private:10001",
+  "t": 1700000000000,
+  "text": "当前状态：在线，运行正常。",
+  "who": "bot"
+},
+  {
+  "chatId": "private:10001",
+  "t": 1700000001000,
+  "text": "今天收了 3 条消息，回了 3 条。",
+  "who": "bot"
+}
+],
+  "description": "主人命令（「/」开头）：回执 + 一条多段拆条回复（\\n---\\n 分隔的数组脚本）",
+  "inbound": [
+  {
+  "at": 1700000000000,
+  "atOthers": false,
+  "chatId": "private:10001",
+  "files": 0,
+  "forwards": [
+
+],
+  "groupId": "",
+  "images": 0,
+  "kind": "private",
+  "mentioned": false,
+  "messageId": "1201",
+  "nickname": "主人",
+  "records": 0,
+  "replyId": "",
+  "stickers": 0,
+  "text": "/状态",
+  "userId": "10001",
+  "wakeText": "/状态"
+}
+],
+  "notices": [
+
+],
+  "outbound": [
+  {
+  "action": "send_private_msg",
+  "at": 1700000000000,
+  "chatId": "private:10001",
+  "messageId": "replay-0001",
+  "note": "当前状态：在线，运行正常。",
+  "params": {
+  "message": [
+  {
+  "data": {
+  "text": "当前状态：在线，运行正常。"
+},
+  "type": "text"
+}
+],
+  "user_id": 10001
+},
+  "seq": 1
+},
+  {
+  "action": "send_private_msg",
+  "at": 1700000001000,
+  "chatId": "private:10001",
+  "messageId": "replay-0002",
+  "note": "今天收了 3 条消息，回了 3 条。",
+  "params": {
+  "message": [
+  {
+  "data": {
+  "text": "今天收了 3 条消息，回了 3 条。"
+},
+  "type": "text"
+}
+],
+  "user_id": 10001
+},
+  "seq": 2
+}
+],
+  "outbox": [
+
+],
+  "ownerId": "10001",
+  "scenario": "owner-command",
+  "seed": 12,
+  "selfId": "10000",
+  "skipped": [
+
+]
+}

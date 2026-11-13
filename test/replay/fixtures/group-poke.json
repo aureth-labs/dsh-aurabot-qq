@@ -1,0 +1,16 @@
+{
+  "name": "group-poke",
+  "description": "戳一戳（消息内 poke 段）+ 群撤回通知（notice 事件）",
+  "seed": 10,
+  "timeBase": 1700000000000,
+  "selfId": "10000",
+  "ownerId": "10001",
+  "allow": { "private": [], "groups": ["20001"] },
+  "events": [
+    { "post_type": "message", "message_type": "group", "self_id": 10000, "time": 1700000000, "message_id": 1001, "group_id": 20001, "user_id": 10004, "sender": { "user_id": 10004, "nickname": "阿杰", "card": "阿杰", "role": "member" }, "message": [{ "type": "poke", "data": { "qq": "10000" } }] },
+    { "post_type": "notice", "notice_type": "group_recall", "time": 1700000030, "self_id": 10000, "group_id": 20001, "user_id": 10005, "operator_id": 10005, "message_id": 401 }
+  ],
+  "script": {
+    "1001": "戳我干嘛，有事直说～"
+  }
+}

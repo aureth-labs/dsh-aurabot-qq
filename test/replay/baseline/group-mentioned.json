@@ -1,0 +1,75 @@
+{
+  "chatlog": [
+  {
+  "chatId": "group:20001",
+  "t": 1700000000000,
+  "text": "帮我算下 37 乘 48",
+  "uid": "10004",
+  "who": "user"
+},
+  {
+  "chatId": "group:20001",
+  "t": 1700000000000,
+  "text": "37 × 48 = 1776。",
+  "who": "bot"
+}
+],
+  "description": "群里被 @：必回",
+  "inbound": [
+  {
+  "at": 1700000000000,
+  "atOthers": false,
+  "chatId": "group:20001",
+  "files": 0,
+  "forwards": [
+
+],
+  "groupId": "20001",
+  "images": 0,
+  "kind": "group",
+  "mentioned": true,
+  "messageId": "301",
+  "nickname": "阿杰",
+  "records": 0,
+  "replyId": "",
+  "stickers": 0,
+  "text": "帮我算下 37 乘 48",
+  "userId": "10004",
+  "wakeText": "帮我算下 37 乘 48"
+}
+],
+  "notices": [
+
+],
+  "outbound": [
+  {
+  "action": "send_group_msg",
+  "at": 1700000000000,
+  "chatId": "group:20001",
+  "messageId": "replay-0001",
+  "note": "37 × 48 = 1776。",
+  "params": {
+  "group_id": 20001,
+  "message": [
+  {
+  "data": {
+  "text": "37 × 48 = 1776。"
+},
+  "type": "text"
+}
+]
+},
+  "seq": 1
+}
+],
+  "outbox": [
+
+],
+  "ownerId": "10001",
+  "scenario": "group-mentioned",
+  "seed": 3,
+  "selfId": "10000",
+  "skipped": [
+
+]
+}

@@ -1,0 +1,21 @@
+{
+  "name": "outbox-reconnect",
+  "description": "网关断线后补发：文字进补发队列，重连后按 FIFO 冲队；含媒体的不进队",
+  "seed": 11,
+  "timeBase": 1700000000000,
+  "selfId": "10000",
+  "ownerId": "10001",
+  "allow": { "private": [], "groups": [] },
+  "events": [
+    { "post_type": "message", "message_type": "private", "sub_type": "friend", "self_id": 10000, "time": 1700000000, "message_id": 1101, "user_id": 10001, "sender": { "user_id": 10001, "nickname": "主人" }, "message": [{ "type": "text", "data": { "text": "帮我记一下明早九点开会" } }] },
+    { "type": "gateway-down" },
+    { "post_type": "message", "message_type": "private", "sub_type": "friend", "self_id": 10000, "time": 1700000060, "message_id": 1102, "user_id": 10001, "sender": { "user_id": 10001, "nickname": "主人" }, "message": [{ "type": "text", "data": { "text": "记好了吗" } }] },
+    { "post_type": "message", "message_type": "private", "sub_type": "friend", "self_id": 10000, "time": 1700000120, "message_id": 1103, "user_id": 10001, "sender": { "user_id": 10001, "nickname": "主人" }, "message": [{ "type": "image", "data": { "url": "https://example.invalid/fake-meeting.png", "file": "fake-meeting.png" } }] },
+    { "type": "gateway-up" }
+  ],
+  "script": {
+    "1101": "好，明天早上九点，开周会。",
+    "1102": "记好了：明早九点，别迟到。",
+    "1103": { "text": "这张会议安排的截图我也收到了，图片我也看到了。", "media": true }
+  }
+}

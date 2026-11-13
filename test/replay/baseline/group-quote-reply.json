@@ -1,0 +1,81 @@
+{
+  "chatlog": [
+  {
+  "chatId": "group:20001",
+  "t": 1700000000000,
+  "text": "刚才那个答案再发一遍呗",
+  "uid": "10004",
+  "who": "user"
+},
+  {
+  "chatId": "group:20001",
+  "t": 1700000000000,
+  "text": "上面那条是 1776，我再贴一次：37 × 48 = 1776。",
+  "who": "bot"
+}
+],
+  "description": "群里引用回复她说过的话：带 reply 段回话",
+  "inbound": [
+  {
+  "at": 1700000000000,
+  "atOthers": false,
+  "chatId": "group:20001",
+  "files": 0,
+  "forwards": [
+
+],
+  "groupId": "20001",
+  "images": 0,
+  "kind": "group",
+  "mentioned": false,
+  "messageId": "501",
+  "nickname": "阿杰",
+  "records": 0,
+  "replyId": "replay-0001",
+  "stickers": 0,
+  "text": "刚才那个答案再发一遍呗",
+  "userId": "10004",
+  "wakeText": "刚才那个答案再发一遍呗"
+}
+],
+  "notices": [
+
+],
+  "outbound": [
+  {
+  "action": "send_group_msg",
+  "at": 1700000000000,
+  "chatId": "group:20001",
+  "messageId": "replay-0001",
+  "note": "上面那条是 1776，我再贴一次：37 × 48 = 1776。",
+  "params": {
+  "group_id": 20001,
+  "message": [
+  {
+  "data": {
+  "id": "replay-0001"
+},
+  "type": "reply"
+},
+  {
+  "data": {
+  "text": "上面那条是 1776，我再贴一次：37 × 48 = 1776。"
+},
+  "type": "text"
+}
+]
+},
+  "seq": 1
+}
+],
+  "outbox": [
+
+],
+  "ownerId": "10001",
+  "scenario": "group-quote-reply",
+  "seed": 5,
+  "selfId": "10000",
+  "skipped": [
+
+]
+}

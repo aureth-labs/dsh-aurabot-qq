@@ -1,0 +1,108 @@
+{
+  "chatlog": [
+  {
+  "chatId": "private:10002",
+  "t": 1700000000000,
+  "text": "在吗，帮忙看看这个",
+  "uid": "10002",
+  "who": "user"
+},
+  {
+  "chatId": "private:10003",
+  "t": 1700000060000,
+  "text": "晚上一起吃饭吗",
+  "uid": "10003",
+  "who": "user"
+},
+  {
+  "chatId": "private:10003",
+  "t": 1700000000000,
+  "text": "好呀，六点老地方见。",
+  "who": "bot"
+}
+],
+  "description": "别人私聊：不在白名单，策略跳过不回话",
+  "inbound": [
+  {
+  "at": 1700000000000,
+  "atOthers": false,
+  "chatId": "private:10002",
+  "files": 0,
+  "forwards": [
+
+],
+  "groupId": "",
+  "images": 0,
+  "kind": "private",
+  "mentioned": false,
+  "messageId": "201",
+  "nickname": "路人甲",
+  "records": 0,
+  "replyId": "",
+  "stickers": 0,
+  "text": "在吗，帮忙看看这个",
+  "userId": "10002",
+  "wakeText": "在吗，帮忙看看这个"
+},
+  {
+  "at": 1700000060000,
+  "atOthers": false,
+  "chatId": "private:10003",
+  "files": 0,
+  "forwards": [
+
+],
+  "groupId": "",
+  "images": 0,
+  "kind": "private",
+  "mentioned": false,
+  "messageId": "202",
+  "nickname": "小林",
+  "records": 0,
+  "replyId": "",
+  "stickers": 0,
+  "text": "晚上一起吃饭吗",
+  "userId": "10003",
+  "wakeText": "晚上一起吃饭吗"
+}
+],
+  "notices": [
+
+],
+  "outbound": [
+  {
+  "action": "send_private_msg",
+  "at": 1700000000000,
+  "chatId": "private:10003",
+  "messageId": "replay-0001",
+  "note": "好呀，六点老地方见。",
+  "params": {
+  "message": [
+  {
+  "data": {
+  "text": "好呀，六点老地方见。"
+},
+  "type": "text"
+}
+],
+  "user_id": 10003
+},
+  "seq": 1
+}
+],
+  "outbox": [
+
+],
+  "ownerId": "10001",
+  "scenario": "stranger-private",
+  "seed": 2,
+  "selfId": "10000",
+  "skipped": [
+  {
+  "at": 1700000000000,
+  "chatId": "private:10002",
+  "messageId": "201",
+  "reason": "private-not-allowed"
+}
+]
+}

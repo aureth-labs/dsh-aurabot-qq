@@ -1,0 +1,14 @@
+{
+  "name": "group-not-mentioned",
+  "description": "群里没被 @（listenAllInGroup=false）：不插话，记流水",
+  "seed": 4,
+  "timeBase": 1700000000000,
+  "selfId": "10000",
+  "ownerId": "10001",
+  "allow": { "private": [], "groups": ["20001"] },
+  "events": [
+    { "post_type": "message", "message_type": "group", "self_id": 10000, "time": 1700000000, "message_id": 401, "group_id": 20001, "user_id": 10004, "sender": { "user_id": 10004, "nickname": "阿杰", "card": "阿杰", "role": "member" }, "message": [{ "type": "text", "data": { "text": "这周末有人去爬山吗" } }] },
+    { "post_type": "message", "message_type": "group", "self_id": 10000, "time": 1700000030, "message_id": 402, "group_id": 20001, "user_id": 10005, "sender": { "user_id": 10005, "nickname": "小雪", "card": "小雪", "role": "member" }, "message": [{ "type": "at", "data": { "qq": "10006" } }, { "type": "text", "data": { "text": " 你上次说的那条路线还记得吗" } }] }
+  ],
+  "script": {}
+}

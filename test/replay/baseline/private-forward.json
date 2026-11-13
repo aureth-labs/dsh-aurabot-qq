@@ -1,0 +1,75 @@
+{
+  "chatlog": [
+  {
+  "chatId": "private:10001",
+  "t": 1700000000000,
+  "text": "[合并转发]这是群里的聊天记录，帮我看看",
+  "uid": "10001",
+  "who": "user"
+},
+  {
+  "chatId": "private:10001",
+  "t": 1700000000000,
+  "text": "看到了，这段记录里主要在讨论周末的安排。",
+  "who": "bot"
+}
+],
+  "description": "合并转发：占位文字「[合并转发]」，记 forwards id 待展开",
+  "inbound": [
+  {
+  "at": 1700000000000,
+  "atOthers": false,
+  "chatId": "private:10001",
+  "files": 0,
+  "forwards": [
+  "fake-forward-001"
+],
+  "groupId": "",
+  "images": 0,
+  "kind": "private",
+  "mentioned": false,
+  "messageId": "901",
+  "nickname": "主人",
+  "records": 0,
+  "replyId": "",
+  "stickers": 0,
+  "text": "[合并转发]这是群里的聊天记录，帮我看看",
+  "userId": "10001",
+  "wakeText": "[合并转发]这是群里的聊天记录，帮我看看"
+}
+],
+  "notices": [
+
+],
+  "outbound": [
+  {
+  "action": "send_private_msg",
+  "at": 1700000000000,
+  "chatId": "private:10001",
+  "messageId": "replay-0001",
+  "note": "看到了，这段记录里主要在讨论周末的安排。",
+  "params": {
+  "message": [
+  {
+  "data": {
+  "text": "看到了，这段记录里主要在讨论周末的安排。"
+},
+  "type": "text"
+}
+],
+  "user_id": 10001
+},
+  "seq": 1
+}
+],
+  "outbox": [
+
+],
+  "ownerId": "10001",
+  "scenario": "private-forward",
+  "seed": 9,
+  "selfId": "10000",
+  "skipped": [
+
+]
+}

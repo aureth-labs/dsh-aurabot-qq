@@ -1,0 +1,188 @@
+{
+  "chatlog": [
+  {
+  "chatId": "private:10001",
+  "t": 1700000000000,
+  "text": "帮我记一下明早九点开会",
+  "uid": "10001",
+  "who": "user"
+},
+  {
+  "chatId": "private:10001",
+  "t": 1700000000000,
+  "text": "好，明天早上九点，开周会。",
+  "who": "bot"
+},
+  {
+  "chatId": "system:gateway",
+  "t": 1700000001000,
+  "text": "【网关离线】",
+  "who": "系统"
+},
+  {
+  "chatId": "private:10001",
+  "t": 1700000060000,
+  "text": "记好了吗",
+  "uid": "10001",
+  "who": "user"
+},
+  {
+  "chatId": "private:10001",
+  "t": 1700000120000,
+  "text": "[图片]",
+  "uid": "10001",
+  "who": "user"
+},
+  {
+  "chatId": "private:10001",
+  "t": 1700000003000,
+  "text": "【发送失败】网关离线且含媒体，不进补发队列",
+  "who": "系统"
+},
+  {
+  "chatId": "system:gateway",
+  "t": 1700000004000,
+  "text": "【网关在线】补发队列开始冲队",
+  "who": "系统"
+},
+  {
+  "chatId": "private:10001",
+  "t": 1700000005000,
+  "text": "记好了：明早九点，别迟到。",
+  "who": "bot"
+}
+],
+  "description": "网关断线后补发：文字进补发队列，重连后按 FIFO 冲队；含媒体的不进队",
+  "inbound": [
+  {
+  "at": 1700000000000,
+  "atOthers": false,
+  "chatId": "private:10001",
+  "files": 0,
+  "forwards": [
+
+],
+  "groupId": "",
+  "images": 0,
+  "kind": "private",
+  "mentioned": false,
+  "messageId": "1101",
+  "nickname": "主人",
+  "records": 0,
+  "replyId": "",
+  "stickers": 0,
+  "text": "帮我记一下明早九点开会",
+  "userId": "10001",
+  "wakeText": "帮我记一下明早九点开会"
+},
+  {
+  "at": 1700000060000,
+  "atOthers": false,
+  "chatId": "private:10001",
+  "files": 0,
+  "forwards": [
+
+],
+  "groupId": "",
+  "images": 0,
+  "kind": "private",
+  "mentioned": false,
+  "messageId": "1102",
+  "nickname": "主人",
+  "records": 0,
+  "replyId": "",
+  "stickers": 0,
+  "text": "记好了吗",
+  "userId": "10001",
+  "wakeText": "记好了吗"
+},
+  {
+  "at": 1700000120000,
+  "atOthers": false,
+  "chatId": "private:10001",
+  "files": 0,
+  "forwards": [
+
+],
+  "groupId": "",
+  "images": 1,
+  "kind": "private",
+  "mentioned": false,
+  "messageId": "1103",
+  "nickname": "主人",
+  "records": 0,
+  "replyId": "",
+  "stickers": 0,
+  "text": "[图片]",
+  "userId": "10001",
+  "wakeText": "[图片]"
+}
+],
+  "notices": [
+
+],
+  "outbound": [
+  {
+  "action": "send_private_msg",
+  "at": 1700000000000,
+  "chatId": "private:10001",
+  "messageId": "replay-0001",
+  "note": "好，明天早上九点，开周会。",
+  "params": {
+  "message": [
+  {
+  "data": {
+  "text": "好，明天早上九点，开周会。"
+},
+  "type": "text"
+}
+],
+  "user_id": 10001
+},
+  "seq": 1
+},
+  {
+  "at": 1700000002000,
+  "chatId": "private:10001",
+  "note": "记好了：明早九点，别迟到。",
+  "queued": true,
+  "queuedId": 1,
+  "seq": 2
+},
+  {
+  "action": "send_private_msg",
+  "at": 1700000005000,
+  "chatId": "private:10001",
+  "flushed": true,
+  "messageId": "replay-0002",
+  "note": "记好了：明早九点，别迟到。",
+  "params": {
+  "message": [
+  {
+  "data": {
+  "text": "记好了：明早九点，别迟到。"
+},
+  "type": "text"
+}
+],
+  "user_id": 10001
+},
+  "seq": 3
+}
+],
+  "outbox": [
+  {
+  "chatId": "private:10001",
+  "flushedId": 3,
+  "kind": "reply",
+  "note": "记好了：明早九点，别迟到。"
+}
+],
+  "ownerId": "10001",
+  "scenario": "outbox-reconnect",
+  "seed": 11,
+  "selfId": "10000",
+  "skipped": [
+
+]
+}

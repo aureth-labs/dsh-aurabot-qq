@@ -1,0 +1,16 @@
+{
+  "name": "stranger-private",
+  "description": "别人私聊：不在白名单，策略跳过不回话",
+  "seed": 2,
+  "timeBase": 1700000000000,
+  "selfId": "10000",
+  "ownerId": "10001",
+  "allow": { "private": ["10003"], "groups": [] },
+  "events": [
+    { "post_type": "message", "message_type": "private", "sub_type": "friend", "self_id": 10000, "time": 1700000000, "message_id": 201, "user_id": 10002, "sender": { "user_id": 10002, "nickname": "路人甲" }, "message": [{ "type": "text", "data": { "text": "在吗，帮忙看看这个" } }] },
+    { "post_type": "message", "message_type": "private", "sub_type": "friend", "self_id": 10000, "time": 1700000060, "message_id": 202, "user_id": 10003, "sender": { "user_id": 10003, "nickname": "小林" }, "message": [{ "type": "text", "data": { "text": "晚上一起吃饭吗" } }] }
+  ],
+  "script": {
+    "202": "好呀，六点老地方见。"
+  }
+}

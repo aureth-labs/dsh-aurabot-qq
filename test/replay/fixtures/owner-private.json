@@ -1,0 +1,17 @@
+{
+  "name": "owner-private",
+  "description": "主人私聊：普通文字往来，必回",
+  "seed": 1,
+  "timeBase": 1700000000000,
+  "selfId": "10000",
+  "ownerId": "10001",
+  "allow": { "private": [], "groups": [] },
+  "events": [
+    { "post_type": "message", "message_type": "private", "sub_type": "friend", "self_id": 10000, "time": 1700000000, "message_id": 101, "user_id": 10001, "sender": { "user_id": 10001, "nickname": "主人" }, "message": [{ "type": "text", "data": { "text": "今天天气怎么样" } }] },
+    { "post_type": "message", "message_type": "private", "sub_type": "friend", "self_id": 10000, "time": 1700000060, "message_id": 102, "user_id": 10001, "sender": { "user_id": 10001, "nickname": "主人" }, "message": [{ "type": "text", "data": { "text": "那下午出门要带伞吗" } }] }
+  ],
+  "script": {
+    "101": "看了一眼，今天多云，二十三度，不太热。",
+    "102": "下午三点有一阵小雨，带把折叠伞稳妥些。"
+  }
+}

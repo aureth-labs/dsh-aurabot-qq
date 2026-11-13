@@ -1,0 +1,16 @@
+{
+  "name": "private-voice",
+  "description": "语音消息：入站记 records 段，回话（语音能力开启）",
+  "seed": 8,
+  "timeBase": 1700000000000,
+  "selfId": "10000",
+  "ownerId": "10001",
+  "allow": { "private": [], "groups": [] },
+  "caps": { "voice": true },
+  "events": [
+    { "post_type": "message", "message_type": "private", "sub_type": "friend", "self_id": 10000, "time": 1700000000, "message_id": 801, "user_id": 10001, "sender": { "user_id": 10001, "nickname": "主人" }, "message": [{ "type": "record", "data": { "url": "https://example.invalid/fake.amr", "file": "fake.amr" } }] }
+  ],
+  "script": {
+    "801": "听到了，这段录音我记下了。"
+  }
+}

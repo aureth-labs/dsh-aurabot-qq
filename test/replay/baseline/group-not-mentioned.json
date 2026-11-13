@@ -1,0 +1,90 @@
+{
+  "chatlog": [
+  {
+  "chatId": "group:20001",
+  "t": 1700000000000,
+  "text": "这周末有人去爬山吗",
+  "uid": "10004",
+  "who": "user"
+},
+  {
+  "chatId": "group:20001",
+  "t": 1700000030000,
+  "text": "@10006  你上次说的那条路线还记得吗",
+  "uid": "10005",
+  "who": "user"
+}
+],
+  "description": "群里没被 @（listenAllInGroup=false）：不插话，记流水",
+  "inbound": [
+  {
+  "at": 1700000000000,
+  "atOthers": false,
+  "chatId": "group:20001",
+  "files": 0,
+  "forwards": [
+
+],
+  "groupId": "20001",
+  "images": 0,
+  "kind": "group",
+  "mentioned": false,
+  "messageId": "401",
+  "nickname": "阿杰",
+  "records": 0,
+  "replyId": "",
+  "stickers": 0,
+  "text": "这周末有人去爬山吗",
+  "userId": "10004",
+  "wakeText": "这周末有人去爬山吗"
+},
+  {
+  "at": 1700000030000,
+  "atOthers": true,
+  "chatId": "group:20001",
+  "files": 0,
+  "forwards": [
+
+],
+  "groupId": "20001",
+  "images": 0,
+  "kind": "group",
+  "mentioned": false,
+  "messageId": "402",
+  "nickname": "小雪",
+  "records": 0,
+  "replyId": "",
+  "stickers": 0,
+  "text": "@10006  你上次说的那条路线还记得吗",
+  "userId": "10005",
+  "wakeText": "@10006  你上次说的那条路线还记得吗"
+}
+],
+  "notices": [
+
+],
+  "outbound": [
+
+],
+  "outbox": [
+
+],
+  "ownerId": "10001",
+  "scenario": "group-not-mentioned",
+  "seed": 4,
+  "selfId": "10000",
+  "skipped": [
+  {
+  "at": 1700000000000,
+  "chatId": "group:20001",
+  "messageId": "401",
+  "reason": "not-mentioned"
+},
+  {
+  "at": 1700000030000,
+  "chatId": "group:20001",
+  "messageId": "402",
+  "reason": "not-mentioned"
+}
+]
+}

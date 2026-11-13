@@ -1,0 +1,15 @@
+{
+  "name": "owner-command",
+  "description": "主人命令（「/」开头）：回执 + 一条多段拆条回复（\\n---\\n 分隔的数组脚本）",
+  "seed": 12,
+  "timeBase": 1700000000000,
+  "selfId": "10000",
+  "ownerId": "10001",
+  "allow": { "private": [], "groups": [] },
+  "events": [
+    { "post_type": "message", "message_type": "private", "sub_type": "friend", "self_id": 10000, "time": 1700000000, "message_id": 1201, "user_id": 10001, "sender": { "user_id": 10001, "nickname": "主人" }, "message": [{ "type": "text", "data": { "text": "/状态" } }] }
+  ],
+  "script": {
+    "1201": ["当前状态：在线，运行正常。", "今天收了 3 条消息，回了 3 条。"]
+  }
+}

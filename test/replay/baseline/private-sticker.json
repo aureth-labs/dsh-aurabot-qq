@@ -1,0 +1,128 @@
+{
+  "chatlog": [
+  {
+  "chatId": "private:10001",
+  "t": 1700000000000,
+  "text": "[笑哭]",
+  "uid": "10001",
+  "who": "user"
+},
+  {
+  "chatId": "private:10001",
+  "t": 1700000000000,
+  "text": "哈哈哈这个表情太形象了。",
+  "who": "bot"
+},
+  {
+  "chatId": "private:10001",
+  "t": 1700000060000,
+  "text": "[表情包]",
+  "uid": "10001",
+  "who": "user"
+},
+  {
+  "chatId": "private:10001",
+  "t": 1700000001000,
+  "text": "这张收了，放进我的表情包库。",
+  "who": "bot"
+}
+],
+  "description": "表情包（mface 与 sub_type=1 图片）：文字化成「[表情包]」",
+  "inbound": [
+  {
+  "at": 1700000000000,
+  "atOthers": false,
+  "chatId": "private:10001",
+  "files": 0,
+  "forwards": [
+
+],
+  "groupId": "",
+  "images": 0,
+  "kind": "private",
+  "mentioned": false,
+  "messageId": "701",
+  "nickname": "主人",
+  "records": 0,
+  "replyId": "",
+  "stickers": 1,
+  "text": "[笑哭]",
+  "userId": "10001",
+  "wakeText": "[笑哭]"
+},
+  {
+  "at": 1700000060000,
+  "atOthers": false,
+  "chatId": "private:10001",
+  "files": 0,
+  "forwards": [
+
+],
+  "groupId": "",
+  "images": 0,
+  "kind": "private",
+  "mentioned": false,
+  "messageId": "702",
+  "nickname": "主人",
+  "records": 0,
+  "replyId": "",
+  "stickers": 1,
+  "text": "[表情包]",
+  "userId": "10001",
+  "wakeText": "[表情包]"
+}
+],
+  "notices": [
+
+],
+  "outbound": [
+  {
+  "action": "send_private_msg",
+  "at": 1700000000000,
+  "chatId": "private:10001",
+  "messageId": "replay-0001",
+  "note": "哈哈哈这个表情太形象了。",
+  "params": {
+  "message": [
+  {
+  "data": {
+  "text": "哈哈哈这个表情太形象了。"
+},
+  "type": "text"
+}
+],
+  "user_id": 10001
+},
+  "seq": 1
+},
+  {
+  "action": "send_private_msg",
+  "at": 1700000001000,
+  "chatId": "private:10001",
+  "messageId": "replay-0002",
+  "note": "这张收了，放进我的表情包库。",
+  "params": {
+  "message": [
+  {
+  "data": {
+  "text": "这张收了，放进我的表情包库。"
+},
+  "type": "text"
+}
+],
+  "user_id": 10001
+},
+  "seq": 2
+}
+],
+  "outbox": [
+
+],
+  "ownerId": "10001",
+  "scenario": "private-sticker",
+  "seed": 7,
+  "selfId": "10000",
+  "skipped": [
+
+]
+}

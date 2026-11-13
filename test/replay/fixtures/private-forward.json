@@ -1,0 +1,15 @@
+{
+  "name": "private-forward",
+  "description": "合并转发：占位文字「[合并转发]」，记 forwards id 待展开",
+  "seed": 9,
+  "timeBase": 1700000000000,
+  "selfId": "10000",
+  "ownerId": "10001",
+  "allow": { "private": [], "groups": [] },
+  "events": [
+    { "post_type": "message", "message_type": "private", "sub_type": "friend", "self_id": 10000, "time": 1700000000, "message_id": 901, "user_id": 10001, "sender": { "user_id": 10001, "nickname": "主人" }, "message": [{ "type": "forward", "data": { "id": "fake-forward-001" } }, { "type": "text", "data": { "text": "这是群里的聊天记录，帮我看看" } }] }
+  ],
+  "script": {
+    "901": "看到了，这段记录里主要在讨论周末的安排。"
+  }
+}

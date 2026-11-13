@@ -1,0 +1,15 @@
+{
+  "name": "private-image",
+  "description": "主人私聊发图片：入站文字化成「[图片]」后回话",
+  "seed": 6,
+  "timeBase": 1700000000000,
+  "selfId": "10000",
+  "ownerId": "10001",
+  "allow": { "private": [], "groups": [] },
+  "events": [
+    { "post_type": "message", "message_type": "private", "sub_type": "friend", "self_id": 10000, "time": 1700000000, "message_id": 601, "user_id": 10001, "sender": { "user_id": 10001, "nickname": "主人" }, "message": [{ "type": "image", "data": { "url": "https://example.invalid/fake-cat.jpg", "file": "fake-cat.jpg" } }, { "type": "text", "data": { "text": "你看这只猫" } }] }
+  ],
+  "script": {
+    "601": "圆滚滚的，毛色也好干净，几岁啦？"
+  }
+}

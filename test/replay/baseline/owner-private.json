@@ -1,0 +1,128 @@
+{
+  "chatlog": [
+  {
+  "chatId": "private:10001",
+  "t": 1700000000000,
+  "text": "今天天气怎么样",
+  "uid": "10001",
+  "who": "user"
+},
+  {
+  "chatId": "private:10001",
+  "t": 1700000000000,
+  "text": "看了一眼，今天多云，二十三度，不太热。",
+  "who": "bot"
+},
+  {
+  "chatId": "private:10001",
+  "t": 1700000060000,
+  "text": "那下午出门要带伞吗",
+  "uid": "10001",
+  "who": "user"
+},
+  {
+  "chatId": "private:10001",
+  "t": 1700000001000,
+  "text": "下午三点有一阵小雨，带把折叠伞稳妥些。",
+  "who": "bot"
+}
+],
+  "description": "主人私聊：普通文字往来，必回",
+  "inbound": [
+  {
+  "at": 1700000000000,
+  "atOthers": false,
+  "chatId": "private:10001",
+  "files": 0,
+  "forwards": [
+
+],
+  "groupId": "",
+  "images": 0,
+  "kind": "private",
+  "mentioned": false,
+  "messageId": "101",
+  "nickname": "主人",
+  "records": 0,
+  "replyId": "",
+  "stickers": 0,
+  "text": "今天天气怎么样",
+  "userId": "10001",
+  "wakeText": "今天天气怎么样"
+},
+  {
+  "at": 1700000060000,
+  "atOthers": false,
+  "chatId": "private:10001",
+  "files": 0,
+  "forwards": [
+
+],
+  "groupId": "",
+  "images": 0,
+  "kind": "private",
+  "mentioned": false,
+  "messageId": "102",
+  "nickname": "主人",
+  "records": 0,
+  "replyId": "",
+  "stickers": 0,
+  "text": "那下午出门要带伞吗",
+  "userId": "10001",
+  "wakeText": "那下午出门要带伞吗"
+}
+],
+  "notices": [
+
+],
+  "outbound": [
+  {
+  "action": "send_private_msg",
+  "at": 1700000000000,
+  "chatId": "private:10001",
+  "messageId": "replay-0001",
+  "note": "看了一眼，今天多云，二十三度，不太热。",
+  "params": {
+  "message": [
+  {
+  "data": {
+  "text": "看了一眼，今天多云，二十三度，不太热。"
+},
+  "type": "text"
+}
+],
+  "user_id": 10001
+},
+  "seq": 1
+},
+  {
+  "action": "send_private_msg",
+  "at": 1700000001000,
+  "chatId": "private:10001",
+  "messageId": "replay-0002",
+  "note": "下午三点有一阵小雨，带把折叠伞稳妥些。",
+  "params": {
+  "message": [
+  {
+  "data": {
+  "text": "下午三点有一阵小雨，带把折叠伞稳妥些。"
+},
+  "type": "text"
+}
+],
+  "user_id": 10001
+},
+  "seq": 2
+}
+],
+  "outbox": [
+
+],
+  "ownerId": "10001",
+  "scenario": "owner-private",
+  "seed": 1,
+  "selfId": "10000",
+  "skipped": [
+
+]
+}

@@ -1,0 +1,15 @@
+{
+  "name": "group-quote-reply",
+  "description": "群里引用回复她说过的话：带 reply 段回话",
+  "seed": 5,
+  "timeBase": 1700000000000,
+  "selfId": "10000",
+  "ownerId": "10001",
+  "allow": { "private": [], "groups": ["20001"] },
+  "events": [
+    { "post_type": "message", "message_type": "group", "self_id": 10000, "time": 1700000000, "message_id": 501, "group_id": 20001, "user_id": 10004, "sender": { "user_id": 10004, "nickname": "阿杰", "card": "阿杰", "role": "member" }, "message": [{ "type": "reply", "data": { "id": "replay-0001" } }, { "type": "text", "data": { "text": "刚才那个答案再发一遍呗" } }] }
+  ],
+  "script": {
+    "501": "上面那条是 1776，我再贴一次：37 × 48 = 1776。"
+  }
+}
