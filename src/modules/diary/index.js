@@ -13,11 +13,17 @@ export default {
   id: 'diary',
   name: '空间日记',
   version: '1.0.0',
+  api: 2,
+  platforms: ['qq'],
   description: '每天自己写几条 QQ 空间说说；主人私聊里能让她发说说（qq_send_qzone）',
   tab: 'diary',
   files: ['features/qzone.js', 'features/qzone-audience.js', 'features/diary-image.js'],
   setup(api) {
     const { hub, onebot, http } = api.core
+    const qqOnebot = {
+      call: (action, params, opts) => (typeof api.native === 'function' ? api.native('qq', action, params, opts) : onebot.call(action, params, opts)),
+      get state() { return api.core.onebot?.state },
+    }
     const panelAction = (run) => async (req) => {
       if (req.method !== 'POST' || !/^application\/json(?:\s*;|$)/i.test(req.headers?.['content-type'] || '')) return { ok: false, message: '请从日记面板发起操作' }
       return run(req)
@@ -29,7 +35,7 @@ export default {
     api.onDispose(() => archive.dispose())
     api.every(300_000, () => archive.collect(), '归档公开浏览图')
     const qzone = createQzone({
-      getConfig: api.config, onebot, hub, log: api.log,
+      getConfig: api.config, onebot: qqOnebot, hub, log: api.log,
       pickImage: () => pickDiaryImage(),
       composeDiary: media.compose,
       // 写过的空间日记也进记忆库：以后聊到相关的事，她会想起自己那天写过什么
@@ -64,7 +70,13 @@ export default {
       catch (error) { return { ok: false, message: error.message } }
     })
     api.route('/diary/friends', async () => {
-      const result = await onebot.call('get_friend_list', {}, { timeoutMs: 20000 })
+      let result
+      try {
+        result = await qqOnebot.call('get_friend_list', {}, { timeoutMs: 20000 })
+      } catch (error) {
+        if (error?.code === 'unsupported-action') return { ok: false, message: '当前 QQ 网关不支持读取好友列表' }
+        throw error
+      }
       const friends = Array.isArray(result) ? result : Array.isArray(result?.friends) ? result.friends : []
       return {
         ok: true,

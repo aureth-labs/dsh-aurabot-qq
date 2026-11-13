@@ -47,9 +47,12 @@ export default {
   id: 'contacts',
   name: '好友申请与白名单',
   version: '1.0.0',
+  api: 2,
+  platforms: ['qq'],
   description: '处理好友申请、加群申请和邀请，改私聊 / 群白名单；权限在「权限」页',
   setup(api) {
     const { hub, onebot } = api.core
+    const qqCall = (action, params, opts) => (typeof api.native === 'function' ? api.native('qq', action, params, opts) : onebot.call(action, params, opts))
     const pendingFile = () => api.dataDir('friend-requests.json')
     const groupPendingFile = () => api.dataDir('group-requests.json')
 
@@ -143,7 +146,7 @@ export default {
         return { ok: false, message: `有 ${pending.length} 个待处理的申请：${pending.map((x) => x.userId).join('、')}。说清楚是哪个 QQ 号` }
       }
       let doubt = []
-      try { doubt = (await onebot.call('get_doubt_friends_add_request', { count: 50 }, { timeoutMs: 15000 })) || [] } catch (error) { doubt = [] }
+      try { doubt = (await qqCall('get_doubt_friends_add_request', { count: 50 }, { timeoutMs: 15000 })) || [] } catch (error) { doubt = [] }
       if (!Array.isArray(doubt)) doubt = []
       const d = qq ? doubt.find((x) => String(x.user_id) === qq) : (doubt.length === 1 ? doubt[0] : null)
       if (d && d.uid) return { ok: true, via: 'doubt', flag: String(d.uid), userId: String(d.user_id || qq || '') }
@@ -169,9 +172,10 @@ export default {
           const verb = approve ? '通过' : '拒绝'
           if (c.dryRun) return { ok: true, message: `试运行：本来要${verb} QQ ${req.userId} 的好友申请` }
           try {
-            if (req.via === 'event') await onebot.call('set_friend_add_request', { flag: req.flag, approve }, { timeoutMs: 15000 })
-            else await onebot.call('set_doubt_friends_add_request', { flag: req.flag, approve }, { timeoutMs: 15000 })
+            if (req.via === 'event') await qqCall('set_friend_add_request', { flag: req.flag, approve }, { timeoutMs: 15000 })
+            else await qqCall('set_doubt_friends_add_request', { flag: req.flag, approve }, { timeoutMs: 15000 })
           } catch (error) {
+            if (error?.code === 'unsupported-action') return { ok: false, message: '当前 QQ 网关不支持处理好友申请' }
             return { ok: false, message: `${verb} QQ ${req.userId} 的好友申请没成功：${error.message}` }
           }
           savePending(loadPending().filter((x) => x.flag !== req.flag && x.userId !== req.userId))
@@ -205,10 +209,11 @@ export default {
             if (groupInFlight.has(req.flag)) return { ok: false, message: '这条申请正在处理' }
             groupInFlight.add(req.flag)
             try {
-              await onebot.call('set_group_add_request', { flag: req.flag, sub_type: req.subType, approve, ...(reason && !approve ? { reason: String(reason) } : {}) }, { timeoutMs: 15000 })
+              await qqCall('set_group_add_request', { flag: req.flag, sub_type: req.subType, approve, ...(reason && !approve ? { reason: String(reason) } : {}) }, { timeoutMs: 15000 })
               saveGroupPending(loadGroupPending().filter((x) => x.flag !== req.flag))
               return { ok: true, message: `已${verb}「${label}」` }
             } catch (error) {
+              if (error?.code === 'unsupported-action') return { ok: false, message: '当前 QQ 网关不支持处理加群申请' }
               return { ok: false, message: `${verb}「${label}」没成功：${error.message}` }
             } finally { groupInFlight.delete(req.flag) }
           }),

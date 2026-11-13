@@ -172,7 +172,12 @@ export function apply(ctx) {
     }
     secrets()
     if (bridge && (before.bridge.dshTools !== cfg.bridge.dshTools || before.persona.current !== cfg.persona.current)) bridge.refresh()
-    if (mods && (JSON.stringify(before.modules) !== JSON.stringify(cfg.modules) || before.safeMode !== cfg.safeMode)) mods.sync().catch(() => {})
+    const platformsChanged = JSON.stringify(before.platforms) !== JSON.stringify(cfg.platforms)
+    if (platformsChanged) {
+      if (hasAnyPlatform() && !platformGateway) ensureGateway()
+      else platformGateway?.sync?.().catch((error) => logger.child('gateway').warn('同步平台网关失败：', error?.message || error))
+    }
+    if (mods && (platformsChanged || JSON.stringify(before.modules) !== JSON.stringify(cfg.modules) || before.safeMode !== cfg.safeMode)) mods.sync().catch(() => {})
     mods?.emit('config', cfg, before)
     if (JSON.stringify(before.backup?.remote) !== JSON.stringify(cfg.backup?.remote)) scheduleRemoteBackup()
     return cfg
@@ -826,6 +831,7 @@ export function apply(ctx) {
   // ---------- 模块 ----------
   const core = {
     hub, onebot, snowluma, local, groupRoles, mutes, logger, bridge: null,
+    get gateway() { return platformGateway },
     root: ROOT,
     // 模块经 api.proactive 访问出站治理面（modules.js 里读它）
     outbound,

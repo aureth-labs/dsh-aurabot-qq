@@ -7,6 +7,8 @@ export default {
   id: 'mood',
   name: '心情',
   version: '1.0.0',
+  api: 2,
+  platforms: ['*'],
   description: '她的心情：会随聊天起伏，影响表情 / 语音频率和回复快慢',
   tab: 'mood',
   files: ['features/companion.js', 'features/mood-context.js'],

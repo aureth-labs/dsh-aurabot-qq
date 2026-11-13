@@ -1229,6 +1229,123 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     }
   }
 
+  function partsToSegmentsFallback(parts = []) {
+    const out = []
+    for (const p of parts) {
+      if (!p || typeof p !== 'object') continue
+      if (p.type === 'text') {
+        if (p.text) out.push({ type: 'text', data: { text: String(p.text) } })
+      } else if (p.type === 'mention') {
+        const qq = p.all ? 'all' : String(p.userId || '')
+        if (qq) out.push({ type: 'at', data: { qq } })
+      } else if (p.type === 'face') {
+        if (p.id != null) out.push({ type: 'face', data: { id: String(p.id) } })
+      } else if (p.type === 'reply') {
+        if (p.messageId != null) out.push({ type: 'reply', data: { id: String(p.messageId) } })
+      } else if (p.type === 'image' || p.type === 'voice' || p.type === 'video' || p.type === 'file') {
+        const file = p.url
+          ? String(p.url)
+          : p.file
+            ? (isAbsolute(String(p.file)) ? pathToFileURL(String(p.file)).href : String(p.file))
+            : p.base64
+              ? `base64://${p.base64}`
+              : ''
+        if (!file) continue
+        const segType = p.type === 'voice' ? 'record' : p.type
+        out.push({ type: segType, data: p.type === 'file' && p.name ? { file, name: String(p.name) } : { file } })
+      }
+    }
+    return out
+  }
+
+  /**
+   * 统一多平台出站发送：接收平台无关的 Part[]，经清洗与门闸后经 gateway.send（无网关时对默认平台退回 sendSegments）。
+   */
+  async function sendParts(chatId, parts, opts = {}) {
+    const { force = false, isCurrent = null, throwOnError = false, timeoutMs, quiet = false, queueKind = 'reply', queueTtlMs, sensitive = false, note = '', replyTo, inResponseTo, replyId } = opts
+    if (disposed) return null
+    let verdict = opts.outboundVerdict || null
+    if (wantsOutbound(opts)) {
+      verdict = passOutbound({ chatId, note, sourceModule: opts.sourceModule, enginePolicy: opts.enginePolicy, cause: opts.cause, itemId: opts.itemId, kind: 'segments' })
+      if (verdict.action === 'deny') {
+        log.info(`出站被策略拦下（${verdict.reason || 'deny'}）→ ${chatId}：${opts.sourceModule || opts.enginePolicy || ''} [${note || ''}]`)
+        return null
+      }
+      opts = { ...opts, sourceModule: undefined, enginePolicy: undefined, cause: undefined, itemId: undefined }
+    }
+    const normId = normalizeChatId(chatId) || String(chatId || '')
+    const addr = parseChatId(normId)
+    if (!addr || !Array.isArray(parts)) return settleOutboundFailed(verdict)
+    const cleaning = cleaningFor(normId)
+    const cleaned = []
+    for (const p of parts) {
+      if (!p || typeof p !== 'object') continue
+      if (p.type === 'text') {
+        const text = cleanOutboundText(String(p.text ?? ''), cleaning)
+        if (text) cleaned.push({ ...p, text })
+      } else {
+        cleaned.push(p)
+      }
+    }
+    if (!cleaned.length || disposed || (isCurrent && !isCurrent())) return settleOutboundFailed(verdict)
+    const defaultPlatform = parseChatId('private:0')?.platform
+    const useGateway = Boolean(gateway && (addr.platform !== defaultPlatform || gateway.caps?.(normId) !== null || !onebot))
+    if (!useGateway) {
+      const segs = partsToSegmentsFallback(cleaned)
+      if (!segs.length) return settleOutboundFailed(verdict)
+      const head = replyTo ?? replyId ? [{ type: 'reply', data: { id: String(replyTo ?? replyId) } }] : []
+      const r = await sendSegments(chatId, [...head, ...segs], note, { ...opts, force, isCurrent, throwOnError, timeoutMs, quiet, queueKind, queueTtlMs, sensitive, outboundVerdict: verdict })
+      return r && typeof r === 'object' ? { ...r, messageId: r.messageId ?? r.message_id ?? r.queuedId ?? '' } : r
+    }
+    const cfg = getConfig()
+    const cap = captureStore.getStore()
+    if (cap) {
+      cap.push({ chatId: normId, note, parts: cleaned, message: partsToSegmentsFallback(cleaned) })
+      if (outputScope.getStore()?.chatId === chatId || outputScope.getStore()?.chatId === normId) outputScope.getStore().sent++
+      settleOutbound(verdict, 'sent')
+      return { messageId: 'sim-' + cap.length, message_id: 'sim-' + cap.length }
+    }
+    if (force) {}
+    else if (!cfg.enabled) {
+      log.info(`总开关关着，没发 → ${normId}：${note}`)
+      return settleOutboundFailed(verdict)
+    }
+    else if (cfg.dryRun) {
+      log.info(`试运行（没真发）→ ${normId}：${note}`)
+      return settleOutboundFailed(verdict)
+    }
+    try {
+      const sent = await gateway.send({
+        chatId: normId,
+        parts: cleaned,
+        replyTo: replyTo ?? replyId,
+        inResponseTo,
+        kind: queueKind === 'proactive' ? 'proactive' : queueKind === 'diary' ? 'diary' : 'reply',
+        note: sensitive ? '敏感命令回执' : (note || ''),
+        force: Boolean(force),
+        sensitive: Boolean(sensitive),
+        timeoutMs,
+      })
+      if (sent?.messageId) {
+        sentIds.add(String(sent.messageId))
+        if (sentIds.size > 500) sentIds.delete(sentIds.values().next().value)
+      }
+      bump('sent')
+      if (outputScope.getStore()?.chatId === chatId || outputScope.getStore()?.chatId === normId) outputScope.getStore().sent++
+      settleOutbound(verdict, 'sent')
+      if (opts.proactive) noteProactive(normId, partsToSegmentsFallback(cleaned), opts)
+      if (sent?.queued) return { messageId: '', queued: true, queuedId: sent.messageId || '' }
+      return { messageId: sent?.messageId ?? '', message_id: sent?.messageId ?? '', degraded: sent?.degraded }
+    } catch (error) {
+      bump('errors')
+      const detail = sensitive ? '敏感命令回执发送失败' : error.message
+      log.warn(`发到 ${normId} 失败（网关）：`, detail)
+      settleOutbound(verdict, 'failed')
+      if (throwOnError || !quiet) throw error
+      return null
+    }
+  }
+
   /** 门闸放行但这一步没发出去：结算成 failed 并把 null 返回给调用方（保持旧真值语义）。 */
   function settleOutboundFailed(verdict) {
     settleOutbound(verdict, 'failed')
@@ -2277,7 +2394,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         role: m.sender.role || 'member',
       },
       // 网关已经算好的字段直接带上，省得 parseMessageEvent 再算一遍（它认这两个键）
-      __gateway: { chatId: m.chatId, platform: m.platform, instance: m.instance, person: m.sender.person, mentionedMe: m.mentionedMe },
+      __gateway: { chatId: m.chatId, platform: m.platform, instance: m.instance, person: m.sender.person, mentionedMe: m.mentionedMe, parts: m.parts },
     }
     if (kind === 'group') {
       event.group_id = Number(id) || id
@@ -3833,6 +3950,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     sendImage,
     checkSendableFile,
     sendSegments,
+    sendParts,
     pushToSession,
     receiveOwnerMessage,
     titleFilter,

@@ -29,6 +29,8 @@ export default {
   id: 'memory',
   name: '记忆',
   version: '1.0.0',
+  api: 2,
+  platforms: ['*'],
   description: '长期记忆：记事、想起、每日整理、小档案和相处经验',
   // 面板拆页后记忆有自己的页（beta 原先挂在心情页）
   tab: 'memory',

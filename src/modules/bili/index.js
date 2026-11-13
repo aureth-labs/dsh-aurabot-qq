@@ -16,6 +16,8 @@ export default {
   id: 'bili',
   name: 'B站',
   version: '1.1.0',
+  api: 2,
+  platforms: ['*'],
   description: '看别人发的 B 站视频；定时自己刷、评论、回评论；可选发弹幕；抽帧看画面、发截图；按权限改自己的头像 / 签名（bili_watch / bili_comment / bili_danmaku / qq_send_shot / bili_set_avatar / bili_set_sign）',
   tab: 'bili',
   files: ['bili/duty.js', 'bili/group-share.js', 'bili/api.js', 'bili/vision.js', 'bili/shots.js', 'bili/danmaku.js', 'bili/login-pause.js', 'bili/qr-login.js'],
@@ -41,7 +43,14 @@ export default {
       getConfig: api.config, hub, memory: api.lazy('memory'), log: api.log, dsh: api.dsh,
       afterBrowse: danmaku.afterBrowse, groupShare,
     })
-    api.every(60_000, () => (api.core.onebot?.state && api.core.onebot.state !== 'connected' ? undefined : bili.tick()), '刷B站')
+    const gatewayIdle = () => {
+      const insts = api.core.gateway?.instances?.()
+      if (Array.isArray(insts) && insts.some((s) => s?.enabled && s.caps !== null)) {
+        return !insts.some((s) => s?.enabled && s.state === 'connected')
+      }
+      return Boolean(api.core.onebot?.state && api.core.onebot.state !== 'connected')
+    }
+    api.every(60_000, () => (gatewayIdle() ? undefined : bili.tick()), '刷B站')
 
     // 看视频谁发的链接都能看，评论要主人开口
     api.tool(({ chat, sessionId }) => {
@@ -129,7 +138,7 @@ export default {
             const pick = media.filter((x) => !x.sticker).at(-1) || media.at(-1)
             if (pick) {
               try {
-                const buf = await segmentBytes(pick.seg, api.core.onebot, { maxBytes: 10 * 1024 * 1024 })
+                const buf = await segmentBytes(pick.seg, null, { maxBytes: 10 * 1024 * 1024 })
                 if (buf && buf.length) return bili.setAvatar(buf)
               } catch (error) { /* 退回网址 */ }
             }

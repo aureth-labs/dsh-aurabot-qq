@@ -10,6 +10,8 @@ export default {
   id: 'song',
   name: '翻唱',
   version: '1.0.0',
+  api: 2,
+  platforms: ['*'],
   description: '用她的声音翻唱一首歌，做好发语音条（qq_song_cover、/sing）',
   tab: 'song',
   files: ['song/studio.js'],

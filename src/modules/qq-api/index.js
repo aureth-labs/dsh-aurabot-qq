@@ -112,9 +112,11 @@ export default {
   name: 'QQ 接口',
   version: '1.0.0',
   description: '把 SnowLuma 的 QQ 能力交给她：查群公告、精华、荣誉、群文件，主人开口时还能撤回、设精华、改群名片等（qq_api_find / qq_api_call）',
-  api: 1,
+  api: 2,
+  platforms: ['qq'],
   setup(api) {
     const { hub, onebot } = api.core
+    const qqCall = (action, params, opts) => (typeof api.native === 'function' ? api.native('qq', action, params, opts) : onebot.call(action, params, opts))
     api.tool(({ chat, level, sessionId }) => {
       if (chat.kind === 'system' || api.config().qqApi?.enabled === false) return []
       const isOwner = () => level === 'full' || Boolean(hub.turnSendersAllOwner?.(sessionId))
@@ -152,8 +154,13 @@ export default {
             if (!cleaned.ok) return { ok: false, message: cleaned.message }
             if (cleaned.changed) api.log.info(`qq_api：${chat.chatId} 调用 ${name} 前清洗了外显文本`)
             api.log.info(`qq_api：${chat.chatId} 调用 ${name}`)
-            const data = await onebot.call(name, cleaned.params, { timeoutMs: 15000, retries: 0 })
-            return { ok: true, message: clipText(JSON.stringify(data ?? null), RESULT_CHARS) }
+            try {
+              const data = await qqCall(name, cleaned.params, { timeoutMs: 15000, retries: 0 })
+              return { ok: true, message: clipText(JSON.stringify(data ?? null), RESULT_CHARS) }
+            } catch (error) {
+              if (error?.code === 'unsupported-action') return { ok: false, message: `当前网关不支持 QQ 接口「${name}」` }
+              throw error
+            }
           },
           render: (_args, value) => [{ type: 'text', text: value?.message || '' }],
         }),

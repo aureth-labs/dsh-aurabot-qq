@@ -16,11 +16,13 @@ export default {
   id: 'voice',
   name: '语音',
   version: '1.0.0',
+  api: 2,
+  platforms: ['*'],
   description: '发语音条：把她的话念出来（关掉后想发语音时改发文字）',
   tab: 'voice',
   files: ['voice/tts.js', 'voice/asr.js', 'voice/rvc.js', 'voice/volcano-voices.js'],
   setup(api) {
-    const { hub, onebot, local, http } = api.core
+    const { hub, local, http } = api.core
 
     async function speak(text, voice = api.config().voice, { useLocal = true } = {}) {
       // 本地接口接管语音合成；出错退回内置。试听用 useLocal=false，避免「本地接口」把任何引擎都顶掉
@@ -139,7 +141,17 @@ export default {
     api.route('/voice/asr-last', async (req) => {
       const b = await http.body(req)
       const uid = Number(b.userId || api.config().ownerQQ)
-      const h = await onebot.call('get_friend_msg_history', { user_id: uid, count: 30 })
+      const gw = api.core.gateway
+      const qqInst = gw?.instances?.()?.find((s) => s?.platform === 'qq' && s.enabled)
+      if (!gw || !qqInst || qqInst.caps === null) {
+        return { ok: false, message: '仅在启用且连接 QQ 网关时支持此自检' }
+      }
+      let h
+      try {
+        h = await gw.native(qqInst.instance, 'get_friend_msg_history', { user_id: uid, count: 30 })
+      } catch (error) {
+        return { ok: false, message: error?.code === 'unsupported-action' ? '当前 QQ 网关不支持读取聊天记录' : (error?.message || '读取 QQ 聊天记录失败') }
+      }
       const recs = (h?.messages || []).filter((m) => String(m.user_id) === String(uid)).flatMap((m) => (m.message || []).filter((s) => s.type === 'record').map((s) => ({ seg: s, time: m.time })))
       const last = recs.at(-1)
       if (!last) return { ok: false, message: '最近的聊天里没有对方发的语音' }

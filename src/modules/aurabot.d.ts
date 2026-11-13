@@ -3,11 +3,78 @@
 //   /** @type {import('../aurabot').AurabotModule} */
 // VS Code 等编辑器就会给 api.* 补全和参数说明。完整说明见同目录的 API.md。
 
-export type ChatId = `private:${string}` | `group:${string}` | `system:${string}`
+export type Platform = 'qq' | 'feishu' | 'qqbot' | 'bridge' | (string & {})
+
+export type ChatId =
+  | `private:${string}`
+  | `group:${string}`
+  | `system:${string}`
+  | `${string}:private:${string}`
+  | `${string}:group:${string}`
+
+export type Part =
+  | { type: 'text'; text: string }
+  | { type: 'image'; file?: string; url?: string; base64?: string; width?: number; height?: number }
+  | { type: 'sticker'; id?: string; file?: string; url?: string; name?: string }
+  | { type: 'voice'; file?: string; url?: string; base64?: string; durationMs?: number }
+  | { type: 'video'; file?: string; url?: string; durationMs?: number }
+  | { type: 'file'; file?: string; url?: string; name?: string; size?: number }
+  | { type: 'mention'; userId?: string; name?: string; all?: boolean }
+  | { type: 'face'; id: string; name?: string }
+  | { type: 'reply'; messageId: string }
+  | { type: 'card'; title: string; summary?: string; url?: string; image?: string }
+  | { type: 'raw'; platform: string; data: unknown }
+
+export interface Caps {
+  image: boolean
+  sticker: boolean
+  voice: 'native' | 'file' | false
+  video: boolean
+  file: boolean
+  maxFileBytes: number
+  quoteReply: boolean
+  mention: boolean
+  mentionAll: boolean
+  poke: boolean
+  typing: boolean
+  recall: boolean
+  card: boolean
+  listenAllInGroup: boolean
+  proactive: 'free' | 'limited' | 'none'
+  replyWindowMs: number
+  repliesPerMessage: number
+  history: boolean
+  memberList: boolean
+  forwardExpand: boolean
+}
+
+export interface InstanceStatus {
+  instance: string
+  platform: Platform
+  name: string
+  enabled: boolean
+  state: 'stopped' | 'connecting' | 'connected' | 'reconnecting' | 'error'
+  detail?: string
+  self?: { account: string; name?: string } | null
+  caps: Caps | null
+}
+
+export interface OutboundSendOpts {
+  note?: string
+  kind?: 'reply' | 'proactive' | 'diary'
+  replyTo?: string
+  inResponseTo?: string
+  force?: boolean
+  sensitive?: boolean
+  throwOnError?: boolean
+  timeoutMs?: number
+  [key: string]: any
+}
 
 export interface Chat {
   chatId: ChatId
   kind: 'private' | 'group' | 'system'
+  platform?: Platform
   userId?: string
   groupId?: string
   title?: string
@@ -17,6 +84,8 @@ export interface Chat {
 export interface Message {
   kind: 'private' | 'group'
   chatId: ChatId
+  platform: Platform
+  instance: string
   userId: string
   groupId: string
   nickname: string
@@ -24,6 +93,10 @@ export interface Message {
   role: string
   messageId: string
   text: string
+  /** 标准化消息段 */
+  parts: Part[]
+  /** 已核对的跨平台统一身份；未认领或未启用身份库时为 null */
+  person: string | null
   /** @ 了她 */
   mentioned: boolean
   /** 引用的那条消息 id */
@@ -32,7 +105,7 @@ export interface Message {
   stickers: any[]
   records: any[]
   forwards: any[]
-  /** 原始 OneBot 事件 */
+  /** 原始平台事件 */
   raw: any
 }
 
@@ -188,8 +261,11 @@ export interface Events {
   activity: (a: { kind: 'in' | 'out'; chatId: ChatId; userId?: string; nickname?: string; text?: string; reply?: string; direct?: boolean; owner?: boolean }) => void
   /** 每条成功落盘后的流水快照；只看不改，调试模式不产生此事件。 */
   'chat/log': (row: ChatLogRow) => void
-  /** 所有原始 OneBot 事件（只看，不管白名单） */
+  /** 平台实例状态变化（只对声明了对应平台或 ['*'] 的模块派发） */
+  'platform/state': (status: InstanceStatus) => void
+  /** 所有原始 OneBot 事件（仅限声明 'qq' 的模块且已启用 QQ；只看不改，不管白名单） */
   onebot: (event: any) => void
+  /** QQ 网关连接状态变化（仅限声明 'qq' 的模块且已启用 QQ） */
   'onebot/state': (state: string) => void
   config: (cfg: any, before: any) => void
   'module/start': (id: string) => void
@@ -253,7 +329,17 @@ export interface Api {
   sendFile(chatId: ChatId | string, file: string, name?: string): Promise<any>
   /** 把本机音频文件当语音条发出去 */
   sendVoiceFile(chatId: ChatId | string, file: string, note?: string): Promise<any>
+  /** 统一多平台发送（经出站清洗与策略门闸，底层走 gateway.send） */
+  sendParts(chatId: ChatId | string, parts: Part[], opts?: OutboundSendOpts): Promise<any>
+  /** 从 chatId 解析平台名（例如 'qq' / 'feishu' / 'qqbot'），无法识别返回 '' */
+  platformOf(chatId: ChatId | string): Platform | ''
+  /** 查询当前聊天所属平台实例的能力表，实例未启动或不支持返回 null */
+  caps(chatId: ChatId | string): Caps | null
+  /** 调用指定平台专有原生动作（必须在模块 platforms 里显式声明该平台） */
+  native(platform: Platform, action: string, params?: any, opts?: { timeoutMs?: number; [key: string]: any }): Promise<any>
+  /** @deprecated 仅 QQ 兼容；请改用 api.sendParts */
   sendSegments(chatId: ChatId | string, segments: Segment[], note?: string): Promise<any>
+  /** @deprecated 仅 QQ 兼容；请改用 api.native('qq', ...) */
   onebot(action: string, params?: any, opts?: { timeoutMs?: number }): Promise<any>
 
   // ---- 模型 ----
@@ -281,8 +367,11 @@ export interface Api {
   has(id: string): boolean
   core: {
     hub: ChatHub
+    gateway?: any
     media: MediaAccess
+    /** @deprecated 仅 QQ 兼容；请改用 api.native('qq', ...) 与 api.on('platform/state', ...) */
     onebot: { call(action: string, params?: any, opts?: any): Promise<any>; state: string }
+    /** @deprecated 仅 QQ 兼容 */
     snowluma: any
     local: any
     groupRoles: any
@@ -322,7 +411,9 @@ export interface AurabotModule {
   name?: string
   version?: string
   /** 按哪一版扩展接口写的 */
-  api?: number
+  api?: 1 | 2 | number
+  /** 声明支持的平台（例如 ['qq']、['qq', 'feishu'] 或 ['*'] 平台无关）；缺省为 ['qq'] */
+  platforms?: (Platform | '*')[]
   description?: string
   defaults?: Record<string, any>
   settings?: Setting[]

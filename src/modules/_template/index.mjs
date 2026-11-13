@@ -10,7 +10,8 @@ export default {
   id: '__ID__', // 要和文件夹名一样；和内置模块同名（比如 diary）就是替换掉内置的
   name: '__NAME__',
   version: '0.1.0',
-  api: 1, // 按哪一版扩展接口写的，别改
+  api: 2, // 按哪一版扩展接口写的，别改
+  platforms: ['*'], // 平台无关模块写 ['*']；只针对某一平台写 ['qq'] 或 ['feishu'] 等
   description: '一个例子：关键词自动回复',
 
   // 面板里自动生成设置表单；值用 api.settings() 读

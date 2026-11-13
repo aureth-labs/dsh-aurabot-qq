@@ -12,6 +12,8 @@ export default {
   id: 'video',
   name: '生视频',
   version: '1.0.0',
+  api: 2,
+  platforms: ['*'],
   description: '用本地脚本生成视频并发到聊天（qq_generate_video）',
   setup(api) {
     const { hub, local } = api.core
@@ -25,7 +27,11 @@ export default {
 
     async function deliver(chatId, file) {
       try {
-        await hub.sendSegments(chatId, [{ type: 'video', data: { file: pathToFileURL(file).href } }], '[视频]', { throwOnError: true, timeoutMs: 120_000 })
+        if (typeof api.sendParts === 'function') {
+          await api.sendParts(chatId, [{ type: 'video', file: pathToFileURL(file).href }], { note: '[视频]', throwOnError: true, timeoutMs: 120_000 })
+        } else {
+          await hub.sendSegments(chatId, [{ type: 'video', data: { file: pathToFileURL(file).href } }], '[视频]', { throwOnError: true, timeoutMs: 120_000 })
+        }
       } catch (error) {
         api.log.warn('按视频发送失败，改发文件：', error.message)
         await hub.sendFile(chatId, file)

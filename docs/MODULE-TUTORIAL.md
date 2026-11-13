@@ -61,14 +61,36 @@ modules/fortune/
   "tags": ["运势"],
   "author": "你的名字",
   "license": "MIT",
-  "api": 1,
+  "api": 2,
+  "platforms": ["*"],
   "minPluginVersion": "1.2.0",
   "requires": [],
   "capabilities": []
 }
 ```
 
-- `id`、`version`、`api` 要和 `index.mjs` 里的一样。
+- `id`、`version`、`api`、`platforms` 要和 `index.mjs` 里的一样。
+- `platforms` 不写默认只支持 `["qq"]`；如果模块与具体平台无关（比如查天气、记事、文生图），写成 `["*"]`。
+
+## 让模块支持多个平台
+
+从扩展接口 v2 开始，Aurabot 支持 QQ 以外的平台（如飞书等）。编写可跨平台运行的模块注意这几件事：
+
+1. **声明 `platforms`**：
+   - 平台无关模块写 `api: 2, platforms: ['*']`。
+   - 依赖平台专有功能的模块显式列出平台，例如 `platforms: ['qq']` 或 `platforms: ['qq', 'feishu']`。
+   - 插件只会在声明的平台至少有一个启用时才启动该模块；平台切走时会自动停掉，切回来时再启动。
+2. **用统一接口发消息、查能力**：
+   - 判断聊天所属平台用 `api.platformOf(chat.chatId)`。
+   - 发出站富媒体或带提及 / 回复的消息用 `api.sendParts(chatId, parts, opts)`，网关会自动按 `api.caps(chatId)` 做降级。
+   - 不要假设每个平台都能随时主动发消息或收非 @ 群消息：发特殊能力前先看 `api.caps(chatId)`（比如 `caps?.video`、`caps?.proactive`）。
+3. **调原生动作用 `api.native`**：
+   - 只有 `platforms` 里明确写了该平台名，才能调 `api.native(platform, action, params, opts)`（写 `['*']` 不能调）。
+   - 如果平台网关不支持某个扩展动作，会抛出 `error.code === 'unsupported-action'`，模块应捕获并给出明确提示。
+4. **v1 模块迁移建议**：
+   - 把 `api: 1` 升到 `api: 2` 并补上 `platforms`。
+   - 把 `api.onebot(...)` / `api.core.onebot.call(...)` 换成 `api.native('qq', ...)`，把 `api.sendSegments(...)` 换成 `api.sendParts(...)`。
+   - `api.on('onebot', ...)` / `api.on('onebot/state', ...)` 仅 QQ 模块能收到；跨平台监听上下线请改用 `api.on('platform/state', (status) => ...)`。
 - `category` 从这些里选：`platform` 逛平台、`social` 聊天互动、`creative` 创作、`desktop` 桌面、`manage` 管理、`tool` 工具。
 - `capabilities` 写模块用到的能力：联网 `network`、读写文件 `filesystem`、启动程序 `process`、动态执行代码 `dynamic-code`、读写配置 `plugin-config`、用内部对象 `plugin-internals`。用到却没写，检查过不了。
 

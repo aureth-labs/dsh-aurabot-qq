@@ -44,11 +44,17 @@ export default {
   id: 'profile',
   name: '改资料',
   version: '1.2.0',
+  api: 2,
+  platforms: ['qq'],
   description: '主人私聊时查看自己的 QQ 资料与头像图片（qq_get_profile）、发送当前头像（qq_send_avatar）；按权限修改 QQ 资料',
   files: ['features/qq-profile.js'],
   setup(api, { fetchAvatar, ask } = {}) {
     const { hub, onebot } = api.core
-    const reader = createQqProfile({ getConfig: api.config, onebot, dsh: api.dsh, log: api.log, fetchAvatar, ask })
+    const qqOnebot = {
+      call: (action, params, opts) => (typeof api.native === 'function' ? api.native('qq', action, params, opts) : onebot.call(action, params, opts)),
+      get state() { return api.core.onebot?.state },
+    }
+    const reader = createQqProfile({ getConfig: api.config, onebot: qqOnebot, dsh: api.dsh, log: api.log, fetchAvatar, ask })
     api.onDispose(reader.dispose)
     api.rule((kind) => kind === 'private' ? '主人谈到你自己的 QQ 昵称、个性签名或头像时，可以主动用 qq_get_profile 查看当前资料，不必等主人明确说“查询”。例如“你现在叫什么”“签名是什么”“喜欢这个头像吗”。问头像画面时传 view_avatar=true，依据本次头像附件和描述回答；查不到就如实说明，不凭旧聊天记录猜。主人明确说“把现在头像发出来”“发你的头像给我”时，用 qq_send_avatar 直接发送，不必先识图；只有工具报告 sent=true 才能说发出去了，成功后不要再用链接或 Markdown 重复发图。查询不会发送图片或修改资料；普通无关聊天无需查询。' : '')
 
@@ -65,9 +71,10 @@ export default {
         writeFileSync(tmp, small)
         for (const file of [`base64://${small.toString('base64')}`, tmp]) {
           try {
-            await onebot.call('set_qq_avatar', { file }, { timeoutMs: 30000 })
+            await qqOnebot.call('set_qq_avatar', { file }, { timeoutMs: 30000 })
             return { ok: true, message: okMessage }
           } catch (error) {
+            if (error?.code === 'unsupported-action') return { ok: false, message: '当前 QQ 网关不支持更换头像' }
             lastError = error
           }
         }
@@ -141,7 +148,12 @@ export default {
           if (!nick) return { ok: false, message: '昵称不能是空的' }
           if ([...nick].length > NICK_MAX) return { ok: false, message: `昵称最多 ${NICK_MAX} 个字` }
           if (c.dryRun) return { ok: true, message: `试运行：本来要把 QQ 昵称改成：${nick}` }
-          await onebot.call('set_qq_profile', { nickname: nick }, { timeoutMs: 15000 })
+          try {
+            await qqOnebot.call('set_qq_profile', { nickname: nick }, { timeoutMs: 15000 })
+          } catch (error) {
+            if (error?.code === 'unsupported-action') return { ok: false, message: '当前 QQ 网关不支持修改昵称' }
+            throw error
+          }
           return { ok: true, message: `QQ 昵称改好了：${nick}` }
         }),
       }))
@@ -155,7 +167,12 @@ export default {
           if (!sign) return { ok: false, message: '签名不能是空的' }
           if ([...sign].length > SIGN_MAX) return { ok: false, message: `签名最多 ${SIGN_MAX} 个字` }
           if (c.dryRun) return { ok: true, message: `试运行：本来要把 QQ 签名改成：${sign}` }
-          await onebot.call('set_self_longnick', { longNick: sign }, { timeoutMs: 15000 })
+          try {
+            await qqOnebot.call('set_self_longnick', { longNick: sign }, { timeoutMs: 15000 })
+          } catch (error) {
+            if (error?.code === 'unsupported-action') return { ok: false, message: '当前 QQ 网关不支持修改个性签名' }
+            throw error
+          }
           return { ok: true, message: `QQ 签名改好了：${sign}` }
         }),
       }))
@@ -175,7 +192,7 @@ export default {
             if (!pick) return { ok: false, message: '最近半小时这个聊天里没人发过图片，先把图发过来' }
             let buf
             try {
-              buf = await segmentBytes(pick.seg, onebot, { maxBytes: 10 * 1024 * 1024 })
+              buf = await segmentBytes(pick.seg, qqOnebot, { maxBytes: 10 * 1024 * 1024 })
             } catch (error) {
               return { ok: false, message: '这张图我拿不到：' + error.message }
             }
@@ -186,7 +203,12 @@ export default {
             const src = avatarSource(raw)
             if (!src.ok) return src
             if (c.dryRun) return { ok: true, message: `试运行：本来要把 QQ 头像换成：${src.file}` }
-            await onebot.call('set_qq_avatar', { file: src.file }, { timeoutMs: 30000 })
+            try {
+              await qqOnebot.call('set_qq_avatar', { file: src.file }, { timeoutMs: 30000 })
+            } catch (error) {
+              if (error?.code === 'unsupported-action') return { ok: false, message: '当前 QQ 网关不支持更换头像' }
+              throw error
+            }
             return { ok: true, message: 'QQ 头像换好了' }
           }
           // ③ 自己画的图：只认「画作」「画作 #1」「#1」或完整文件名；绝对路径一律不认
