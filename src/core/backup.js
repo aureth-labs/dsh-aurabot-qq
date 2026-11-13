@@ -8,9 +8,13 @@ import { open, mkdir, readdir, rename, rm } from 'node:fs/promises'
 import { constants, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { crc32, deflateRawSync, inflateRawSync } from 'node:zlib'
 import { homedir } from 'node:os'
-import { join, parse, relative } from 'node:path'
+import { dirname, join, parse, relative } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { dataDir, dshHome } from './store.js'
-import { captureMemoryBackup, MEMORY_FILES } from '../features/memory-store.js'
+import { captureMemoryBackup, MEMORY_FILES, readMemoryDatabase } from '../features/memory-store.js'
+import { captureIdentityBackup, IDENTITY_FILE, IDENTITY_FILES } from '../gateway/identity-store.js'
+import { createIdentity } from '../gateway/identity.js'
+import { enumeratePeopleFromState } from '../features/memory.js'
 
 const MANIFEST = 'aurabot-backup.json'
 const SCHEMA = 1
@@ -26,10 +30,14 @@ const STORE_EXT = /\.(png|jpe?g|gif|webp|mp3|mp4|m4a|ogg|opus|webm|zip|7z|rar|pt
  * 不进备份的东西。logs、缓存没有价值；edge-profile 是浏览器资料，登录态绑定这台电脑，
  * 带过去也用不了。市场模块不打包，恢复后按名单重新下载。
  */
-const SKIP = ['backups', '.restore', '.restore-sessions', '.restore-pending.json', '.restore-modules.json', 'logs', 'tmp', 'voice-cache', 'archive-cache', 'douyin/edge-profile']
+const GATEWAY_IDENTITY_FILES = IDENTITY_FILES.map((name) => 'gateway/' + name)
+const RESULT_FILE = '.restore-result.json'
+const REBUILD_NOTICE = '身份表是重建的，非 QQ 平台的绑定需要重新做'
+let cachedRestoreResult = null
+const SKIP = ['backups', '.restore', '.restore-sessions', '.restore-pending.json', '.restore-modules.json', RESULT_FILE, 'logs', 'tmp', 'voice-cache', 'archive-cache', 'douyin/edge-profile']
 // 仅配置备份：媒体不进包，但保留体积很小的聊天流水和当前工作区 DSH 会话
 const CONFIG_ONLY_SKIP = ['imagegen', 'stickers', 'bili-shots', 'douyin']
-const skipped = (rel) => SKIP.some((s) => rel === s || rel.startsWith(s + '/')) || rel.split('/').includes('node_modules') || rel.endsWith('.tmp') || rel === 'memory.sqlite-shm' || rel.startsWith('memory.sqlite.migrating')
+const skipped = (rel) => SKIP.some((s) => rel === s || rel.startsWith(s + '/')) || rel.split('/').includes('node_modules') || rel.endsWith('.tmp') || rel === 'memory.sqlite-shm' || rel === `gateway/${IDENTITY_FILE}-shm` || rel.startsWith('memory.sqlite.migrating')
 
 // 旧版生活推进的暂存可能仍在数据目录。只在导出时排除，历史归档仍可导入。
 const LIFE_UUID = '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}'
@@ -194,8 +202,8 @@ function centralHeader(entry) {
 }
 
 /** 打包数据目录，返回 { file, name, files, bytes, skipped }。configOnly = 只带配置/记忆/人格等文本数据，不带媒体、聊天流水和 DSH 会话。 */
-export async function createBackup({ version = '', workspaceDir = '', now = new Date(), onProgress = () => {}, configOnly = false } = {}) {
-  const root = dataDir()
+export async function createBackup({ version = '', workspaceDir = '', now = new Date(), onProgress = () => {}, configOnly = false, root: customRoot = '' } = {}) {
+  const root = customRoot || dataDir()
   await mkdir(root, { recursive: true })
   const data = dataBoundary(root)
   checkPath(data, 'backups', { directory: true, create: true })
@@ -209,13 +217,17 @@ export async function createBackup({ version = '', workspaceDir = '', now = new 
   const walked = []
   const skippedFiles = []
   await walk(data, '', walked, skippedFiles, market, configOnly ? CONFIG_ONLY_SKIP : [])
-  // 在同一个同步临界区取主库、WAL 和 JSON 回退状态，后续异步打包只读快照。
-  // 记忆快照失败必须让备份失败，不能把缺一半的记忆库当成功交给用户。
+  // 在同一个同步临界区分别锁住记忆库和身份库并连 WAL 一起读快照，后续异步打包只读内存副本。
+  // 任一库快照失败必须让备份失败，不能把缺一半的数据当成一致备份交给用户。
   for (const rel of MEMORY_FILES) checkPath(data, rel)
   const memoryFiles = captureMemoryBackup(data.root)
-  const files = walked.filter(({ rel }) => !MEMORY_FILES.includes(rel) && !LEGACY_LIFE_TEMP.some((pattern) => pattern.test(rel)))
+  for (const rel of GATEWAY_IDENTITY_FILES) checkPath(data, rel)
+  const identityFiles = captureIdentityBackup(join(data.root, 'gateway'))
+  const paired = new Set([...MEMORY_FILES, ...GATEWAY_IDENTITY_FILES])
+  const files = walked.filter(({ rel }) => !paired.has(rel) && !LEGACY_LIFE_TEMP.some((pattern) => pattern.test(rel)))
   const queue = files.map((entry) => ({ base: data, entry, name: 'data/' + entry.rel }))
   for (const [rel, captured] of memoryFiles) queue.push({ name: 'data/' + rel, captured })
+  for (const [rel, captured] of identityFiles) queue.push({ name: 'data/gateway/' + rel, captured })
   const sessionFiles = []
   if (workspaceDir && existsSync(dshHome())) {
     const home = dataBoundary(dshHome())
@@ -462,6 +474,10 @@ async function stageBackup(path, received) {
     const head = entries.find((entry) => entry.name === MANIFEST)
     if (!head) throw new Error('这不是 Aurabot 的备份文件')
     if (!entries.some((entry) => entry.name === 'data/config.json')) throw new Error('备份里没有配置文件')
+    const hasMemory = entries.some((entry) => entry.name === 'data/memory.sqlite' || entry.name === 'data/memories.json')
+    const hasIdentity = entries.some((entry) => entry.name === 'data/gateway/' + IDENTITY_FILE)
+    if (!hasMemory && hasIdentity) throw new Error('备份里只有身份库没有记忆库，无法单独恢复这组数据')
+    const identityMissing = Boolean(hasMemory && !hasIdentity)
     const manifest = JSON.parse((await readEntry(fh, head)).toString('utf8'))
     if (manifest.schema !== SCHEMA || manifest.app !== 'aurabot') throw new Error('这个备份的格式认不出来，先更新插件')
     const { createdAt, version, dataDir: oldData, home, workspaceDir, platform, market = [], sessions = 0 } = manifest
@@ -490,11 +506,11 @@ async function stageBackup(path, received) {
     const pending = job + '/pending.json'
     const { file, key } = await openCheckedOutput(data, pending)
     try {
-      await file.writeFile(JSON.stringify({ at: Date.now(), files, createdAt, version, dataDir: oldData, home, workspaceDir, platform, market, sessions }, null, 2))
+      await file.writeFile(JSON.stringify({ at: Date.now(), files, createdAt, version, dataDir: oldData, home, workspaceDir, platform, market, sessions, identityMissing }, null, 2))
     } finally { await file.close() }
     verifyFile(data, { rel: pending, key })
     publishStage(data, job)
-    return { ok: true, files, createdAt, version, platform, market, sessions, skipped: manifest.skipped || [] }
+    return { ok: true, files, createdAt, version, platform, market, sessions, identityMissing, skipped: manifest.skipped || [] }
   } catch (error) {
     keepJob = error.code === 'RESTORE_ROLLBACK_FAILED'
     throw error
@@ -588,10 +604,49 @@ function preparedFile(data, rel, content) {
   return { rel, key: checkPath(data, rel).key }
 }
 
+function readMemoryStateForIdentityRebuild(root) {
+  const sqliteFile = join(root, 'memory.sqlite')
+  if (existsSync(sqliteFile)) {
+    let db
+    try {
+      db = new DatabaseSync(sqliteFile)
+      return readMemoryDatabase(db)
+    } finally {
+      try { db?.close() } catch {}
+    }
+  }
+  const jsonFile = join(root, 'memories.json')
+  if (!existsSync(jsonFile)) return null
+  try {
+    const parsed = JSON.parse(readFileSync(jsonFile, 'utf8'))
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+function rebuildIdentityFromRestoredMemory(root) {
+  const state = readMemoryStateForIdentityRebuild(root)
+  if (!state) return 0
+  const numbers = enumeratePeopleFromState(state).filter((id) => /^\d+$/.test(id))
+  const identity = createIdentity({ dataDir: join(root, 'gateway') })
+  const res = identity.importLegacyQQ(numbers)
+  return res.added + res.existing
+}
+
+/** 最近一次恢复的结构化结果（含旧备份重建身份表时的明确提示）。 */
+export function lastRestoreResult(root = dataDir()) {
+  const file = join(root, RESULT_FILE)
+  try {
+    if (existsSync(file)) return JSON.parse(readFileSync(file, 'utf8'))
+  } catch {}
+  return cachedRestoreResult
+}
+
 /** 启动时、读配置之前应用暂存备份。 */
-export function applyPendingRestore(now = Date.now()) {
+export function applyPendingRestore(now = Date.now(), { root: customRoot = '' } = {}) {
   if (restoreInProgress) throw new Error('另一个备份正在暂存')
-  const root = dataDir()
+  const root = customRoot || dataDir()
   if (!existsSync(root)) return 0
   const data = dataBoundary(root)
   const pendingRel = '.restore-pending.json'
@@ -603,8 +658,13 @@ export function applyPendingRestore(now = Date.now()) {
   const config = files.find(({ rel }) => rel === 'config.json')
   if (!config) throw unsafePath('config.json')
   const restoreMemory = files.some(({ rel }) => rel === 'memory.sqlite' || rel === 'memories.json')
+  const restoreIdentity = files.some(({ rel }) => rel === 'gateway/' + IDENTITY_FILE)
+  if (!restoreMemory && restoreIdentity) throw new Error('暂存的恢复内容里只有身份库没有记忆库，无法恢复')
   const targets = new Set(files.map(({ rel }) => rel))
-  if (restoreMemory) for (const rel of MEMORY_FILES) targets.add(rel)
+  if (restoreMemory) {
+    for (const rel of MEMORY_FILES) targets.add(rel)
+    for (const rel of GATEWAY_IDENTITY_FILES) targets.add(rel)
+  }
   const modulesRel = '.restore-modules.json'
   if (info.market?.length) targets.add(modulesRel)
 
@@ -628,9 +688,12 @@ export function applyPendingRestore(now = Date.now()) {
         const current = originals.get(rel)
         if (current) move(data, current, data, keep + '/' + rel)
       }
-      if (restoreMemory) for (const rel of MEMORY_FILES) saveOriginal(rel)
+      if (restoreMemory) {
+        for (const rel of MEMORY_FILES) saveOriginal(rel)
+        for (const rel of GATEWAY_IDENTITY_FILES) saveOriginal(rel)
+      }
       for (const { file, rel } of files) {
-        if (!restoreMemory || !MEMORY_FILES.includes(rel)) saveOriginal(rel)
+        if (!restoreMemory || (!MEMORY_FILES.includes(rel) && !GATEWAY_IDENTITY_FILES.includes(rel))) saveOriginal(rel)
         move(data, file, data, rel)
       }
       if (sessions?.target) {
@@ -648,6 +711,24 @@ export function applyPendingRestore(now = Date.now()) {
     })
     if (sessions) removeChecked(data, '.restore-sessions', true)
     removeChecked(data, '.restore', true)
+    let identityRebuilt = false
+    let rebuiltPeople = 0
+    let notice = ''
+    if (restoreMemory && !restoreIdentity) {
+      rebuiltPeople = rebuildIdentityFromRestoredMemory(root)
+      identityRebuilt = true
+      notice = REBUILD_NOTICE
+    }
+    cachedRestoreResult = {
+      files: files.length,
+      memoryRestored: restoreMemory,
+      identityRestored: restoreIdentity,
+      identityRebuilt,
+      rebuiltPeople,
+      notice,
+    }
+    if (notice) writeFileSync(join(root, RESULT_FILE), JSON.stringify(cachedRestoreResult, null, 2))
+    else rmSync(join(root, RESULT_FILE), { force: true })
     return files.length
   } catch (error) {
     keepJob = error.code === 'RESTORE_ROLLBACK_FAILED'
@@ -736,4 +817,63 @@ export function stageReceivedBackup(buf, name = 'incoming.zip') {
       } catch { /* 身份变化时保留供核对。 */ }
     }
   })
+}
+
+/**
+ * 为「同时改写记忆库和身份库」的操作创建成组快照，供运行期失败立即整组回退或撤销使用。
+ * 快照放在 `<root>/backups/paired-<tag>-.../`（已在 SKIP 内，不污染正式备份流）。
+ */
+export function createPairedBackup({ root = dataDir(), tag = 'paired', now = new Date() } = {}) {
+  mkdirSync(root, { recursive: true })
+  const memoryFiles = captureMemoryBackup(root)
+  const gatewayDir = join(root, 'gateway')
+  const identityFiles = captureIdentityBackup(gatewayDir)
+  const stamp = now.toISOString().replace(/[-:.]/g, '').replace('T', '-').slice(0, 15)
+  const snapDir = join(root, 'backups', `paired-${String(tag || 'paired').replace(/[^a-zA-Z0-9_-]/g, '')}-${stamp}-${randomUUID().slice(0, 8)}`)
+  mkdirSync(join(snapDir, 'memory'), { recursive: true })
+  mkdirSync(join(snapDir, 'gateway'), { recursive: true })
+  for (const [rel, buf] of memoryFiles) writeFileSync(join(snapDir, 'memory', rel), buf, { mode: 0o600 })
+  for (const [rel, buf] of identityFiles) writeFileSync(join(snapDir, 'gateway', rel), buf, { mode: 0o600 })
+  const manifest = {
+    at: now.getTime(),
+    tag,
+    memoryFiles: [...memoryFiles.keys()],
+    identityFiles: [...identityFiles.keys()],
+  }
+  writeFileSync(join(snapDir, 'manifest.json'), JSON.stringify(manifest, null, 2), { mode: 0o600 })
+  return { dir: snapDir, ...manifest }
+}
+
+function replaceGroupFiles(targetDir, allowedFiles, sourceDir, savedNames) {
+  const payload = new Map()
+  for (const rel of savedNames) {
+    if (!allowedFiles.includes(rel)) throw unsafePath(rel)
+    payload.set(rel, readFileSync(join(sourceDir, rel)))
+  }
+  const staged = new Map()
+  try {
+    mkdirSync(targetDir, { recursive: true })
+    for (const [rel, buf] of payload) {
+      const tmp = join(targetDir, `.${rel}.restore-${process.pid}-${randomUUID().slice(0, 8)}.tmp`)
+      writeFileSync(tmp, buf, { mode: 0o600 })
+      staged.set(rel, tmp)
+    }
+    for (const rel of allowedFiles) rmSync(join(targetDir, rel), { force: true })
+    for (const [rel, tmp] of staged) renameSync(tmp, join(targetDir, rel))
+  } finally {
+    for (const tmp of staged.values()) rmSync(tmp, { force: true })
+  }
+}
+
+/** 从成组快照整组回退记忆库与身份库，并清掉运行期缓存。 */
+export function restorePairedBackup(snapshot, { root = dataDir(), memory = null } = {}) {
+  const snapDir = typeof snapshot === 'string' ? snapshot : snapshot?.dir
+  if (!snapDir || !existsSync(join(snapDir, 'manifest.json'))) throw new Error('成组备份不存在或已损坏')
+  const manifest = JSON.parse(readFileSync(join(snapDir, 'manifest.json'), 'utf8'))
+  const memList = Array.isArray(manifest.memoryFiles) ? manifest.memoryFiles : []
+  const idList = Array.isArray(manifest.identityFiles) ? manifest.identityFiles : []
+  replaceGroupFiles(root, MEMORY_FILES, join(snapDir, 'memory'), memList)
+  replaceGroupFiles(join(root, 'gateway'), IDENTITY_FILES, join(snapDir, 'gateway'), idList)
+  memory?.invalidateCache?.()
+  return { ok: true, memoryFiles: memList.length, identityFiles: idList.length }
 }

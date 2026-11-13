@@ -256,3 +256,5 @@ export function captureMemoryBackup(root = dataDir()) {
     return files
   } finally { db?.close() }
 }
+
+export { initialize as initializeMemoryDb, readDatabase as readMemoryDatabase, rowsOf as rowsOfMemoryState, tables as MEMORY_TABLES }

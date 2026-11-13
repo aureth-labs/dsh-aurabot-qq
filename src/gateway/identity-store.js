@@ -3,7 +3,7 @@
 // 契约：src/gateway/contracts.d.ts §2（PersonId / Account / Identity）、docs/CONTRACTS.md §四。
 // 写法范式照抄 src/features/memory-store.js：node:sqlite、WAL、句柄不跨操作持有、
 // user_version 管版本、库版本比代码新时拒绝打开并保留原库、坏库报清楚的错且不新建空库盖原文件。
-import { existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 let DatabaseSync
@@ -84,4 +84,24 @@ export function openIdentityStore({ dataDir, log = console } = {}) {
   }
 
   return { transact, file }
+}
+
+/** 同步锁住写入并一起读取主库与 WAL；-shm 由 SQLite 按机重建，不打包进快照。 */
+export function captureIdentityBackup(gatewayDir) {
+  const file = join(gatewayDir, IDENTITY_FILE)
+  const files = new Map()
+  let db
+  try {
+    if (existsSync(file)) {
+      db = new DatabaseSync(file)
+      db.exec('PRAGMA busy_timeout = 1000; BEGIN IMMEDIATE')
+      files.set(IDENTITY_FILE, readFileSync(file))
+      const wal = `${IDENTITY_FILE}-wal`
+      if (existsSync(join(gatewayDir, wal))) files.set(wal, readFileSync(join(gatewayDir, wal)))
+      db.exec('ROLLBACK')
+    }
+    return files
+  } finally {
+    try { db?.close() } catch { /* 关闭失败也不吞掉原错误 */ }
+  }
 }

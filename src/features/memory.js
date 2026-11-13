@@ -775,6 +775,231 @@ const relationText = (r) => `${r.subj} ${r.pred} ${r.obj}`
 const relationPair = (r) => [r.subjQq || r.subj, r.objQq || r.obj].sort().join('|')
 const relationHas = (r, qq, names = []) => String(r.subjQq || '') === String(qq) || String(r.objQq || '') === String(qq) || names.includes(r.subj) || names.includes(r.obj)
 
+/** 从记忆状态快照枚举所有出现过的人（PersonId 集合）；不漏档案、短期状态、印象、说话习惯、条目、梗概、关系与老数字私聊地址。 */
+export function enumeratePeopleFromState(state, { isPersonId = defaultIsPersonId } = {}) {
+  const people = new Set()
+  const add = (value) => {
+    const id = String(value || '')
+    if (id && isPersonId(id)) people.add(id)
+  }
+  const addAddr = (chatId) => {
+    const addr = addrOf(chatId)
+    if (addr?.kind === 'private' && /^\d+$/.test(addr.id)) add(addr.id)
+  }
+  for (const key of Object.keys(state?.profiles || {})) add(key)
+  for (const key of Object.keys(state?.shortTerm || {})) add(key)
+  for (const key of Object.keys(state?.dirtyProfiles || {})) add(key)
+  for (const map of [state?.insights, state?.insightNames, state?.styles]) {
+    for (const key of Object.keys(map || {})) {
+      if (key.startsWith('qq:')) add(key.slice(3))
+      else if (key !== 'self' && !key.startsWith('group:')) add(key)
+    }
+  }
+  for (const m of state?.items || []) {
+    if (!m) continue
+    add(m.about)
+    add(m.speaker)
+    addAddr(m.chatId)
+  }
+  for (const g of state?.gists || []) {
+    if (!g) continue
+    add(g.about)
+    addAddr(g.chatId)
+  }
+  for (const r of state?.relations || []) {
+    if (!r) continue
+    add(r.subjQq)
+    add(r.objQq)
+    add(r.speaker)
+  }
+  return [...people].sort()
+}
+
+function prefixedPersonKey(map, personId) {
+  if (!map || typeof map !== 'object') return ''
+  if (Object.hasOwn(map, `qq:${personId}`)) return `qq:${personId}`
+  if (personId !== 'self' && !personId.startsWith('group:') && Object.hasOwn(map, personId)) return personId
+  return ''
+}
+
+/** 枚举一个人名下在记忆库里挂着的所有记录与计数（I2/I4）。 */
+export function ownedByFromState(state, person) {
+  const id = String(person || '')
+  if (!id) {
+    return {
+      person: '', items: [], gists: [], profile: null, shortTerm: null, dirty: false,
+      insights: [], insightName: '', styles: [], relations: [], tags: [], noMemory: false,
+      itemCount: 0, total: 0,
+    }
+  }
+  const profileRaw = state?.profiles?.[id] || null
+  const names = [profileRaw?.name, profileRaw?.alias].filter(Boolean)
+  const items = (state?.items || []).filter((m) => m && String(m.about || '') === id)
+  const gists = (state?.gists || []).filter((g) => g && String(g.about || '') === id)
+  const shortTerm = state?.shortTerm?.[id] || null
+  const dirty = Boolean(state?.dirtyProfiles?.[id])
+  const insKey = prefixedPersonKey(state?.insights, id)
+  const insights = insKey && Array.isArray(state.insights[insKey]) ? state.insights[insKey] : []
+  const insNameKey = prefixedPersonKey(state?.insightNames, id)
+  const insightName = insNameKey ? String(state.insightNames[insNameKey] || '') : ''
+  const styKey = prefixedPersonKey(state?.styles, id)
+  const styles = styKey && Array.isArray(state.styles[styKey]) ? state.styles[styKey] : []
+  const relations = (state?.relations || []).filter((r) => r && relationHas(r, id, names))
+  const tags = Array.isArray(profileRaw?.tags) ? [...profileRaw.tags] : []
+  const noMemory = profileRaw?.noMemory === true
+  const total = items.length + gists.length + (profileRaw ? 1 : 0) + (shortTerm ? 1 : 0) + (dirty ? 1 : 0) + insights.length + styles.length + relations.length
+  return {
+    person: id,
+    items: structuredClone(items),
+    gists: structuredClone(gists),
+    profile: profileRaw ? structuredClone(profileRaw) : null,
+    shortTerm: shortTerm ? structuredClone(shortTerm) : null,
+    dirty,
+    insights: structuredClone(insights),
+    insightName,
+    styles: structuredClone(styles),
+    relations: structuredClone(relations),
+    tags,
+    noMemory,
+    itemCount: items.length,
+    total,
+  }
+}
+
+function mergeTags(intoTags = [], fromTags = []) {
+  const out = [...new Set([...(Array.isArray(intoTags) ? intoTags : []), ...(Array.isArray(fromTags) ? fromTags : [])].filter((t) => typeof t === 'string' && t))]
+  if (out.includes('喜欢') && out.includes('讨厌')) {
+    const keepHate = Array.isArray(intoTags) && intoTags.includes('讨厌') && !intoTags.includes('喜欢')
+    return out.filter((t) => t !== (keepHate ? '喜欢' : '讨厌')).slice(0, 8)
+  }
+  return out.slice(0, 8)
+}
+
+function mergeDistinctByKey(first = [], second = [], keyOf, cap) {
+  const seen = new Set()
+  const out = []
+  for (const item of [...first, ...second]) {
+    const k = String(keyOf(item) || '').trim()
+    if (!k || seen.has(k)) continue
+    seen.add(k)
+    out.push(structuredClone(item))
+    if (cap && out.length >= cap) break
+  }
+  return out
+}
+
+/** 在状态快照里把 from 名下全部记忆与印象改挂到 into（原地更新传入对象）。 */
+export function reassignPersonInState(state, from, into, { now = Date.now() } = {}) {
+  const src = String(from || '')
+  const dst = String(into || '')
+  if (!src || !dst || src === dst) return state
+  const fromProfile = state.profiles?.[src] || null
+  const intoProfile = state.profiles?.[dst] || null
+  const fromNames = [fromProfile?.name, fromProfile?.alias].filter(Boolean)
+
+  for (const m of state.items || []) {
+    if (!m) continue
+    if (String(m.about || '') === src) m.about = dst
+    if (String(m.speaker || '') === src) m.speaker = dst
+  }
+  for (const g of state.gists || []) {
+    if (g && String(g.about || '') === src) g.about = dst
+  }
+
+  let markDirty = Boolean(state.dirtyProfiles?.[src])
+  if (state.dirtyProfiles) delete state.dirtyProfiles[src]
+
+  if (fromProfile && intoProfile) {
+    const merged = { ...structuredClone(intoProfile) }
+    if (fromProfile.text && intoProfile.text && fromProfile.text !== intoProfile.text) {
+      merged.text = `${intoProfile.text}；${fromProfile.text}`.slice(0, 200)
+      markDirty = true
+    } else if (!intoProfile.text && fromProfile.text) {
+      merged.text = fromProfile.text
+    }
+    for (const field of ['name', 'alias', 'style', 'persona', 'handle']) {
+      if (fromProfile[field] && intoProfile[field] && fromProfile[field] !== intoProfile[field]) markDirty = true
+      if (!merged[field] && fromProfile[field]) merged[field] = fromProfile[field]
+    }
+    const tags = mergeTags(intoProfile.tags, fromProfile.tags)
+    if (tags.length) merged.tags = tags
+    if (!merged.tagsBy && fromProfile.tagsBy) merged.tagsBy = fromProfile.tagsBy
+    if (intoProfile.noMemory !== true) delete merged.noMemory
+    merged.at = Math.max(Number(intoProfile.at) || 0, Number(fromProfile.at) || 0, now)
+    state.profiles[dst] = merged
+    delete state.profiles[src]
+  } else if (fromProfile) {
+    state.profiles ||= {}
+    state.profiles[dst] = structuredClone(fromProfile)
+    delete state.profiles[src]
+  }
+
+  const fromShort = state.shortTerm?.[src]
+  const intoShort = state.shortTerm?.[dst]
+  if (fromShort && intoShort) {
+    state.shortTerm[dst] = {
+      text: intoShort.text === fromShort.text ? intoShort.text : [intoShort.text, fromShort.text].filter(Boolean).join('；').slice(0, 300),
+      at: Math.max(Number(intoShort.at) || 0, Number(fromShort.at) || 0, now),
+      through: Math.max(Number(intoShort.through) || 0, Number(fromShort.through) || 0),
+    }
+    markDirty = true
+    delete state.shortTerm[src]
+  } else if (fromShort) {
+    state.shortTerm ||= {}
+    state.shortTerm[dst] = structuredClone(fromShort)
+    delete state.shortTerm[src]
+  }
+
+  if (markDirty) {
+    state.dirtyProfiles ||= {}
+    state.dirtyProfiles[dst] = true
+  }
+
+  const dstIns = state.insights?.[`qq:${dst}`] || []
+  const srcIns = state.insights?.[`qq:${src}`] || state.insights?.[src] || []
+  if (srcIns.length || dstIns.length) {
+    state.insights ||= {}
+    state.insights[`qq:${dst}`] = mergeDistinctByKey(dstIns, srcIns, (x) => typeof x === 'string' ? x : x?.text, 8)
+  }
+  if (state.insights) { delete state.insights[`qq:${src}`]; delete state.insights[src] }
+
+  const srcName = state.insightNames?.[`qq:${src}`] || state.insightNames?.[src] || ''
+  if (srcName) {
+    state.insightNames ||= {}
+    if (!state.insightNames[`qq:${dst}`]) state.insightNames[`qq:${dst}`] = srcName
+  }
+  if (state.insightNames) { delete state.insightNames[`qq:${src}`]; delete state.insightNames[src] }
+
+  const dstSty = state.styles?.[`qq:${dst}`] || []
+  const srcSty = state.styles?.[`qq:${src}`] || state.styles?.[src] || []
+  if (srcSty.length || dstSty.length) {
+    state.styles ||= {}
+    state.styles[`qq:${dst}`] = mergeDistinctByKey(dstSty, srcSty, (x) => x, 5)
+  }
+  if (state.styles) { delete state.styles[`qq:${src}`]; delete state.styles[src] }
+
+  if (Array.isArray(state.relations) && state.relations.length) {
+    const updated = []
+    const byPair = new Map()
+    for (const rel of state.relations) {
+      if (!rel) continue
+      const r = { ...rel }
+      if (String(r.subjQq || '') === src || (!r.subjQq && fromNames.includes(r.subj))) r.subjQq = dst
+      if (String(r.objQq || '') === src || (!r.objQq && fromNames.includes(r.obj))) r.objQq = dst
+      if (String(r.speaker || '') === src) r.speaker = dst
+      if (String(r.subjQq || '') === dst && String(r.objQq || '') === dst) continue
+      const pair = relationPair(r)
+      const prev = byPair.get(pair)
+      if (!prev || (Number(r.at) || 0) >= (Number(prev.at) || 0)) byPair.set(pair, r)
+    }
+    for (const r of byPair.values()) updated.push(r)
+    state.relations = updated
+  }
+
+  state.rev = (state.rev || 0) + 1
+  return state
+}
+
 // ---------------- 记忆压缩：细节淡化 → 长期印象 ----------------
 /** 压缩参数：每次整理最多调几次模型（成本上限）、每簇最少/最多几条、印象长度与敏感词。 */
 export const COMPRESS = { maxCallsPerRun: 2, minItems: 4, maxItems: 8, minChars: 8, maxChars: 120 }
@@ -3229,11 +3454,12 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
    * 按人整组合并：同一个人名下的重复条目交给模型判断，是同一件事就并成一条。
    * 只并 importance 低的；约定/边界这类（>= 0.85）只加不并。默认关（memory.mergeGroups）。
    */
-  async function mergeGroups() {
+  async function mergeGroups({ person = '' } = {}) {
+    const targetPerson = String(person || '')
     const version = forgetVersion
     const cfg = getConfig()
-    if (!cfg.memory?.mergeGroups) return { groups: 0, calls: 0, merged: 0 }
-    const list = load().items.filter((m) => rememberedItem(m) && isCurrent(m) && m.kind !== 'seen' && m.source !== 'abstract')
+    if (!cfg.memory?.mergeGroups || !dsh) return { groups: 0, calls: 0, merged: 0 }
+    const list = load().items.filter((m) => (!targetPerson || String(m.about || '') === targetPerson) && rememberedItem(m) && isCurrent(m) && m.kind !== 'seen' && m.source !== 'abstract')
     const by = new Map()
     for (const m of list) {
       // F5：按「可见性来源」分组再交给模型合并。普通记忆带上 chatId（没有来源的旧数据单独一组），
@@ -3651,6 +3877,23 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     vector,
     add, addEvent, recentEvents, update, remove, restore, recall, recallAsync, contextFor, consolidate, tick, topicScore, compressDetails, importCandidates, importCommit,
     deletePerson, resetPerson, setNoMemory, remembers, isAcquainted,
+    enumeratePeople: () => enumeratePeopleFromState(load(), { isPersonId: (v) => Boolean(v) && (defaultIsPersonId(v) || isPersonId(v)) }),
+    ownedBy: (person) => ownedByFromState(load(), person),
+    reassignPerson: (from, into) => {
+      forgetVersion++
+      const s = load()
+      reassignPersonInState(s, from, into)
+      save(s)
+      shortSwitch.delete(String(from || ''))
+      tailCache = crossCache = historyCache = null
+      return ownedByFromState(s, into)
+    },
+    mergeGroups,
+    invalidateCache: () => {
+      forgetVersion++
+      shortSwitch.clear()
+      cache = tailCache = crossCache = historyCache = null
+    },
     personaOverview, personaGraph, platformStats, recommendations, personaPerson, personaNotes, savePersonaPerson, personTags, dislikes, chats, saveChat, gists, timeline, deleteGist, saveRelation, deleteRelation, lookupPerson, lookupChat,
     profiles: () => { const s = load(); return Object.entries(s.profiles || {}).map(([qq, p]) => ({ qq, ...p })).sort((a, b) => b.at - a.at) },
     setProfile, buildProfile,

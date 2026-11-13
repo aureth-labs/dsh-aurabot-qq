@@ -44,7 +44,7 @@ import { createCommunity, REGISTRY_URL, GITEE_MIRROR } from './core/community.js
 import { createApprovalRelay } from './security/approval.js'
 import { createNoticeRelay, normalizeWorkspace } from './features/notice.js'
 import { captureSystemPrompt } from './security/leak-guard.js'
-import { applyPendingRestore, cancelRestore, createBackup, listBackups, pendingModules, pendingRestore, setPendingModules, stageReceivedBackup, stageRestore } from './core/backup.js'
+import { applyPendingRestore, cancelRestore, createBackup, lastRestoreResult, listBackups, pendingModules, pendingRestore, setPendingModules, stageReceivedBackup, stageRestore } from './core/backup.js'
 import { pushBackup, listWebdavBackups, downloadWebdavBackup } from './core/backup-push.js'
 import { cleanText } from './core/text.js'
 import { createBridge } from './core/bridge.js'
@@ -142,7 +142,11 @@ export function apply(ctx) {
   // 恢复备份必须在读配置之前：读完配置后内存里的旧状态会写回去
   try {
     const restored = applyPendingRestore()
-    if (restored) log.info(`已恢复备份：${restored} 个文件，原来的文件在 backups/ 里留了底`)
+    if (restored) {
+      log.info(`已恢复备份：${restored} 个文件，原来的文件在 backups/ 里留了底`)
+      const report = lastRestoreResult()
+      if (report?.notice) log.warn(report.notice)
+    }
   } catch (error) { log.error('恢复备份失败：', error.message) }
   let cfg = loadConfig()
   if (cfg.ownerQQ && !ownerAuthorizationRevision(cfg)) {
