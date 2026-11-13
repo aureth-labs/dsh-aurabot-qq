@@ -28,3 +28,9 @@ ode --test "test/replay/**/*.test.js"。
 - 原因：npm 上有个叫 `tsc` 的摆烂恶搞包，npx 找不到本地 typescript 时按名字拉到了它。
 - 解决：显式指定包名：`npx -y -p typescript tsc --noEmit --strict ...`（P0 校验 contracts.d.ts 用这个，实测 exit 0 才算数）。
 - 涉及文件/命令：src/gateway/contracts.d.ts；命令 `npx -y -p typescript tsc`。
+
+## 2026-11-13 I1 身份库：SQLite 错误包装不能罩住业务错误
+- 现象：identity-store 的 transact 把 fn 里的所有异常都包成「身份库损坏」，导致 link 的 IdentityConflict 被 test 判 instanceof 失败。
+- 原因：try 块同时包住了「开库/初始化」和「fn 执行」，坏库包装范围过宽。
+- 解决：只在开库+initialize 阶段做损坏包装（且仅当文件已存在），fn 的错误原样抛出。涉及 src/gateway/identity-store.js。
+- 另：createIdentity 原本懒开库，库损坏要到第一次调用才炸；改成构造时 transact(() => {}) 预热，启动当场报错（任务书过关条件要求「启动报清楚的错」）。
