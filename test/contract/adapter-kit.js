@@ -60,14 +60,19 @@ const send = (adapter, partial = {}) => adapter.send({
   ...partial,
 })
 
-/** 按 caps 造「声明支持的」parts：verbal 文本 + 逐个媒体类型。 */
+/**
+ * 按 caps 造「声明支持的」parts：文本 + 逐个媒体类型。
+ * 媒体同时带 id 和 url：有 id 的平台端直接用（飞书/QQ 这类要用平台内 key 的），
+ * 只有 url 的平台端自己下载或忽略——契约不要求平台端一定能抓到外网 URL
+ * （kit 跑在离线环境里，真去下载 example.com 必然失败）。
+ */
 function supportedParts(caps) {
   const parts = [{ type: 'text', text: '能力自检' }]
-  if (caps.image) parts.push({ type: 'image', media: { url: 'https://example.com/a.png', mime: 'image/png' } })
-  if (caps.sticker) parts.push({ type: 'sticker', media: { url: 'https://example.com/s.png' }, label: '[测试表情]' })
-  if (caps.voice) parts.push({ type: 'voice', media: { url: 'https://example.com/a.mp3' }, durationMs: 1200 })
-  if (caps.video) parts.push({ type: 'video', media: { url: 'https://example.com/v.mp4' } })
-  if (caps.file) parts.push({ type: 'file', media: { url: 'https://example.com/f.txt', name: 'f.txt', size: Math.min(1024, caps.maxFileBytes || 1024) } })
+  if (caps.image) parts.push({ type: 'image', media: { id: 'kit-image-1', url: 'https://example.com/a.png', mime: 'image/png' } })
+  if (caps.sticker) parts.push({ type: 'sticker', media: { id: 'kit-sticker-1', url: 'https://example.com/s.png' }, label: '[测试表情]' })
+  if (caps.voice) parts.push({ type: 'voice', media: { id: 'kit-voice-1', url: 'https://example.com/a.mp3' }, durationMs: 1200 })
+  if (caps.video) parts.push({ type: 'video', media: { id: 'kit-video-1', url: 'https://example.com/v.mp4' } })
+  if (caps.file) parts.push({ type: 'file', media: { id: 'kit-file-1', url: 'https://example.com/f.txt', name: 'f.txt', size: Math.min(1024, caps.maxFileBytes || 1024) } })
   if (caps.mention) parts.push({ type: 'mention', account: '10002', name: '小明' })
   if (caps.poke) parts.push({ type: 'poke' })
   return parts
