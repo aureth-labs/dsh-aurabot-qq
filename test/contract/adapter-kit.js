@@ -124,30 +124,47 @@ export async function runAdapterContract(makeAdapter, harness) {
   }
 
   // ── 用例 3：send 收到 caps 声明支持的 parts 不抛错 ──
+  // 注意：platform 若 proactive='none'（只能被动回复），主动 send 必然被拒——这是契约要求的，
+  // 不是缺陷。所以这里凡是 proactive 不是 'free' 的平台，先拿一条入站消息的 messageId 当
+  // inResponseTo，把这次发送变成「被动回复」，才符合「声明支持的 parts 要能发出去」的原意。
   {
     const adapter = await makeAdapter()
     const ctx = makeCtx(adapter)
     await adapter.start(ctx)
     const caps = adapter.caps()
-    const result = await send(adapter, { parts: supportedParts(caps) })
+    let inResponseTo
+    if (caps.proactive !== 'free') {
+      await harness.injectInbound(adapter, ctx)
+      inResponseTo = ctx.emitted.at(-1)?.messageId
+      assert.ok(inResponseTo, `${adapter.id}：proactive='${caps.proactive}' 时需要入站消息拿 inResponseTo`)
+    }
+    const result = await send(adapter, { parts: supportedParts(caps), inResponseTo })
     assert.ok(result && typeof result.messageId === 'string' && result.messageId, `${adapter.id}：send 应返回非空 messageId`)
     await adapter.stop()
   }
 
   // ── 用例 4：连不上 → not-sent；超时 → unknown ──
+  // 同用例 3：proactive 不是 'free' 的平台必须先拿一条入站的 messageId 当 inResponseTo，
+  // 否则会被 proactive 检查先拦下（那是 not-sent，测不出「超时应为 unknown」这一条）。
   {
     const adapter = await makeAdapter()
     const ctx = makeCtx(adapter)
     await adapter.start(ctx)
+    const caps = adapter.caps()
+    let inResponseTo
+    if (caps.proactive !== 'free') {
+      await harness.injectInbound(adapter, ctx)
+      inResponseTo = ctx.emitted.at(-1)?.messageId
+    }
     harness.failSend(adapter, 'refused')
     await assert.rejects(
-      () => send(adapter),
+      () => send(adapter, { inResponseTo }),
       (e) => { assertSendError(e, 'not-sent', ctx.instance, `${adapter.id} 连不上`); return true },
       `${adapter.id}：模拟连不上时应抛 certainty='not-sent' 的 SendError`,
     )
     harness.failSend(adapter, 'timeout')
     await assert.rejects(
-      () => send(adapter, { timeoutMs: 150 }),
+      () => send(adapter, { inResponseTo, timeoutMs: 150 }),
       (e) => { assertSendError(e, 'unknown', ctx.instance, `${adapter.id} 超时`); return true },
       `${adapter.id}：模拟超时应抛 certainty='unknown' 的 SendError`,
     )
@@ -217,9 +234,16 @@ export async function runAdapterContract(makeAdapter, harness) {
     const adapter = await makeAdapter()
     const ctx = makeCtx(adapter)
     await adapter.start(ctx)
+    // 同用例 3/4：proactive 不是 'free' 的平台不能主动发，先拿一条入站消息当 inResponseTo
+    const caps = adapter.caps()
+    let inResponseTo
+    if (caps.proactive !== 'free') {
+      await harness.injectInbound(adapter, ctx)
+      inResponseTo = ctx.emitted.at(-1)?.messageId
+    }
     await harness.reconnect(adapter, ctx)
     assert.equal(ctx.states.at(-1)?.[0], 'connected', `${adapter.id}：重连后状态应回到 connected`)
-    const ok = await send(adapter)
+    const ok = await send(adapter, { inResponseTo })
     assert.ok(ok?.messageId, `${adapter.id}：重连后 send 应恢复`)
     await adapter.stop()
   }
