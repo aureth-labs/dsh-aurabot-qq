@@ -999,6 +999,23 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     }
   }
 
+  /**
+   * 慢工具提示是她提前说的一句话，不是普通 sendText：要走和最终回复一样的解析，
+   * 这样 <sticker:…> 会真的发表情，不会把标签原样发到 QQ。
+   */
+  async function sendSlowNotice(chatId, text, isCurrent) {
+    const parsed = parseReply(text, cleaningFor(chatId))
+    if (parsed.silent) return
+    for (const item of parsed.items) {
+      if (!isCurrent()) return
+      if (item.kind === 'text') {
+        await sendText(chatId, item.value, undefined, [], undefined, { isCurrent })
+      } else if (item.kind === 'sticker') {
+        await sendSticker(chatId, item.value)
+      }
+    }
+  }
+
   function mount(agent, chat, level) {
     assertActive()
     const sid = sessionKey(agent.session?.id ?? agent.id)
@@ -1045,7 +1062,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
                   if (!said) return
                   slowNoticeSent.add(sid)
                   if (!fixedNotice && state) { state.toolText = ''; state.text = '' } // 已经提前发了，turn/end 不再重复
-                  sendText(chat.chatId, said, undefined, [], undefined, { isCurrent }).catch((error) => log.debug('慢工具提示没发出去：', error.message))
+                  sendSlowNotice(chat.chatId, said, isCurrent).catch((error) => log.debug('慢工具提示没发出去：', error.message))
                 }, 1500)
                 slowTimers.set(timer, sid)
                 timer.unref?.()
