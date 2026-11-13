@@ -298,6 +298,50 @@ export function apply(ctx) {
   }
   // 网关未就绪时先攒着：只有「确定没发出去」的消息才入队，连接后按 TTL 补发。
   const outbox = createOutbox({ log: logger.child('outbox') })
+  // ── 多平台网关（G3）：中枢只和网关说话，平台端按 config.platforms 启停 ──
+  // **惰性创建**：配置里一个平台都没开时不建网关、不开身份库。
+  // 原因有两条，都是踩出来的：
+  //  ① createIdentity 会打开 SQLite；createGateway+sync 会注册平台端并起重连定时器。
+  //     未启用多平台的宿主（含测试的 fake ctx）不该为此付出句柄代价，
+  //     否则 apply() 之后进程不退出（hub-lifecycle 26/26 全过却挂住，就是这么来的）。
+  //  ② 现有直连 OneBot 的路径必须保持行为不变——网关存在本身就会让 sendSegments 改走
+  //     gateway.send，而 e2e 的既有断言是照直连路径写的。
+  let platformGateway = null
+  let identity = null
+  const hasAnyPlatform = () => Object.values((getConfig()?.platforms) || {}).some((p) => p && p.enabled !== false)
+  /** 需要网关时才建（面板访问、配置里有平台、或中枢要路由时） */
+  function ensureGateway() {
+    if (platformGateway) return platformGateway
+    try {
+      // I1 的 dataDir 要**目录字符串**（它自己拼 identity.sqlite），G1 的 dataDir 是函数，别混用
+      identity = createIdentity({ dataDir: dataDir('gateway'), log: logger.child('identity') })
+      platformGateway = createGateway({
+        config: { get platforms() { return getConfig()?.platforms || {} } },
+        dataDir: (...p) => dataDir('gateway', ...p),
+        http: { route: (path, handler) => {
+          const off = route(path, async (req, res) => {
+            try { await handler(req, res) } catch (error) { logger.child('gateway').warn(`平台回调 ${path} 出错：`, error?.message || error) }
+          })
+          return off || (() => {})
+        } },
+        identity,
+        log: logger.child('gateway'),
+      })
+      for (const [factory, id] of [[createQqAdapter, 'qq'], [createFeishuAdapter, 'feishu'], [createQqbotAdapter, 'qqbot'], [createBridgeAdapter, 'bridge']]) {
+        try { platformGateway.register(() => factory()) } catch (error) { logger.child('gateway').warn(`注册平台端 ${id} 失败：`, error?.message || error) }
+      }
+      // 接线要等 hub 建好；这里只登记，由下面的 effect 在 hub 就绪后订阅
+      gatewayReady?.(platformGateway)
+    } catch (error) {
+      // 网关建不起来不能拖垮整个插件：QQ 直连路径照旧跑
+      logger.child('gateway').warn('多平台网关初始化失败（已退回仅 QQ 直连）：', error?.message || error)
+      platformGateway = null
+    }
+    return platformGateway
+  }
+  let gatewayReady = null
+  // 配置里已经有启用的平台：启动时就建，面板与入站立刻可用
+  if (hasAnyPlatform()) ensureGateway()
   // 网关预热：从第一次 connecting 到 connected 之间的时间，用于面板显示「已等 N 秒」而不是干等
   let gatewayWarmSince = 0
   let gatewayLastLogAt = 0
@@ -438,6 +482,9 @@ export function apply(ctx) {
     log: logger.child('chat'),
     onebot,
     outbox,
+    // ── G3：把网关交给中枢。出站改走 gateway.send；中枢原有直连路径在 gateway 为空时保留。
+    // 惰性：只有配置里真开了平台才把它给 hub（见 ensureGateway），QQ 单平台时行为与改动前完全一致。
+    gateway: platformGateway,
     stickers,
     tts,
     buildTools: (where) => mods.buildTools(where),
@@ -493,6 +540,25 @@ export function apply(ctx) {
       journal: (row) => mods?.emit('chat/log', row),
     },
   })
+
+  // 网关建好之后再接线（惰性创建，见上面 ensureGateway 的说明）
+  gatewayReady = (gw) => {
+    const offMsg = gw.onMessage((m) => {
+      hub?.onGatewayMessage(m).catch((error) => logger.child('gateway').error('处理平台消息出错：', error?.message || error))
+    })
+    const offFlushed = gw.onFlushed((message, result) => {
+      try { hub?.onGatewayFlushed?.(message, result) } catch (error) { logger.child('gateway').debug?.('补发留痕出错：', error?.message || error) }
+    })
+    gw.sync().catch((error) => logger.child('gateway').warn('网关首次同步失败：', error?.message || error))
+    return () => { offMsg?.(); offFlushed?.() }
+  }
+  let gatewayOff = null
+  if (platformGateway) gatewayOff = gatewayReady(platformGateway)
+  ctx.effect(() => () => {
+    try { gatewayOff?.() } catch {}
+    // 关掉全部实例（平台端的重连/长轮询定时器必须收掉，否则宿主 dispose 后进程不退出）
+    Promise.resolve(platformGateway?.stopAll?.()).catch((error) => logger.child('gateway').debug?.('停实例出错：', error?.message || error))
+  }, 'aurabot: 网关接线')
 
   // ---------- 面板接口的小工具 ----------
   const send = (res, code, body, type = 'application/json; charset=utf-8', req = null) => {

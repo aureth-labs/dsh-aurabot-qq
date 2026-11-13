@@ -604,6 +604,19 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
 
     sync,
 
+    /**
+     * 停掉全部实例（宿主 dispose / 插件卸载时调）。
+     * 平台端的重连定时器、长轮询、HTTP 回调路由都必须在这里收掉，否则宿主关了进程还不退出。
+     */
+    async stopAll() {
+      for (const instanceName of Array.from(runs.keys())) {
+        await stopInstance(instanceName, '网关已停止')
+      }
+      for (const [instanceName, want] of Object.entries(platformsConfig())) {
+        if (!runs.has(instanceName)) idle.set(instanceName, { state: 'stopped', detail: '网关已停止' })
+      }
+    },
+
     instances() {
       const list = []
       for (const [instanceName, want] of Object.entries(platformsConfig())) {

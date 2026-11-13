@@ -42,6 +42,7 @@ import { matchesMemoryKeyword, parseMemoryCommand } from '../features/memory.js'
 import { currentTimeLine } from './time-context.js'
 import { SESSION_BACKOFF, isSessionBackoff } from './session-backoff.js'
 import { recordUsage, moduleLabel, moduleOfTool } from '../core/usage.js'
+import { normalizeChatId, parseChatId, sameChat, formatChatId } from '../gateway/address.js'
 
 // QQ 会话的工作区目录，第一次收到消息时自动创建。面板「连接」页能改（config.workspaceDir，#32）；
 // 没填就用环境变量 AURABOT_WORKSPACE，再没有：老安装沿用 C:\Aurabot\qq-chats，新安装放在用户目录下（不用往 C 盘根目录写）
@@ -99,7 +100,7 @@ export function reallySent (r) {
   return Boolean(r) && r.message_id !== undefined && !String(r.message_id).startsWith('sim-')
 }
 
-export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, buildTools, contextProviders, onActivity, memoryScore, onMemoryCommand, onCommand, isMuted, dislikes, random = Math.random, moodEffects, localApi, hooks, availableModels, toolsGeneration, capabilitiesOf }) {
+export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, buildTools, contextProviders, onActivity, memoryScore, onMemoryCommand, onCommand, isMuted, dislikes, random = Math.random, moodEffects, localApi, hooks, availableModels, toolsGeneration, capabilitiesOf, gateway = null }) {
   const archives = new Map()
   let forgottenRules = null
   const forgottenFile = () => join(dataDir('conversation-context'), 'forgotten.json')
@@ -1089,8 +1090,11 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
 
   // ---------- 发到 QQ ----------
   function targetOf(chatId) {
-    const [kind, id] = String(chatId).split(':')
-    return kind === 'group' ? { kind: 'group', id } : kind === 'private' ? { kind: 'private', id } : null
+    // G3：地址处理统一走 address.js（旧写法 private:10001 自动当 qq:private:10001）
+    const norm = normalizeChatId(chatId)
+    if (!norm) return null
+    const addr = parseChatId(norm)
+    return addr && (addr.kind === 'private' || addr.kind === 'group') ? { kind: addr.kind, id: addr.id } : null
   }
 
   // quiet：这一条是额外的（比如语音后面补发的表情），失败了不算到这一轮头上（deliver 按 failStore 里的条数判断整条有没有发出去）。
@@ -1154,6 +1158,42 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const action = tgt.kind === 'group' ? 'send_group_msg' : 'send_private_msg'
     const sourceGroupId = tgt.kind === 'private' ? privateSources.get(tgt.id) : ''
     const params = tgt.kind === 'group' ? { group_id: Number(tgt.id), message } : { user_id: Number(tgt.id), ...(sourceGroupId ? { group_id: Number(sourceGroupId) } : {}), message }
+    // G3：有网关就走网关（多平台、降级、补发队列都在网关一侧统一处理）；
+    // 没有网关时（未迁移的宿主、回放测试的旧驱动桩）保留原来直连 OneBot 的路径，
+    // 这样回放结果才能逐条比对——见包-G3「只搬不改」。
+    if (gateway) {
+      try {
+        const sent = await gateway.send({
+          chatId: normalizeChatId(chatId) || chatId,
+          parts: gateway.toParts(chatId, message),
+          kind: queueKind === 'proactive' ? 'proactive' : queueKind === 'diary' ? 'diary' : 'reply',
+          note: sensitive ? '敏感命令回执' : (note || ''),
+          force: Boolean(force),
+          sensitive: Boolean(sensitive),
+          inResponseTo: opts.inResponseTo,
+          timeoutMs,
+        })
+        if (sent?.messageId) {
+          sentIds.add(String(sent.messageId))
+          if (sentIds.size > 500) sentIds.delete(sentIds.values().next().value)
+        }
+        bump('sent')
+        if (outputScope.getStore()?.chatId === chatId) outputScope.getStore().sent++
+        settleOutbound(verdict, 'sent')
+        if (opts.proactive) noteProactive(chatId, message, opts)
+        // 网关说「进了补发队列」时，中枢这边照旧返回 queued 形状，上层逻辑不用改
+        if (sent?.queued) return { queued: true, queuedId: sent.messageId || '' }
+        return { message_id: sent?.messageId ?? '', degraded: sent?.degraded }
+      } catch (error) {
+        // 入队/补发已经由网关负责，这里不再自己入队（避免重复补发）
+        bump('errors')
+        const detail = sensitive ? '敏感命令回执发送失败' : error.message
+        log.warn(`发到 ${chatId} 失败（网关）：`, detail)
+        settleOutbound(verdict, 'failed')
+        if (throwOnError || !quiet) throw error
+        return null
+      }
+    }
     try {
       const r = await onebot.call(action, params, timeoutMs ? { timeoutMs } : undefined)
       if (r && r.message_id !== undefined) {
@@ -2183,6 +2223,81 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       }
     }
     return out
+  }
+
+  /**
+   * G3 · 网关入站接缝。
+   * 网关交来的是规范化 InboundMessage；中枢现有 onMessage 吃的是 OneBot 事件形态。
+   * 为了「只搬不改」，这里把 InboundMessage 还原成 OneBot 事件形状再交给 onMessage——
+   * 后面的 1400 行（白名单、群策略、记忆、回合调度）一行都不用动。
+   * 还原是有损的（只有 QQ 平台端声明支持的消息段能来回转），所以：
+   *   · 非 QQ 平台（飞书等）走另一条路：直接由 mountChat + 记忆拼接，不进这个函数
+   *   · parts 里 QQ 表达不了的东西（card / other）用 text 兜底，不丢内容
+   */
+  function inboundToOneBotEvent(m) {
+    const self = String(selfId || getConfig().botQQ || '')
+    const segments = []
+    for (const part of Array.isArray(m.parts) ? m.parts : []) {
+      switch (part.type) {
+        case 'text': segments.push({ type: 'text', data: { text: String(part.text ?? '') } }); break
+        case 'mention':
+          if (part.account === 'all') segments.push({ type: 'at', data: { qq: 'all' } })
+          else segments.push({ type: 'at', data: { qq: String(part.account), name: part.name } })
+          break
+        case 'image': segments.push({ type: 'image', data: { file: part.media?.id || part.media?.url || '', url: part.media?.url, sub_type: 0 } }); break
+        case 'sticker': segments.push({ type: 'image', data: { file: part.media?.id || part.media?.url || '', url: part.media?.url, sub_type: 1, summary: part.label } }); break
+        case 'face': segments.push({ type: 'face', data: { raw: part.value, id: part.name } }); break
+        case 'voice': segments.push({ type: 'record', data: { file: part.media?.id || part.media?.url || '', url: part.media?.url } }); break
+        case 'video': segments.push({ type: 'video', data: { file: part.media?.id || part.media?.url || '', url: part.media?.url } }); break
+        case 'file': segments.push({ type: 'file', data: { file: part.media?.id || part.media?.url || '', name: part.media?.name, url: part.media?.url } }); break
+        case 'forward': segments.push({ type: 'forward', data: { id: part.id } }); break
+        case 'poke': segments.push({ type: 'shake', data: {} }); break
+        case 'card':
+          segments.push({ type: 'text', data: { text: `[卡片] ${part.text || part.title || ''}${part.url ? ' ' + part.url : ''}` } })
+          break
+        default:
+          if (part.text) segments.push({ type: 'text', data: { text: String(part.text) } })
+      }
+    }
+    const addr = parseChatId(m.chatId)
+    const kind = addr?.kind || m.kind
+    const id = addr?.id || m.chat.id
+    const event = {
+      post_type: 'message',
+      message_type: kind,
+      sub_type: kind === 'private' ? 'friend' : 'normal',
+      self_id: Number(self) || self,
+      time: Math.floor((Number(m.at) || Date.now()) / 1000),
+      message_id: /^\d+$/.test(String(m.messageId)) ? Number(m.messageId) : m.messageId,
+      raw_message: m.text || '',
+      message: segments,
+      sender: {
+        user_id: Number(m.sender.account) || m.sender.account,
+        nickname: m.sender.name || String(m.sender.account),
+        role: m.sender.role || 'member',
+      },
+      // 网关已经算好的字段直接带上，省得 parseMessageEvent 再算一遍（它认这两个键）
+      __gateway: { chatId: m.chatId, platform: m.platform, instance: m.instance, person: m.sender.person, mentionedMe: m.mentionedMe },
+    }
+    if (kind === 'group') {
+      event.group_id = Number(id) || id
+      event.user_id = Number(m.sender.account) || m.sender.account
+    } else {
+      event.user_id = Number(m.sender.account) || m.sender.account
+    }
+    if (m.replyTo) event.message = [{ type: 'reply', data: { id: String(m.replyTo) } }, ...segments]
+    return event
+  }
+
+  /** G3：网关入站（与 onMessage 并列的入口；走同一套后续逻辑） */
+  async function onGatewayMessage(m) {
+    if (disposed || !m) return
+    // 非 QQ 平台暂不进中枢（G3 只做 QQ 的迁移，别的平台等 F2）
+    if (m.platform && m.platform !== 'qq') return
+    // 能力判断：群里收不到非 @ 消息的平台不做群上下文（CONTRACTS §八.3）
+    try { gateway?.noteSeen?.(m.sender.person, m.chatId, Number(m.at) || Date.now()) } catch {}
+    const event = inboundToOneBotEvent(m)
+    return onMessage(event)
   }
 
   async function onMessage(event) {
@@ -3680,6 +3795,26 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     capture,
     simulateTurn,
     onMessage,
+    /** G3：网关入站入口。收到 InboundMessage 走这条；未装网关时等价于不接线，行为不变。 */
+    onGatewayMessage,
+    /** G3：补发成功后留痕（G1 的 onFlushed 回调接这里，#327） */
+    onGatewayFlushed(message, result) {
+      try {
+        const mid = String(result?.messageId || '')
+        if (mid) {
+          sentIds.add(mid)
+          if (sentIds.size > 500) sentIds.delete(sentIds.values().next().value)
+        }
+        bump('sent')
+        const chatId = message?.chatId
+        if (chatId && Array.isArray(message?.parts)) {
+          const text = message.parts.filter((p) => p?.type === 'text').map((p) => p.text).join('')
+          if (text) logChat(chatId, 'bot', text, '', { via: message?.note ? '补发' : '' })
+        }
+      } catch (error) {
+        log.debug?.('补发留痕失败：', error?.message || error)
+      }
+    },
     onPoke,
     onGroupFile,
     onSessionEvent,
