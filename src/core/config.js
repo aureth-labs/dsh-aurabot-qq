@@ -1,9 +1,12 @@
 // 插件配置：默认值 + 归一化 + 读写。配置文件 ~/.dsh/plugins-data/aurabot/config.json
 
+import { randomUUID } from 'node:crypto'
+import { normalizeChatEfforts } from '../chat/effort-command.js'
 import { dataDir, readJson, writeJson } from './store.js'
 import { DEFAULT_GROUP_POLICY } from '../chat/group-policy.js'
 import { LEVELS, PROFILE_PERM_KEYS, PROFILE_PERM_LEVELS, profilePermDefault } from '../chat/access.js'
 import { normalizeChatModels } from '../chat/chat-model.js'
+import { DELEGATED_COMMANDS, isDelegatedCommandKey } from '../chat/delegated-commands.js'
 import { DIARY_AUDIENCES } from '../features/qzone-audience.js'
 import { DEFAULT_TIER_DAYS } from '../features/memory-rules.js'
 
@@ -24,6 +27,8 @@ export const DEFAULTS = {
   qqApi: { enabled: true }, // 她能用 qq_api_call 调 QQ 接口：别人只能查当前群，写操作只听主人
   approvalViaQQ: true, // 主人私聊会话要授权时，在 QQ 回复「确认」直接批准这一次
   profilePerms: { qqNickname: 'owner', qqSignature: 'owner', qqAvatar: 'owner', biliSign: 'owner', biliAvatar: 'owner', biliComment: 'owner', qqFriendRequest: 'owner', whitelist: 'owner', douyinBrowse: 'owner', douyinLike: 'owner', douyinComment: 'owner', douyinShareOwner: 'owner', douyinDm: 'owner' }, // 改资料类操作（含抖音浏览 / 点赞 / 评论 / 分享）的权限：off 关 / owner 仅主人私聊 / all 所有人。抖音项默认仅主人，总开关默认关
+  capabilityAllow: { image: [], song: [], video: [] },
+  commandAllow: Object.fromEntries(DELEGATED_COMMANDS.map((name) => [name, []])),
   longTasks: true, // 长任务模式：主人私聊（完整权限）额外挂 dsh-tool-jobs + dsh-tool-schedule，会多一点工具定义、稍慢
   // 后台子智能体委派（默认关）：模块用 hub.runSubagentTurn 派子智能体时，正常要求「主人开口」的来源；
   // 定时任务这类没人应答的场合，只有打开这个开关才允许派活。关着 = 一律拒绝（一审 #177 的审批策略）。
@@ -66,6 +71,7 @@ export const DEFAULTS = {
   },
   model: { provider: '', model: '', reasoningEffort: 'low', vision: 'auto' }, // 留空 = 跟随 DSH 默认；vision: auto/on/off
   // 按聊天选模型（主人在面板「模型」页设）：私聊 QQ 号 > 群号 > 所有私聊 / 所有群默认 > 上面的全局模型；没写的一级退到下一级
+  chatEfforts: {}, // QQ 聊天单独选择的思考档位
   chatModels: { privateDefault: { provider: '', model: '', reasoningEffort: '' }, groupDefault: { provider: '', model: '', reasoningEffort: '' }, privates: {}, groups: {} },
   merge: { enabled: true, waitSec: 2.5, maxSec: 8, groupWaitSec: 5, groupMaxSec: 15 }, // 连发合并：对方停顿 waitSec 秒再一起回，最多等 maxSec 秒；群里等得久一点，把一段话攒齐
   forward: { expandEarly: false, expandHistory: false }, // 合并转发：expandEarly=消息一进来就展开成文字存进上下文（哪怕这条不交给她，代价是每条转发多调一次 get_forward_msg）；expandHistory=交给她之前把缓冲里还没展开过的转发补展开（每条只拉一次）
@@ -76,6 +82,8 @@ export const DEFAULTS = {
     baseUrlOptions: [], // 面板「服务地址」下拉里用户自己添加的常用地址（官方推荐的赞助商地址固定第一项，不存这里）
     apiKey: '',
     model: '',
+    fallbackEnabled: false,
+    fallbacks: [],
     size: '1024x1024',
     shape: 'her', // 工具可选构图；her 时未指定就沿用 size
     stylePrompt: '', // 每次生图自动加在前面的风格描述
@@ -214,7 +222,7 @@ export const DEFAULTS = {
       groupId: '', // 目标群号；空 = 不生效。生产群号留在部署侧 config.json，不进默认值（上游开源）
       dailyLimit: 3, // 每天最多真发几条到群
       pendingTtlHours: 24, // 待批多久没回就当不发
-      queueLimit: 5, // 一次最多攒几条待批（避免一次问一长串）
+      queueLimit: 1, // 一次最多攒几条待批：默认 1，一次只问一条、只发一条（发多了像刷屏）
     },
   },
   // 刷抖音：专用浏览器（独立登录资料，不碰你平时的浏览器），经 CDP 控制。浏览 / 点赞 / 评论 / 分享各项权限在 profilePerms.douyin*。
@@ -299,7 +307,11 @@ export const DEFAULTS = {
   // rescueFromThinking：整轮一段正文都没写时，从思考里捞出她自己定稿的那段（默认关，捞不到就不发）
   // turnTimeoutMinutes：一轮跑超过这么多分钟就强制放开（模型/工具卡死时 turn/end 永远不来，
   // 私聊新消息会被一直当成 steer 塞进那一轮，看上去就是「不理人」）。填 0 关掉兜底。
-  chat: { seedHistory: false, seedHistoryCount: 20, everyStep: false, rescueFromThinking: false, turnTimeoutMinutes: 30 },
+  // thinkingGuard：出站前的正文污染闸。模型偶尔把思考直接写进正文（英文判断 + 中文真话），
+  //   或者思考塌缩成「做。做。做。…」。开着就切掉思考前缀、拦住退化内容；拦下就当她这轮没说话（默认开）。
+  // replyMarker：代码注入格式要求，模型必须用 ⟦REPLY⟧ 包住要发的话；没有标记就要求重写一次，
+  //   重写后仍然没有就不发。默认关：打开会改变所有会话的输出格式，先在面板/配置里手动开。
+  chat: { seedHistory: false, seedHistoryCount: 20, everyStep: false, rescueFromThinking: false, turnTimeoutMinutes: 30, thinkingGuard: { enabled: true }, replyMarker: { enabled: false } },
   // 原话档案独立于摘要记忆；默认关闭，由使用者明确开启并管理保留期限。
   conversationContext: { enabled: false },
   memory: {
@@ -484,7 +496,17 @@ export function normalize(raw) {
   c.longTasks = bool(c.longTasks, true)
   c.subagentBackground = bool(c.subagentBackground, false)
   c.chatModels = normalizeChatModels(c.chatModels)
+  c.chatEfforts = normalizeChatEfforts(c.chatEfforts)
   c.profilePerms = Object.fromEntries(PROFILE_PERM_KEYS.map((k) => [k, PROFILE_PERM_LEVELS.includes(c.profilePerms?.[k]) ? c.profilePerms[k] : profilePermDefault(k)]))
+  c.capabilityAllow = Object.fromEntries(['image', 'song', 'video'].map((key) => {
+    const ids = Array.isArray(c.capabilityAllow?.[key]) ? c.capabilityAllow[key] : []
+    return [key, [...new Set(ids.map(String).map((id) => id.trim()).filter((id) => /^\d{5,}$/.test(id)))]]
+  }))
+  const commandKeys = [...new Set([...DELEGATED_COMMANDS, ...Object.keys(c.commandAllow || {}).filter(isDelegatedCommandKey)])]
+  c.commandAllow = Object.fromEntries(commandKeys.map((key) => {
+    const ids = Array.isArray(c.commandAllow?.[key]) ? c.commandAllow[key] : []
+    return [key, [...new Set(ids.map(String).map((id) => id.trim()).filter((id) => /^\d{5,}$/.test(id)))]]
+  }))
   // 旧版 douyinDm 是「回别人私信」的权限，含义已不同（现在是主动发私信），老配置一律回到默认「仅主人」
   if (isObj(raw?.profilePerms) && 'douyinDm' in raw.profilePerms) c.profilePerms.douyinDm = profilePermDefault('douyinDm')
   c.allow = { private: qqList(c.allow.private), groups: qqList(c.allow.groups) }
@@ -657,7 +679,7 @@ export function normalize(raw) {
   b.groupShare.groups = [...new Set((Array.isArray(b.groupShare.groups) ? b.groupShare.groups : []).map(qq).filter(Boolean))].slice(0, 20)
   b.groupShare.dailyLimit = Math.round(num(b.groupShare.dailyLimit, 3, 0, BIG))
   b.groupShare.pendingTtlHours = Math.round(num(b.groupShare.pendingTtlHours, 24, 1, 24 * 30))
-  b.groupShare.queueLimit = Math.round(num(b.groupShare.queueLimit, 5, 1, 20))
+  b.groupShare.queueLimit = Math.round(num(b.groupShare.queueLimit, 1, 1, 20))
   b.intervalHours = num(b.intervalHours, 4, 0.1, BIG)
   b.maxRunsPerDay = num(b.maxRunsPerDay, 3, 0, BIG)
   b.perRun = num(b.perRun, 3, 1, BIG)
@@ -738,6 +760,8 @@ export function normalize(raw) {
   c.chat.seedHistoryCount = num(c.chat.seedHistoryCount, 20, 1, BIG)
   c.chat.everyStep = bool(c.chat.everyStep, false)
   c.chat.rescueFromThinking = bool(c.chat.rescueFromThinking, false)
+  c.chat.thinkingGuard = { enabled: bool(c.chat.thinkingGuard?.enabled, true) }
+  c.chat.replyMarker = { enabled: bool(c.chat.replyMarker?.enabled, false) }
   c.chat.turnTimeoutMinutes = num(c.chat.turnTimeoutMinutes, 30, 0, 180)
   c.memory.recallCount = num(c.memory.recallCount, 6, 0, BIG)
   // 总数护栏：0 表示不限制（直接 recallCount + 联想 assoc.recall）；设了就封顶，防止上下文爆掉
@@ -863,6 +887,8 @@ export function normalize(raw) {
   c.voice.rate = signed(pct ? Math.max(-50, Math.min(50, Number(pct[1]))) : 0, '%')
   const hz = /^([+-]?\d{1,3})\s*Hz$/i.exec(String(c.voice.pitch || '').trim())
   c.voice.pitch = signed(hz ? Math.max(-80, Math.min(80, Number(hz[1]))) : 0, 'Hz')
+  c.imageGen.fallbackEnabled = bool(c.imageGen.fallbackEnabled, false)
+  c.imageGen.fallbacks = (Array.isArray(c.imageGen.fallbacks) ? c.imageGen.fallbacks : []).map(e => ({ id: String(e?.id || '').slice(0, 100), provider: e?.provider === 'codex' ? 'codex' : 'openai', baseUrl: String(e?.baseUrl || '').trim(), apiKey: String(e?.apiKey || ''), model: String(e?.model || '').trim() })).filter(e => e.id)
   c.imageGen.enabled = bool(c.imageGen.enabled, false)
   c.imageGen.ownerOnly = bool(c.imageGen.ownerOnly, true)
   c.imageGen.seeOwn = bool(c.imageGen.seeOwn, true)
@@ -1033,8 +1059,19 @@ export function loadConfig() {
   return normalize(raw)
 }
 
-export function saveConfig(cfg) {
+export function ownerAuthorizationRevision(cfg) {
+  const binding = cfg.ownerAuthorization
+  return cfg.ownerQQ && binding?.owner === cfg.ownerQQ && typeof binding.revision === 'string'
+    && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/u.test(binding.revision) ? binding.revision : ''
+}
+
+export function saveConfig(cfg, previous = loadConfig()) {
   const c = normalize(cfg)
+  // Only the previous authoritative configuration can carry an authorization forward.
+  if (c.ownerQQ) {
+    const revision = c.ownerQQ === previous.ownerQQ ? ownerAuthorizationRevision(previous) : ''
+    c.ownerAuthorization = { owner: c.ownerQQ, revision: revision || randomUUID() }
+  } else delete c.ownerAuthorization
   writeJson(FILE(), c)
   return c
 }
@@ -1042,8 +1079,11 @@ export function saveConfig(cfg) {
 /** 给面板看的版本：密码 / token 不回传原文，只告诉有没有填。 */
 export function publicConfig(cfg) {
   const c = structuredClone(cfg)
+  delete c.ownerAuthorization
   // 面板上的「试运行」只表示「试运行但不调试」：调试开着时它显示为关
   c.dryRun = Boolean(c.dryRun && !c.debug)
+  // 面板要能显示/修改「单个聊天的思考档位」（chatEfforts），所以回传这份配置；
+  // 它本来就不含敏感内容，只是「聊天 → 模型 → 档位」的映射。
   for (const [g, k] of HINTED) c[g][`${k}Hint`] = c[g][k] ? '…' + String(c[g][k]).slice(-4) : ''
   for (const path of allSecrets()) {
     const p = parentOf(c, path, false)
@@ -1052,12 +1092,19 @@ export function publicConfig(cfg) {
     p[`${k}Set`] = Boolean(p[k])
     p[k] = ''
   }
+  for (const e of c.imageGen.fallbacks || []) { e.apiKeySet = Boolean(e.apiKey); e.apiKey = '' }
   return c
 }
 
 /** 面板保存时：没改的密码字段（空串）保留原值。 */
 export function mergeFromPanel(current, incoming) {
   const next = deepMerge(current, incoming || {})
+  // 面板明确带了非空 chatEfforts（面板上改过单个聊天的档位）就以面板为准；
+  // 没带或带的是空对象（旧版面板 / 面板没动过）时保留当前值——QQ 里 /effort 设过的不被清掉。
+  const incomingEfforts = incoming && incoming.chatEfforts
+  next.chatEfforts = incomingEfforts && typeof incomingEfforts === 'object' && Object.keys(incomingEfforts).length
+    ? incomingEfforts
+    : current.chatEfforts
   for (const path of allSecrets()) {
     const v = getAt(incoming || {}, path)
     const p = parentOf(next, path, v !== undefined)
@@ -1067,6 +1114,10 @@ export function mergeFromPanel(current, incoming) {
     else if (v === undefined || v === '') p[k] = getAt(current, path) ?? ''
     delete p[`${k}Set`]
     delete p[`${k}Hint`]
+  }
+  if (Array.isArray(incoming?.imageGen?.fallbacks)) {
+    const old = new Map((current.imageGen?.fallbacks || []).map(e => [e.id, e]))
+    next.imageGen.fallbacks = incoming.imageGen.fallbacks.map(e => ({ ...e, apiKey: e.apiKey === null ? '' : (e.apiKey || old.get(e.id)?.apiKey || '') }))
   }
   // 主人的抖音 secUid / uid / 昵称只能由「核对」写入，面板存配置时保留原值
   next.douyin.owner = { ...next.douyin.owner, ...Object.fromEntries(['secUid', 'uid', 'nickname', 'confirmedInput'].map((k) => [k, current.douyin?.owner?.[k] ?? ''])) }

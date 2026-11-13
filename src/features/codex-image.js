@@ -3,10 +3,12 @@ import { randomUUID } from 'node:crypto'
 import { fetchImage } from '../core/net.js'
 import { pickShape } from './image-shape.js'
 
+function requestError(message, status) { const error = new Error(message); error.imageRequestFailed = true; if (status) error.imageStatus = status; return error }
+
 export function createCodexImage({ auth, fetchImpl, log }) {
   return async function generate(config, prompt, { shape, image } = {}) {
     // 现有订阅端点只有 JSON 文生图约定，没有已知的参考图字段；不能带图时偷跑文生图。
-    if (image) throw new Error('这个生图服务不支持参考图')
+    if (image) throw requestError('这个生图服务不支持参考图')
     const revision = auth.revision?.()
     const check = () => auth.assertCurrent?.(revision)
     check()
@@ -16,30 +18,31 @@ export function createCodexImage({ auth, fetchImpl, log }) {
     const once = async ({ access, accountId }) => {
       check()
       if (!accountId) throw new Error('登录信息里没有账号 ID，去生图页重新登录 ChatGPT')
-      return fetchImpl('https://chatgpt.com/backend-api/codex/images/generations', {
+      try { return await fetchImpl('https://chatgpt.com/backend-api/codex/images/generations', {
         method: 'POST',
         headers: { authorization: `Bearer ${access}`, 'chatgpt-account-id': accountId, accept: 'application/json', 'content-type': 'application/json', originator: 'pi', 'x-codex-image-turn-id': randomUUID(), 'user-agent': 'aurabot-qq' },
         body: JSON.stringify(body), signal: AbortSignal.timeout(180000),
-      })
+      }) } catch (error) { error.imageRequestFailed = true; error.imageNetworkFailure = true; throw error }
     }
     log.info(`订阅生图请求：${body.model} / ${body.quality}`)
-    let r = await once(await auth.ensureAccess())
+    let credential
+    try { credential = await auth.ensureAccess() } catch (error) { error.imageRequestFailed = true; throw error }
+    let r = await once(credential)
     check()
     if (r.status === 401) {
       await r.body?.cancel()
-      let credential
       try { credential = await auth.ensureAccess({ force: true }) }
-      catch (error) { throw new Error('订阅登录已过期，去生图页重新登录 ChatGPT') }
+      catch (error) { throw requestError('订阅登录已过期，去生图页重新登录 ChatGPT') }
       r = await once(credential)
       check()
     }
     const j = await r.json().catch(() => null)
     check()
     if (!r.ok) {
-      if (r.status === 401) throw new Error('订阅登录已失效，去生图页重新登录 ChatGPT')
-      if (r.status === 403) throw new Error('这个订阅 / 工作区不能用生图（HTTP 403）')
-      if (r.status === 429) throw new Error('订阅生图用得太频繁或额度用完了（HTTP 429）')
-      throw new Error(`订阅生图失败（HTTP ${r.status}）`)
+      if (r.status === 401) throw requestError('订阅登录已失效，去生图页重新登录 ChatGPT', 401)
+      if (r.status === 403) throw requestError('这个订阅 / 工作区不能用生图（HTTP 403）', 403)
+      if (r.status === 429) throw requestError('订阅生图用得太频繁或额度用完了（HTTP 429）', 429)
+      throw requestError(`订阅生图失败（HTTP ${r.status}）`, r.status)
     }
     const item = j?.data?.[0]
     if (typeof item?.b64_json === 'string' && item.b64_json) return Buffer.from(item.b64_json, 'base64')

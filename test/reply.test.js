@@ -80,3 +80,21 @@ test('isSilence：沉默标记重复/带空白/带标点仍算沉默，正文里
     assert.equal(isSilence(s), false, `不应判沉默: ${JSON.stringify(s)}`)
   }
 })
+
+test('方括号写「戳了戳你」：转成真戳，动作文字不发出去', () => {
+  const r = parseReply('[戳了戳你：尾巴往回一收] 又揉，都揉半天了。')
+  assert.ok(r.items.some((i) => i.kind === 'poke'), '要转成 poke 段')
+  const body = texts(r).join('')
+  assert.ok(!body.includes('戳了戳'), '动作描述不能当文字发出')
+  assert.ok(body.includes('又揉'), '后面的话要保留')
+})
+
+test('全角方括号 / 没写「你」的戳也认', () => {
+  assert.ok(parseReply('【戳了戳你：揉了揉头】哼').items.some((i) => i.kind === 'poke'))
+  assert.ok(parseReply('[戳了戳：尾巴一甩] 别闹').items.some((i) => i.kind === 'poke'))
+})
+
+test('普通方括号（[图片] 之类）不受影响', () => {
+  assert.deepEqual(texts(parseReply('[图片] 这张好看')), ['[图片] 这张好看'])
+  assert.deepEqual(texts(parseReply('[动画表情] 笑死')), ['[动画表情] 笑死'])
+})

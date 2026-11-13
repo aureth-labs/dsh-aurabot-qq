@@ -14,7 +14,7 @@ import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
 import net from 'node:net'
-import { loadConfig, saveConfig, publicConfig, mergeFromPanel } from './core/config.js'
+import { loadConfig, saveConfig, publicConfig, mergeFromPanel, ownerAuthorizationRevision } from './core/config.js'
 import { createLogger } from './core/logger.js'
 import { encodeResponse } from './core/http-compress.js'
 import { registerSecret, redact } from './core/redact.js'
@@ -35,13 +35,16 @@ import { dataDir, ensureDir } from './core/store.js'
 import { initUsage, usageReport } from './core/usage.js'
 import { createUpdateChecker, changelogSection, hostEnv, updatePlan, repoOf } from './core/update.js'
 import { parseCommand, runCommand, createMutes, commandList } from './chat/commands.js'
+import { isOwner } from './chat/access.js'
+import { changePermissions, changePrivateWhitelist, privatePermissionCatalog } from './chat/permission-policy.js'
+import { canUseDelegatedCommand, delegatedCommandKey, runPersonalModelCommand } from './chat/delegated-commands.js'
 import { listPersonas, readPersona, savePersona, deletePersona, currentPersonaText, rulesText, seedPersonas } from './persona/personas.js'
 import { createModules, API_VERSION } from './core/modules.js'
 import { createCommunity, REGISTRY_URL, GITEE_MIRROR } from './core/community.js'
 import { createApprovalRelay } from './security/approval.js'
 import { createNoticeRelay, normalizeWorkspace } from './features/notice.js'
 import { captureSystemPrompt } from './security/leak-guard.js'
-import { applyPendingRestore, cancelRestore, createBackup, listBackups, pendingModules, pendingRestore, saveUpload, setPendingModules, stageRestore } from './core/backup.js'
+import { applyPendingRestore, cancelRestore, createBackup, listBackups, pendingModules, pendingRestore, setPendingModules, stageReceivedBackup, stageRestore } from './core/backup.js'
 import { pushBackup, listWebdavBackups, downloadWebdavBackup } from './core/backup-push.js'
 import { cleanText } from './core/text.js'
 import { createBridge } from './core/bridge.js'
@@ -142,6 +145,10 @@ export function apply(ctx) {
     if (restored) log.info(`已恢复备份：${restored} 个文件，原来的文件在 backups/ 里留了底`)
   } catch (error) { log.error('恢复备份失败：', error.message) }
   let cfg = loadConfig()
+  if (cfg.ownerQQ && !ownerAuthorizationRevision(cfg)) {
+    try { cfg = saveConfig(cfg, cfg) }
+    catch { log.warn('初始化主人授权记录失败，本次启动使用会话授权') }
+  }
   let mods = null
   let bridge = null
   // 备份与云备份推送的任务状态声明在顶部：setConfig 里改云备份设置时要提前排定时器
@@ -154,10 +161,10 @@ export function apply(ctx) {
   const enginePolicies = new Map()
   const getConfig = () => cfg
   setSsrpMode(() => (getConfig().security && getConfig().security.ssrfMode === 'loose' ? 'loose' : 'strict'))
-  const secrets = () => { for (const k of ['webuiPassword', 'httpToken', 'wsToken']) registerSecret(cfg.snowluma[k]); registerSecret(cfg.imageGen.apiKey); registerSecret(cfg.bridge.token); registerSecret(cfg.backup?.remote?.token); registerSecret(cfg.backup?.remote?.webdav?.password) } // backup 令牌/WebDAV 密码也按密钥脱敏（云备份）
+  const secrets = () => { for (const k of ['webuiPassword', 'httpToken', 'wsToken']) registerSecret(cfg.snowluma[k]); registerSecret(cfg.imageGen.apiKey); for (const e of cfg.imageGen.fallbacks || []) registerSecret(e.apiKey); registerSecret(cfg.bridge.token); registerSecret(cfg.backup?.remote?.token); registerSecret(cfg.backup?.remote?.webdav?.password) } // backup 令牌/WebDAV 密码也按密钥脱敏（云备份）
   const setConfig = (next) => {
     const before = cfg
-    cfg = saveConfig(next)
+    cfg = saveConfig(next, before)
     // 改机器人号后旧连接的核对结果立刻失效，必须重新核对才能处理消息或完成向导。
     if (before.botQQ !== cfg.botQQ) {
       wrongAccount = ''
@@ -443,11 +450,28 @@ export function apply(ctx) {
     dislikes: (qq) => use('memory')?.dislikes?.(qq) ?? false,
     onMemoryCommand: (msg, text) => use('memory')?.handleCommand?.(msg, text),
     // QQ 里的主人命令（模块加的命令优先）
-    onCommand: async (msg) => {
-      const cmd = parseCommand(msg.text, mods.commands())
+    onCommand: async (msg, markSensitive, ownerStillCurrent) => {
+      const commands = mods.commands()
+      const cmd = parseCommand(msg.text, commands)
       if (!cmd) return null
-      if (cmd.ext) return String((await cmd.ext.run(cmd.arg, msg)) ?? '')
-      return runCommand(cmd, msg, { getConfig, setConfig, mutes, hub, mood: use('mood'), memory: use('memory'), qzone: use('diary'), song: use('song'), listModels, defaultModel: () => defaultModel(ctx, { model: {} }), extraCommands: mods.commands() })
+      if (!ownerStillCurrent()) {
+        const key = delegatedCommandKey(cmd)
+        if (!canUseDelegatedCommand(getConfig(), msg, key)) return '你没有使用这个命令的权限，请联系主人设置。'
+        if (key === 'help') {
+          const list = commandList(commands).filter((item) => canUseDelegatedCommand(getConfig(), msg, delegatedCommandKey(parseCommand('/' + item.name, commands))))
+          return '你可以使用的命令：\n' + list.map((item) => {
+            const desc = item.name === 'model' ? '查看或切换当前私聊模型' : item.desc
+            return `/${item.name}  ${desc}`
+          }).join('\n')
+        }
+        if (key === 'model') return runPersonalModelCommand(cmd, msg, { getConfig, setConfig, listModels, defaultModel: () => defaultModel(ctx, getConfig()) })
+      }
+      if (cmd.ext) {
+        if (cmd.ext.sensitive === true && !markSensitive(cmd.name)) return ''
+        return String((await cmd.ext.run(cmd.arg, msg)) ?? '')
+      }
+      if (cmd.name === 'permissions' && !markSensitive(cmd.name)) return ''
+      return runCommand(cmd, msg, { getConfig, setConfig, mutes, hub, mood: use('mood'), memory: use('memory'), qzone: use('diary'), song: use('song'), listModels, reasoningFor: (provider, model) => modelReasoning(ctx, provider, model, { refresh: true }), defaultModel: () => defaultModel(ctx, { model: {} }), extraCommands: mods.commands() })
     },
     isMuted: (chatId) => mutes.muted(chatId),
     moodEffects: () => use('mood')?.effects?.() ?? null,
@@ -1844,6 +1868,37 @@ export function apply(ctx) {
     return r
   })
   route('/commands', async () => ({ ok: true, list: commandList(mods.commands()) }))
+  route('/permissions/catalog', async () => ({ ok: true, list: privatePermissionCatalog(mods.commands()) }))
+  route('/permissions/subject', async (req) => {
+    if (req.method !== 'POST' || !/^application\/json(?:\s*;|$)/i.test(String(req.headers?.['content-type'] || ''))) return { ok: false, message: '权限修改需要 POST JSON 请求' }
+    const body = await readBody(req)
+    const result = changePermissions(cfg, body || {}, mods.commands())
+    if (!result.ok) return result
+    setConfig(result.config)
+    return { ok: true }
+  })
+  route('/permissions/private-batch', async (req) => {
+    if (req.method !== 'POST' || !/^application\/json(?:\s*;|$)/i.test(String(req.headers?.['content-type'] || ''))) return { ok: false, message: '私聊名单修改需要 POST JSON 请求' }
+    const body = await readBody(req)
+    const result = changePrivateWhitelist(cfg, body || {})
+    if (!result.ok) return result
+    if (result.config) setConfig(result.config)
+    return {
+      ok: true,
+      changed: result.changed,
+      skipped: result.skipped,
+      message: `已加入私聊白名单 ${result.changed} 人，跳过 ${result.skipped} 个重复、已存在或主人号码`,
+    }
+  })
+  route('/permissions/friends', async () => {
+    try {
+      const result = await onebot.call('get_friend_list', {}, { timeoutMs: 8000 })
+      const friends = Array.isArray(result) ? result : (result?.friends || [])
+      return { ok: true, friends: friends.map((friend) => ({ id: String(friend.user_id || ''), name: String(friend.remark || friend.nickname || '') })).filter(({ id }) => /^\d{5,12}$/.test(id)) }
+    } catch (error) {
+      return { ok: false, message: `读取 QQ 好友失败：${error.message || String(error)}` }
+    }
+  })
   // 更新：检查 GitHub 上有没有新版本；这次更新了什么
   const checkUpdate = createUpdateChecker({ pkg: PKG, log, unstable: () => getConfig().update.unstable })
   // 宿主环境（Windows/macOS/Linux + 桌面版/网页版）决定更新命令怎么写、发布页指向哪
@@ -2122,14 +2177,16 @@ export function apply(ctx) {
   route('/backup/upload', backupAction(async (req) => {
     const buf = await readRaw(req, 2 * 1024 * 1024 * 1024 - 1)
     if (!buf.length) return { ok: false, message: '文件是空的' }
-    try { return await stageRestore(await saveUpload(buf)) } catch (error) { return { ok: false, message: error.message } }
+    try { return await stageReceivedBackup(buf) } catch (error) { return { ok: false, message: error.message } }
   }))
   route('/backup/restore-path', backupAction(async (req) => {
     const path = String((await readBody(req)).path || '').trim().replace(/^"|"$/g, '')
     if (!path) return { ok: false, message: '填备份文件的完整路径' }
     try { return await stageRestore(path) } catch (error) { return { ok: false, message: error.message } }
   }))
-  route('/backup/cancel', backupAction(async () => { cancelRestore(); return { ok: true, message: '取消了' } }))
+  route('/backup/cancel', backupAction(async () => {
+    try { cancelRestore(); return { ok: true, message: '取消了' } } catch (error) { return { ok: false, message: error.message } }
+  }))
   // ---------- 云备份：每天到点自动打包，并把最新备份推到 Gitee 私有仓库（走本机 git）----------
   const alive = () => { try { return !unloaded } catch { return true } }
   const nextRemoteAt = () => {
@@ -2203,12 +2260,9 @@ export function apply(ctx) {
     if (!/^aurabot-(?:backup|config)-\d{8}-\d{4}\.zip$/.test(name)) return { ok: false, message: '备份文件名不对' }
     try {
       const got = await downloadWebdavBackup(r, name)
-      const dir = dataDir('backups')
-      mkdirSync(dir, { recursive: true })
-      const target = join(dir, name)
-      writeFileSync(target, got.buffer)
+      const result = await stageReceivedBackup(got.buffer, name)
       log.info(`已从 WebDAV 拉回备份：${name}（${got.buffer.length} 字节）`)
-      return await stageRestore(target)
+      return result
     } catch (error) {
       return { ok: false, message: error.message }
     }
@@ -2355,8 +2409,10 @@ export function apply(ctx) {
     const msg = { ...chat, nickname: owner ? cfg.ownerName || '主人' : '路人', role: '', messageId: 'sim', text, mentioned: Boolean(b.mentioned), replyId: '', images: [], stickers: [], records: [], forwards: [], raw: { simulated: true } }
     const { sent } = await hub.capture(async () => {
       if (text) {
-        const cmd = owner && /^\s*[/／]/.test(text) ? parseCommand(text, mods.commands()) : null
-        if (cmd && cmd.ext) {
+        const cmd = (owner || chat.kind === 'private') && /^\s*[/／]/.test(text) ? parseCommand(text, mods.commands()) : null
+        if (cmd && !owner && !canUseDelegatedCommand(cfg, msg, delegatedCommandKey(cmd))) {
+          steps.push('这个私聊对象没有使用该命令的权限')
+        } else if (cmd && cmd.ext) {
           const reply = String((await cmd.ext.run(cmd.arg, msg)) ?? '')
           steps.push(`命令 /${cmd.name}（模块「${cmd.ext.module}」）回：${reply || '（空）'}`)
           if (reply) await hub.sendText(chat.chatId, reply)

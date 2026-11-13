@@ -201,6 +201,26 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-deep:#9cc4f5;--ab-sea:#6
 .ab-finder-empty{padding:12px 10px;color:var(--ab-dim);font-size:12px}
 @media (max-width:640px){.ab-grp{padding:0 10px;gap:5px}.ab-find-btn .t,.ab-find-btn .ab-kbd{display:none}.ab-finder{left:6px;right:6px;width:auto;max-width:none}}
 .ab-grid{display:grid;gap:12px}
+.ab-permission-grid{display:grid;grid-template-columns:minmax(220px,1fr) minmax(0,2fr);gap:12px;align-items:start}
+.ab-permission-grid>.ab-card{padding:14px 16px}
+.ab-permission-grid>.ab-card h3{margin-bottom:2px}
+.ab-permission-grid>.ab-card .ab-desc{margin:3px 0 8px;line-height:1.45}
+.ab-permission-people{display:grid;gap:3px;margin:8px 0 0;max-height:370px;overflow:auto}
+.ab-permission-person-row{display:flex;align-items:center;gap:6px;min-width:0}
+.ab-permission-person{display:flex;align-items:center;justify-content:space-between;gap:8px;text-align:left;padding:6px 8px;border:1px solid transparent;border-radius:8px;background:transparent;color:var(--ab-text);font:inherit;cursor:pointer}
+.ab-permission-person-row>.ab-permission-person{flex:1;min-width:0;width:100%}
+.ab-permission-person:hover,.ab-permission-person.on{border-color:var(--ab-line);background:var(--ab-foam)}
+.ab-permission-person small{display:block;color:var(--ab-sub)}
+.ab-permission-bulk{margin-top:8px;padding:10px 12px;border:1px solid var(--ab-line);border-radius:10px;background:var(--ab-foam)}
+.ab-permission-bulk>p{margin:4px 0 8px}
+.ab-permission-options{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}
+.ab-permission-options .ab-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px 10px;padding:10px 12px;border:1px solid var(--ab-line);border-radius:10px}
+.ab-permission-options .ab-row .ab-label{flex:none;min-width:0;padding-top:0}
+.ab-permission-options .ab-row .ab-label small{max-width:none}
+.ab-permission-options .ab-row .ab-ctl{flex:none;grid-column:2;grid-row:1;justify-content:flex-end}
+.ab-permission-group-row .ab-ctl{justify-content:flex-end}
+.ab-permission-section h4{margin:10px 0 4px}
+@media(max-width:800px){.ab-permission-grid{grid-template-columns:1fr}.ab-permission-people{max-height:190px}}
 .ab-g2{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
 .ab-g4{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
 .ab-card{background:var(--ab-card);border:1px solid var(--ab-line);border-radius:14px;padding:16px 18px}
@@ -510,6 +530,12 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-deep:#9cc4f5;--ab-sea:#6
 .ab-choice.on{border-color:var(--ab-sea);box-shadow:0 0 0 3px var(--ab-foam);background:linear-gradient(var(--ab-foam),var(--ab-foam)),var(--ab-card)}
 .ab-choice b{display:flex;align-items:center;gap:6px;font-weight:600}
 .ab-choice small{display:block;color:var(--ab-dim);font-size:11.5px;margin-top:3px;line-height:1.45}
+.ab-choice-pin{position:absolute;right:8px;top:8px;display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:7px;color:var(--ab-dim);opacity:.55;cursor:pointer;transition:opacity .12s,color .12s,background .12s}
+.ab-choice-pin:hover{opacity:1;background:var(--ab-hover)}
+.ab-choice-pin.on{opacity:1;color:var(--ab-sea);background:var(--ab-foam)}
+.ab-choice-more{display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;min-height:78px}
+.ab-choice-more b{justify-content:center}
+.ab-choice-more small{text-align:center}
 .ab-tab .dirty{width:6px;height:6px;border-radius:50%;background:var(--ab-warn)}
 .ab-toast.ok{background:var(--ab-ok);color:#fff}.ab-toast.err{background:var(--ab-err);color:#fff}
 .ab-kbd{font-family:var(--dsh-font-family-code,monospace);font-size:11px;padding:0 5px;border:1px solid var(--ab-line-2);border-radius:5px;color:var(--ab-dim)}
@@ -888,7 +914,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     ]
     // 自己写的模块：名字像逛平台的放「平台」，其余放「系统」（排在「日志」前面）
     const PLATFORM_EXT = /逛|刷|B站|抖音|小红书|闲鱼|淘宝|微博|知乎|贴吧|快手|触站|小黑盒/
-    const navGroupOf = (t) => NAV_GROUPS.find((g) => g.tabs.includes(t.id)) || (t.ext && PLATFORM_EXT.test(t.label) ? NAV_GROUPS[3] : NAV_GROUPS[4])
+    const navGroupById = (id) => NAV_GROUPS.find((group) => group.id === id)
+    const navGroupOf = (t) => NAV_GROUPS.find((g) => g.tabs.includes(t.id)) || navGroupById(t.navGroup) ||
+      (t.ext && PLATFORM_EXT.test(t.label) ? NAV_GROUPS[3] : NAV_GROUPS[4])
     const navOrder = (g, t) => { const i = g.tabs.indexOf(t.id); return i >= 0 ? i : g.tabs.length - (g.tabs.includes('logs') ? 1.5 : 0) }
     const NAV_ALIAS = {
       overview: '首页 状态', connect: 'qq 网关 snowluma onebot 登录 工作区', character: '人设 性格 设定 头像', persona: '人物 画像 小档案 群印象 梗概 时间轴 相处经验 说话方式', access: '主人 白名单 权限 群管 改资料',
@@ -1720,7 +1748,181 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           : rows)
     }
 
-    function Access({ st, draft, setDraft, toast }) {
+    function Access(props) {
+      const [tab, setTab] = useState('people')
+      return h('div', { className: 'ab-grid' },
+        h('div', null, h(Seg, { value: tab, onChange: setTab, options: [
+          { value: 'people', label: '私聊用户' }, { value: 'groups', label: '群聊' }, { value: 'global', label: '全局设置' },
+        ] })),
+        tab === 'people' ? h(PrivatePermissions, props)
+          : tab === 'groups' ? h(GroupPermissions, props) : h(GlobalAccess, props),
+      )
+    }
+
+    function usePermissionSave(toast, reload) {
+      const [busy, setBusy] = useState(false)
+      const pending = useRef(false)
+      const save = async (path, payload) => {
+        if (pending.current) return false
+        pending.current = true
+        setBusy(true)
+        try {
+          const result = await post(path, payload)
+          if (!result.ok) { toast(result.message || '保存权限失败', 'err'); return false }
+          if (path === '/permissions/subject' || result.changed) await reload()
+          toast(result.message || '权限已保存', 'ok')
+          return true
+        } finally {
+          pending.current = false
+          setBusy(false)
+        }
+      }
+      const apply = (id, kind, changes) => save('/permissions/subject', { id, kind, changes })
+      const applyMany = (ids) => save('/permissions/private-batch', { ids })
+      return { busy, apply, applyMany }
+    }
+
+    function PrivatePermissions({ st, toast, reload }) {
+      const [catalog, setCatalog] = useState(null)
+      const [friends, setFriends] = useState([])
+      const [query, setQuery] = useState('')
+      const [selected, setSelected] = useState('')
+      const [quickQQ, setQuickQQ] = useState('')
+      const [batchOpen, setBatchOpen] = useState(false)
+      const [batchText, setBatchText] = useState('')
+      const [permissionGroupsOpen, setPermissionGroupsOpen] = useState({ 功能: true })
+      const { busy, apply, applyMany } = usePermissionSave(toast, reload)
+      const modules = (st.modules || []).map(({ id, running, commands }) => [id, running, commands])
+      const catalogVersion = JSON.stringify(modules)
+      useEffect(() => {
+        let active = true
+        get('/permissions/catalog').then((r) => { if (active) setCatalog(r) })
+        return () => { active = false }
+      }, [catalogVersion])
+      const loadFriends = async () => {
+        try {
+          const r = await get('/permissions/friends')
+          if (r.ok) { setFriends(r.friends); return true }
+          toast(r.message || '读取好友失败', 'err')
+        } catch (error) { toast(error.message || '读取好友失败', 'err') }
+        return false
+      }
+      const cfg = st.config
+      const owner = String(cfg.ownerQQ)
+      const privateAllow = (cfg.allow.private || []).map(String)
+      const isOpen = (qq) => privateAllow.includes(String(qq))
+      const saved = [cfg.allow.private, ...Object.values(cfg.capabilityAllow || {}), ...Object.values(cfg.commandAllow || {})]
+      const ids = [...new Set(saved.flat().map(String))].filter((id) => id !== owner)
+      const names = new Map(friends.map(({ id, name }) => [id, name]))
+      const q = query.trim().toLowerCase()
+      const matching = [...new Set([...ids, ...names.keys()])].filter((id) => id !== owner && (!q ? ids.includes(id) || names.has(id) : id.includes(q) || names.get(id)?.toLowerCase().includes(q)))
+      const entries = matching.slice(0, 50)
+      const id = selected || (!q ? entries[0] : '')
+      const open = Boolean(id && isOpen(id))
+      const has = (key) => key === 'chat' ? open : (cfg.capabilityAllow?.[key] || cfg.commandAllow?.[key] || []).includes(id)
+      const canOpen = /^\d{5,12}$/.test(q) && q !== owner && !entries.includes(q)
+      const permissions = catalog?.list || []
+      const known = new Set(permissions.map(({ key }) => key))
+      const inactive = Object.keys(cfg.commandAllow || {}).filter((key) => has(key) && !known.has(key))
+      const quickId = quickQQ.trim()
+      const canQuickAdd = /^\d{5,12}$/.test(quickId) && quickId !== owner && !isOpen(quickId)
+      const addPrivate = async (qq) => {
+        if (!/^\d{5,12}$/.test(String(qq)) || String(qq) === owner) return
+        if (await apply(String(qq), 'private', { chat: true })) { setSelected(String(qq)); setQuickQQ('') }
+      }
+      const batchTokens = batchText.split(/[\s,，;；、]+/).filter(Boolean)
+      const batchValid = batchTokens.filter((value) => /^\d{5,12}$/.test(value))
+      const batchUnique = [...new Set(batchValid)]
+      const ownerCount = batchUnique.filter((value) => value === owner).length
+      const batchIds = batchUnique.filter((value) => value !== owner)
+      const batchAdd = batchIds.filter((value) => !isOpen(value))
+      const tooManyBatchAdd = batchAdd.length > 500
+      const batchDuplicates = batchValid.length - batchUnique.length
+      const batchInvalid = batchTokens.length - batchValid.length
+      const toggle = ({ key, label, description }) => {
+        const publicFeature = (key === 'image' && cfg.imageGen.ownerOnly === false) || (key === 'song' && cfg.song.ownerOnly === false)
+        const hint = publicFeature ? `${description}。当前功能对所有白名单会话开放。` : description
+        return h(Row, { key, label, hint },
+          h(Switch, { on: has(key), title: label, disabled: busy, onChange: (value) => apply(id, 'private', { [key]: value }) }))
+      }
+      return h('div', { className: 'ab-permission-grid' },
+        h(Card, { title: '私聊用户', className: 'ab-permission-card', desc: '按昵称选好友，或输入 QQ 号添加。', right: h('div', { className: 'ab-flex', style: { gap: 6, flexWrap: 'wrap' } },
+          h(Btn, { small: true, kind: 'ghost', onClick: loadFriends }, friends.length ? '刷新好友' : '读取 QQ 好友'),
+          h(Btn, { small: true, kind: 'primary', onClick: () => setBatchOpen(!batchOpen) }, batchOpen ? '收起' : '批量添加')) },
+          h('input', { className: 'ab-input wide', value: query, 'aria-label': '搜索已授权用户或好友昵称', placeholder: '搜索已授权用户或好友昵称', onChange: (e) => setQuery(e.target.value) }),
+          h('div', { className: 'ab-flex', style: { marginTop: 6, flexWrap: 'wrap' } },
+            h('input', { className: 'ab-input', style: { flex: 1, minWidth: 140 }, inputMode: 'numeric', value: quickQQ, 'aria-label': '直接输入 QQ 号添加私聊', placeholder: '输入 QQ 号（5～12 位）', onChange: (e) => setQuickQQ(e.target.value) }),
+            h(Btn, { kind: 'primary', disabled: busy || !canQuickAdd, onClick: () => addPrivate(quickId) }, '添加私聊'),
+          ),
+          batchOpen ? h('div', { className: 'ab-permission-bulk' },
+            h('div', { className: 'ab-flex', style: { marginBottom: 6 } },
+              h('b', null, '批量添加私聊白名单'), h('div', { className: 'ab-spacer' }),
+              h(Btn, { small: true, kind: 'ghost', onClick: () => setBatchOpen(false) }, '关闭')),
+            h('textarea', { className: 'ab-textarea', style: { width: '100%', minHeight: 76, boxSizing: 'border-box' }, value: batchText, 'aria-label': '批量 QQ 号列表', placeholder: '粘贴 QQ 号，支持换行、空格、逗号或顿号', onChange: (e) => setBatchText(e.target.value) }),
+            h('div', { className: 'ab-flex', style: { flexWrap: 'wrap', marginTop: 6 } },
+              h('span', { className: 'ab-muted ab-small' }, `可新增 ${batchAdd.length} 人 · 重复 ${batchDuplicates} 个 · 跳过主人 ${ownerCount} 个 · 格式不对 ${batchInvalid} 条`),
+              h('div', { className: 'ab-spacer' }),
+              h(Btn, { small: true, kind: 'primary', disabled: busy || !batchAdd.length || tooManyBatchAdd, onClick: async () => { if (await applyMany(batchAdd)) setBatchText('') } }, `批量添加 ${batchAdd.length} 人`))) : null,
+          h('div', { className: 'ab-permission-people' }, entries.map((qq) => h('div', { key: qq, className: 'ab-permission-person-row' },
+            h('button', {
+              type: 'button', className: cx('ab-permission-person', qq === id && 'on'), 'aria-pressed': qq === id,
+              disabled: busy, onClick: () => setSelected(qq),
+            }, h('span', null, names.get(qq) || qq, names.get(qq) ? h('small', null, qq) : null),
+            h('small', null, isOpen(qq) ? '允许私聊' : ids.includes(qq) ? '已暂停' : '未授权')),
+            !isOpen(qq) ? h(Btn, { small: true, kind: 'ghost', disabled: busy, onClick: () => addPrivate(qq) }, '添加') : null))),
+          canOpen ? h(Btn, { small: true, disabled: busy, onClick: () => setSelected(q) }, `查看 ${q} 的权限`) : null,
+          !entries.length && !canOpen ? h('p', { className: 'ab-muted ab-small' }, q ? '没有匹配的用户' : '读取好友后可以按昵称添加；也可以在上方直接输入 QQ 号。') : null,
+          matching.length > entries.length ? h('p', { className: 'ab-muted ab-small' }, '请继续输入，缩小搜索范围。') : null,
+        ),
+        !id ? h(Card, null, h(Empty, { text: '选择一位私聊用户来管理授权' }))
+          : h(Card, { title: names.get(id) || id, className: 'ab-permission-card', desc: names.get(id) ? `QQ ${id}` : undefined },
+            h('div', { className: 'ab-permission-options' }, toggle({ key: 'chat', label: '允许私聊', description: '关闭会暂停这个人的其他授权，重新开启即可恢复。' })),
+            !open ? h('p', { className: 'ab-muted ab-small' }, '这个人目前无法私聊。可以先选好功能，开启私聊后授权生效。') : null,
+            catalog?.ok === false ? h('p', { className: 'ab-note err' }, catalog.message || '读取可授权项失败') : null,
+            catalog?.ok ? h(Fragment, null,
+              h('div', { className: 'ab-flex', style: { margin: '10px 0', flexWrap: 'wrap' } },
+                h(Btn, { small: true, disabled: busy || (open && has('help') && has('reset')), onClick: () => apply(id, 'private', { chat: true, help: true, reset: true }) }, open ? '授予会话自助' : '开放私聊和会话自助'),
+                h('span', { className: 'ab-muted ab-small' }, '包含 /help、/reset')),
+              ['功能', '命令', '扩展命令'].map((group) => {
+                const items = permissions.filter((item) => item.group === group)
+                if (!items.length) return null
+                const collapsible = group !== '功能'
+                const open = !collapsible || permissionGroupsOpen[group] === true
+                const optionsId = `private-permissions-${group}`
+                return h('section', { key: group, className: 'ab-permission-section' },
+                  collapsible
+                    ? h('div', { className: 'ab-row ab-permission-group-row' },
+                      h('div', { className: 'ab-label' }, h('b', null, group)),
+                      h('div', { className: 'ab-ctl' }, h('button', { type: 'button', className: 'ab-btn sm primary', 'aria-expanded': open, 'aria-controls': optionsId, onClick: () => setPermissionGroupsOpen((old) => ({ ...old, [group]: !open })) }, open ? '收起' : '展开')))
+                    : h('h4', null, group),
+                  open ? h('div', { id: optionsId, className: 'ab-permission-options' }, items.map(toggle)) : null,
+                )
+              }),
+              inactive.length ? h('section', { className: 'ab-permission-section' }, h('h4', null, '当前不可用的授权'),
+                inactive.map((key) => toggle({ key, label: key, description: '此模块命令未启用或已停止开放，可以撤销原授权。' }))) : null,
+            ) : null,
+            modOn(st, 'memory') ? h(Row, { label: '用户记忆' }, h(PersonMemoryReset, { key: id, qq: id, toast })) : null,
+          ),
+      )
+    }
+
+    function GroupPermissions({ st, toast, reload }) {
+      const [input, setInput] = useState('')
+      const { busy, apply } = usePermissionSave(toast, reload)
+      const id = input.trim()
+      const groups = st.config.allow.groups
+      return h('div', { className: 'ab-grid' },
+        h(Card, { title: '群白名单', desc: '机器人只在白名单中的群聊响应消息。' },
+          h('div', { className: 'ab-flex' },
+            h('input', { className: 'ab-input', 'aria-label': '群号', placeholder: '输入群号', inputMode: 'numeric', value: input, onChange: (e) => setInput(e.target.value) }),
+            h(Btn, { kind: 'primary', disabled: busy || !/^\d{5,}$/.test(id) || groups.includes(id), onClick: async () => { if (await apply(id, 'group', { chat: true })) setInput('') } }, '添加群聊')),
+          groups.map((qq) => h(Row, { key: qq, label: qq }, h(Btn, { small: true, disabled: busy, onClick: () => apply(qq, 'group', { chat: false }) }, '移除'))),
+        ),
+        modOn(st, 'group-admin') ? h(GroupRoles, null) : null,
+      )
+    }
+
+    function GlobalAccess({ st, draft, setDraft, toast }) {
       const f = useField(draft, setDraft)
       return h('div', { className: 'ab-grid' },
         h(Card, { title: '主人', desc: '主人的 QQ 号。群管、点歌、电脑上的操作只听主人的。' },
@@ -1752,11 +1954,6 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             ] })),
         ),
         h(ProfilePerms, { st, draft, setDraft }),
-        h(Card, { title: '白名单', desc: '只有名单里的人和群，ta才会理。一行一个号码。' },
-          h(Row, { label: '私聊白名单', hint: '主人默认就在里面。' }, f.list('allow.private', { placeholder: '每行一个 QQ 号', numbers: true })),
-          h(Row, { label: '群白名单', hint: '把机器人拉进群后，把群号加到这里。' }, f.list('allow.groups', { placeholder: '每行一个群号', numbers: true })),
-        ),
-        modOn(st, 'group-admin') ? h(GroupRoles, null) : null,
         h(CommandList, null),
       )
     }
@@ -1798,7 +1995,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     function CommandList() {
       const [list, setList] = useState([])
       useEffect(() => { get('/commands').then((r) => setList(r.list || [])) }, [])
-      return h(Card, { title: 'QQ 命令', desc: '主人在 QQ 里（私聊或白名单群）直接发这些命令就能管ta，别人发了不算。总开关关着时也能用。' },
+      return h(Card, { title: 'QQ 命令', desc: '主人可以在 QQ 私聊或白名单群使用命令。其他人获授权后可在自己的私聊使用对应命令。' },
         h('table', { className: 'ab-table' }, h('tbody', null, list.map((c) => h('tr', { key: c.name },
           h('td', { style: { whiteSpace: 'nowrap' } }, h('code', null, '/' + c.name), c.aliases.length ? h('div', { className: 'ab-muted ab-small' }, c.aliases.map((a) => '/' + a).join(' ')) : null),
           h('td', null, c.desc))))))
@@ -1971,13 +2168,43 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         setAdd({ ...add, id: '' })
       }
       const remove = (kind, id) => { const field = kind === 'private' ? 'privates' : 'groups'; const n = { ...(cm[field] || {}) }; delete n[id]; setCm({ [field]: n }) }
-      return h(Card, { title: '按聊天选模型', desc: '顺序：这个私聊 > 这个群 > 所有私聊 / 所有群的默认 > 上面的全局模型。没选的一级就用下一级；选的模型在 DSH 里找不到时也自动退回。只有你能在这里改，聊天里的人换不了。换了之后从那个聊天的下一条消息起生效。' },
+      // 思考强度：beta 的 chatEfforts 按「聊天 + 当前模型」各存一份，键是 JSON.stringify([provider, model])。
+      const globalModel = draft.model || {}
+      const EFFORTS = [
+        { value: '', label: '跟随默认' },
+        { value: 'low', label: '低（快）' },
+        { value: 'high', label: '高' },
+        { value: 'max', label: '最高' },
+      ]
+      const modelOf = (sel) => ({ provider: (sel && sel.provider) || globalModel.provider || '', model: (sel && sel.model) || globalModel.model || '' })
+      const effortOf = (kind, id, sel) => {
+        const m = modelOf(sel)
+        if (!m.provider || !m.model) return ''
+        return ((draft.chatEfforts || {})[`${kind}:${id}`] || {})[JSON.stringify([m.provider, m.model])] || ''
+      }
+      const setEffort = (kind, id, sel, eff) => {
+        const m = modelOf(sel)
+        if (!m.provider || !m.model) return
+        const cid = `${kind}:${id}`
+        const key = JSON.stringify([m.provider, m.model])
+        const cur = { ...(draft.chatEfforts || {}) }
+        const row = { ...(cur[cid] || {}) }
+        if (eff) row[key] = eff
+        else delete row[key]
+        if (Object.keys(row).length) cur[cid] = row
+        else delete cur[cid]
+        setDraft(setPath(draft, 'chatEfforts', cur))
+      }
+      return h(Card, { title: '按聊天选模型 / 思考强度', desc: '顺序：这个私聊 > 这个群 > 所有私聊 / 所有群的默认 > 上面的全局模型。没选的一级就用下一级；选的模型在 DSH 里找不到时也自动退回。单个聊天的「思考强度」按「聊天 + 当前模型」各存一份（和 /effort 命令是同一份配置）。只有你能在这里改，聊天里的人换不了。换了之后从那个聊天的下一条消息起生效。' },
         h(Row, { label: '私聊默认模型' }, h(Select, { value: val(cm.privateDefault), width: 280, options: optsFor(val(cm.privateDefault)), onChange: (v) => setCm({ privateDefault: toSel(v) }) })),
         h(Row, { label: '群聊默认模型' }, h(Select, { value: val(cm.groupDefault), width: 280, options: optsFor(val(cm.groupDefault)), onChange: (v) => setCm({ groupDefault: toSel(v) }) })),
         h('div', { style: { marginTop: 8 } }, h(Btn, { small: true, kind: 'ghost', onClick: () => setOpen(!open) }, (open ? '收起' : '展开') + '单个 QQ / 群的例外（' + rows.length + '）')),
         open ? h('div', { style: { marginTop: 8 } },
           rows.length === 0 ? h('div', { className: 'ab-muted', style: { marginBottom: 10 } }, '还没有单独设置的 QQ 或群。') :
-            rows.map((r) => h(Row, { key: r.kind + r.id, label: (r.kind === 'private' ? '私聊 ' : '群 ') + r.id }, h('span', { className: 'ab-muted' }, label(r.sel)), h(Btn, { small: true, kind: 'ghost', onClick: () => remove(r.kind, r.id) }, '移除'))),
+            rows.map((r) => h(Row, { key: r.kind + r.id, label: (r.kind === 'private' ? '私聊 ' : '群 ') + r.id },
+              h('span', { className: 'ab-muted' }, label(r.sel)),
+              h(Select, { value: effortOf(r.kind, r.id, r.sel), width: 140, options: EFFORTS, onChange: (v) => setEffort(r.kind, r.id, r.sel, v) }),
+              h(Btn, { small: true, kind: 'ghost', onClick: () => remove(r.kind, r.id) }, '移除'))),
           h('div', { className: 'ab-flex' },
             h(Seg, { value: add.kind, onChange: (v) => setAdd({ ...add, kind: v }), options: [{ value: 'private', label: '私聊' }, { value: 'group', label: '群' }] }),
             h('input', { className: 'ab-input', placeholder: add.kind === 'private' ? 'QQ 号' : '群号', value: add.id, onChange: (e) => setAdd({ ...add, id: e.target.value.replace(/\D/g, '') }) }),
@@ -2200,25 +2427,122 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       ]
     }
 
+    function PinIcon({ filled }) {
+      return h('svg', {
+        width: 13, height: 13, viewBox: '0 0 24 24', fill: filled ? 'currentColor' : 'none',
+        stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true',
+      },
+        h('path', { d: 'M12 17v5' }),
+        h('path', { d: 'M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z' }))
+    }
+
+    /**
+     * 语音接口选择：默认只露前 4 个；常用接口可置顶（最多 4 个），
+     * 其余接口点「更多」再显示。置顶状态存本地，不跟设置草稿走。
+     */
+    function VoiceEngineChoices({ options, value, active, onChange, toast }) {
+      const [pinned, setPinned] = usePersisted('voice.pinnedEngines', [])
+      const [more, setMore] = useState(false)
+      const raw = Array.isArray(pinned) ? pinned : []
+      // 自动置顶看「已保存」的接口，不跟当前草稿选择走。
+      const current = String(active || '')
+      const validRaw = raw.filter((id) => options.some((o) => o.value === id))
+      // 保存后，正在使用的接口永远排第一；它也算一个置顶。超过 4 个时从末尾淘汰。
+      const activePins = (current && options.some((o) => o.value === current)
+        ? [current, ...validRaw.filter((id) => id !== current)]
+        : validRaw).slice(0, 4)
+      const activeKey = activePins.join('|')
+      const rawKey = validRaw.join('|')
+      useEffect(() => {
+        if (activeKey !== rawKey) setPinned(activePins)
+      }, [activeKey, rawKey])
+      const ordered = [...activePins.map((id) => options.find((o) => o.value === id)).filter(Boolean), ...options.filter((o) => !activePins.includes(o.value))]
+      // 当前接口已经由 activePins 保证在第一张；折叠时固定显示前 4 张 + 更多卡片。
+      const visible = more ? ordered : ordered.slice(0, 4)
+      const togglePin = (id) => {
+        if (id === current) {
+          if (toast) toast('正在使用的接口默认置顶')
+          return
+        }
+        if (activePins.includes(id)) {
+          setPinned(activePins.filter((x) => x !== id))
+          return
+        }
+        // 新置顶插到当前接口之后；超过 4 个就淘汰原来的末尾。
+        const next = (current ? [current, id, ...activePins.filter((x) => x !== current)] : [id, ...activePins]).slice(0, 4)
+        setPinned(next)
+      }
+      return h('div', null,
+        h('div', { className: 'ab-choices', role: 'radiogroup' }, [
+          ...visible.map((o) => {
+            const on = o.value === value
+            const pinnedNow = activePins.includes(o.value)
+            return h('div', {
+              key: o.value,
+              role: 'radio',
+              'aria-checked': on,
+              tabIndex: 0,
+              className: cx('ab-choice', on && 'on'),
+              style: { position: 'relative', paddingRight: 36 },
+              onClick: () => onChange(o.value),
+              onKeyDown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onChange(o.value) } },
+            },
+              h('b', null, o.icon || null, o.label), o.desc ? h('small', null, o.desc) : null,
+              h('span', {
+                className: cx('ab-choice-pin', pinnedNow && 'on'),
+                role: 'button',
+                tabIndex: 0,
+                title: pinnedNow ? '取消置顶' : '置顶这个接口',
+                'aria-label': (pinnedNow ? '取消置顶 ' : '置顶 ') + o.label,
+                'aria-pressed': pinnedNow,
+                style: { position: 'absolute', right: 8, top: 8, zIndex: 2 },
+                onClick: (e) => { e.stopPropagation(); togglePin(o.value) },
+                onKeyDown: (e) => {
+                  if (e.key !== 'Enter' && e.key !== ' ') return
+                  e.preventDefault(); e.stopPropagation(); togglePin(o.value)
+                },
+              }, h(PinIcon, { filled: pinnedNow })))
+          }),
+          h('div', {
+            key: '__more',
+            className: 'ab-choice ab-choice-more',
+            role: 'button',
+            tabIndex: 0,
+            onClick: () => setMore((v) => !v),
+            onKeyDown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setMore((v) => !v) } },
+          },
+            h('b', null, more ? '收起' : '更多'),
+            h('small', null, more ? '只看常用接口' : '还有 ' + Math.max(0, options.length - visible.length) + ' 个接口')),
+        ]),
+        h('div', { className: 'ab-muted ab-small', style: { marginTop: 8 } }, '保存设置后，正在使用的接口自动排第一；最多置顶 4 个，超出会取消末尾的置顶。'))
+    }
+
     function Voice({ st, draft, setDraft, toast, reload }) {
       const f = useField(draft, setDraft)
       const voiceDirty = Boolean(st && st.config) && JSON.stringify(draft.voice) !== JSON.stringify(st.config.voice)
       const [txt, setTxt] = useState('晚安啦，今天也辛苦了，明天见～')
       const [src, setSrc] = useState('')
+      const engineOptions = [
+        { value: 'auto', label: '自动', desc: 'edge-tts 优先，不行用 Windows 语音' },
+        { value: 'edge', label: '微软 edge-tts', desc: st.voice.edgeInstalled ? '在线，音色自然（已装好）' : '在线，音色自然（还没装）' },
+        { value: 'cosyvoice', label: '本地 CosyVoice', desc: '自己部署的 CosyVoice 服务，可克隆音色' },
+        { value: 'gptsovits', label: '本地 GPT-SoVITS', desc: 'GPT-SoVITS api_v2，用参考音频定音色' },
+        { value: 'volcano', label: '豆包语音（火山）', desc: '只填 API Key，选个音色就行' },
+        { value: 'breeze', label: 'Breeze 语音', desc: 'BreezeBlue 云端或自建，填 Key + 音色 id' },
+        { value: 'minimax', label: 'MiniMax 语音', desc: '在线，音色多，支持自定义音色和情绪' },
+        { value: 'http', label: '其他 HTTP 接口', desc: '任意返回音频的地址' },
+        { value: 'windows', label: 'Windows 自带', desc: '离线可用，机械感重一些' },
+      ]
       return h('div', { className: 'ab-grid' },
         h(Card, { title: '说话（文字转语音）', right: f.sw('voice.enabled'), desc: '回复里写了 <voice>…</voice> 的部分会变成 QQ 语音条；对方明确要语音时一定发语音；短回复也有一定概率整条变语音。' },
           voiceDirty ? h('div', { className: 'ab-note' }, '语音设置有未保存的改动：点「生成」试听会直接用当前设置；真正聊天要等点底部「保存设置」后生效。') : null,
-          h('div', { style: { margin: '4px 0 12px' } }, f.choices('voice.engine', [
-            { value: 'auto', label: '自动', desc: 'edge-tts 优先，不行用 Windows 语音' },
-            { value: 'edge', label: '微软 edge-tts', desc: st.voice.edgeInstalled ? '在线，音色自然（已装好）' : '在线，音色自然（还没装）' },
-            { value: 'cosyvoice', label: '本地 CosyVoice', desc: '自己部署的 CosyVoice 服务，可克隆音色' },
-            { value: 'gptsovits', label: '本地 GPT-SoVITS', desc: 'GPT-SoVITS api_v2，用参考音频定音色' },
-            { value: 'volcano', label: '豆包语音（火山）', desc: '只填 API Key，选个音色就行' },
-            { value: 'breeze', label: 'Breeze 语音', desc: 'BreezeBlue 云端或自建，填 Key + 音色 id' },
-            { value: 'minimax', label: 'MiniMax 语音', desc: '在线，音色多，支持自定义音色和情绪' },
-            { value: 'http', label: '其他 HTTP 接口', desc: '任意返回音频的地址' },
-            { value: 'windows', label: 'Windows 自带', desc: '离线可用，机械感重一些' },
-          ])),
+          h('div', { style: { margin: '4px 0 12px' } }, h(VoiceEngineChoices, {
+            options: engineOptions,
+            value: draft.voice.engine,
+            active: st && st.config && st.config.voice ? st.config.voice.engine : '',
+            onChange: (v) => setDraft(setPath(draft, 'voice.engine', v)),
+            toast,
+          })),
           ['auto', 'edge'].includes(draft.voice.engine) ? [
             !st.voice.edgeInstalled ? h(Row, { key: 'i', label: 'edge-tts', hint: '装在插件自己的 Python 环境里，不影响系统' }, h(Btn, { small: true, onClick: async () => { toast('正在安装，可能要一两分钟…'); const r = await post('/voice/install'); toast(r.message); reload() } }, '安装 edge-tts')) : null,
             h(Row, { key: 'v', label: '音色' }, f.select('voice.voice', [
@@ -4313,6 +4637,20 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         selected ? h(PersonaDetail, { key: selected, qq: selected, toast, back: () => setSelected(''), onChanged: load }) : h('div', { className: 'ab-pm-detail' }, h(Empty, { text: '选一个人看看' })))
     }
 
+    function PersonMemoryReset({ qq, toast, onDone }) {
+      const [busy, setBusy] = useState(false)
+      const reset = async () => {
+        if (busy || !confirm(`清理 QQ ${qq} 的记忆并重开私聊？\n相关记忆会被删除，清理前的消息将退出机器人上下文。旧会话仍可在 QQ 和 DSH 中查看，权限设置会保留。`)) return
+        setBusy(true)
+        try {
+          const result = await post('/persona/person/reset', { qq })
+          toast(result.message || (result.ok ? '记忆已清理' : '清理失败'), result.ok ? 'ok' : 'err')
+          if (result.ok) await onDone?.()
+        } finally { setBusy(false) }
+      }
+      return h(Btn, { small: true, kind: 'danger', disabled: busy, onClick: reset }, '清理记忆并重开私聊')
+    }
+
     function PersonaDetail({ qq, toast, back, onChanged }) {
       const [data, setData] = useState(null)
       const [form, setForm] = useState(null)
@@ -4412,7 +4750,8 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         h(Card, { title: '是否留下记忆', desc: '讨厌 = 不爱搭理；不再记住 = 不留记忆。两者分别设置。消息仍照常进入聊天，她能看懂当下的对话。撤销后，以后的互动会恢复记忆。' },
           h(Row, { label: '不再记住', hint: p.isOwner ? '主人始终会被记住。' : p.noMemory ? '已停止形成人物记忆，已有记忆也不会带进聊天。' : '可以随时开启或撤销。' },
             h('input', { type: 'checkbox', role: 'switch', 'aria-label': '不再记住', checked: Boolean(p.noMemory && !p.isOwner), disabled: p.isOwner, onChange: (e) => toggleNoMemory(e.target.checked) })),
-          !p.isOwner ? h(Btn, { small: true, kind: 'ghost', onClick: forgetPerson }, '删除这个人') : null),
+          !p.isOwner ? h(Btn, { small: true, kind: 'ghost', onClick: forgetPerson }, '删除这个人') : null,
+          h(PersonMemoryReset, { qq, toast, onDone: () => { back(); return onChanged() } })),
         editing ? h(Card, { title: '编辑印象' },
           h('div', { className: 'ab-pm-form' }, PERSON_FIELDS.map(([key, label]) => h('label', { key, className: key === 'text' ? 'full' : '' }, label,
             h('textarea', { className: 'ab-textarea', rows: key === 'text' ? 3 : 2, value: form[key], onChange: (e) => setForm({ ...form, [key]: e.target.value }) })))),
@@ -6164,7 +6503,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h(Row, { label: '截哪一段' }, f.choices('song.clipStart', [{ value: 'auto', label: '副歌附近', desc: '从全曲大约 30% 的地方开始' }, { value: 'head', label: '从头开始' }])),
           h(Row, { label: '人声音量' }, f.range('song.vocalVolume', 0.2, 2, 0.05, (v) => Math.round(v * 100) + '%')),
           h(Row, { label: '伴奏音量' }, f.range('song.instVolume', 0.1, 2, 0.05, (v) => Math.round(v * 100) + '%')),
-          h(Row, { label: '只有主人能点歌' }, f.sw('song.ownerOnly')),
+          h(Row, { label: '限制点歌权限', hint: '开启时主人和权限页授权的私聊对象可以点歌。' }, f.sw('song.ownerOnly')),
         ),
         h(Card, { title: '网易云', desc: '不登录也能唱免费歌；会员歌、版权歌要填网易云的 Cookie。' },
           h(Row, { label: 'Cookie（MUSIC_U）', hint: '电脑浏览器登录 music.163.com → F12 → 应用 / 存储 → Cookie → 复制 MUSIC_U 的值。只存在本机，不显示' },
@@ -6753,6 +7092,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h(Row, { label: '自己发评论', hint: '只管ta自己刷视频时发不发；别人让ta发，看「权限」页的 B 站评论' }, f.sw('bili.comment'), h('span', { className: 'ab-muted' }, '每天最多'), f.num('bili.maxCommentsPerDay', { min: 0, max: 50 }), h('span', { className: 'ab-muted' }, '条')),
           h(Row, { label: '回别人回ta的评论' }, f.sw('bili.reply'), h('span', { className: 'ab-muted' }, '每天最多'), f.num('bili.maxRepliesPerDay', { min: 0, max: 100 }), h('span', { className: 'ab-muted' }, '条')),
           h(Row, { label: '看到好玩的分享给你', hint: '私聊发给主人，带视频链接' }, f.sw('bili.shareToOwner')),
+          h(Row, { label: '也提议发到群里', hint: '刷到合适的先私聊问主人，批准了才发；关着就不提' }, f.sw('bili.groupShare.enabled')),
+          h(Row, { label: '发到哪个群', hint: '群号。留空则不生效' }, f.text('bili.groupShare.groupId', { placeholder: '群号' })),
+          h(Row, { label: '每天最多发', hint: '只算真发进群的条数' }, f.num('bili.groupShare.dailyLimit', { min: 0, max: 20 }), h('span', { className: 'ab-muted' }, '条')),
           h(Row, { label: '顺手点赞' }, f.sw('bili.like')),
         ),
         h(Card, { title: '看画面（抽帧 + 视觉）', desc: '默认只读标题、简介、字幕和热评。打开后用 ffmpeg 抽帧交给视觉模型，截图保存到本机，可以在 QQ 聊天里让ta挑一张发送。没有 ffmpeg、模型明确不支持图片或处理失败时，自动继续文字阅读。' },
@@ -7009,7 +7351,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         const actN = parts.filter(findAct).length
         return { act: actN, plain: parts.length - actN }
       }
-      // 选话题：活动 / 普通互斥；活动只能 1 个，普通最多 3 个
+      // 选话题：活动 / 普通不互斥，但一帖共享 3 个名额（活动最多 1 个）。
+      // 口径与模块侧 resolveHashtagItems 的 HASHTAG_TOTAL_CAP=3 一致，别在这边放宽。
+      const TOPIC_CAP = 3
       const toggleTopic = (i, name) => setDraft(function (d) {
         const hb = d.heybox || {}
         const list = (Array.isArray(hb.dailyPosts) ? hb.dailyPosts : []).slice()
@@ -7021,11 +7365,13 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         if (parts.includes(name)) {
           nextVals = parts.filter(function (x) { return x !== name })
         } else if (wantAct) {
-          nextVals = [name]
+          // 换活动：新的顶替旧的，普通话题保留但只留得下 2 个（活动占 1 席）
+          const plains = parts.filter(function (x) { return !isActIn(x) })
+          if (plains.length > TOPIC_CAP - 1) toast('活动占 1 个名额，普通话题只保留前 ' + (TOPIC_CAP - 1) + ' 个', 'err')
+          nextVals = [name].concat(plains.slice(0, TOPIC_CAP - 1))
         } else {
-          const plainOnly = parts.filter(function (x) { return !isActIn(x) })
-          if (plainOnly.length >= 3) { toast('普通话题最多选 3 个', 'err'); return d }
-          nextVals = plainOnly.concat([name])
+          if (parts.length >= TOPIC_CAP) { toast('一帖最多挂 ' + TOPIC_CAP + ' 个话题（活动、普通共享名额）', 'err'); return d }
+          nextVals = parts.concat([name])
         }
         item.hashtagsText = joinHashtags(nextVals)
         item.hashtags = nextVals.slice()
@@ -7040,12 +7386,13 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       }
       const renderSelSummary = function (i) {
         const c = countSel(i)
-        if (c.act > 0) return h('span', { className: 'ab-small', style: { whiteSpace: 'nowrap', color: 'var(--ab-ok)' } }, '已选创作活动 ' + c.act + '/1')
-        if (c.plain > 0) {
-          const color = c.plain >= 3 ? 'var(--ab-warn)' : 'var(--ab-ok)'
-          return h('span', { className: 'ab-small', style: { whiteSpace: 'nowrap', color: color } }, '已选普通话题 ' + c.plain + '/3')
+        const total = c.act + c.plain
+        if (total > 0) {
+          const color = total >= TOPIC_CAP ? 'var(--ab-warn)' : 'var(--ab-ok)'
+          const detail = c.act > 0 ? '活动 ' + c.act + '/1 + 普通 ' + c.plain : '普通 ' + c.plain
+          return h('span', { className: 'ab-small', style: { whiteSpace: 'nowrap', color: color } }, '已选话题 ' + total + '/' + TOPIC_CAP + '（' + detail + '）')
         }
-        return h('span', { className: 'ab-small ab-muted', style: { whiteSpace: 'nowrap' } }, '未选（活动 / 普通各选一种）')
+        return h('span', { className: 'ab-small ab-muted', style: { whiteSpace: 'nowrap' } }, '未选（活动、普通共享 ' + TOPIC_CAP + ' 个名额）')
       }
       // 搜索 + 分组渲染（创作活动在前）
       const renderTopicGroups = function (i) {
@@ -7339,7 +7686,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
                       f.num('heybox.dailyPosts.' + i + '.wordsMin', { min: 0, max: 2000 }), h('span', { className: 'ab-muted' }, '–'),
                       f.num('heybox.dailyPosts.' + i + '.wordsMax', { min: 0, max: 3000 }), h('span', { className: 'ab-muted' }, '字')),
                   ),
-                  h(Row, { label: '话题', hint: '创作活动和普通话题只能选一种：选活动会自动清掉普通（限 1 个），选普通会清掉活动（最多 3 个）' },
+                  h(Row, { label: '话题', hint: '创作活动和普通话题可以一起挂，但一帖共享 3 个名额：活动最多 1 个，占 1 席后普通话题还能选 2 个' },
                     h('div', { style: { width: '100%' } },
                       h('div', { className: 'ab-flex', style: { marginBottom: 6 } },
                         h('input', {
@@ -7399,7 +7746,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           right: h('div', { className: 'ab-flex' },
             h(Btn, { small: true, kind: 'primary', onClick: () => post('/heybox/acts/refresh').then((r) => { toast(r.message || '已刷新', r.ok === false ? 'err' : 'ok'); load() }).catch(() => toast('刷新失败', 'err')), disabled: !!busy }, busy === 'acts' ? '刷新中…' : '刷新话题'),
             h(Btn, { small: true, onClick: load }, '重新读')),
-          desc: '写帖要挂话题就从这里挑（带「活动」角标的优先，有奖励）。活动和普通话题**可以一起挂**：活动最多 1 个 + 普通最多 3 个（共 4 个）。她发帖时话题是以**纯文本名字**提交的，服务端自己匹配成话题；传对象（name+hashtag_id）会让发帖直接失败。',
+          desc: '写帖要挂话题就从这里挑（带「活动」角标的优先，有奖励）。活动和普通话题**可以一起挂**，但一帖**共享 3 个名额**：活动最多 1 个，剩下的给普通话题（和排期里的话题勾选、模块侧截断同一口径）。她发帖时话题是以**纯文本名字**提交的，服务端自己匹配成话题；传对象（name+hashtag_id）会让发帖直接失败。',
         },
           (() => {
             const acts = s && (s.actsList || [])
@@ -7587,60 +7934,66 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     function ImageGen({ draft, setDraft, toast }) {
       const f = useField(draft, setDraft)
       const c = draft.imageGen
+      const [testing, setTesting] = useState('')
+      const [results, setResults] = useState({})
+      const snapshot = JSON.stringify(c); const current = useRef(snapshot); current.current = snapshot
+      useEffect(() => { setResults({}) }, [snapshot])
+      const test = async (id) => {
+        const key = id || 'primary'; const version = snapshot
+        setTesting(key); setResults(old => ({ ...old, [key]: { pending: true, message: '正在测试，生图可能需要几分钟…' } }))
+        try { const r = await post('/image/test', { id, imageGen: c }); const result = current.current !== version ? { ok: false, message: '测试期间配置已更改，请重新测试。' } : { ok: r.ok === true, message: r.message || (r.ok ? '生图成功' : '测试失败') }; setResults(old => ({ ...old, [key]: result })); toast(result.message, result.ok ? 'ok' : 'err') }
+        finally { setTesting('') }
+      }
+      const testButton = (id) => { const key = id || 'primary'; const r = results[key]; return h('div', { className: 'ab-flex', style: { gap: 8, marginTop: 6, flexWrap: 'wrap' } }, h(Btn, { small: true, disabled: Boolean(testing), onClick: () => test(id) }, testing === key ? '测试中…' : '测试生图'), r ? h('span', { className: 'ab-small', role: 'status', style: { color: r.pending ? 'var(--ab-warn)' : r.ok ? 'var(--ab-ok)' : 'var(--ab-err)', fontWeight: 600 } }, r.pending ? r.message : (r.ok ? '✓ 测试成功：' : '✗ ') + r.message) : null) }
+      const fallbacks = Array.isArray(c.fallbacks) ? c.fallbacks : []
+      const setFallbacks = next => setDraft(setPath(draft, 'imageGen.fallbacks', next))
+      const setFallback = (i, k, value) => setFallbacks(fallbacks.map((e, j) => j === i ? { ...e, [k]: value } : e))
+      const moveFallback = (i, step) => { const next = fallbacks.slice(); const j = i + step; if (j < 0 || j >= next.length) return; [next[i], next[j]] = [next[j], next[i]]; setFallbacks(next) }
       const custom = c.custom || {}
-      const isCustom = c.provider === 'custom'
-      const isCodex = c.provider === 'codex'
+      const [tab, setTab] = useState(() => c.provider === 'codex' ? 'codex' : c.provider === 'custom' ? 'custom' : c.baseUrl === SPONSOR_BASE ? 'sponsor' : 'openai')
+      const isCustom = tab === 'custom'
+      const isCodex = tab === 'codex'
       const isPost = custom.method === 'POST'
       const params = Array.isArray(custom.params) ? custom.params : []
       const setParams = (next) => setDraft(setPath(draft, 'imageGen.custom.params', next))
       const setP = (i, k, v) => setParams(params.map((p, j) => (j === i ? { ...p, [k]: v } : p)))
-      // 「服务地址」下拉：官方推荐固定第一项（不可删）+ 用户自添地址（config.imageGen.baseUrlOptions，{ name, url }，可删）
-      // 添加只能走「＋ 添加」弹窗；切换只能通过下拉框
-      const baseUrlOptions = Array.isArray(c.baseUrlOptions) ? c.baseUrlOptions : []
-      const baseUrlKnown = Boolean(c.baseUrl) && (c.baseUrl === SPONSOR_BASE || baseUrlOptions.some((o) => o.url === c.baseUrl))
-      const [showSponsor, setShowSponsor] = useState(false) // 「官方推荐地址」展开面板
-      // 「＋ 添加」弹窗：名字 + 地址
-      const [addOpen, setAddOpen] = useState(false)
-      const [addName, setAddName] = useState('')
-      const [addUrl, setAddUrl] = useState('')
-      const baseOptions = [
-        { value: SPONSOR_BASE, label: '官方推荐 · ntmd.cn · 0.04/张（赞助商）' },
-        ...baseUrlOptions.map((o) => ({ value: o.url, label: o.name, desc: o.url })),
-      ]
-      const pickBase = (v) => setDraft(setPath(draft, 'imageGen.baseUrl', v))
-      const saveAdd = () => {
-        const url = addUrl.trim()
-        const name = addName.trim()
-        if (!/^https?:\/\//.test(url)) { toast('地址要以 http(s):// 开头'); return }
-        if (url === SPONSOR_BASE) { toast('官方推荐地址已内置在下拉里'); setAddOpen(false); return }
-        if (baseUrlOptions.some((o) => o.url === url)) { toast('这个地址已经加过了'); setAddOpen(false); return }
-        let label = name
-        if (!label) { try { label = new URL(url).hostname } catch { label = url } }
-        setDraft({ ...draft, imageGen: { ...draft.imageGen, baseUrlOptions: [...baseUrlOptions, { name: label.slice(0, 60), url }], baseUrl: url } })
-        setAddOpen(false); setAddName(''); setAddUrl('')
-        toast('已添加并选为服务地址，记得保存')
+      const [sponsorHintClosed, setSponsorHintClosed] = useState(false)
+      const sponsorSelected = c.baseUrl === SPONSOR_BASE
+      const sponsorOptions = [{ value: SPONSOR_BASE, label: '国粹 · ntmd.cn · 0.04/张（官方推荐赞助商）' }]
+      const changeTab = (v) => {
+        setTab(v)
+        if (v === 'sponsor') {
+          setDraft(setPath(draft, 'imageGen.provider', 'openai'))
+          setSponsorHintClosed(false)
+        } else {
+          setDraft(setPath(draft, 'imageGen.provider', v))
+        }
       }
-      const delBaseUrl = (url) => setDraft({ ...draft, imageGen: { ...draft.imageGen, baseUrlOptions: baseUrlOptions.filter((o) => o.url !== url), baseUrl: c.baseUrl === url ? '' : c.baseUrl } })
-      const useSponsor = () => {
-        setDraft({ ...draft, imageGen: { ...draft.imageGen, provider: 'openai', baseUrl: SPONSOR_BASE } })
+      const pickSponsor = (v) => {
+        setDraft({ ...draft, imageGen: { ...draft.imageGen, provider: 'openai', baseUrl: v } })
+        setSponsorHintClosed(false)
         toast('已选官方推荐地址，记得保存')
       }
       return h('div', { className: 'ab-grid' },
         h(Card, { title: '让ta画图', right: f.sw('imageGen.enabled'), desc: '接上生图服务后，让ta「画一张……」就会画好发出来。可选 OpenAI 兼容接口、自定义接口，或登录 ChatGPT 使用实验性 Codex 订阅接法。本机 SD WebUI / ComfyUI 可在「本地接口」页接「生图」。也可以让ta照着最近发的图、引用消息里的图或自己的画作来改；服务不支持参考图时会明确告诉你。' },
           h(Row, { label: '接口格式', hint: '第二个适合 pollinations 这类「GET 一个地址就出图」的服务' },
             h(Seg, {
-              value: isCodex ? 'codex' : isCustom ? 'custom' : 'openai',
-              onChange: (v) => { if (v === 'sponsor') setShowSponsor((s) => !s); else { setShowSponsor(false); setDraft(setPath(draft, 'imageGen.provider', v)) } },
+              value: tab,
+              onChange: changeTab,
               options: [{ value: 'openai', label: 'OpenAI 格式' }, { value: 'custom', label: '自定义接口' }, { value: 'codex', label: 'Codex 订阅（实验性）' }, { value: 'sponsor', label: '官方推荐地址' }],
             })),
-          showSponsor ? h('div', { className: 'ab-note', style: { margin: '8px 0' } },
-            h('div', null, '国粹（官方推荐赞助商）：官网地址 ',
-              h('a', { href: SPONSOR_SITE, target: '_blank', rel: 'noreferrer' }, 'ntmd.cn'),
-              '，接口地址 ' + SPONSOR_BASE + ' —— 0.04/张 超快出图'),
-            h('div', { className: 'ab-flex', style: { marginTop: 6 } },
-              h(Btn, { small: true, onClick: useSponsor }, '使用这个地址'),
-              h(Btn, { small: true, kind: 'ghost', onClick: () => setShowSponsor(false) }, '收起'))) : null,
-          isCodex ? h(CodexSub, { draft, setDraft, toast }) : isCustom ? h('div', null,
+          tab === 'sponsor' ? h('div', null,
+            sponsorSelected && !sponsorHintClosed ? h('div', { className: 'ab-note', style: { marginBottom: 10 } },
+              h('div', null, '国粹（官方推荐赞助商）：官网地址 ',
+                h('a', { href: SPONSOR_SITE, target: '_blank', rel: 'noreferrer' }, 'ntmd.cn'),
+                '，接口地址 ' + SPONSOR_BASE + ' —— 0.04/张 超快出图'),
+              h('div', { className: 'ab-flex', style: { marginTop: 6 } },
+                h(Btn, { small: true, kind: 'ghost', onClick: () => setSponsorHintClosed(true) }, '收起'))) : null,
+            h(Row, { label: '服务地址', hint: '选择官方推荐赞助商地址；选中即设为当前服务地址' },
+              h(Select, { value: sponsorSelected ? SPONSOR_BASE : '', options: sponsorOptions, width: 320, ariaLabel: '赞助商服务地址', placeholder: '选择赞助商服务地址', onChange: pickSponsor })),
+            h(Row, { label: 'API Key', hint: '只存在本机，不会显示出来' }, f.text('imageGen.apiKey', { type: 'password', placeholder: c.apiKeySet ? '已保存（不改就留空）' : '没有就留空' })),
+            h(Row, { label: '模型' }, f.text('imageGen.model', { size: 'wide', placeholder: '例如 Kwai-Kolors/Kolors' })),
+          ) : isCodex ? h(CodexSub, { draft, setDraft, toast }) : isCustom ? h('div', null,
             h(Row, { label: '请求方式', hint: 'GET 把参数都拼在地址上；POST 放进请求体' },
               h(Seg, {
                 value: isPost ? 'POST' : 'GET',
@@ -7671,18 +8024,21 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             h(Row, { label: '取值路径', hint: '接口直接回图片就留空；回 JSON 时填地址字段' },
               f.text('imageGen.custom.responsePath', { size: 'wide', placeholder: '如 data.0.url（留空自动找）' })),
           ) : h('div', null,
-            h(Row, { label: '服务地址', hint: '官方推荐固定内置不可删；点「＋ 添加」弹窗加自己的常用地址，下拉切换使用' },
-              h('div', null,
-                h('div', { className: 'ab-flex' },
-                  h(Select, { value: baseUrlKnown ? c.baseUrl : '', options: baseOptions, width: 280, ariaLabel: '服务地址', placeholder: '选择服务地址', onChange: pickBase }),
-                  h(Btn, { small: true, title: '添加常用服务地址（名字 + 地址）', onClick: () => { setAddName(''); setAddUrl(''); setAddOpen(true) } }, '＋ 添加')),
-                baseUrlOptions.length ? h('div', { className: 'ab-flex', style: { gap: 6, marginTop: 6, flexWrap: 'wrap' } },
-                  baseUrlOptions.map((o) => h('span', { key: o.url, className: 'ab-small', title: o.url, style: { border: '1px solid rgba(127,127,127,.25)', borderRadius: 10, padding: '1px 8px' } },
-                    o.name + ' · ' + o.url,
-                    h('button', { type: 'button', className: 'ab-btn sm danger x', title: '从下拉里删掉这个地址', style: { marginLeft: 4 }, onClick: () => delBaseUrl(o.url) }, '✕')))) : null)),
+            h(Row, { label: '服务地址', hint: '一般以 /v1 结尾' }, f.text('imageGen.baseUrl', { size: 'wide', placeholder: 'https://api.siliconflow.cn/v1' })),
             h(Row, { label: 'API Key', hint: '只存在本机，不会显示出来' }, f.text('imageGen.apiKey', { type: 'password', placeholder: c.apiKeySet ? '已保存（不改就留空）' : '没有就留空' })),
             h(Row, { label: '模型' }, f.text('imageGen.model', { size: 'wide', placeholder: '例如 Kwai-Kolors/Kolors' })),
           ),
+          h('div', { className: 'ab-muted ab-small' }, '测试会实际生成图片，可能消耗额度；使用当前页面配置，不自动切换或发送到 QQ。'),
+          testButton(''),
+          h(Row, { label: '生图失败自动切换', hint: '连接失败或接口返回错误时按顺序尝试；备用服务会收到画图描述及参考图，图片下载失败不会重发' }, f.sw('imageGen.fallbackEnabled')),
+          h('div', { className: 'ab-label', style: { marginTop: 12 } }, h('b', null, '备用接口与模型（从上到下为优先级）')),
+          fallbacks.map((e, i) => h('div', { key: e.id, className: 'ab-note', style: { marginBottom: 8 } },
+            h('div', { className: 'ab-flex', style: { gap: 6, marginBottom: 6 } }, h('b', null, '备用 ' + (i + 1)), h(Btn, { small: true, disabled: i === 0, onClick: () => moveFallback(i, -1) }, '上移'), h(Btn, { small: true, disabled: i === fallbacks.length - 1, onClick: () => moveFallback(i, 1) }, '下移'), h(Btn, { small: true, onClick: () => setFallbacks(fallbacks.filter((_, j) => j !== i)) }, '删除')),
+            h(Row, { label: '接法' }, h(Seg, { value: e.provider || 'openai', onChange: value => setFallback(i, 'provider', value), options: [{ value: 'openai', label: 'OpenAI 格式' }, { value: 'codex', label: 'Codex 订阅' }] })),
+            e.provider !== 'codex' ? h(Row, { label: '服务地址' }, h('input', { className: 'ab-input', value: e.baseUrl || '', placeholder: 'https://example.com/v1', onChange: event => setFallback(i, 'baseUrl', event.target.value) })) : h('div', { className: 'ab-muted ab-small' }, '使用已登录的 ChatGPT 账号及订阅质量、背景设置。'),
+            e.provider !== 'codex' ? h(Row, { label: 'API Key' }, h('input', { className: 'ab-input', type: 'password', value: e.apiKey || '', placeholder: e.apiKeySet ? '已保存（不改就留空）' : '没有就留空', onChange: event => setFallback(i, 'apiKey', event.target.value) })) : null,
+            h(Row, { label: '模型' }, h('input', { className: 'ab-input', value: e.model || '', placeholder: '模型名称', onChange: event => setFallback(i, 'model', event.target.value) })), testButton(e.id))),
+          h(Btn, { small: true, onClick: () => setFallbacks([...fallbacks, { id: crypto.randomUUID(), provider: 'openai', baseUrl: '', apiKey: '', model: '' }]) }, '＋ 添加备用接口 / 模型'),
           h(Row, { label: '默认构图', hint: isCodex ? '通过构图提示引导，实际尺寸由服务端选择，不保证严格比例' : '聊天工具可指定本次构图。服务不支持所选尺寸时会报告失败，请换一种构图；自定义接口需使用尺寸占位符' },
             f.select('imageGen.shape', [
               { value: 'her', label: '让ta选择', desc: isCodex ? '未指定时由服务端选择' : '未指定时沿用图片尺寸' },
@@ -7692,31 +8048,15 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
               { value: 'wide', label: isCodex ? '宽幅 16:9' : '宽幅 16:9（1536 × 864）' },
             ], { width: 260 })),
           !isCodex && (!c.shape || c.shape === 'her') ? h(Row, { label: '图片尺寸', hint: isCustom ? '接口地址 / 参数里可以用 {size} 或 {width}/{height}' : '未指定构图时沿用这个尺寸' },
-            f.select('imageGen.size', [{ value: '1024x1024', label: '1024 × 1024', desc: '方图' }, { value: '768x1024', label: '768 × 1024', desc: '竖图' }, { value: '1024x768', label: '1024 × 768', desc: '横图' }, { value: '512x512', label: '512 × 512', desc: '小图，更快' }], { width: 200 })) : null,
+            f.select('imageGen.size', [{ value: '1024x1024', label: '1024 × 1024', desc: '方图' }, { value: '768x1024', label: '768 × 1024', desc: '竖图' }, { value: '1024x768', label: '1024 × 768', desc: '横图' }, { value: '512x512', label: '512 × 512', desc: '小图，更快' }, { value: '2048x2048', label: '2K · 2048 × 2048', desc: '2K 方图' }, { value: '4096x4096', label: '4K · 4096 × 4096', desc: '4K 方图' }], { width: 230 })) : null,
           h(Row, { label: '固定风格', hint: '每次画都会加在描述前面' }, f.text('imageGen.stylePrompt', { size: 'wide', placeholder: '例如：日系二次元，柔和光线，蓝白配色' })),
-          h(Row, { label: '只给主人画', hint: '关掉后群友也能让ta画（会花你的额度）' }, f.sw('imageGen.ownerOnly')),
+          h(Row, { label: '限制生图权限', hint: '开启时主人和权限页授权的私聊对象可以生图；关闭后允许白名单中的聊天使用。' }, f.sw('imageGen.ownerOnly')),
           h(Row, { label: '允许参考图改画', hint: '默认开启，只接受当前聊天收到的图、引用图或图库文件名；Codex 订阅暂不支持' }, f.sw('imageGen.img2img')),
           h(Row, { label: '让ta画完自己看一眼', hint: '开着才把画好的图传给ta看（模型不支持看图时自动不传）；关掉就只回一句「画好了」，不传图' }, f.sw('imageGen.seeOwn')),
           isCustom ? h('div', { className: 'ab-note', style: { marginTop: 10 } }, '例子：地址填 https://image.pollinations.ai/prompt/{prompt}，再加 model=flux-anime、width=1080、height=1920、nologo=true 四个参数，GET 就会请求 …/prompt/<提示词>?model=flux-anime&width=1080&…') : null,
           !c.enabled ? h('div', { className: 'ab-note', style: { marginTop: 10 } }, '还没开启。填好接口信息、打开右上角开关并保存后，ta就会多一个「画图」能力。') : null,
         ),
         h(PaintGallery, { draft, setDraft, toast }),
-        // 「＋ 添加服务地址」弹窗：名字 + 地址；点遮罩关闭，内容区阻止冒泡
-        addOpen ? h('div', { style: { position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(12,28,38,.45)', zIndex: 80, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24 }, onClick: () => setAddOpen(false) },
-          h('div', { style: { background: 'var(--ab-card)', border: '1px solid var(--ab-line)', borderRadius: 14, padding: '16px 18px', width: 420, maxWidth: '92%', boxShadow: 'var(--ab-shadow)' }, onClick: (e) => e.stopPropagation() },
-            h('div', { className: 'ab-flex', style: { marginBottom: 12 } },
-              h('b', null, '添加服务地址'),
-              h('div', { className: 'ab-spacer' }),
-              h('button', { type: 'button', className: 'ab-btn sm ghost', title: '关闭', onClick: () => setAddOpen(false) }, '✕')),
-            h('div', { style: { marginBottom: 10 } },
-              h('div', { className: 'ab-label' }, h('b', null, '名字'), h('small', null, '显示在下拉列表里；留空就用地址的域名')),
-              h('input', { className: 'ab-input', style: { width: '100%' }, value: addName, placeholder: '例如：硅基流动', onChange: (e) => setAddName(e.target.value) })),
-            h('div', { style: { marginBottom: 14 } },
-              h('div', { className: 'ab-label' }, h('b', null, '地址'), h('small', null, 'OpenAI 兼容接口，一般以 /v1 结尾')),
-              h('input', { className: 'ab-input', style: { width: '100%' }, value: addUrl, placeholder: 'https://api.siliconflow.cn/v1', onChange: (e) => setAddUrl(e.target.value) })),
-            h('div', { className: 'ab-flex', style: { justifyContent: 'flex-end', gap: 8 } },
-              h(Btn, { small: true, kind: 'ghost', onClick: () => setAddOpen(false) }, '取消'),
-              h(Btn, { small: true, onClick: saveAdd }, '添加并使用')))) : null,
       )
     }
 
@@ -8216,7 +8556,10 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         if (Number(r.startedAt)) pluginStartRef.current = Number(r.startedAt)
         setErr('')
         setSt(r)
-        if (!dirtyRef.current) setDraft(clone(r.config))
+        setDraft((current) => {
+          if (!dirtyRef.current || !current) return clone(r.config)
+          return { ...current, allow: r.config.allow, commandAllow: r.config.commandAllow, capabilityAllow: r.config.capabilityAllow }
+        })
         return r
       }, [])
       useEffect(() => {
@@ -8262,7 +8605,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       dirtyRef.current = dirty
       const setD = (d) => setDraft(d)
       const save = async (override) => {
-        const body = override || draft
+        const { allow, commandAllow, capabilityAllow, ...body } = override || draft
         const r = await post('/save', body)
         if (r.ok === false) { toast(r.message || '保存失败', 'err'); return false }
         dirtyRef.current = false
@@ -8320,9 +8663,19 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         : m.running === 'builtin' && Boolean(m.panel))
       // 写了 tab 的模块嵌进那个内置标签页；没写（或写的页不存在）的单独一页
       // 旧模块的 tab: 'persona' 原本嵌在「人格」，继续放回原页。
-      const tabOf = (m) => m.tab === 'persona' ? 'character' : m.tab
+      const tabOf = (m) => {
+        if (navGroupById(m.navGroup) || NAV_GROUPS.some((group) => group.tabs.includes('ext:' + m.id))) return ''
+        return m.tab === 'persona' ? 'character' : m.tab
+      }
       const intoTab = (m) => Boolean(tabOf(m) && TABS.some((t) => t.id === tabOf(m)))
-      const extTabs = mods.filter((m) => hasUi(m) && !intoTab(m)).map((m) => ({ id: 'ext:' + m.id, label: m.name, ext: m.id, flag: m.flag ? `ext.${m.id}.${m.flag}` : '', flagDefault: getPath(m.defaults || {}, m.flag || '') }))
+      const extTabs = mods.filter((m) => hasUi(m) && !intoTab(m)).map((m) => ({
+        id: 'ext:' + m.id,
+        label: m.name,
+        ext: m.id,
+        navGroup: m.navGroup,
+        flag: m.flag ? `ext.${m.id}.${m.flag}` : '',
+        flagDefault: getPath(m.defaults || {}, m.flag || ''),
+      }))
       const tabs = TABS.filter((t) => !TAB_MODS[t.id] || TAB_MODS[t.id].some(running))
       tabs.splice(tabs.findIndex((t) => t.id === 'logs'), 0, ...extTabs)
       const curTab = tabs.find((t) => t.id === tab) || tabs[0]
@@ -8331,7 +8684,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         stickers: Stickers, imagegen: ImageGen, diary: Diary, speakup: SpeakUp, autotelic: Autotelic, pet: PetPanel, mood: Mood, memory: MemoryPage, persona: PersonaMemory, song: Song, bili: Bili, douyin: Douyin, heybox: Heybox, local: LocalApi, browser: Browser, security: Security, market: Market, modules: Modules, logs: Logs, about: About, backup: Backup,
       }[curTab.id] || Overview
       // 哪些标签有没保存的改动
-      const TAB_KEYS = { connect: ['snowluma', 'botQQ'], access: ['ownerQQ', 'ownerName', 'ownerLevel', 'approvalNotify', 'approvalViaQQ', 'qqApi', 'longTasks', 'profilePerms', 'allow'], group: ['group', 'merge', 'titleFilter', 'chat'], model: ['model', 'chatModels'], voice: ['voice'], asr: ['voice'], stickers: ['stickers'], imagegen: ['imageGen'], diary: ['diary', 'qzoneSocial'], speakup: ['speakUp'], autotelic: [], pet: [], mood: ['mood', 'memory'], song: ['song'], bili: ['bili'], douyin: ['douyin'], heybox: ['heybox'], local: ['local'], browser: ['browser'], security: ['security', 'update'] }
+      const TAB_KEYS = { connect: ['snowluma', 'botQQ'], access: ['ownerQQ', 'ownerName', 'ownerLevel', 'approvalNotify', 'approvalViaQQ', 'qqApi', 'longTasks', 'profilePerms', 'subagentBackground'], group: ['group', 'merge', 'titleFilter', 'chat'], model: ['model', 'chatModels'], voice: ['voice'], asr: ['voice'], stickers: ['stickers'], imagegen: ['imageGen'], diary: ['diary', 'qzoneSocial'], speakup: ['speakUp'], autotelic: [], pet: [], mood: ['mood', 'memory'], song: ['song'], bili: ['bili'], douyin: ['douyin'], heybox: ['heybox'], local: ['local'], browser: ['browser'], security: ['security', 'update'] }
       const tabDirty = (id) => {
         if (!dirty) return false
         if (id.startsWith('ext:')) { const k = id.slice(4); return JSON.stringify((draft.ext || {})[k]) !== JSON.stringify((cfg.ext || {})[k]) }

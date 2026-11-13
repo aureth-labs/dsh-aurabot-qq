@@ -10,6 +10,7 @@
 // 另外顺手把模型偶尔漏出来的 Markdown 洗掉——QQ 不渲染 Markdown。
 
 import { contextInjectionRanges, currentPromptSources, promptFingerprint, promptTextRanges } from '../security/leak-guard.js'
+import { stripMarkers } from './reply-marker.js'
 import { stripHtmlFragments } from './html-fragments.js'
 
 export const SILENCE = '[沉默]'
@@ -206,7 +207,40 @@ function rangeExempt (range, { explain, code, ownerPrivate, raw }) {
   }
   if (range.kind === 'json') return inCode ? (explain || (ownerPrivate && !fenceOnly)) : (explain && ownerPrivate)
   if (range.kind === 'generic') return inCode && (explain || ownerPrivate)
+  if (range.kind === 'thinking') return inCode
   return false
+}
+
+
+/** 无标记思考的保守清洗：只删明确的思考标签/括号段、带元信息的标签行，以及「最终回答」前的推理开场。 */
+function thinkingTextRanges (raw) {
+  const found = []
+  const add = (start, end) => { if (end > start) found.push({ start, end, kind: 'thinking', paired: true }) }
+
+  // 【思考】…【/思考】、[analysis]…[/analysis] 这类显式块
+  for (const m of raw.matchAll(/(?:【|\[)\s*(?:思考|分析|推理|内心|思路|thinking|analysis|reasoning)\s*(?:】|\])[\s\S]*?(?:【|\[)\s*\/\s*(?:思考|分析|推理|内心|思路|thinking|analysis|reasoning)\s*(?:】|\])/gi)) add(m.index, m.index + m[0].length)
+
+  // （思考：…）/（分析：…）这类括号内心段
+  for (const m of raw.matchAll(/[（(]\s*(?:思考|分析|推理|内心活动)\s*[：:][\s\S]{0,2000}?[）)]/g)) add(m.index, m.index + m[0].length)
+
+  // 单独成行的「思考过程：/分析：…」；只在带元信息时删，避免误伤正常回答里的“分析：这个方案…”
+  for (const m of raw.matchAll(/(^|\n)([ \t]*(?:\*\*)?(?:思考过程|分析过程|推理过程|思考|分析|推理|内心活动|内心|思路|回复策略|回答策略|意图分析|用户意图)\s*[：:][^\n]*)(?=\n|$)/g)) {
+    const line = m[2]
+    if (/(?:用户|对方|她|他|我|需要|先|然后|回复|回答|意图|情绪|场景|判断|想)/.test(line)) add(m.index + m[1].length, m.index + m[0].length)
+  }
+
+  // 结构化推理开场 + 「最终回答：」：只保留最终回答，前面有明确元信息才触发
+  const final = /(?:^|\n)[ \t]*(?:最终回答|最终回复|最终答复|回复用户|答复)\s*[：:][ \t]*/i.exec(raw)
+  if (final && final.index > 0) {
+    const prefix = raw.slice(0, final.index)
+    if (/(?:用户|对方|提问者|需要|让我|首先|接下来|分析|判断|回复|回答)/.test(prefix)) add(0, final.index + final[0].length)
+  }
+
+  // 「用户说…」+ 空行 + 正文：把纯推理开场段落去掉
+  const meta = /^\s*(?:用户|对方|提问者)(?:说|问|想|希望|要求)[\s\S]{0,300}?(?:。|！|？)\s*\n\s*\n/.exec(raw)
+  if (meta) add(0, meta[0].length)
+
+  return found
 }
 
 /** 成对调用连同参数一起去掉；孤立开/闭标签、缺少 > 的尾片只去标记，保留旁边的正常话。 */
@@ -276,6 +310,8 @@ function toolTextRanges (raw, { ownerPrivate = false } = {}) {
     if (toolTag(match[0])) continue // 已知协议标签已单独处理，这里只补通用下划线形式
     found.push({ start: match.index, end: match.index + match[0].length, kind: 'generic', paired: false })
   }
+
+  found.push(...thinkingTextRanges(raw))
 
   // 5) 解释/示例语境豁免
   const explain = EXPLAIN_CONTEXT.test(raw)
@@ -364,7 +400,9 @@ export function cleanOutboundText(text, { warn, promptSources, fingerprint, user
     clean = ''
   }
   onRanges?.(ranges)
-  return clean
+  // 出站统一兜底：正文标记本身不能发出去。turn/end 已经解析过标记，
+  // 但空间说说、B 站评论、命令回复这些不走 turn/end 的出口也要剥一次（没有标记时原样返回）。
+  return stripMarkers(clean)
 }
 
 /** 最终平台出口：合并检查整条消息的文字段，避免调用被拆段绕过；引用、@ 和媒体段原样保留。 */
@@ -389,8 +427,11 @@ export function cleanOutboundSegments(message, options) {
 
 /** 解析一轮回复；在拆气泡/语音前清洗，避免协议里的竖线被误作气泡分隔符。 */
 export function parseReply(text, options) {
+  // 模型偶尔把「戳人」写成方括号动作（[戳了戳你：尾巴往回一收]），插件不认这种写法，
+  // 会原样当文字发出去。这里统一转成 <poke>，让戳一戳变成真的系统动作。
+  const forwarded = String(text || '').replace(/[[【]\s*戳了戳(?:你|他|她)?[^\]】]*[\]】]/g, '<poke>')
   // 模型偶尔把换行写成 HTML `<br>`：当真正的换行处理；代码示例里的字面量保留。
-  const cleaned = stripModelArtifacts(cleanOutboundText(text, options))
+  const cleaned = stripModelArtifacts(cleanOutboundText(forwarded, options))
   const code = codeRanges(cleaned)
   const raw = cleaned.replace(/<br\s*\/?>/gi, (tag, offset) => insideCode(code, offset, offset + tag.length) ? tag : '\n').trim()
   if (isSilence(raw)) return { silent: true, items: [] }

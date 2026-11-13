@@ -73,7 +73,7 @@ test('回复解析：只认短命令，正常聊天和超长句不碰', () => {
 
 test('攒待批：问主人一次，编号从 1 开始；同一条视频不重复问', async () => {
   fresh()
-  const { gs, sent } = setup()
+  const { gs, sent } = setup({ over: { queueLimit: 5 } })
   const r = await gs.submit([{ bvid: 'BV1aaaaaaa1', title: '米饭大赛', text: '群友快看这个' }])
   assert.deepEqual(r, { ok: true, n: 1 })
   assert.equal(sent.length, 1)
@@ -121,7 +121,7 @@ test('回执模型没话说：退回模板，主人照样知道发了没有', as
 
 test('回「发 2」：只发那一条、带链接、给主人回执、当天计数 +1', async () => {
   fresh()
-  const { gs, sent } = setup()
+  const { gs, sent } = setup({ over: { queueLimit: 5 } })
   await gs.submit([
     { bvid: 'BV1aaaaaaa1', title: '米饭大赛', text: '群友快看' },
     { bvid: 'BV1bbbbbbb2', title: '猫猫做饭', text: '猫猫好会' },
@@ -159,7 +159,7 @@ test('「不发 1」丢掉那一条，一条也不发群', async () => {
 
 test('「发全部」碰到每日上限就停，剩下的还留着待批', async () => {
   fresh()
-  const { gs, sent } = setup({ over: { dailyLimit: 1 } })
+  const { gs, sent } = setup({ over: { dailyLimit: 1, queueLimit: 5 } })
   await gs.submit([
     { bvid: 'BV1aaaaaaa1', title: 'A', text: 'a' },
     { bvid: 'BV1bbbbbbb2', title: 'B', text: 'b' },
@@ -182,7 +182,7 @@ test('裸「发」：不管几条待批都只发第一条，不刷屏', async ()
   assert.equal(one.sent.filter((x) => x.chatId === `group:${GROUP}`).length, 1)
 
   fresh()
-  const two = setup()
+  const two = setup({ over: { queueLimit: 5 } })
   await two.gs.submit([
     { bvid: 'BV1aaaaaaa1', title: 'A', text: 'a' },
     { bvid: 'BV1bbbbbbb2', title: 'B', text: 'b' },
@@ -198,7 +198,7 @@ test('裸「发」：不管几条待批都只发第一条，不刷屏', async ()
 
 test('说「都发」才把剩下的都发出去', async () => {
   fresh()
-  const { gs, sent } = setup()
+  const { gs, sent } = setup({ over: { queueLimit: 5 } })
   await gs.submit([
     { bvid: 'BV1aaaaaaa1', title: 'A', text: 'a' },
     { bvid: 'BV1bbbbbbb2', title: 'B', text: 'b' },
@@ -211,7 +211,7 @@ test('说「都发」才把剩下的都发出去', async () => {
 
 test('模型没点名发哪条：也只发第一条', async () => {
   fresh()
-  const { gs, sent } = setup({ understand: '{"action":"send","items":[],"groups":[]}' })
+  const { gs, sent } = setup({ over: { queueLimit: 5 }, understand: '{"action":"send","items":[],"groups":[]}' })
   await gs.submit([
     { bvid: 'BV1aaaaaaa1', title: 'A', text: 'a' },
     { bvid: 'BV1bbbbbbb2', title: 'B', text: 'b' },
@@ -423,7 +423,7 @@ test('审批消息发不出去（网关断线 / 试运行模拟）：这批直�
 
 test('问完之后有条目过期：编号跟着当时的快照走，不会拿新条目顶上去', async () => {
   fresh()
-  const { gs, sent } = setup({ over: { pendingTtlHours: 1 } })
+  const { gs, sent } = setup({ over: { pendingTtlHours: 1, queueLimit: 5 } })
   await gs.submit([
     { bvid: 'BV1aaaaaaa1', title: 'A', text: 'a' },
     { bvid: 'BV1bbbbbbb2', title: 'B', text: 'b' },
@@ -447,7 +447,7 @@ test('问完之后有条目过期：编号跟着当时的快照走，不会拿�
 
 test('主人连发两次「发 1」：只发一条，额度只扣一次', async () => {
   fresh()
-  const { gs, sent } = setup()
+  const { gs, sent } = setup({ over: { queueLimit: 5 } })
   await gs.submit([
     { bvid: 'BV1aaaaaaa1', title: 'A', text: 'a' },
     { bvid: 'BV1bbbbbbb2', title: 'B', text: 'b' },
@@ -463,7 +463,7 @@ test('主人连发两次「发 1」：只发一条，额度只扣一次', async 
 
 test('发全部碰到额度：回执说清楚还剩几条（不是只说 1 条）', async () => {
   fresh()
-  const { gs, sent } = setup({ over: { dailyLimit: 1 } })
+  const { gs, sent } = setup({ over: { dailyLimit: 1, queueLimit: 5 } })
   await gs.submit([
     { bvid: 'BV1aaaaaaa1', title: 'A', text: 'a' },
     { bvid: 'BV1bbbbbbb2', title: 'B', text: 'b' },
@@ -475,6 +475,60 @@ test('发全部碰到额度：回执说清楚还剩几条（不是只说 1 条�
   assert.equal(sent.filter((x) => x.chatId.startsWith('group:')).length, 1)
   assert.match(sent.at(-1).text, /还有 2 条没发/)
   assert.equal(gs.pending().length, 2, '没发出去的还在待批里')
+})
+
+test('默认一次只攒一条：同批里多出来的当场不攒，主人回完才轮到下一条', async () => {
+  fresh()
+  const { gs } = setup()
+  const r = await gs.submit([
+    { bvid: 'BV1aaaaaaa1', title: 'A', text: 'a' },
+    { bvid: 'BV1bbbbbbb2', title: 'B', text: 'b' },
+    { bvid: 'BV1ccccccc3', title: 'C', text: 'c' },
+  ])
+  assert.deepEqual(r, { ok: true, n: 1 }, '默认 queueLimit=1：一次只攒一条')
+  assert.equal(gs.pending().length, 1)
+  const again = await gs.submit([{ bvid: 'BV1bbbbbbb2', title: 'B', text: 'b' }])
+  assert.equal(again.ok, false)
+  assert.match(again.why, /待批的还没回/)
+})
+
+test('中间那条过期：后面的编号不往前挪，「发 2」不会改成发第 3 条', async () => {
+  fresh()
+  const { gs, sent } = setup({ over: { pendingTtlHours: 1, queueLimit: 5 } })
+  await gs.submit([
+    { bvid: 'BV1aaaaaaa1', title: 'A', text: 'a' },
+    { bvid: 'BV1bbbbbbb2', title: 'B', text: 'b' },
+    { bvid: 'BV1ccccccc3', title: 'C', text: 'c' },
+  ])
+  const s = store.readJson(file(), null)
+  s.items.find((x) => x.title === 'B').at = Date.now() - 2 * 3600_000
+  store.writeJson(file(), s)
+  sent.length = 0
+  // 问的是 1.A 2.B 3.C，B 过期后 2 号格子必须还空着
+  assert.equal(await gs.handleReply(`private:${OWNER}`, OWNER, '发 2'), true)
+  await tick()
+  assert.equal(sent.filter((x) => x.chatId.startsWith('group:')).length, 0, '2 号过期了就不能拿 3 号顶')
+  assert.match(sent.at(-1).text, /第 2 条已经不在了/)
+  assert.equal(await gs.handleReply(`private:${OWNER}`, OWNER, '发 3'), true)
+  await tick()
+  const toGroup = sent.filter((x) => x.chatId.startsWith('group:'))
+  assert.equal(toGroup.length, 1)
+  assert.match(toGroup[0].text, /BV1ccccccc3/, '3 号还是 C')
+})
+
+test('问过的那批全过期了：回「发」不拿之后新攒的顶替', async () => {
+  fresh()
+  const { gs, sent } = setup({ over: { pendingTtlHours: 1, queueLimit: 5 } })
+  await gs.submit([{ bvid: 'BV1aaaaaaa1', title: 'A', text: 'a' }])
+  // A 问过之后过期了，紧接着又攒进来一条 B（还没问过他）
+  const s = store.readJson(file(), null)
+  s.items[0].at = Date.now() - 2 * 3600_000
+  s.items.push({ id: s.nextId++, at: Date.now(), bvid: 'BV1bbbbbbb2', title: 'B', text: 'b', shotIds: [], groupId: GROUP, state: 'pending', decidedAt: 0 })
+  store.writeJson(file(), s)
+  sent.length = 0
+  assert.equal(await gs.handleReply(`private:${OWNER}`, OWNER, '发'), false, '问过的那条没了就不发，别拿没问过的顶')
+  await tick()
+  assert.equal(sent.length, 0)
 })
 
 test('同一批里同一条视频只攒一次', async () => {

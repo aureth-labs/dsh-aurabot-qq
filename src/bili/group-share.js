@@ -316,7 +316,10 @@ export function createGroupShare({ getConfig, hub, log = console, think: thinkIn
     if (!think) return null
     const names = []
     for (const gid of allowedGroups()) names.push(`${await nameOf(gid)}（${gid}）`)
-    const lines = list.map((it, i) => `${i + 1}.《${clip(it.title, 40)}》——点评：${clip(it.text, 80)}`)
+    // 编号必须跟问话时一一对应：过期那格留成空行，别让它后面的编号整体前移
+    const lines = list.map((it, i) => (it
+      ? `${i + 1}.《${clip(it.title, 40)}》——点评：${clip(it.text, 80)}`
+      : `${i + 1}.（这条已经过期或处理过了）`))
     const prompt = [
       '【读懂主人对「这批 B 站视频能不能发群」的回复】',
       `主人刚说：「${clip(text, 200)}」`,
@@ -340,10 +343,21 @@ export function createGroupShare({ getConfig, hub, log = console, think: thinkIn
     if (!g.ownerQQ || chatId !== ownerChat() || String(userId) !== String(g.ownerQQ)) return false
     const s = load()
     if (expireIn(s)) save(s) // 网关断线时 tick 可能很久没跑，回话前先清一次，别把过期的发出去
-    const list = pendingOf(s)
-    if (!list.length) return false
     const askedIds = Array.isArray(s.lastAsked?.ids) ? s.lastAsked.ids : null
-    const byNumber = (n) => (askedIds ? askedIds[n - 1] : list[n - 1]?.id)
+    // 他回的一定是「我刚问他的那一批」，而且编号要钉在问话时的位置上：
+    // 过期那格留空、后面的绝不往前挪。否则问了 5 条、中间过期 1 条，
+    // 他回「发 3」发出去的就是原来第 4 条 —— 还是「问的是这条、发的是另一条」。
+    const slots = askedIds
+      ? askedIds.map((id) => {
+          const it = s.items.find((x) => x.id === id)
+          return it && it.state === 'pending' ? it : null
+        })
+      : pendingOf(s)
+    // 问过话就只认问过的那批：全过期了也不拿新攒的顶替
+    const list = slots.filter(Boolean)
+    if (!list.length) return false
+    // 编号 → id 一律按 slots 的格子取；空格子代表那条已经不在了，不拿别的顶
+    const byNumber = (n) => slots[n - 1]?.id
 
     // 规则快判：口令仍认，秒回
     const d = parseDecision(text)
@@ -368,7 +382,7 @@ export function createGroupShare({ getConfig, hub, log = console, think: thinkIn
     }
 
     // 听不懂口令就交给模型：理解成「发哪些、发哪个群」
-    const plan = await understand(text, list)
+    const plan = await understand(text, slots)
     if (!plan || plan.action === 'none') return false
     // 模型没点名就发第一条：默认一次只挑一条，别刷屏
     const ids = (plan.items.length ? plan.items.map(byNumber) : [list[0].id]).filter((id) => list.some((x) => x.id === id))

@@ -82,12 +82,12 @@ test('服务拒绝尺寸时透传错误，不静默重试成另一种构图', as
 })
 
 test('qq_draw_image 的构图可选，传到生成器；原主人权限在取图前复查', async () => {
-  let build, owner = true
+  let build, context, owner = true
   const seen = [], c = config()
   imagegenModule.setup({
-    config: () => c, log, dsh: {}, lazy: () => ({}), route() {}, tool: (fn) => { build = fn },
+    config: () => c, log, dsh: {}, lazy: () => ({}), route() {}, tool: (fn) => { build = fn }, context: (fn) => { context = fn },
     core: { local: { active: () => true, call: async (_kind, args) => { seen.push(args); return PNG } },
-      hub: { turnSendersAllOwner: () => owner, sendSegments: async () => ({ message_id: 1 }), canSeeImages: async () => false } },
+      hub: { turnSendersAllOwner: () => owner, sendText: async () => ({ message_id: 1 }), sendSegments: async () => ({ message_id: 1 }), canSeeImages: async () => false } },
   })
   const tool = build({ chat: { kind: 'private', chatId: 'private:10001', userId: '10001' }, sessionId: 'shape-test' })
   assert.ok(!tool.parameters.required.includes('shape'))
@@ -97,4 +97,42 @@ test('qq_draw_image 的构图可选，传到生成器；原主人权限在取图
   owner = false
   assert.equal((await tool.execute({ prompt: '猫', shape: 'wide' })).ok, false)
   assert.equal(seen.length, 1)
+  c.allow.private = ['10001']
+  c.capabilityAllow.image = ['10001']
+  assert.match(context({ chat: { kind: 'private', userId: '10001' } }), /已经获得主人的画图授权/)
+  assert.equal((await tool.execute({ prompt: '猫', shape: 'wide' })).ok, true)
+  assert.equal(seen[1].size, '1536x864')
+  c.capabilityAllow.image = []
+  assert.equal(context({ chat: { kind: 'private', userId: '10001' } }), '')
+  assert.equal((await tool.execute({ prompt: '猫' })).ok, false)
+})
+
+test('显式 size 支持 2K/4K，并优先于 shape / 面板默认', async (t) => {
+  const seen = [], c = config()
+  t.mock.method(globalThis, 'fetch', async (_url, init) => {
+    seen.push(JSON.parse(init.body))
+    return new Response(JSON.stringify({ data: [{ b64_json: PNG.toString('base64') }] }))
+  })
+  const gen = createImageGen({ getConfig: () => c, log })
+  await gen.generate('猫', { shape: 'portrait', size: '2048x2048' })
+  assert.equal(seen.at(-1).size, '2048x2048')
+  await gen.generate('猫', { size: '4096x4096' })
+  assert.equal(seen.at(-1).size, '4096x4096')
+  await gen.generate('猫', { shape: 'landscape' })
+  assert.equal(seen.at(-1).size, '1536x1024')
+})
+
+test('qq_draw_image 的 size 参数暴露 2K/4K，传给生成器', async () => {
+  let build
+  const seen = [], c = config()
+  imagegenModule.setup({
+    config: () => c, log, dsh: {}, lazy: () => ({}), route() {}, tool: (fn) => { build = fn },
+    core: { local: { active: () => true, call: async (_kind, args) => { seen.push(args); return PNG } },
+      hub: { turnSendersAllOwner: () => true, sendText: async () => true, sendSegments: async () => ({ message_id: 1 }), canSeeImages: async () => false } },
+  })
+  const tool = build({ chat: { kind: 'private', chatId: 'private:10001', userId: '10001' }, sessionId: 'size-test' })
+  assert.ok(tool.parameters.properties.size.enum.includes('2048x2048'))
+  assert.ok(tool.parameters.properties.size.enum.includes('4096x4096'))
+  assert.equal((await tool.execute({ prompt: '猫', size: '4096x4096' })).ok, true)
+  assert.equal(seen.at(-1).size, '4096x4096')
 })

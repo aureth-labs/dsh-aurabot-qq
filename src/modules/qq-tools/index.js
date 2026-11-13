@@ -113,7 +113,10 @@ export default {
           const r = groupId
             ? await onebot.call('get_group_msg_history', { group_id: Number(groupId), ...page }, { timeoutMs: 15000 })
             : await onebot.call('get_friend_msg_history', { user_id: Number(chat.userId), ...page }, { timeoutMs: 15000 })
-          const msgs = (r?.messages || []).filter((m) => !anchor || String(m.message_id) !== String(Number(anchor))).slice(-n)
+          const history = Array.isArray(r) ? r : (r?.messages || [])
+          const historyChatId = groupId ? 'group:' + groupId : 'private:' + chat.userId
+          const visible = hub.filterHistory?.(historyChatId, history) ?? history
+          const msgs = visible.filter((m) => !anchor || String(m.message_id) !== String(Number(anchor))).slice(-n)
           if (!msgs.length) return { ok: true, message: '没翻到聊天记录' }
           const self = String(api.config().botQQ)
           const lines = msgs.map((m) => {

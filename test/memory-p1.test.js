@@ -449,3 +449,27 @@ test('跨会话感知默认关', (t) => {
   assert.equal(s.make().recallHint(privateChat(OWNER), '今天怎么样').includes('冷清群'), false)
 })
 
+test('清理前的流水不占提炼预算，当天仍可从新私聊生成事实和相处经验', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-11-12T14:00:00') })
+  const chatId = `private:${A}`
+  const resetAt = Date.now() - 5 * 60_000
+  const s = setup(t, ({ system }) => system.includes('整理长期记忆')
+    ? JSON.stringify([{ text: '小明最近在学习水彩', about_qq: A, speaker: A, importance: 0.7 }])
+    : '{"insights":["可以问问他最近画了什么"],"style":[]}',
+  { memory: { extractIdleMinutes: 1, extractMinLines: 2, extractDailyBatches: 1, gistEnabled: false, shortTerm: false } })
+  s.cfg.memory.consolidateTimes = []
+  s.hub.memoryResetAt = (qq) => qq === A ? resetAt : 0
+  s.putState({ items: [], reflectedAt: { [chatId]: resetAt - 1000 } })
+  const forgotten = (id, qq) => ({ ...row(id, qq, '不应再进入模型的旧内容', resetAt - 2000), forgottenAt: resetAt })
+  s.logs.set(dayKey(), [forgotten(`private:${B}`, B), forgotten(chatId, A), row(chatId, A, '我最近在学习水彩', resetAt + 1000)])
+  const mem = s.make()
+  await mem.tick()
+  assert.equal(extractCalls(s).length, 0, '清理前的行不算新聊天条数')
+  assert.equal((await mem.consolidate({ includeToday: true })).ok, true)
+  assert.equal(s.state().extractBatches.count, 1, '只有含新消息的批次占预算')
+  assert.equal(extractCalls(s).length, 1)
+  assert.match(extractCalls(s)[0].text, /学习水彩/)
+  assert.doesNotMatch(extractCalls(s)[0].text, /旧内容/)
+  assert.equal(mem.list('').find((item) => item.about === A)?.text, '小明最近在学习水彩')
+  assert.equal(reflectCalls(s).length, 1, '清理前当天整理过也可以重新写经验')
+})

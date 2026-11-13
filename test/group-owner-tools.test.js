@@ -86,7 +86,7 @@ test('接线契约：preset、人格变量、闸门、面板开关都在', () =>
   assert.ok(hub.includes('known global tools?\\s*[:：]'), '探测正则要匹配宿主原文格式')
   assert.ok(hub.includes("return null"), '问不出工具名时要能降级')
   assert.ok(!hub.includes('GROUP_TOOL_DENY'), 'deny 名单已废弃，别再引回来')
-  const safeLine = /GROUP_GUEST_SAFE = \[([\s\S]*?)\]\n/.exec(hub)
+  const safeLine = /GROUP_GUEST_SAFE = \[([\s\S]*?)\]\r?\n/.exec(hub)
   assert.ok(safeLine, '没找到 GROUP_GUEST_SAFE 定义')
   const patterns = [...safeLine[1].matchAll(/\/((?:\\.|[^/\\])+)\//g)].map((m) => new RegExp(m[1]))
   assert.ok(patterns.length >= 5, '白名单正则没解析出来')

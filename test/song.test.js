@@ -244,3 +244,26 @@ test('检查更新：Release Atom 连不上就走 GitHub API', async () => {
   assert.equal(r.newer, true)
   assert.ok(seen[1].includes('api.github.com'))
 })
+
+test('翻唱失败那句话：让她自己说，提示词带上歌名和真实原因、明说别念内部信息', async () => {
+  const { failPrompt } = await import('../src/modules/song/index.js')
+  const p = failPrompt('雨爱', '翻唱环境不完整，在面板里点「重新检查」')
+  assert.ok(p.includes('《雨爱》'))
+  assert.ok(p.includes('翻唱环境不完整'))
+  assert.ok(p.includes('不要念出来'))
+  assert.ok(p.includes('[沉默]'))
+})
+
+test('翻唱失败那句话：清洗只留一句口语，[沉默] 和念了内部信息的都当没说话', async () => {
+  const { cleanFailLine } = await import('../src/modules/song/index.js')
+  assert.equal(cleanFailLine('  「这次嗓子有点哑，等我润润再来～」\n后面还有废话'), '这次嗓子有点哑，等我润润再来～')
+  assert.equal(cleanFailLine('大肥鱼：刚没唱成，回头再试试？'), '刚没唱成，回头再试试？')
+  assert.equal(cleanFailLine('**好，我记下了。**'), '好，我记下了。')
+  assert.equal(cleanFailLine('[沉默]'), '')
+  assert.equal(cleanFailLine('（沉默）'), '')
+  assert.equal(cleanFailLine('   '), '')
+  // 念了报错 / 路径 / 额度就不发这句，交给兜底
+  assert.equal(cleanFailLine('下载失败：Error: ENOENT /root/x.mp3，额度不够'), '')
+  // 太长截到第一个句末
+  assert.equal(cleanFailLine('今天嗓子不太行呀，这个调太高了，我唱不上去，等我想想办法再录一次好不好。要是还不行，我回头自己练两天，练好了再给你唱一遍试试'), '今天嗓子不太行呀，这个调太高了，我唱不上去，等我想想办法再录一次好不好。')
+})

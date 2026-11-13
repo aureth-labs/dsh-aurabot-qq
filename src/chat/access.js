@@ -64,6 +64,14 @@ export function isOwner(cfg, userId) {
   return String(userId || '') !== '' && String(userId) === String(cfg.ownerQQ || '')
 }
 
+/** 授权名单只作用于已获准聊天的私聊对象。 */
+export function privateCapabilityAllowed(cfg, chat, capability) {
+  if (chat?.kind !== 'private') return false
+  const userId = String(chat.userId || '')
+  if (!userId || !(cfg.allow?.private || []).map(String).includes(userId)) return false
+  return (cfg.capabilityAllow?.[capability] || []).map(String).includes(userId)
+}
+
 /** 改资料类操作（改昵称 / 签名 / 头像、改 B 站签名），以及处理好友申请、改白名单的三档权限。 */
 export const PROFILE_PERM_LEVELS = ['off', 'owner', 'all']
 export const DOUYIN_PERM_KEYS = ['douyinBrowse', 'douyinLike', 'douyinComment', 'douyinShareOwner', 'douyinDm']

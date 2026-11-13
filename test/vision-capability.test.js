@@ -104,7 +104,9 @@ test('模型不支持看图：图片换成一行文字提示，这一轮照常�
   const t = fake.turns.at(-1)
   assert.ok(t, '应该跑了一轮')
   assert.equal(t.images, 0, '不该把图片塞给不支持看图的模型')
-  assert.match(String(t.ctxText || t.userText || ''), /看不了图|图片/, '要有文字提示: ' + (t.ctxText || t.userText))
+  // 上下文和用户消息都要看：系统提示里另有注入内容时，不能用 || 短路掉用户消息。
+  const prompt = String(t.ctxText || '') + '\n' + String(t.userText || '')
+  assert.match(prompt, /看不了图|图片/, '要有文字提示: ' + prompt)
 })
 
 test('模型支持看图：图片照常交给她', async () => {

@@ -53,6 +53,9 @@ export function createRecentMedia({ file = dataDir('recent-media.json'), log } =
       if (prune(Date.now())) save()
       return (chats.get(String(chatId)) || []).filter((item) => !userId || item.userId === String(userId))
     },
+    clear(chatId) {
+      if (chats.delete(String(chatId))) save()
+    },
     dispose() {
       disposed = true
       chats.clear()

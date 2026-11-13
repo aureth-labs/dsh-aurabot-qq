@@ -2,6 +2,7 @@
 // 生视频要十几分钟，不能让这一轮一直等：工具马上返回，后台做完再发。
 
 import { pathToFileURL } from 'node:url'
+import { privateCapabilityAllowed } from '../../chat/access.js'
 import { defineTool, str } from '../../tools/tools.js'
 
 /** 脚本的返回值统一成文件路径：字符串或 { file }。 */
@@ -17,6 +18,10 @@ export default {
     let running = false
     let stopped = false
     api.onDispose?.(() => { stopped = true })
+    api.context?.(({ chat }) => {
+      if (!local.active('video') || !privateCapabilityAllowed(api.config(), chat, 'video')) return ''
+      return '当前私聊对象已经获得主人的视频生成授权。对方请求生成视频时可以使用 qq_generate_video，以当前授权为准。'
+    })
 
     async function deliver(chatId, file) {
       try {
@@ -42,16 +47,16 @@ export default {
     }
 
     api.rule(() => (local.active('video')
-      ? ['- 你能用 qq_generate_video 生成视频，只有主人让你做时才用。生成很慢，通常要十几分钟，开始前先告诉对方要等多久；做好会自动发出来，不用再发一次。']
+      ? ['- 你能用 qq_generate_video 生成视频，主人和已授权的私聊对象可以使用。生成很慢，通常要十几分钟，开始前先告诉对方要等多久；做好会自动发出来，不用再发一次。']
       : []))
 
     api.tool(({ chat, sessionId }) => (local.active('video') && chat.kind !== 'system' ? defineTool({
       name: 'qq_generate_video',
-      description: '生成一段视频，做好后自动发到当前聊天。很慢，通常要十几分钟，开始前先告诉对方要等。只有主人让你做时才用。',
+      description: '生成一段视频，做好后自动发到当前聊天。很慢，通常要十几分钟，开始前先告诉对方要等。主人和已授权的私聊对象可以使用。',
       properties: { prompt: str('视频内容描述'), seconds: str('可选：时长（秒）') },
       required: ['prompt'],
       execute: async ({ prompt, seconds }) => {
-        if (!hub.turnSendersAllOwner(sessionId)) return { ok: false, message: '只有主人能让我生成视频' }
+        if (!hub.turnSendersAllOwner(sessionId) && !privateCapabilityAllowed(api.config(), chat, 'video')) return { ok: false, message: '你还没有获得视频生成权限' }
         const text = String(prompt || '').trim()
         if (!text) return { ok: false, message: '要生成什么内容？' }
         if (running) return { ok: false, message: '上一段视频还在生成，等它好了再说' }

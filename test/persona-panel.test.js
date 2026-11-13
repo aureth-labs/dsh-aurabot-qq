@@ -8,6 +8,8 @@ import { Script } from 'node:vm'
 import { normalize } from '../src/core/config.js'
 import { createMemoryStore } from '../src/features/memory.js'
 import { readMemoryState } from './helpers/memory-state.js'
+import { createFakeDsh } from './helpers/fake-dsh.js'
+import { createConversationArchive } from '../src/chat/conversation-context.js'
 import memoryModule from '../src/modules/memory/index.js'
 
 const OWNER = '10000001'
@@ -366,4 +368,87 @@ test('人物关系进常驻上下文，说忘掉时一起忘', (t) => {
   assert.match(mem.contextFor(chat, 's'), /人物关系.*奶茶店老板/)
   mem.handleCommand(chat, '忘掉奶茶店')
   assert.doesNotMatch(mem.contextFor(chat, 's'), /奶茶店老板/)
+})
+
+test('面板一键清理按 QQ 隔离，旧流水不再读入，下一条私聊走新会话', async (t) => {
+  const s = setup(t)
+  const dir = process.env.AURABOT_DATA_DIR
+  const chatId = `private:${ALICE}`
+  const oldSession = 'old-alice-session'
+  const debugSession = 'old-alice-debug-session'
+  writeFileSync(join(dir, 'sessions.json'), JSON.stringify({ chats: { [chatId]: { sessionId: oldSession, sessions: { live: oldSession, debug: debugSession } } } }))
+  writeFileSync(join(dir, 'config.json'), JSON.stringify({ enabled: true, dryRun: true, setupDone: true,
+    ownerQQ: OWNER, botQQ: '20000002', allow: { private: [ALICE, BOB] }, workspaceDir: join(dir, 'workspace'),
+    snowluma: { autoStart: false, autoAttach: false }, chat: { seedHistory: true }, conversationContext: { enabled: true }, memory: { dailyConsolidate: false } }))
+  const fake = createFakeDsh({ brain: async () => '' })
+  try {
+    const { apply } = await import('../src/host.js')
+    const api = apply(fake.ctx)
+    await api.ready
+    const memory = api.modules.use('memory')
+    const archive = createConversationArchive({ directory: join(dir, 'conversation-context'), namespace: api.getConfig().persona.current })
+    archive.append(chatId, { role: 'user', speakerId: ALICE, text: '清理前归档的原话', at: s.now - 1000 })
+    assert.equal(api.hub.recentMessagesOf(chatId).at(-1).text, '清理前归档的原话')
+    memory.setInsights(`qq:${ALICE}`, ['旧的相处经验'])
+    memory.setStyle(`qq:${ALICE}`, ['旧的说话方式'])
+    memory.setInsights(`qq:${BOB}`, ['其他人的经验'])
+    memory.saveRelation({ ...relation({ subjQq: ALICE }), id: 'alice-relation' })
+    memory.saveRelation({ ...relation({ subjQq: BOB, obj: '另一个人' }), id: 'bob-relation' })
+    api.hub.logChat(chatId, '用户', '清理前的私聊', ALICE, { at: s.now - 1000 })
+    api.hub.logChat('group:777', '用户', '清理前的群发言', ALICE, { at: s.now - 1000 })
+    api.hub.logChat('group:777', '其他人', '其他人的群发言', BOB, { at: s.now - 1000 })
+    const headers = { 'content-type': 'application/json' }
+    assert.equal((await fake.call('/persona/person/reset', { qq: ALICE }, { ...headers, host: 'evil.example' })).status, 403)
+    assert.equal((await fake.call(`/persona/person/reset?qq=${ALICE}`)).json().ok, false)
+    assert.equal((await fake.call('/persona/person/reset', { qq: ALICE }, { ...headers, origin: 'https://evil.example' })).status, 403)
+    assert.equal((await fake.call('/persona/person/reset', { qq: ALICE }, { ...headers, 'content-type': 'text/plain' })).json().ok, false)
+    assert.ok(memory.personaPerson(ALICE))
+    assert.equal((await fake.call('/persona/person/reset', { qq: ALICE }, headers)).json().ok, true)
+    assert.equal(memory.personaPerson(ALICE), null)
+    assert.deepEqual(api.hub.recentMessagesOf(chatId), [])
+    assert.deepEqual(memory.personaPerson(BOB).insights.map((entry) => entry.text), ['其他人的经验'])
+    assert.ok(memory.gists().some((entry) => entry.id === 'group-gist'))
+    assert.equal(memory.chats().find((entry) => entry.chatId === 'group:777').impression, '很友好')
+    assert.deepEqual(api.getConfig().allow.private, [ALICE, BOB])
+    assert.equal(api.hub.chatOfSession(oldSession), '')
+    assert.deepEqual(fake.ctx.workspaceRegistry.archivedSessionIds, [oldSession, debugSession])
+    assert.equal(api.hub.chatOfSession(debugSession), '')
+    const day = api.hub.chatLogDays()[0]
+    const rows = () => api.hub.chatLogOf(day)
+    assert.deepEqual(rows().map((entry) => entry.text), ['', '', '其他人的群发言'])
+    assert.ok(rows().slice(0, 2).every((entry) => entry.forgottenAt))
+    const cutoff = api.hub.memoryResetAt(ALICE)
+    assert.equal(JSON.parse(readFileSync(join(dir, 'sessions.json'), 'utf8')).memoryCutoffs[ALICE], cutoff)
+    api.hub.logChat(chatId, '用户', '清理后新消息', ALICE, { at: cutoff + 1000 })
+    assert.equal(rows().at(-1).text, '清理后新消息')
+    assert.equal(api.hub.logChat(chatId, '用户', '旧消息迟到', ALICE, { at: cutoff - 1 }), false)
+    assert.deepEqual(api.hub.filterHistory('group:777', [
+      { user_id: ALICE, time: cutoff - 1, message: '旧群消息' },
+      { user_id: BOB, time: cutoff - 1, message: '其他人的群消息' },
+    ]).map((message) => message.message), ['其他人的群消息'])
+    api.setConfig({ ...api.getConfig(), dryRun: false })
+    api.onebot.call = async (action) => {
+      assert.equal(action, 'get_friend_msg_history')
+      return { messages: [
+        { time: Math.floor((cutoff - 10000) / 1000), message: 'QQ 历史里的旧消息' },
+        { message: 'QQ 历史里没有时间的消息' },
+        { time: Math.ceil((cutoff + 1000) / 1000), message: 'QQ 历史里的新消息' },
+      ] }
+    }
+    await api.hub.pushToSession({ chatId, kind: 'private', userId: ALICE }, [{ type: 'text', text: '你好' }], ALICE)
+    assert.notEqual(fake.turns.at(-1).sessionId, oldSession)
+    assert.match(fake.turns.at(-1).userText, /QQ 历史里的新消息/)
+    assert.doesNotMatch(fake.turns.at(-1).userText, /旧消息|没有时间/)
+    const tools = api.modules.buildTools({ chat: { chatId, kind: 'private', userId: ALICE }, level: 'social', sessionId: fake.turns.at(-1).sessionId })
+    const result = await tools.find((tool) => tool.name === 'qq_chat_history').execute({})
+    assert.match(result.message, /QQ 历史里的新消息/)
+    assert.doesNotMatch(result.message, /旧消息|没有时间/)
+    assert.equal(api.hub.recentMessagesOf(chatId).at(-1).text, '你好')
+    memory.setNoMemory(BOB, true)
+    assert.equal((await fake.call('/persona/person/reset', { qq: BOB }, headers)).json().ok, true)
+    assert.equal(memory.remembers(BOB), false)
+    assert.equal((await fake.call('/persona/person/reset', { qq: OWNER }, headers)).json().ok, true)
+    assert.equal(api.getConfig().ownerQQ, OWNER)
+    assert.equal(memory.remembers(OWNER), true)
+  } finally { fake.dispose() }
 })

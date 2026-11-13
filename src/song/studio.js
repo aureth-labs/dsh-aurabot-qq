@@ -386,7 +386,9 @@ function run(cmd, args, { cwd, env, log, onLine, timeoutMs = 30 * 60_000 } = {})
  * @param {() => object} deps.getConfig
  * @param {object} deps.log
  * @param {(chatId: string, file: string, note: string) => Promise<any>} deps.sendVoiceFile  把做好的语音发到聊天
- * @param {(chatId: string, text: string) => Promise<any>} [deps.sendText]
+ * @param {(chatId: string, text: string) => Promise<any>} [deps.sendText]  没接 say 时的兜底发送
+ * @param {(o: { chatId: string, title: string, query: string, why: string, error: string }) => Promise<any>} [deps.say]
+ *   翻唱失败时说的话由她本人决定（模块层接模型生成），失败提示不再是一句写死的模板
  */
 /** 翻唱出错翻译成人话（给点歌的人看）。 */
 export function explainSongError(message) {
@@ -401,7 +403,7 @@ export function explainSongError(message) {
   return m
 }
 
-export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, onSung, local }) {
+export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, say, onSung, local }) {
   const cfg = () => getConfig().song
   const P = () => pathsOf(cfg().root || defaultRoot())
   const work = () => dataDir('songs')
@@ -413,6 +415,9 @@ export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, onSu
   let current = null // 正在做的翻唱
   let history = [] // 最近做过的 [{at, title, voice, ok, message, file}]
   let install = { running: false, step: '', log: [], ok: null, message: '' }
+  // 失败提示的节流：同一个聊天 60 秒内只提示一次——连着点几首、同一原因反复失败时不刷屏
+  const failNoticed = new Map() // chatId → { at, why }
+  const FAIL_NOTICE_GAP = 60_000
 
   // 光看 shim 文件在不在会骗人：env/Scripts/*.exe 在 Linux 上只是一行「转给真解释器」的脚本，
   // 真解释器（venv）被删了文件还在，一跑就 127。所以真跑一次探针。
@@ -847,6 +852,30 @@ export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, onSu
     return { file: cached, voice: voice?.id, pitch, dir }
   }
 
+  /** 翻唱失败：让她自己说一句（say 由模块层接模型生成），同一聊天 60 秒内只提示一次。 */
+  function noticeFail(job, error, why) {
+    const title = job.title || job.query
+    const now = Date.now()
+    const last = failNoticed.get(job.chatId)
+    if (last && now - last.at < FAIL_NOTICE_GAP) {
+      log.info(`翻唱失败提示刚发过（${Math.round((now - last.at) / 1000)} 秒前），这次不重复：「${title}」`)
+      return
+    }
+    failNoticed.set(job.chatId, { at: now, why })
+    // 模型那边彻底挂了也得让人听到一句，不能一声不吭；这句只是兜底，不是原来的模板
+    const plain = `「${title}」这次没唱成，回头再试试？`
+    if (!say) {
+      Promise.resolve(sendText?.(job.chatId, plain)).catch(() => {})
+      return
+    }
+    Promise.resolve()
+      .then(() => say({ chatId: job.chatId, title, query: job.query, why, error: String(error?.message || '') }))
+      .catch((e) => {
+        log.warn('翻唱失败提示没说出来，退回一句短的：', e?.message || e)
+        Promise.resolve(sendText?.(job.chatId, plain)).catch(() => {})
+      })
+  }
+
   async function pump() {
     if (current || !queue.length) return
     const job = queue.shift()
@@ -864,7 +893,8 @@ export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, onSu
       const why = explainSongError(error.message)
       history.unshift({ at: Date.now(), title: job.title || job.query, ok: false, message: why })
       log.warn(`翻唱失败：「${job.query}」：`, error.message)
-      sendText?.(job.chatId, `「${job.title || job.query}」还在休息中，以后再唱～`).catch(() => {})
+      // 说什么由她自己定：原来那句固定文案对谁、什么原因都一样，听着不像她说的
+      noticeFail(job, error, why)
     } finally {
       history = history.slice(0, 20)
       current = null

@@ -144,11 +144,14 @@ export default {
 | `api.defineTool({ name, description, properties, required, execute })` | 做一个工具 |
 | `api.context(({ chat, sessionId }) => '文字')` | 每轮聊天前塞进她上下文的话（比如「现在北京 20 度」）；返回空串就不塞 |
 | `api.rule((kind, cfg) => '一条规则')` | 补一条她的规则（会放进系统提示词；kind 是 `private` 主人私聊 / `social` 群聊和别人）。告诉她「你会查天气，用 xxx 工具」就写在这里。可以直接给字符串、也可以返回多条（数组）；函数**每一轮都会重新调用**，所以里面可以拼当前设置 |
-| `api.command({ name, aliases, desc, run(arg, msg) })` | 主人在 QQ 里发 `/name 参数` 时调用，`run` 返回的文字直接回到**发命令的那个聊天**（群里发就回群里）。名字可以是中文（`name: '天气'`），中文命令后面可以不加空格（`/天气北京`）；`arg` 是命令名后面剩下的全部文字，已经去掉首尾空格。**只认主人**：别人发 `/xxx` 当普通消息处理。和内置命令同名时你的优先 |
+| `api.command({ name, aliases, desc, delegatable, run(arg, msg) })` | 主人可在 QQ 私聊或白名单群里发送命令。默认仅主人可用。只有显式设置 `delegatable: true` 的命令，主人才能授权给私聊白名单中的 QQ 用户。此时 `run` 会收到实际发送者的消息，模块应自行限制命令的操作范围。返回的文字回到发命令的聊天。名字可以是中文，中文命令后面可以不加空格；`arg` 已去掉首尾空格。和内置命令同名时模块命令优先 |
 | `api.every(毫秒, fn, 名字?)` | 定时任务（名字用在出错日志里） |
 | `api.later(毫秒, fn)` | 过一会儿做一次 |
 | `api.route('/路径', async (req, res) => 返回值, options?)` | 加一个网页接口：地址是 `/aurabot/api/ext/<id>/路径`；返回对象就当 JSON 回；要自己回（比如图片）就用 `api.core.http.send(res, 200, buf, 'image/png')`。1.3.0 起管理接口可传 `{ access: 'panel' }`，复用宿主回环/可信代理、Host 与 CSRF 闸；不传时保持现有行为，由模块验证客户端凭据 |
 | `api.onDispose(fn)` | 模块停下时要做的收尾 |
+
+QQ 主人命令的参数或回执涉及隐私时，可用 `api.command({ name: 'private-query', sensitive: true, run })`。宿主的命令日志只记命令名，回执发送失败时结束本次发送。敏感命令仅主人可用，即使同时声明 `delegatable: true`。
+宿主在执行敏感命令和发送回执前复核主人及授权代次。模块可以按需限制为主人私聊，并单独处理模拟命令。
 
 **别的模块和插件内部**（全开放）
 
@@ -252,7 +255,7 @@ api.on('reply/items', (items) => [...items, { kind: 'text', value: '—— 大�
 
 ## 工具
 
-工具是**她自己决定什么时候用**的能力（和命令不同，命令是主人手动发）。
+工具是**她自己决定什么时候用**的能力，命令由获得授权的用户手动发送。
 
 ```js
 api.tool(({ chat, level, sessionId }) => {
@@ -284,6 +287,8 @@ api.tool(({ chat, level, sessionId }) => {
 
 **自动表单**：写了 `settings`，面板会多一个这个模块的标签页，自动生成设置表单，用户改完点保存。
 定义里写了 `tab: '内置标签页'`（`voice` `stickers` `imagegen` `diary` `speakup` `mood` `song` `bili` `local` `group` `model` `persona` `access` `connect` `overview`），设置和面板就放进那一页的最下面，不单独占一页。比如给翻唱加功能的模块写 `tab: 'song'`。
+
+定义里写 `navGroup: 'market'`，模块会在「模块」分组显示独立标签，和「已安装」「本地接口」并排。可用分组为 `home`、`self`、`express`、`platform`、`system`、`market`。同时填写 `tab` 时，支持 `navGroup` 的宿主优先使用独立标签，旧宿主仍使用 `tab`。
 
 ```js
 settings: [

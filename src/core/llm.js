@@ -96,10 +96,10 @@ function temperatureUnsupported (provider, model) {
  * 这个模型支持哪些思考强度。
  * @returns {Promise<{efforts:string[], default?:string}|null>} 不支持（没有推理元数据）返回 null
  */
-export async function modelReasoning (dsh, provider, model) {
+export async function modelReasoning (dsh, provider, model, { refresh = false } = {}) {
   const key = `${provider}::${model}`
   const hit = reasoningCache.get(key)
-  if (hit && Date.now() - hit.at < REASONING_TTL) return hit.value
+  if (!refresh && hit && Date.now() - hit.at < REASONING_TTL) return hit.value
   let value = null
   try {
     const llm = dsh.llm || dsh.get('llm')

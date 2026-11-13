@@ -1060,6 +1060,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
         // 接口是不是挂在根路径（内置模块的老路径）；面板里的 call() 靠它决定加不加 /ext/<id> 前缀
         routesAtRoot: routesAtRoot(id),
         tab: def.tab || '',
+        navGroup: typeof def.navGroup === 'string' ? def.navGroup : '',
         flag: typeof def.flag === 'string' ? def.flag : (def.settings || []).some((f) => f?.key === 'enabled') ? 'enabled' : '',
         keepPanel: Boolean(def.keepPanel),
         startedAt: rec?.startedAt || 0,

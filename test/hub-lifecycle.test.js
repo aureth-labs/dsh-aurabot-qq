@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createFakeDsh } from './helpers/fake-dsh.js'
-import { normalize } from '../src/core/config.js'
+import { normalize, ownerAuthorizationRevision, saveConfig } from '../src/core/config.js'
 import { OneBotError } from '../src/onebot/client.js'
 
 const root = mkdtempSync(join(tmpdir(), 'aurabot-lifecycle-'))
@@ -458,5 +458,97 @@ test('网关明确没连上时，发送失败的消息进补发队列', { timeou
   assert.equal(r && r.queued, true, '确定没发出去的发送应返回 queued')
   assert.equal(calls, 1)
   assert.equal(outbox.status().count, 1, '消息应进补发队列')
+})
+
+test('LA-27 敏感命令发送失败时不记录参数、回执和网关错误，也不补发', async (t) => {
+  const { createOutbox } = await import('../src/onebot/outbox.js')
+  const dir = mkdtempSync(join(root, 'outbox-'))
+  const outbox = createOutbox({ log: { info() {}, warn() {}, debug() {} }, file: join(dir, 'queue.json') })
+  const onebot = {
+    connected: false,
+    async call(action) {
+      if (action !== 'send_private_msg') return []
+      throw new OneBotError(action, { message: '合成网关错误' }, { transport: true })
+    },
+  }
+  const { hub, fake } = setup(t, {
+    cfg: config({ dryRun: false }), onebot, outbox,
+    onCommand: async (_msg, markSensitive) => {
+      markSensitive('news')
+      return '合成回执'
+    },
+  })
+  await hub.onMessage(event('/news 合成查询地区'))
+  const logs = fake.logs.join('\n')
+  assert.match(logs, /主人命令 \/news/)
+  assert.match(logs, /敏感命令回执发送失败/)
+  assert.doesNotMatch(logs, /合成查询地区|合成回执|合成网关错误/)
+  assert.equal(outbox.status().count, 0)
+})
+
+for (const [label, owners, shouldSend] of [
+  ['同一主人保存普通配置', [OWNER], true],
+  ['切换主人', [OTHER], false],
+  ['切换主人再切回', [OTHER, OWNER], false],
+]) {
+  test(`敏感回执等待发送时${label}`, async (t) => {
+    const entered = deferred()
+    const resume = deferred()
+    t.after(() => resume.resolve())
+    const cfg = config({ dryRun: false })
+    const { hub, calls } = setup(t, {
+      cfg,
+      hooks: { send: async (message) => { entered.resolve(); await resume.promise; return message } },
+      onCommand: async (_msg, markSensitive) => {
+        assert.equal(markSensitive('events'), true)
+        return '合成回执'
+      },
+    })
+    Object.assign(cfg, saveConfig(cfg, cfg))
+    assert.ok(ownerAuthorizationRevision(cfg))
+    const work = hub.onMessage(event('/events'))
+    await entered.promise
+    for (const ownerQQ of owners) {
+      const previousRevision = ownerAuthorizationRevision(cfg)
+      const sameOwner = cfg.ownerQQ === ownerQQ
+      Object.assign(cfg, saveConfig({ ...cfg, ownerQQ, ownerName: '保存后的昵称' }, cfg))
+      assert.equal(ownerAuthorizationRevision(cfg) === previousRevision, sameOwner)
+    }
+    resume.resolve()
+    await work
+    assert.equal(calls.some(({ action }) => action === 'send_private_msg'), shouldSend)
+  })
+}
+
+test('敏感命令执行前发现授权代次已变化', async (t) => {
+  const entered = deferred()
+  const resume = deferred()
+  t.after(() => resume.resolve())
+  const cfg = config({ dryRun: false })
+  let executed = false
+  const { hub } = setup(t, {
+    cfg,
+    onebot: {
+      connected: true,
+      async call(action) {
+        assert.equal(action, 'get_friend_list')
+        entered.resolve()
+        await resume.promise
+        return []
+      },
+    },
+    onCommand: async (_msg, markSensitive) => {
+      if (!markSensitive('events')) return ''
+      executed = true
+      return '合成回执'
+    },
+  })
+  Object.assign(cfg, saveConfig(cfg, cfg))
+  const work = hub.onMessage(event('/events'))
+  await entered.promise
+  for (const ownerQQ of [OTHER, OWNER]) Object.assign(cfg, saveConfig({ ...cfg, ownerQQ }, cfg))
+  resume.resolve()
+  await work
+  assert.equal(executed, false)
 })
 

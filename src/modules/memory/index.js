@@ -458,6 +458,10 @@ export default {
       return memory.savePersonaPerson(b.qq, b)
     })
     api.route('/persona/person/delete', async (req) => memory.deletePerson((await http.body(req)).qq))
+    api.route('/persona/person/reset', async (req) => {
+      if (req.method !== 'POST' || !/^application\/json(?:\s*;|$)/i.test(String(req.headers?.['content-type'] || ''))) return { ok: false, message: '清理记忆需要 POST JSON 请求' }
+      return memory.resetPerson((await http.body(req))?.qq)
+    }, { access: 'panel' })
     api.route('/persona/person/no-memory', async (req) => {
       const b = await http.body(req)
       return memory.setNoMemory(b.qq, b.enabled, { deleteExisting: b.deleteExisting === true })

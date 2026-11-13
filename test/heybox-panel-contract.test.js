@@ -27,6 +27,19 @@ test('话题是多选（带搜索），不是只读列表', () => {
   assert.ok(src.includes('const renderSelSummary = function (i)'), '缺已选摘要')
 })
 
+test('话题名额：活动/普通不互斥，共享 3 席（与模块 HASHTAG_TOTAL_CAP 同口径）', () => {
+  // 2026-11-12 主人定的规则：一帖总共 3 个话题，活动最多 1 个、普通共享剩余名额。
+  // 旧代码有两处回退点必须按住：
+  //   ① 选活动走 nextVals = [name] —— 会把已选的普通话题整个清空（互斥残留）；
+  //   ② 只数普通话题的 3 上限 —— 1 活动 + 3 普通会挂出 4 个，超出主人定的口径。
+  assert.ok(src.includes('const TOPIC_CAP = 3'), '缺共享名额常量（要和模块侧 resolveHashtagItems 的 HASHTAG_TOTAL_CAP=3 一起改）')
+  assert.ok(!/nextVals = \[name\]\s*(?:\r?\n)/.test(src), '选活动不许再走「清空其他话题」的互斥老路')
+  assert.ok(!/普通话题最多选 3 个/.test(src), '旧的「普通单独限 3」文案不该还在')
+  assert.ok(src.includes('parts.length >= TOPIC_CAP'), '勾普通话题要按共享总名额拦')
+  assert.ok(src.includes('plains.slice(0, TOPIC_CAP - 1)'), '换活动时要保留普通话题（只截到剩余名额）')
+  assert.ok(src.includes("'已选话题 ' + total + '/' + TOPIC_CAP"), '摘要要显示共享名额的总数')
+})
+
 test('卡片说明与模块新行为一致：配图按字数自动配，不再说「走小黑盒图床」', () => {
   assert.ok(src.includes('配图按正文字数自动配'), '说明要写自动配图')
   assert.ok(!src.includes('配图走小黑盒图床'), '旧的「配图走小黑盒图床」不该还在')

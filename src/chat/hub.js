@@ -9,11 +9,12 @@ import { appendFileSync, mkdirSync, readFileSync, writeFileSync, renameSync, exi
 import { basename, isAbsolute, join, relative, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { ownerAuthorizationRevision } from '../core/config.js'
 import { dataDir, readJson, writeJson } from '../core/store.js'
 import { isDefiniteFailure } from '../onebot/client.js'
 import { parseMessageEvent, gifFrames, segmentsOf } from './inbound.js'
 import { parseReply, bubbleDelay, wantsVoice, itemsToLine, cleanOutboundText, cleanOutboundSegments, clockLabel } from './reply.js'
-import { decideGroupReply, engagedHint, pickAutoReply, policyFor, sameNameNote, topicRelevance } from './group-policy.js'
+import { decideGroupReply, engagedHint, pickAutoReply, pickDirectRequester, policyFor, sameNameNote, topicRelevance } from './group-policy.js'
 import { checkAllowed, levelFor, presetFor, isOwner, groupOwnerTools } from './access.js'
 import { fetchImage, segmentBytes } from '../core/net.js'
 import { toMono16k } from '../voice/wav.js'
@@ -24,12 +25,15 @@ import { findFfmpeg, findSharp, shrinkImage, shrinkWithSharp } from '../core/img
 import { redact } from '../core/redact.js'
 import { defaultModel, pickReasoningEffort, canSeeImages, modelVision } from '../core/llm.js'
 import { resolveChatModel } from './chat-model.js'
+import { chatEffortFor } from './effort-command.js'
 import { createFaces, textToSegments, stripFaceTags, splitSpeakable } from './faces.js'
 import { expandMentions, hasMention } from './mentions.js'
 import { cleanContent, cleanText } from '../core/text.js'
 import { createRecentMedia } from './recent-media.js'
 import { createTitleFilter } from './title-filter.js'
 import { takeInterim, reasoningOf, rescueFromThinking } from './steps.js'
+import { guardOutgoing, codeFenceInstruction } from './guard.js'
+import { markerInstruction, extractMarkedReply, stripMarkers } from './reply-marker.js'
 import { grantOwner } from '../core/workspace-move.js'
 import { withPromptCapture, currentPromptSources, memoryPromptRanges } from '../security/leak-guard.js'
 import { noticeText } from './notices.js'
@@ -107,9 +111,10 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     }
     return forgottenRules
   }
-  const conversationVisible = (chatId, message) => !conversationRules().some(r => (message.contextAt ?? message.at) <= r.at
-    && (chatId === 'private:' + r.qq || (chatId.startsWith('group:') && message.role === 'user' && message.speakerId === r.qq))
-    && (!r.query || matchesMemoryKeyword(message.text, r.query)))
+  const conversationVisible = (chatId, message) => !isBeforeMemoryReset(chatId, message.role === 'user' ? message.speakerId : '', message.at)
+    && !conversationRules().some(r => (message.contextAt ?? message.at) <= r.at
+      && (chatId === 'private:' + r.qq || (chatId.startsWith('group:') && message.role === 'user' && message.speakerId === r.qq))
+      && (!r.query || matchesMemoryKeyword(message.text, r.query)))
   const conversationArchive = (namespace = String(getConfig().persona?.current || 'default')) => {
     if (!archives.has(namespace)) archives.set(namespace, createConversationArchive({ directory: dataDir('conversation-context'), namespace, visible: conversationVisible }))
     return archives.get(namespace)
@@ -119,6 +124,23 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   const mapFile = () => dataDir('sessions.json')
   const map = () => readJson(mapFile(), () => ({ chats: {} }))
   const saveMap = (m) => writeJson(mapFile(), m)
+  const memoryCutoffs = map().memoryCutoffs || {}
+  const memoryResetAt = (qq) => Number(memoryCutoffs[qq]) || 0
+  function chatMemoryCutoff(chatId, uid) {
+    const qq = chatId.startsWith('private:') ? chatId.slice(8) : chatId.startsWith('group:') ? uid : ''
+    return memoryResetAt(qq)
+  }
+  function isBeforeMemoryReset(chatId, uid, at) {
+    const cutoff = chatMemoryCutoff(chatId, uid)
+    return cutoff > 0 && (Number(at) || 0) <= cutoff
+  }
+  function historyVisible(chatId, uid, time) {
+    const at = Number(time) || 0
+    return !isBeforeMemoryReset(chatId, uid, at < 1e12 ? at * 1000 : at)
+  }
+  function filterHistory(chatId, messages) {
+    return messages.filter((message) => message && historyVisible(chatId, message.sender?.user_id ?? message.user_id, message.time))
+  }
 
   const mounted = new Map() // sessionKey → { agent, offs, chatId, toolsKey }  按会话记，agent 对象换了也能清掉旧工具（#90）
 
@@ -209,6 +231,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   }
   const privateSources = new Map() // 私聊 QQ 号 → 最近一次临时会话的来源群
   const recentMedia = createRecentMedia({ log }) // 最近发来的图片和表情，短期落盘恢复
+  const recentMediaOf = (chatId, userId) => recentMedia.get(chatId, userId).filter((item) => !isBeforeMemoryReset(chatId, item.userId, item.at))
   const recentFiles = new Map() // chatId → 最近发来的文件
   // 「她挑 / 只听主人的」：这一轮收到的表情先按会话记着，她想收时凭编号来取。
   // 落盘存一份 —— 只在内存里的话，DSH 一重启就什么都没有了，她只好绕路（拷附件 + qq_add_sticker）。
@@ -466,7 +489,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   function logChat(chatId, who, text, uid = '', { via, at, interaction, originId, proactive } = {}) {
     // 模块「模拟测试」的 simulation 上下文：只回放给面板看，不能写真实聊天流水。
     // 否则 private:10001 这类模拟会话会进短时记忆和人物记忆，删掉又出现。
-    if (simulationStore.getStore()) return false
+    if (simulationStore.getStore() || isBeforeMemoryReset(String(chatId), uid, at ?? Date.now())) return false
     // 调试模式：不写聊天流水，只进插件日志。流水是长期记忆的原料，写了就等于把调试对话记进记忆。
     if (getConfig().debug) {
       log.info(`[调试] ${who}${uid ? '（' + uid + '）' : ''} → ${chatId}：${String(text || '').slice(0, 300)}`)
@@ -560,7 +583,13 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     try {
       const f = join(dataDir('chatlog'), `${day}.jsonl`)
       if (!existsSync(f)) return []
-      return readFileSync(f, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))
+      return readFileSync(f, 'utf8').split('\n').filter(Boolean).map((line) => {
+        const row = JSON.parse(line)
+        // 保留行位置，让每日整理仍能使用原有流水进度。
+        const cutoff = chatMemoryCutoff(String(row.chatId || ''), row.uid)
+        if (cutoff && (Number(row.t) || 0) <= cutoff) return { ...row, text: '', forgottenAt: row.forgottenAt || cutoff }
+        return row
+      })
     } catch (error) {
       return []
     }
@@ -580,7 +609,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
     })
     const rows = [...new Set(days)].flatMap((day) => chatLogOf(day))
-      .filter((r) => r && r.chatId === chatId && r.who === 'bot' && r.proactive && Number(r.t) > since)
+      .filter((r) => r && r.chatId === chatId && r.who === 'bot' && r.proactive && !r.forgottenAt && Number(r.t) > since)
       .sort((a, b) => Number(a.t) - Number(b.t))
       .slice(-5)
     if (!rows.length) return []
@@ -797,7 +826,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   }
 
   /** 拿到这个 QQ 会话对应的活 agent（没有就建，权限档位变了就换新会话）。 */
-  async function agentFor(chat, turnToken) {
+  async function agentFor(chat, turnToken, assertMemoryCurrent) {
     checkTurn(chat.chatId, turnToken)
     const failure = sessionFailure(chat.chatId)
     if (failure && Date.now() < failure.until) throw backoffError(chat.chatId, failure)
@@ -849,6 +878,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       assertActive()
       agent = await resolveAgent(sid)
     }
+    assertMemoryCurrent?.()
     // 切回某个模式时也要把「当前会话」写回映射，否则投递守卫会把它当旧会话
     if (sid) {
       const mm = map()
@@ -868,6 +898,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     // 模型 / 思考强度和设置不一致就切过去（面板改了模型，下一条消息起生效）
     const target = await resolveTarget(chat)
     assertActive()
+    assertMemoryCurrent?.()
     const want = keyOf(target)
     const m = map()
     if (want && m.chats[chat.chatId]) {
@@ -901,7 +932,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         if (r && r.provider && r.model) sel = { reasoningEffort: '', ...r }
       } catch (error) {}
     }
-    return sel
+    const effort = chatEffortFor(cfg, chat?.chatId, sel)
+    return sel && effort ? { ...sel, reasoningEffort: effort } : sel
   }
 
   // 入站图片也按最终聊天模型（包括模块覆盖）判断；全局手动 vision 声明仍优先。
@@ -1023,6 +1055,12 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         order: 905,
         text: () => {
           const parts = []
+          // 正文标记：代码注入，不改人格文件。模型必须用 ⟦REPLY⟧ 包住要发的话。
+          try {
+            if (getConfig().chat?.replyMarker?.enabled === true) parts.push(markerInstruction())
+            // 贴代码要加围栏：guard 对 ``` 整段豁免，模型得知道包起来才不会被当成超长思考。
+            if (getConfig().chat?.thinkingGuard?.enabled !== false) parts.push(codeFenceInstruction())
+          } catch (error) {}
           for (const p of contextProviders || []) {
             try {
               const t = p({ chat, sessionId: sid })
@@ -1058,7 +1096,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   // quiet：这一条是额外的（比如语音后面补发的表情），失败了不算到这一轮头上（deliver 按 failStore 里的条数判断整条有没有发出去）。
   // queueKind / queueTtlMs：网关短暂不可达时，确定没发出去的消息进入本地补发队列。
   async function sendSegments(chatId, message, note, opts = {}) {
-    const { force = false, isCurrent = null, throwOnError = false, timeoutMs, quiet = false, queueKind = 'reply', queueTtlMs } = opts
+    const { force = false, isCurrent = null, throwOnError = false, timeoutMs, quiet = false, queueKind = 'reply', queueTtlMs, sensitive = false } = opts
     if (disposed) return null
     // 出口层第二道保险：模块直接调 scopedHub.sendSegments/sendImage/sendFile/sendFile 时也要过门闸。
     // 只认带 sourceModule（模块发起）或 enginePolicy（引擎路径）的请求；hub 内部发送不带这两个标记，行为不变。
@@ -1091,7 +1129,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         }
         if (Array.isArray(next)) message = next
       } catch (error) {
-        log.warn('扩展模块改写发送内容出错：', error.message)
+        log.warn('扩展模块改写发送内容出错：', sensitive ? '敏感命令回执' : error.message)
       }
     }
     // 钩子可能重新写入工具标记；最终网关出口仍使用同一份清洗。
@@ -1132,7 +1170,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     } catch (error) {
       // 网关预热/短暂不可达：确定没发出去的消息放进补发队列，连上后按 TTL 补发。
       // 超时（uncertain）不入队，避免同一条消息发两次。
-      if (outbox && isDefiniteFailure(error)) {
+      if (!sensitive && outbox && isDefiniteFailure(error)) {
         const q = outbox.add({ action, params, chatId, note, kind: queueKind, ttlMs: queueTtlMs })
         if (q.ok) {
           log.warn(`发到 ${chatId} 时网关还没就绪，已排队补发：${note || error.message}`)
@@ -1141,11 +1179,12 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         log.warn(`发到 ${chatId} 失败，且无法入队（${q.message}）：`, error.message)
       }
       bump('errors')
-      log.warn(`发到 ${chatId} 失败：`, error.message)
+      const detail = sensitive ? '敏感命令回执发送失败' : error.message
+      log.warn(`发到 ${chatId} 失败：`, detail)
       // 结果不确定（超时 / 断线）时按 uncertain 结算：可能已经发出去了，不能当没发去退款重发
       settleOutbound(verdict, isDefiniteFailure(error) ? 'failed' : 'uncertain')
       if (throwOnError) throw error
-      if (!quiet) failStore.getStore()?.push(error.message)
+      if (!quiet) failStore.getStore()?.push(detail)
       return null
     }
   }
@@ -1539,6 +1578,18 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     }
     if (disposed) return
     text = cleanOutboundText(text, { ...cleaningFor(chatId), onPromptDecision: (allow) => { outputScope.getStore().allowPromptEcho = allow } })
+    // 出站污染闸：模型偶尔会把思考直接写进正文（英文判断 + 中文真话），或者思考塌缩成复读。
+    // 这里切掉思考前缀、拦住退化内容；拦下就当她这轮没说话，宁可沉默也不发半句思考。
+    if (cfg.chat?.thinkingGuard?.enabled !== false) {
+      const guarded = guardOutgoing(text, { source: opts.fromThinking ? 'reasoning' : (opts.interim ? 'interim' : 'message') })
+      if (!guarded.ok) {
+        // 带上被拦原文的前 80 字：blank / thinking-only 这类判定看不出拦了什么，排查时只能靠它。
+        log.info(`${chatId}：这条没发出去（${guarded.reason}）：${String(text || '').replace(/\s+/g, ' ').slice(0, 80)}`)
+        if (!opts.interim) silenceTurn(chatId)
+        return
+      }
+      text = guarded.text
+    }
     const r = parseReply(text, cleaningFor(chatId))
     if (r.silent) return silenceTurn(chatId)
     let items = r.items
@@ -1734,13 +1785,55 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       const d = event.data || {}
       const completed = d.reason && d.reason.kind === 'completed'
       let text = st.lastTurn === d.turn ? st.text : ''
+      let fromThinking = false
       // 整轮一段正文都没有：她可能把话全写在思考里了（Reply: 起草 → Careful: 自检 → N lines: 定稿），
       // 正文块是空的。chat.rescueFromThinking 打开时从最后一步的思考里捞回定稿；捞不到就照旧不发。
       if (!text && completed && getConfig().chat?.rescueFromThinking && st.thinking && st.thinking.turn === d.turn) {
         const rescued = rescueFromThinking(st.thinking.text)
         if (rescued) {
           text = rescued
+          fromThinking = true
           log.info(`${chatId}：整轮没有正文，从思考里捞回一段（${rescued.length} 字）`)
+        }
+      }
+      // 正文标记：代码注入的格式要求。模型必须用 ⟦REPLY⟧ 包住要发的话。
+      // 没有标记就要求重写一次；重写后仍然没有，这轮不发（宁可沉默也不发思考）。
+      if (text && completed && getConfig().chat?.replyMarker?.enabled === true) {
+        const marked = extractMarkedReply(text)
+        if (marked.found) {
+          text = stripMarkers(marked.text)
+          fromThinking = false
+        } else if (!st.markerRetried) {
+          st.markerRetried = true
+          const rec = mounted.get(key)
+          const agent = rec && rec.agent
+          if (agent && typeof agent.followup === 'function') {
+            log.info(`${chatId}：输出里没有正文标记，要求重写一次`)
+            try {
+              markRunning(chatId)
+              const msg = {
+                id: randomUUID(),
+                role: 'user',
+                content: [{ type: 'text', text: '（系统提醒，不是对方说的话）你刚才的输出没有正文标记，这条发不出去。现在重新输出：只写 ⟦REPLY⟧你要说的话⟦/REPLY⟧，标记外面不要有任何内容。' }],
+                source: { kind: SOURCE_KIND, speaker: { role: 'system', chat: String(chatId).startsWith('group:') ? 'group' : 'private' } },
+              }
+              // 重写请求发不出去时必须放开这一轮：否则 running/busy 一直挂着，
+              // 后面来的消息全被当成 steer 塞进一个永远不会结束的轮次。
+              agent.followup(msg).catch((error) => {
+                log.warn('重写请求失败：', error.message)
+                release(chatId)
+              })
+            } catch (error) {
+              log.warn('重写请求发不出去：', error.message)
+              release(chatId)
+            }
+          } else {
+            release(chatId)
+          }
+          return
+        } else {
+          log.info(`${chatId}：重写后仍然没有正文标记，这轮不发`)
+          text = ''
         }
       }
       st.thinking = null
@@ -1760,9 +1853,12 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       st.pendingOnDelivered = null
       st.autoReply = null
       st.text = ''
+      st.markerRetried = false
       // 上一轮还在跑时新消息已经排队给「下一轮」：这一轮 turn/end 不能把下一轮的说话人清掉（#90）
       st.senders = st.pendingSenders || new Set()
       st.pendingSenders = new Set()
+      st.directRequester = st.pendingDirectRequester || null
+      st.pendingDirectRequester = null
       st.directOwner = false
       st.system = null
       st.turnToken = null
@@ -1783,7 +1879,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       // 发完再放开：发送期间来的消息也攒到下一段。
       // 没有中间段在发的时候就走原来的路径（同步开始、release 跟着这一条走），时序和以前一模一样；
       // 只有前面真有中间段没发完时才排队，保证最后一段一定是最后一条（#214 review）。
-      const sendLast = () => deliver(chatId, text, { wantVoice, autoReply, userText: st.lastText || '', own: true, onDelivered })
+      const sendLast = () => deliver(chatId, text, { wantVoice, autoReply, userText: st.lastText || '', own: true, onDelivered, fromThinking })
         .catch((error) => log.warn('发送出错：', error.message))
         .finally(() => release(chatId, turnToken))
       const pending = sendChain.get(chatId)
@@ -1852,6 +1948,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const key = `${chatId}|${id}`
     if (quoteCache.has(key)) {
       const cached = quoteCache.get(key)
+      if (!historyVisible(chatId, cached.uid, cached.time)) return null
       cached.at = Date.now()
       quoteCache.delete(key)
       quoteCache.set(key, cached)
@@ -1865,6 +1962,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       out.time = Number(m?.time) || 0
       const sender = m?.sender || {}
       out.uid = String(sender.user_id ?? m?.user_id ?? '')
+      if (out.time && !historyVisible(chatId, out.uid, out.time)) return null
       out.who = String(sender.card || sender.nickname || out.uid || '某人')
       const kind = ctx?.groupId ? 'group' : 'private'
       let parsed = parseMessageEvent({ message_type: kind, group_id: ctx?.groupId, user_id: out.uid, sender, message: m?.message ?? m?.raw_message ?? '' }, selfId, { faceName: faces.nameOf })
@@ -1896,6 +1994,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     } catch (error) {
       log.debug(`引用消息没拉到（${id}）：`, error.message)
     }
+    if (!historyVisible(chatId, out.uid, out.time)) return null
     if (quoteCache.size >= QUOTE_CACHE_MAX) quoteCache.delete(quoteCache.keys().next().value)
     quoteCache.set(key, out)
     return out
@@ -1950,7 +2049,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       const q = [...quoteCache.values()].findLast((item) => item.chatId === chat.chatId && item.ok && item.at <= now && now - item.at < 30 * 60_000)
       seg = q?.images.at(-1) || q?.stickers.at(-1)
     } else {
-      seg = recentMedia.get(chat.chatId).at(-1)?.seg
+      seg = recentMediaOf(chat.chatId).at(-1)?.seg
     }
     if (!seg) throw new Error(source === 'quote' ? '当前聊天没有可用的引用图片，请引用带图的消息再试' : '当前聊天最近半小时没有收到图片，请先发一张图')
     return segmentBytes(seg, onebot, { maxBytes: MAX_IMAGE_BYTES, allowLocal: false })
@@ -2092,11 +2191,14 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const cfg = getConfig()
     const msg = parseMessageEvent(event, selfId, { faceName: faces.nameOf })
     if (msg.userId === selfId) return
+    const now = Date.now()
+    const wasCleared = () => isBeforeMemoryReset(msg.chatId, msg.userId, now)
+    const fromOwner = onCommand && isOwner(cfg, msg.userId)
+    const ownerRevision = fromOwner ? ownerAuthorizationRevision(cfg) : ''
     // 按群头衔过滤：这条当没看见（不进群聊上下文、不触发回复，@ 她、主人命令也一样）
     if (msg.kind === 'group' && await titleFilter.shouldIgnore(event)) return
-    if (disposed) return
+    if (disposed || wasCleared()) return
     bump('received')
-    const now = Date.now()
 
     // 群里的每条消息都记进缓冲（给上下文和「群里在不在聊」用）
     let groupEntry = null
@@ -2142,14 +2244,14 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (disposed) return
     // 静默分支也保存直接互动证据，引用识别沿用现有缓存。
     const quotedBot = msg.kind === 'group' && msg.replyId ? await repliedToBot(msg.replyId, msg) : false
-    if (disposed) return
+    if (disposed || wasCleared()) return
     const interaction = msg.kind === 'private' || msg.mentioned || quotedBot ? [msg.userId] : []
-    const logIncoming = (text = msg.text) => logChat(msg.chatId, msg.nickname, text, msg.userId, { interaction })
+    const logIncoming = (text = msg.text) => logChat(msg.chatId, msg.nickname, text, msg.userId, { interaction, at: now })
     // 合并转发：一进来就展开并写回缓冲，哪怕这条不交给她——否则群里回头问她「上面那条转发说了啥」，她只看得见占位符。
     // 默认关：开着就是每来一条转发多调一次 get_forward_msg，接口慢的时候会拖慢这一轮。
     if (cfg.forward?.expandEarly && msg.forwards?.length) {
       msg.text = await expandForwards(msg, msg.text, { timeoutMs: 5000 })
-      if (disposed) return
+      if (disposed || wasCleared()) return
       msg.forwardExpanded = true
       if (groupEntry) {
         groupEntry.text = msg.text || groupEntry.text
@@ -2168,22 +2270,38 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       recentMedia.remember(msg.chatId, segmentsOf(event).filter((seg) => msg.images.includes(seg) || msg.stickers.includes(seg)).map((seg) => ({ seg, userId: msg.userId, sticker: msg.stickers.includes(seg) })))
     }
     // 主人命令（/silent /active …）：总开关关着也处理，回复直接发
-    if (onCommand && isOwner(cfg, msg.userId) && /^\s*[/／]/.test(msg.text)) {
+    if (onCommand && (fromOwner || msg.kind === 'private') && /^\s*[/／]/.test(msg.text)) {
+      let sensitiveCommand = ''
+      const ownerStillCurrent = () => {
+        const current = getConfig()
+        return fromOwner && isOwner(current, msg.userId) && ownerAuthorizationRevision(current) === ownerRevision
+      }
       try {
-        const reply = await onCommand(msg)
-        if (disposed) return
+        const reply = await onCommand(msg, (name) => {
+          sensitiveCommand = '主人命令 /' + name
+          return ownerStillCurrent()
+        }, ownerStillCurrent)
+        if (disposed || (sensitiveCommand && !ownerStillCurrent())) return
         if (reply) {
-          log.info(`主人命令 ${msg.text.trim().slice(0, 30)} → ${reply.split('\n')[0]}`)
-          await sendSegments(msg.chatId, [{ type: 'text', data: { text: reply } }], reply.slice(0, 60), { force: true })
+          log.info(sensitiveCommand || `QQ 命令 ${msg.text.trim().slice(0, 30)} → ${reply.split('\n')[0]}`)
+          await sendSegments(msg.chatId, [{ type: 'text', data: { text: reply } }], sensitiveCommand || reply.slice(0, 60), {
+            force: true, sensitive: Boolean(sensitiveCommand), isCurrent: sensitiveCommand ? ownerStillCurrent : null,
+          })
           return
         }
+        if (sensitiveCommand || reply === '') return
       } catch (error) {
-        if (disposed) return
-        log.warn('执行命令出错：', error.message)
-        await sendSegments(msg.chatId, [{ type: 'text', data: { text: '命令没执行成功：' + error.message } }], '命令出错', { force: true })
+        if (disposed || (sensitiveCommand && !ownerStillCurrent())) return
+        const detail = sensitiveCommand || error.message
+        log.warn('执行命令出错：', detail)
+        const text = sensitiveCommand ? '命令没执行成功' : '命令没执行成功：' + detail
+        await sendSegments(msg.chatId, [{ type: 'text', data: { text } }], '命令出错', {
+          force: true, sensitive: Boolean(sensitiveCommand), isCurrent: sensitiveCommand ? ownerStillCurrent : null,
+        })
         return
       }
     }
+    if (wasCleared()) return
     if (!getConfig().enabled) {
       log.info(`总开关关着，收到 ${msg.chatId} 的消息但不处理：${msg.text.slice(0, 30)}`)
       return
@@ -2236,7 +2354,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         log.warn('扩展模块处理消息出错：', error.message)
       }
     }
-    if (disposed) return
+    if (disposed || wasCleared()) return
 
     // 贴表情和「回不回复」分家：她可以只看不说话，顺手给这条消息贴一个表情。
     // 放在群聊「要不要插话」的判定之前，所以不回复也会贴；闭嘴（isMuted）时不贴。
@@ -2316,7 +2434,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const voiceText = cfg.voice.asr && msg.records.length
       ? (groupEntry?.voicePromise ? await groupEntry.voicePromise : await transcribe(msg))
       : msg.records.length ? '[发来一条语音]' : ''
-    if (disposed) return
+    if (disposed || wasCleared()) return
     if (voiceText) text = (text ? text + ' ' : '') + voiceText
     if (voiceText && msg.kind === 'private' && onMemoryCommand) {
       try { onMemoryCommand(msg, text) } catch (error) { log.warn('处理记忆请求失败：', error.message) }
@@ -2344,7 +2462,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       const qImgs = await quoteImages(quoted, Math.min(2, 4 - imgs.length))
       for (const c of qImgs) content.push(c)
     }
-    if (disposed) return
+    if (disposed || wasCleared()) return
     logIncoming(text)
     lastChatAt = now
     if (msg.kind === 'private' && msg.userId === cfg.ownerQQ) lastOwnerChatAt = now
@@ -2414,7 +2532,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       post_type: 'message', message_type: group ? 'group' : 'private', sub_type: group ? 'normal' : 'friend',
       self_id: Number(self), user_id: Number(poker), ...(group ? { group_id: Number(group) } : {}), message_id: 0,
       sender: { user_id: Number(poker), nickname, card: nickname },
-      message: [{ type: 'at', data: { qq: self } }, { type: 'text', data: { text: ` [戳了戳你${ev.action ? '：' + ev.action + (ev.suffix || '') : ''}]` } }],
+      message: [{ type: 'at', data: { qq: self } }, { type: 'text', data: { text: ev.action ? ' [' + ev.action + (ev.suffix || '') + '（这是戳一戳的动作）]' : ' [戳了戳你]' } }],
     })
   }
 
@@ -2531,7 +2649,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     }
     const archiveMessages = fresh.filter(x => x.text).map(x => ({ role: 'user', text: x.text,
       speakerId: String(x.uid || ''), at: x.t, id: x.mid && x.mid !== '0' ? 'qq:' + chat.groupId + ':' + x.mid : randomUUID() }))
-    return { text: text + mediaNote, query, speakers, autoReply: pickAutoReply(fresh), images: [...quotedImages, ...extraImages], archiveMessages, freshCount: fresh.length }
+    return { text: text + mediaNote, query, speakers, autoReply: pickAutoReply(fresh), directRequester: pickDirectRequester(fresh), images: [...quotedImages, ...extraImages], archiveMessages, freshCount: fresh.length }
   }
 
   // ---------- 连发合并：人常常一口气发好几句，等对方说完再一起交给她，别一句一回 ----------
@@ -2718,6 +2836,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       p.speakers = [...new Set([...(p.retrySpeakers || []), ...gp.speakers])]
       p.autoReply = gp.autoReply
       p.archiveMessages = [...(p.retryArchiveMessages || []), ...gp.archiveMessages.filter((message) => !retainedIds.has(message.id))]
+      p.directRequester = gp.directRequester
     } else {
       content = [{ type: 'text', text: p.texts.join('\n') + hint }, ...p.images]
     }
@@ -2730,7 +2849,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       const [first, ...rest] = [...p.senders]
       // 私聊：检索记忆时去掉「【私聊】某某(QQ)：」这个头
       const query = p.query ?? p.texts.map((t) => t.replace(/^【私聊】[^：]*：/, '')).join('\n')
-      await pushToSession(p.chat, content, first, { wantVoice: p.wantVoice, extraSenders: rest, queryText: query, speakers: p.speakers, autoReply: p.autoReply, turnToken, archiveMessages: p.archiveMessages })
+      await pushToSession(p.chat, content, first, { wantVoice: p.wantVoice, extraSenders: rest, queryText: query, speakers: p.speakers, autoReply: p.autoReply, turnToken, archiveMessages: p.archiveMessages, directRequester: p.directRequester })
     } catch (error) {
       if (isSessionBackoff(error)) {
         retainSessionMessages(chatId, p, content)
@@ -2834,7 +2953,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         ? await onebot.call('get_group_msg_history', { group_id: Number(tgt.id), count }, { timeoutMs: 8000 })
         : await onebot.call('get_friend_msg_history', { user_id: Number(tgt.id), count }, { timeoutMs: 8000 })
       const list = Array.isArray(r) ? r : (r?.messages || [])
-      const lines = flatHistory(list).slice(-count)
+      const lines = flatHistory(filterHistory(chat.chatId, list)).slice(-count)
       if (!lines.length) return content
       log.info(`${chat.chatId}：新会话，补看最近 ${lines.length} 条历史`)
       const block = `【你刚上线，先补看最近 ${lines.length} 条${tgt.kind === 'group' ? '群' : '私聊'}记录】\n${lines.join('\n')}\n【补看结束，接着回下面这条】`
@@ -2865,7 +2984,11 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     assertActive(); opts.assertAuthorized?.()
     const turnToken = opts.turnToken
     checkTurn(chat.chatId, turnToken)
-    const { agent, sessionId } = await agentFor(chat, turnToken)
+    const cutoff = chat.kind === 'private' ? memoryResetAt(chat.userId) : 0
+    const assertMemoryCurrent = () => {
+      if (chat.kind === 'private' && memoryResetAt(chat.userId) !== cutoff) throw new Error('私聊记忆已清理，取消旧轮次')
+    }
+    const { agent, sessionId } = await agentFor(chat, turnToken, assertMemoryCurrent)
     checkTurn(chat.chatId, turnToken)
     assertActive(); opts.assertAuthorized?.()
     const key = sessionKey(sessionId)
@@ -2927,7 +3050,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     for (const block of admitted.filter((c) => c.type === 'text')) {
       for (const r of memoryPromptRanges(block.text, { toEndOfText: true })) sources.memory.push(block.text.slice(r.start, r.end))
     }
-    assertActive(); opts.assertAuthorized?.()
+    assertActive(); opts.assertAuthorized?.(); assertMemoryCurrent()
     startTyping(key, chat)
     if (chat.kind !== 'system' && getConfig().conversationContext?.enabled === true) {
       try {
@@ -2962,6 +3085,12 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     for (const s of opts.extraSenders || []) addSender(s)
     // 群聊本机工具按「这一轮说话的人」开合：全是主人就放开，掺了别人就收回去
     if (chat.kind === 'group') applyGroupGate(key, turnSendersAllOwner(sessionId))
+    // 排队消息的直接请求者不能给正在执行的上一轮借权。
+    if (!opts.steer) {
+      if (queuedNextTurn) st.pendingDirectRequester = opts.directRequester || null
+      else st.directRequester = opts.directRequester || null
+    }
+    // 上一句也留着：这一句太短（「嗯嗯」「然后呢」）时一起拿去想起相关的事
     if (st.lastText) st.prevText = st.lastText
     st.lastText = userText.slice(-600)
     st.speakers = opts.speakers || (senderId ? [String(senderId), ...(opts.extraSenders || []).map(String)] : [])
@@ -3228,6 +3357,13 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     return [...st.senders].every((u) => isOwner(getConfig(), u))
   }
 
+  /** 生图的群聊例外：主人是本轮唯一明确 @ / 引用回复的请求者。 */
+  function turnDirectFromOwner(sessionId) {
+    const st = turnState.get(sessionKey(sessionId))
+    const uid = String(st?.directRequester?.uid || '')
+    return Boolean(uid && st?.senders.has(uid) && isOwner(getConfig(), uid))
+  }
+
   function chatOfSession(sessionId) {
     const key = sessionKey(sessionId)
     const live = sessionToChat.get(key)
@@ -3254,19 +3390,64 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   }
 
   /** 只让一个聊天重新开始：归档它的会话，下一条消息开新会话。 */
-  function resetChat(chatId) {
+  function resetChat(chatId, { memoryResetAt: cutoff = 0 } = {}) {
     const reg = dsh.workspaceRegistry || dsh.get('workspaceRegistry')
     const m = map()
-    const e = m.chats[chatId]
-    if (!e) return false
-    Promise.resolve(reg?.archiveSession?.(e.sessionId)).catch((error) => log.debug('归档会话失败：', error.message))
-    sessionToChat.delete(sessionKey(e.sessionId))
-    turnState.delete(sessionKey(e.sessionId))
-    outputSources.delete(chatId)
+    const entry = m.chats[chatId]
+    if (!entry && !cutoff) return false
+    const qq = chatId.slice(8)
+    if (cutoff) m.memoryCutoffs = { ...memoryCutoffs, [qq]: cutoff }
     delete m.chats[chatId]
     saveMap(m)
+    if (cutoff) {
+      memoryCutoffs[qq] = cutoff
+      chatLogRevision++
+    }
+    const sessions = new Set([entry?.sessionId, ...(cutoff ? Object.values(entry?.sessions || {}) : [])].filter(Boolean))
+    for (const sessionId of sessions) {
+      const key = sessionKey(sessionId)
+      sessionToChat.delete(key)
+      turnState.delete(key)
+      if (cutoff) {
+        const rec = mounted.get(key)
+        if (rec) unmount(rec)
+        mounted.delete(key)
+        sessionTarget.delete(key)
+        historySeeded.delete(key)
+        clearSlowNotices(key)
+        stopTyping(key)
+      }
+      try {
+        Promise.resolve(reg?.archiveSession?.(sessionId)).catch((error) => log.debug('归档会话失败：', error.message))
+      } catch (error) { log.debug('归档会话失败：', error.message) }
+    }
+    outputSources.delete(chatId)
     log.info(`${chatId} 重新开始`)
     return true
+  }
+
+  function resetPersonChat(qq) {
+    const chatId = `private:${qq}`
+    if (isBusy(chatId) || running.has(chatId) || sendChain.has(chatId)
+      || sessionCreating.has(chatId + ':live') || sessionCreating.has(chatId + ':debug')) {
+      return { ok: false, message: '该私聊正在回复，请等这轮结束后再清理' }
+    }
+    const cutoff = Date.now()
+    resetChat(chatId, { memoryResetAt: cutoff })
+    clearTimeout(pending.get(chatId)?.timer)
+    pending.delete(chatId)
+    busy.delete(chatId)
+    busyTurns.delete(chatId)
+    busySessions.delete(chatId)
+    noticesFor.delete(chatId)
+    saidElsewhere.delete(chatId)
+    recentFiles.delete(chatId)
+    recentMedia.clear(chatId)
+    for (const key of quoteCache.keys()) if (key.startsWith(chatId + "|")) quoteCache.delete(key)
+    for (const [groupId, entries] of groupBuf) {
+      groupBuf.set(groupId, entries.filter((entry) => entry.uid !== qq || entry.t > cutoff))
+    }
+    return { ok: true }
   }
 
   /** 重新开始：把现有的 QQ 会话都归档（侧栏里还能找回），下一条消息起开新会话。 */
@@ -3492,7 +3673,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     debugSay,
     modelFor: targetModel,
     /** 这个聊天最近发来的图片 / 表情（新的在后面），可选只要某人发的 */
-    recentMedia: (chatId, userId) => recentMedia.get(chatId, userId),
+    recentMedia: recentMediaOf,
     referenceImage,
     recentFiles: (chatId) => recentFiles.get(chatId) || [],
     stickerOf,
@@ -3526,10 +3707,14 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     runSubagentTurn,
     subagentFor,
     turnSendersAllOwner,
+    turnDirectFromOwner,
     onNotice,
     turnHasOwner,
     turnSenders,
     resetChat,
+    resetPersonChat,
+    memoryResetAt,
+    filterHistory,
     joinTopic: (gid) => groupEngaged.set(String(gid), Date.now() + ENGAGE_MS),
     leaveTopic: (gid) => groupEngaged.delete(String(gid)),
     chatOfSession,

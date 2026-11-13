@@ -1,6 +1,8 @@
 // QQ 里的主人命令：/silent /active 之类，直接在 QQ 上管她。只认主人；在总开关关着时也能用（所以 /on 才有用）。
 
+import { runEffortCommand } from './effort-command.js'
 import { dataDir, readJson, writeJson } from '../core/store.js'
+import { runPermissionsCommand } from './permissions-command.js'
 
 /**
  * 解析命令：「/silent 30」→ { name: 'silent', arg: '30' }。不是命令返回 null。支持全角斜杠和中文别名。
@@ -10,6 +12,8 @@ export function parseCommand(text, extra = []) {
   const m = String(text || '').trim().match(/^[/／]\s*([A-Za-z0-9一-龥_-]+)\s*([\s\S]*)$/)
   if (!m) return null
   const word = m[1].toLowerCase()
+  // 权限管理是保留命令，扩展模块不能抢占。
+  if (word === '权限' || word === 'permissions' || word === 'perms') return { name: 'permissions', arg: m[2].trim() }
   for (const c of extra) {
     const names = [c.name, ...(c.aliases || [])].map((x) => String(x).toLowerCase())
     if (names.includes(word)) return { name: c.name, arg: m[2].trim(), ext: c }
@@ -31,6 +35,7 @@ const ALIASES = {
   多说: 'chatty', 话多: 'chatty',
   正常: 'normal',
   模型: 'model', 换模型: 'model',
+  思考: 'effort', 思考强度: 'effort',
   唱: 'sing', 点歌: 'sing', 翻唱: 'sing',
   状态: 'status', 心情: 'mood', 日记: 'diary', 记住: 'remember', 记一下: 'remember',
   搭话: 'speak', 主动搭话: 'speak',
@@ -39,12 +44,14 @@ const ALIASES = {
 
 const COMMANDS = {
   help: '看这份命令列表',
+  permissions: '主人私聊管理权限：/权限 查看用法',
   silent: '在这里闭嘴（可带分钟数，如 /silent 30；不带就一直到 /active）',
   active: '解除闭嘴；在群里还会接着参与话题一会儿',
   quiet: '这个群里只在被叫到时说话，不插话',
   chatty: '这个群里话多一点，更爱插话',
   normal: '这个群恢复默认的插话频率',
   model: '看或换她用的模型：/model 看列表，/model 2 或 /model 名字 换，/model 默认 跟随 DSH',
+  effort: '查看当前聊天的模型思考档位；发 /effort 序号 或 档位名切换，/effort 默认恢复跟随',
   sing: '让她翻唱一首：/sing 小幸运 田馥甄；后面加 +12 / -3 之类可以变调（原唱是男声一般 +12）',
   status: '看她现在的状态',
   mood: '看她现在的心情',
@@ -109,6 +116,8 @@ export async function runCommand(cmd, msg, deps) {
     setConfig({ ...cfg, group: { ...cfg.group, overrides } })
   }
   switch (cmd.name) {
+    case 'permissions':
+      return runPermissionsCommand(cmd.arg, msg, deps)
     case 'help':
       return helpText(deps.extraCommands || [])
     case 'silent': {
@@ -189,6 +198,8 @@ export async function runCommand(cmd, msg, deps) {
       setConfig({ ...cfg, model: { ...cfg.model, provider: hit.provider, model: hit.model } })
       return `好，换成 ${label(hit)} 了，下一句起生效`
     }
+    case 'effort':
+      return runEffortCommand(cmd.arg, msg, deps)
     case 'sing': {
       if (!deps.song) return '翻唱功能不可用'
       // 末尾的 +12 / -3 是变调

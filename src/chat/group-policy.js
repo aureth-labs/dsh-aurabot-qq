@@ -125,6 +125,14 @@ export function pickAutoReply(fresh) {
   return target ? { mid: target.mid, uid: target.uid } : null
 }
 
+/** 本批唯一直接请求者，只读真实 QQ 元数据；不受自动引用的展示策略影响。 */
+export function pickDirectRequester(fresh) {
+  const direct = fresh.filter((x) => x.direct && x.uid && x.mid && String(x.mid) !== '0')
+  if (new Set(direct.map((x) => String(x.uid))).size !== 1) return null
+  const target = direct.at(-1)
+  return { mid: String(target.mid), uid: String(target.uid) }
+}
+
 /** 接话时给她的提示：告诉她已经连着说了几次没人理，让她自己判断要不要停。 */
 export function engagedHint(run = 0) {
   const said = run > 1 ? `你已经连着接了 ${run - 1} 次，这期间没人叫你或回你。` : ''

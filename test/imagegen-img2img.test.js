@@ -258,6 +258,7 @@ function drawTool(cfg, overrides = {}) {
   const generated = [], sent = [], events = [], references = []
   const hub = {
     turnSendersAllOwner: () => true,
+    sendText: async () => ({ message_id: 1 }),
     referenceImage: async (chat, source) => { references.push({ chat, source }); return PNG },
     sendSegments: async (...args) => { sent.push(args); return { message_id: 1 } },
     canSeeImages: async () => false,
