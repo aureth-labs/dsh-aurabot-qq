@@ -424,6 +424,19 @@ test('长连接：收到数据帧 → emit 一条；并回一个同 SeqID 的应
   await adapter.stop()
 })
 
+test('长连接：WebSocket 以 Blob 交付时也能解帧并 emit', async () => {
+  const { adapter, ws, ctx } = await bootWs({ verificationToken: VERIFY_TOKEN })
+  ws.push(new Blob([encodeFrame({
+    SeqID: 43, LogID: 10, Service: 1, Method: 1,
+    Headers: [{ key: 'type', value: 'event' }],
+    PayloadType: 'json',
+    Payload: JSON.stringify(inboundEvent()),
+  })]))
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(ctx.emitted.length, 1, 'Blob 数据帧应 emit 一条')
+  await adapter.stop()
+})
+
 test('长连接：ping 帧回 pong；pong 不做事', async () => {
   const { adapter, ws, ctx } = await bootWs()
   const before = ws.sent.length

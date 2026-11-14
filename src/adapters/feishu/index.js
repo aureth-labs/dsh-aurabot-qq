@@ -1181,6 +1181,9 @@ export function createFeishuAdapter(options = {}) {
         finish(new Error('wsFactory 没有返回 WebSocket 对象'))
         return
       }
+      // Node 自带 WebSocket 的 binaryType 默认是 blob；不改成 arraybuffer 时
+      // onmessage 拿到的是 Blob，下面的 Buffer/ArrayBuffer 分支全都接不到，事件会超时。
+      try { ws.binaryType = 'arraybuffer' } catch (error) {}
 
       ws.onopen = () => {
         clearTimeout(timer)
@@ -1202,7 +1205,12 @@ export function createFeishuAdapter(options = {}) {
         if (Buffer.isBuffer(data)) handleFrame(data)
         else if (data instanceof ArrayBuffer) handleFrame(Buffer.from(data))
         else if (ArrayBuffer.isView(data)) handleFrame(Buffer.from(data.buffer, data.byteOffset, data.byteLength))
-        else if (typeof data === 'string') handleFrame(Buffer.from(data, 'utf8'))
+        else if (typeof data.arrayBuffer === 'function') {
+          // 兼容浏览器/部分 WebSocket 实现返回 Blob 的情况。
+          data.arrayBuffer().then((buf) => handleFrame(Buffer.from(buf))).catch((error) => {
+            log().warn('飞书长连接 Blob 读取失败：', error?.message || error)
+          })
+        } else if (typeof data === 'string') handleFrame(Buffer.from(data, 'utf8'))
       }
 
       ws.onerror = () => {
