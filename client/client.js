@@ -2155,8 +2155,10 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h(Row, { label: '连着接话几次', hint: '她会自己判断该不该停，这里只是兜底：没人叫她时最多连着接几次。0 = 不接话' }, f.range('group.engagedMax', 0, 10, 1, (v) => v + ' 次')),
           h(Row, { label: '最多说几次' }, f.range('group.burstMax', 1, 20, 1, (v) => v + ' 次'), h('span', { className: 'ab-muted' }, '/'), f.range('group.burstWindowSec', 30, 600, 30, (v) => Math.round(v / 6) / 10 + ' 分钟')),
         ),
-        h(Card, { title: '群里插话', desc: '没人叫ta的时候，ta也可能自然地插一句；ta看完群里在聊什么，也可以决定不说话。' },
-          h(Row, { label: '插话概率', hint: '每条普通消息触发插话的机会' }, f.percent('group.interjectChance')),
+        h(Card, { title: '群里插话', desc: '下面是所有白名单群的默认设置；个别群可以在「按群单独设置」里改。' },
+          h(Row, { label: '主动加入话题', hint: '没人叫ta、也没在和ta聊天时，允许ta偶尔插一句；仍受概率、冷却和每小时上限限制' }, f.sw('group.proactiveEnabled', { on: draft.group.proactiveEnabled !== false, title: '主动加入话题' })),
+          h(Row, { label: '窗口内接话', hint: 'ta最近 3 分钟说过话时，允许继续接相关话题；仍受静默时段、连续接话次数和安全刹车限制' }, f.sw('group.engagedEnabled', { on: typeof draft.group.engagedEnabled === 'boolean' ? draft.group.engagedEnabled : draft.group.interjectChance > 0, title: '窗口内接话' })),
+          h(Row, { label: '插话概率', hint: '主动加入话题的基础概率。旧设置为 0 时也关闭接话；想只接话，可单独打开上面的「窗口内接话」' }, f.percent('group.interjectChance')),
           h(Row, { label: '冷却', hint: '两次插话至少隔多久' }, f.range('group.cooldownSec', 0, 600, 10, (v) => v + ' 秒')),
           h(Row, { label: '每小时最多插话' }, f.range('group.maxPerHour', 0, 30, 1, (v) => v + ' 次')),
           h(Row, { label: 'ta感兴趣的话题', hint: '群里在聊这些（或ta记得相关的事）时更容易插话；一行一个' }, f.list('group.interests', { placeholder: '白米饭\n游戏\n追剧' })),
@@ -2169,15 +2171,34 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             h('input', { className: 'ab-input sm', type: 'number', min: 0, max: 23, value: draft.group.quietHours[1], onChange: (e) => setDraft(setPath(draft, 'group.quietHours', [draft.group.quietHours[0], Number(e.target.value)])) }),
             h('span', { className: 'ab-muted' }, '点')),
         ),
-        h(Card, { title: '按群单独设置', desc: '某个群想让ta更安静或更活跃，在这里单独设插话概率。' },
-          Object.keys(overrides).length === 0 ? h('div', { className: 'ab-muted', style: { marginBottom: 10 } }, '还没有单独设置的群。') :
-            Object.entries(overrides).map(([gid, o]) => h(Row, { key: gid, label: '群 ' + gid },
-              h('input', { className: 'ab-input sm', type: 'number', min: 0, max: 100, value: pct(o.interjectChance ?? draft.group.interjectChance), onChange: (e) => setDraft(setPath(draft, 'group.overrides', { ...overrides, [gid]: { ...o, interjectChance: Number(e.target.value) / 100 } })) }),
-              h('span', { className: 'ab-muted' }, '% 插话'),
-              h(Btn, { small: true, kind: 'ghost', onClick: () => { const n = { ...overrides }; delete n[gid]; setDraft(setPath(draft, 'group.overrides', n)) } }, '移除'))),
-          h('div', { className: 'ab-flex' }, h('input', { className: 'ab-input', placeholder: '群号', value: newGid, onChange: (e) => setNewGid(e.target.value.replace(/\D/g, '')) }),
-            h(Btn, { small: true, disabled: !newGid, onClick: () => { setDraft(setPath(draft, 'group.overrides', { ...overrides, [newGid]: { interjectChance: draft.group.interjectChance } })); setNewGid('') } }, '添加')),
+        h(Card, { title: '按群单独设置', desc: '只影响白名单群。想让某个群「不主动凑热闹，但聊起来能接话」：主动加入选关，窗口内接话选开。@、引用、叫名字和紧接着追问仍按原规则处理；模块的定时推送另行设置。' },
+          Object.keys(overrides).length === 0 ? h('div', { className: 'ab-muted', style: { marginBottom: 10 } }, '所有群都跟随上面的默认设置。') :
+            Object.entries(overrides).map(([gid, raw]) => {
+              const o = raw && typeof raw === 'object' ? raw : {}
+              const change = (key, value) => {
+                const next = { ...o }
+                if (value === '') delete next[key]
+                else next[key] = value === 'on'
+                setDraft(setPath(draft, 'group.overrides', { ...overrides, [gid]: next }))
+              }
+              return h('div', { key: gid, style: { borderTop: '1px solid var(--ab-line)', paddingTop: 10, marginTop: 10 } },
+                h('div', { className: 'ab-flex' }, h('b', null, '群 ' + gid), h('div', { className: 'ab-spacer' }),
+                  h(Btn, { small: true, kind: 'ghost', onClick: () => { const n = { ...overrides }; delete n[gid]; setDraft(setPath(draft, 'group.overrides', n)) } }, '恢复跟随默认')),
+                ...[['proactiveEnabled', '主动加入话题'], ['engagedEnabled', '窗口内接话']].map(([key, label]) =>
+                  h(Row, { key, label }, h(Select, { ariaLabel: '群 ' + gid + ' ' + label, value: typeof o[key] === 'boolean' ? (o[key] ? 'on' : 'off') : '',
+                    options: [{ value: '', label: '跟随默认' }, { value: 'on', label: '开' }, { value: 'off', label: '关' }], onChange: (v) => change(key, v) }))),
+                h(Row, { label: '主动加入的概率', hint: '留空跟随默认；单独打开窗口内接话后，不受此概率限制' },
+                  h('input', { className: 'ab-input sm', 'aria-label': '群 ' + gid + ' 插话概率', type: 'number', min: 0, max: 100,
+                    placeholder: String(pct(draft.group.interjectChance)), value: o.interjectChance == null ? '' : pct(o.interjectChance),
+                    onChange: (e) => { const next = { ...o }; if (e.target.value === '') delete next.interjectChance; else next.interjectChance = Math.max(0, Math.min(100, Number(e.target.value))) / 100; setDraft(setPath(draft, 'group.overrides', { ...overrides, [gid]: next })) } }),
+                  h('span', { className: 'ab-muted' }, '%')))
+            }),
+          h('div', { className: 'ab-flex', style: { marginTop: 12 } }, h('input', { className: 'ab-input', 'aria-label': '单独设置的群号', placeholder: '输入群号', value: newGid, onChange: (e) => setNewGid(e.target.value.replace(/\D/g, '')) }),
+            h(Btn, { small: true, disabled: !newGid || Object.hasOwn(overrides, newGid), onClick: () => { setDraft(setPath(draft, 'group.overrides', { ...overrides, [newGid]: {} })); setNewGid('') } }, '添加群')),
         ),
+        h(Card, { title: '非白名单群：只旁听记忆', desc: '留空就不记录。填入群号后，只保存收到的文字，供现有记忆整理使用；不会因此回复、执行命令、下载图片或转写语音。' },
+          h(Row, { label: '允许旁听的群号', hint: '一行一个。需要总开关和记忆开关开启；仅处理之后收到的消息，不补抓旧记录。白名单群仍沿用原来的记忆规则。' }, f.list('memory.passiveGroups', { numbers: true, placeholder: '100200300' })),
+          h('p', { className: 'ab-muted ab-small' }, '旁听内容会保存在本机；记忆整理可能调用模型并产生费用，与其他聊天共用现有整理额度。移除群号后停止新增，已记录的内容不会自动删除，可在记忆页清理。')),
       )
     }
 
@@ -8800,7 +8821,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const tabDirty = (id) => {
         if (!dirty) return false
         if (id.startsWith('ext:')) { const k = id.slice(4); return JSON.stringify((draft.ext || {})[k]) !== JSON.stringify((cfg.ext || {})[k]) }
-        // 「生图」页现在也管着 dsh-image 模块的设置（ext.dsh-image 存在草稿里），改没改要一起算。
+        // 「聊天」页的旁听名单存于 memory，也需要显示未保存标记。
+        if (id === 'group' && JSON.stringify(draft.memory?.passiveGroups) !== JSON.stringify(cfg.memory?.passiveGroups)) return true
+        // 「生图」页也管着 dsh-image 模块的设置。
         if (id === 'imagegen' && JSON.stringify((draft.ext || {})['dsh-image']) !== JSON.stringify((cfg.ext || {})['dsh-image'])) return true
         return (TAB_KEYS[id] || []).some((k) => JSON.stringify(draft[k]) !== JSON.stringify(cfg[k]))
       }

@@ -15,7 +15,7 @@ import { isDefiniteFailure } from '../onebot/client.js'
 import { parseMessageEvent, gifFrames, segmentsOf } from './inbound.js'
 import { parseReply, bubbleDelay, wantsVoice, itemsToLine, cleanOutboundText, cleanOutboundSegments, capOutboundSegments, clockLabel } from './reply.js'
 import { decideGroupReply, engagedHint, pickAutoReply, pickDirectRequester, policyFor, sameNameNote, topicRelevance } from './group-policy.js'
-import { checkAllowed, levelFor, presetFor, isOwner, groupOwnerTools } from './access.js'
+import { checkAllowed, shouldObserveGroup, levelFor, presetFor, isOwner, groupOwnerTools } from './access.js'
 import { fetchImage, segmentBytes } from '../core/net.js'
 import { toMono16k } from '../voice/wav.js'
 import { asrConfigured, transcribeAudio } from '../voice/asr.js'
@@ -2280,6 +2280,11 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       }
     }
     if (!allowed.allowed) {
+      // 旁听只走现有文字流水 → 记忆整理；不展开转发、不识图/听音、不运行消息钩子或命令。
+      // 头衔过滤、人格隔离、调试模式和清空记忆的保护仍由上方检查及 logChat 负责。
+      if (shouldObserveGroup(cfg, msg) && msg.text.trim()) {
+        logChat(msg.chatId, msg.nickname, msg.text, msg.userId, { at: now })
+      }
       log.debug(`忽略 ${msg.chatId}（${allowed.reason}）`)
       return
     }
