@@ -100,10 +100,16 @@ export function reallySent (r) {
   return Boolean(r) && r.message_id !== undefined && !String(r.message_id).startsWith('sim-')
 }
 
-export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, buildTools, contextProviders, onActivity, memoryScore, onMemoryCommand, onCommand, isMuted, dislikes, random = Math.random, moodEffects, localApi, hooks, availableModels, toolsGeneration, capabilitiesOf, gateway = null, identity = null, handover = null, routeOwner: routeOwnerInjected = null }) {
+export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, buildTools, contextProviders, onActivity, memoryScore, onMemoryCommand, onCommand, isMuted, dislikes, random = Math.random, moodEffects, localApi, hooks, availableModels, toolsGeneration, capabilitiesOf, gateway = null, identity = null, handover = null, platformLabel: platformLabelInjected = null, routeOwner: routeOwnerInjected = null }) {
   const ownerRef = () => identity
   const ownerId = () => identity?.owner?.() || null
   const defaultPlatform = () => parseChatId('private:0')?.platform || ''
+  const platformLabelOf = (platform) => {
+    if (typeof platformLabelInjected === 'function') {
+      try { const label = platformLabelInjected(platform); if (label) return String(label) } catch (error) {}
+    }
+    return String(platform || '')
+  }
   const chatPlatform = (chatOrId) => {
     if (chatOrId && typeof chatOrId === 'object') {
       if (chatOrId.platform) return String(chatOrId.platform)
@@ -715,13 +721,16 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
 
   function titleFor(chat) {
     const owner = getConfig().ownerName || '主人'
+    const plat = chatPlatform(chat.chatId || chat) || defaultPlatform()
+    const label = platformLabelOf(plat) || plat || '平台'
+    const systemPrefix = `${label} · `
     // 模块自带「QQ · 」前缀时不要再拼一层，否则工作区里会显示成「QQ · QQ · 主动搭话…」
     if (chat.kind === 'system') {
       const t = String(chat.title || '后台')
-      return t.startsWith('QQ · ') ? t : `QQ · ${t}`
+      return t.startsWith(systemPrefix) ? t : systemPrefix + t
     }
-    if (chat.kind === 'group') return `QQ 群 · ${groupNames.get(chat.groupId) || chat.groupId}`
-    return isOwnerPrivateChat(ownerRef(), chat) ? `QQ · ${owner}私聊` : `QQ 私聊 · ${chat.nickname || chat.userId}`
+    if (chat.kind === 'group') return `${label} 群 · ${groupNames.get(chat.groupId) || chat.groupId}`
+    return isOwnerPrivateChat(ownerRef(), chat) ? `${label} · ${owner}私聊` : `${label} 私聊 · ${chat.nickname || chat.userId}`
   }
 
   // 后台会话点名 preset（自驱引擎 P0.2，docs/AUTOTELIC-PLAN.md §3/§4.2）：

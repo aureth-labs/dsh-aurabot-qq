@@ -550,6 +550,7 @@ export function apply(ctx) {
     gateway: platformGateway,
     identity,
     handover: createHandover({ dsh: ctx, getConfig, identity, log: logger.child('handover') }),
+    platformLabel: (platform) => ({ qq: 'QQ', feishu: '飞书', qqbot: 'QQ 官方机器人', bridge: '通用桥' })[platform] || platform,
     routeOwner,
     stickers,
     tts,
