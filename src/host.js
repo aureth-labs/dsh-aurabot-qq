@@ -2547,7 +2547,7 @@ export function apply(ctx) {
         legacy: true,
         state: onebotState,
         detail: onebotState === 'connected' ? '旧版直连 QQ（由连接页管理）' : (onebot.problem || '旧版直连 QQ'),
-        self: login ? { account: String(login.uin || ''), name: login.nickname || '' } : null,
+        self: (onebot.login?.uin || cfg.botQQ) ? { account: String(onebot.login?.uin || cfg.botQQ), name: onebot.login?.nickname || '' } : null,
         caps: null,
         settings: [],
       }]
