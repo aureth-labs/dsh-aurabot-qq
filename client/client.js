@@ -870,6 +870,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     const TABS = [
       { id: 'overview', label: '概览' },
       { id: 'platforms', label: '平台' },
+      { id: 'tools', label: '外置工具' },
       { id: 'connect', label: '连接' },
       { id: 'character', label: '人格' },
       { id: 'access', label: '权限' },
@@ -910,7 +911,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       { id: 'self', label: '人设', icon: 'M12 12.5a4.25 4.25 0 1 0 0-8.5 4.25 4.25 0 0 0 0 8.5zM4.5 20.5c.9-3.6 3.9-5.5 7.5-5.5s6.6 1.9 7.5 5.5', tabs: ['character', 'group', 'speakup', 'autotelic', 'mood', 'memory', 'persona'] },
       { id: 'express', label: '表达', icon: 'M20.5 11.5a8 8 0 0 1-11.7 7.1L4 20l1.4-4.4A8 8 0 1 1 20.5 11.5zM9 13.2s1.1 1.5 3 1.5 3-1.5 3-1.5M9.5 9.6h.01M14.5 9.6h.01', tabs: ['voice', 'asr', 'stickers', 'imagegen', 'song', 'pet'] },
       { id: 'platform', label: '平台', icon: 'M3.5 6.5h17v11h-17zM10.5 9.8v4.4l3.8-2.2z', tabs: ['diary', 'bili', 'douyin', 'heybox'] },
-      { id: 'system', label: '系统', icon: 'M4 7h9M17 7h3M4 12h3M11 12h9M4 17h11M19 17h1M15 5v4M9 10v4M17 15v4', tabs: ['platforms', 'connect', 'model', 'access', 'browser', 'security', 'backup', 'about', 'logs'] },
+      { id: 'system', label: '系统', icon: 'M4 7h9M17 7h3M4 12h3M11 12h9M4 17h11M19 17h1M15 5v4M9 10v4M17 15v4', tabs: ['platforms', 'tools', 'connect', 'model', 'access', 'browser', 'security', 'backup', 'about', 'logs'] },
       { id: 'market', label: '模块', icon: 'M4 9.5 5.5 4h13L20 9.5M4 9.5a2.7 2.7 0 0 0 5.3 0 2.7 2.7 0 0 0 5.4 0 2.7 2.7 0 0 0 5.3 0M5.5 12.5V20h13v-7.5M10 20v-4.5h4V20', tabs: ['market', 'modules', 'local'] },
     ]
     // 自己写的模块：名字像逛平台的放「平台」，其余放「系统」（排在「日志」前面）
@@ -920,7 +921,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       (t.ext && PLATFORM_EXT.test(t.label) ? NAV_GROUPS[3] : NAV_GROUPS[4])
     const navOrder = (g, t) => { const i = g.tabs.indexOf(t.id); return i >= 0 ? i : g.tabs.length - (g.tabs.includes('logs') ? 1.5 : 0) }
     const NAV_ALIAS = {
-      overview: '首页 状态', connect: 'qq 网关 snowluma onebot 登录 工作区', character: '人设 性格 设定 头像', persona: '人物 画像 小档案 群印象 梗概 时间轴 相处经验 说话方式', access: '主人 白名单 权限 群管 改资料',
+      overview: '首页 状态', tools: '外置工具 ffmpeg python uv git edge-tts', connect: 'qq 网关 snowluma onebot 登录 工作区', character: '人设 性格 设定 头像', persona: '人物 画像 小档案 群印象 梗概 时间轴 相处经验 说话方式', access: '主人 白名单 权限 群管 改资料',
       group: '群聊 插话 合并', model: 'ai 大模型 视觉 思考强度', voice: '语音 tts 说话 音色 edge', asr: '语音识别 听语音 转文字 asr 语音转文本', stickers: '表情 小黄脸 gif 商城表情',
       imagegen: '画图 图片', diary: '空间 说说 日记', speakup: '搭话 主动', autotelic: '自驱 自主 后台 账本 审计 做梦 立项', mood: '心情', memory: '记忆 星图 联想 翻一翻 向量 重排', song: '唱歌 翻唱 rvc 点歌',
       bili: 'b站 bilibili 视频', douyin: '抖音 短视频 私信', pet: '桌宠 宠物 悬浮窗 气泡 electron', local: '本地 接口 sd sovits', browser: '浏览器 侧边 侧边栏 ego 共享 独立窗口', security: '安全 防护 ssrf 内网 图片 下载', modules: '扩展 自己写 模板 安全模式', market: '模块 市场 插件 社区 下载 安装 桌宠 抖音 小黑盒 群管', logs: '日志 报错', about: '关于 关于我们 版本 许可 鸣谢 开源', backup: '备份 恢复 换电脑 迁移 导入 导出',
@@ -1387,6 +1388,45 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
 
     const PLATFORM_NAMES = { qq: 'QQ', feishu: '飞书', qqbot: 'QQ 官方机器人', bridge: '通用桥' }
     const platformLabel = (name) => PLATFORM_NAMES[name] || name || '平台'
+
+    const TOOL_STATUS = { ready: '已就绪', missing: '未找到', invalid: '不可用' }
+    const TOOL_SOURCE = { auto: '自动检测', legacy: '旧 B 站设置', config: '手动指定', managed: '托管安装' }
+
+    /** U1：外置工具页。只读探测；安装/路径选择在下一阶段接。 */
+    function Tools({ toast }) {
+      const [data, setData] = useState(null)
+      const [busy, setBusy] = useState(false)
+      const load = (manual = false) => {
+        if (manual) setBusy(true)
+        return get(manual ? '/tools/refresh' : '/tools').then((r) => setData(r)).catch((error) => {
+          if (manual) toast(error.message || '检测失败', 'err')
+        }).finally(() => setBusy(false))
+      }
+      useEffect(() => {
+        let alive = true
+        const tick = () => get('/tools').then((r) => { if (alive) setData(r) }).catch(() => {})
+        tick()
+        const timer = setInterval(tick, 5000)
+        return () => { alive = false; clearInterval(timer) }
+      }, [])
+      const tools = (data && data.tools) || []
+      return h('div', { className: 'ab-grid' },
+        h(Card, { title: '外置工具', desc: '这里只做检测，不会自动下载或修改配置。FFmpeg 等工具被多个功能共用，统一显示位置、版本和状态。', right: h(Btn, { small: true, disabled: busy, onClick: () => load(true) }, busy ? '检测中…' : '重新检测') },
+          h('div', { className: 'ab-small ab-muted' }, '工具缺失时对应功能会给出明确提示；不影响其他功能。')),
+        tools.map((tool) => h(Card, {
+          key: tool.id,
+          title: tool.label,
+          right: h('span', { className: cx('ab-badge', tool.status === 'ready' ? 'ok' : tool.status === 'missing' ? 'err' : 'warn') }, TOOL_STATUS[tool.status] || tool.status),
+        },
+          h(Row, { label: '版本' }, h('span', null, tool.version || '—')),
+          h(Row, { label: '路径' }, h('code', { className: 'ab-small', style: { wordBreak: 'break-all' } }, tool.path || '未找到')),
+          h(Row, { label: '来源' }, h('span', null, TOOL_SOURCE[tool.source] || tool.source || '—')),
+          h(Row, { label: '被这些功能使用' }, h('span', { className: 'ab-small' }, (tool.usedBy || []).join(' · ') || '—')),
+          tool.detail && tool.status !== 'ready' ? h('div', { className: 'ab-small ab-muted', style: { marginTop: 8, wordBreak: 'break-word' } }, tool.detail) : null,
+        )),
+        !tools.length ? h(Card, null, h(Empty, { icon: '🧰', text: '正在检测外置工具…' })) : null,
+      )
+    }
 
     /** U1：平台页。平台端声明的 settings 自动生成表单；开关即时生效，不需要重启。 */
     function Platforms({ st, draft, setDraft, toast, reload, go }) {
@@ -8960,11 +9000,11 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       tabs.splice(tabs.findIndex((t) => t.id === 'logs'), 0, ...extTabs)
       const curTab = tabs.find((t) => t.id === tab) || tabs[0]
       const body = curTab.ext ? ExtPage : {
-        overview: Overview, platforms: Platforms, connect: Connect, character: Persona, access: Access, group: Group, model: Model, voice: Voice, asr: Asr,
+        overview: Overview, platforms: Platforms, tools: Tools, connect: Connect, character: Persona, access: Access, group: Group, model: Model, voice: Voice, asr: Asr,
         stickers: Stickers, imagegen: ImageGen, diary: Diary, speakup: SpeakUp, autotelic: Autotelic, pet: PetPanel, mood: Mood, memory: MemoryPage, persona: PersonaMemory, song: Song, bili: Bili, douyin: Douyin, heybox: Heybox, local: LocalApi, browser: Browser, security: Security, market: Market, modules: Modules, logs: Logs, about: About, backup: Backup,
       }[curTab.id] || Overview
       // 哪些标签有没保存的改动
-      const TAB_KEYS = { platforms: ['platforms'], connect: ['snowluma', 'botQQ'], access: ['ownerQQ', 'ownerName', 'ownerLevel', 'approvalNotify', 'approvalViaQQ', 'qqApi', 'longTasks', 'profilePerms', 'subagentBackground'], group: ['group', 'merge', 'titleFilter', 'chat'], model: ['model', 'chatModels'], voice: ['voice'], asr: ['voice'], stickers: ['stickers'], imagegen: ['imageGen'], diary: ['diary', 'qzoneSocial'], speakup: ['speakUp'], autotelic: [], pet: [], mood: ['mood', 'memory'], song: ['song'], bili: ['bili'], douyin: ['douyin'], heybox: ['heybox'], local: ['local'], browser: ['browser'], security: ['security', 'update'] }
+      const TAB_KEYS = { platforms: ['platforms'], tools: [], connect: ['snowluma', 'botQQ'], access: ['ownerQQ', 'ownerName', 'ownerLevel', 'approvalNotify', 'approvalViaQQ', 'qqApi', 'longTasks', 'profilePerms', 'subagentBackground'], group: ['group', 'merge', 'titleFilter', 'chat'], model: ['model', 'chatModels'], voice: ['voice'], asr: ['voice'], stickers: ['stickers'], imagegen: ['imageGen'], diary: ['diary', 'qzoneSocial'], speakup: ['speakUp'], autotelic: [], pet: [], mood: ['mood', 'memory'], song: ['song'], bili: ['bili'], douyin: ['douyin'], heybox: ['heybox'], local: ['local'], browser: ['browser'], security: ['security', 'update'] }
       const tabDirty = (id) => {
         if (!dirty) return false
         if (id.startsWith('ext:')) { const k = id.slice(4); return JSON.stringify((draft.ext || {})[k]) !== JSON.stringify((cfg.ext || {})[k]) }

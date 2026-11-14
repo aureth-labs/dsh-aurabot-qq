@@ -62,6 +62,7 @@ import { createFeishuAdapter } from './adapters/feishu/index.js'
 import { createQqbotAdapter } from './adapters/qqbot/index.js'
 import { createBridgeAdapter } from './adapters/bridge/index.js'
 import { ensureUpgradedStorage } from './features/import-qq.js'
+import { listTools } from './core/tools.js'
 import { createHandover } from './features/handover.js'
 import { mergePerson } from './features/merge-person.js'
 import { importFromQQ } from './features/import-qq.js'
@@ -2566,6 +2567,9 @@ export function apply(ctx) {
     }
   }
   route('/platforms', async () => platformView())
+  // 外置工具页：只读探测，不改配置、不下载；安装/修复留到下一阶段。
+  route('/tools', async () => listTools(getConfig))
+  route('/tools/refresh', async () => listTools(getConfig, { fresh: true }))
   route('/platforms/add', async (req) => {
     const b = await readBody(req)
     const platform = String(b.platform || '').trim()

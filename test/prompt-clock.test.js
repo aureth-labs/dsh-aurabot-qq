@@ -15,9 +15,9 @@ test('钟点统一按东八区压成 HH:MM', () => {
 
 test('私聊与群聊拼提示词时都带上钟点', () => {
   const hub = readFileSync(new URL('../src/chat/hub.js', import.meta.url), 'utf8')
-  // 私聊：钟点放在【私聊】之后，这样「去掉【私聊】某某(QQ)：头」的旧正则还能用
+  // 私聊：钟点放在聊天标签之后，这样「去掉【飞书私聊】某某(...)：头」的正则还能用
   assert.ok(
-    hub.includes('`【私聊】[${clockLabel(now)}] ${msg.nickname}(${msg.userId})：`'),
+    hub.includes('`【${chatTag}】[${clockLabel(now)}] ${msg.nickname}(${msg.userId})：`'),
     '私聊正文应挂 [HH:MM]',
   )
   // 群聊：每行都挂，之前的背景句和这一段新说的话都算

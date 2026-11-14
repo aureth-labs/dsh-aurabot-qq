@@ -9,7 +9,7 @@ const host = readFileSync(new URL('../src/host.js', import.meta.url), 'utf8')
 test('平台页接上了 TABS、组件表和系统分组', () => {
   assert.ok(client.includes("{ id: 'platforms', label: '平台' }"), 'TABS 缺平台页')
   assert.ok(client.includes('platforms: Platforms'), '组件表缺 platforms → Platforms')
-  assert.ok(client.includes("tabs: ['platforms', 'connect'"), '系统分组缺 platforms')
+  assert.ok(client.includes("tabs: ['platforms', 'tools', 'connect'"), '系统分组缺 platforms')
   assert.ok(client.includes('function Platforms({ st, draft, setDraft, toast, reload, go })'), '缺 Platforms 组件')
 })
 
