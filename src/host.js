@@ -9,7 +9,7 @@
 //
 // ⚠ 安全默认：总开关关、试运行开。不手动打开，一句都不会真的发到 QQ。
 
-import { readFileSync, existsSync, writeFileSync, unlinkSync, statSync, mkdirSync } from 'node:fs'
+import { readFileSync, readdirSync, existsSync, writeFileSync, unlinkSync, statSync, mkdirSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
@@ -2603,6 +2603,31 @@ export function apply(ctx) {
       }
     }).sort((a, b) => Number(b.owner) - Number(a.owner) || String(a.person).localeCompare(String(b.person)))
     return { ok: true, list, owner: identity.owner(), platforms: [...new Set(list.flatMap((x) => x.accounts.map((a) => a.platform)))].sort() }
+  })
+  route('/platforms/chats', async () => {
+    const dir = dataDir('chatlog')
+    let files = []
+    try { files = readdirSync(dir).filter((f) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(f)).sort().slice(-3) } catch {}
+    const map = new Map()
+    for (const file of files) {
+      let lines = []
+      try { lines = readFileSync(join(dir, file), 'utf8').split(/\r?\n/) } catch { continue }
+      for (const line of lines) {
+        if (!line.trim()) continue
+        let row
+        try { row = JSON.parse(line) } catch { continue }
+        const addr = row?.chatId ? parseChatId(row.chatId) : null
+        if (!addr || !['private', 'group'].includes(addr.kind)) continue
+        const old = map.get(row.chatId) || { chatId: row.chatId, platform: addr.platform, kind: addr.kind, name: '', last: 0 }
+        if (Number(row.t) >= old.last) {
+          old.last = Number(row.t) || old.last
+          old.name = row.nick || old.name
+          old.text = String(row.text || '').slice(0, 80)
+        }
+        map.set(row.chatId, old)
+      }
+    }
+    return { ok: true, list: [...map.values()].sort((a, b) => b.last - a.last).slice(0, 100) }
   })
   route('/platforms/people/merge', async (req) => {
     const b = await readBody(req)

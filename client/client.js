@@ -1445,6 +1445,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         } finally { setBusy('') }
       }
       const [peopleData, setPeopleData] = useState(null)
+      const [chats, setChats] = useState([])
       const [mergeFrom, setMergeFrom] = useState('')
       const [mergeInto, setMergeInto] = useState('')
       const [mergeMsg, setMergeMsg] = useState(null)
@@ -1453,7 +1454,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [importMsg, setImportMsg] = useState('')
       const [importBusy, setImportBusy] = useState(false)
       const loadPeople = () => get('/platforms/people').then(setPeopleData).catch(() => {})
-      useEffect(() => { loadPeople() }, [])
+      useEffect(() => { loadPeople(); get('/platforms/chats').then((r) => setChats(r.list || [])).catch(() => {}) }, [])
       const people = (peopleData && peopleData.list) || []
       const personName = (id) => {
         const p = people.find((x) => x.person === id)
@@ -1551,6 +1552,12 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             h(Btn, { small: true, onClick: () => merge(true) }, '预览合并'),
             h(Btn, { small: true, kind: 'primary', disabled: !mergeMsg || mergeMsg.dryRun !== true, onClick: () => merge(false) }, '确认合并')),
           mergeMsg ? h('pre', { className: 'ab-code', style: { whiteSpace: 'pre-wrap', marginTop: 8 } }, JSON.stringify(mergeMsg, null, 2)) : null),
+        h(Card, { title: '最近聊天', desc: '显示为「平台 + 会话」，不用记 QQ 号。白名单和按聊天选模型可以直接用这里的 ChatId。' },
+          chats.length ? chats.map((c) => h('div', { key: c.chatId, className: 'ab-flex', style: { alignItems: 'center', gap: 8, padding: '5px 0', borderBottom: '1px solid var(--ab-line)' } },
+            h('span', { className: 'ab-badge' }, platformLabel(c.platform)),
+            h('span', null, c.kind === 'group' ? '群' : '私聊', ' · ', c.name || c.chatId),
+            h('div', { className: 'ab-spacer' }),
+            h('code', { className: 'ab-small ab-muted' }, c.chatId))) : h('div', { className: 'ab-small ab-muted' }, '还没有聊天记录。')),
         h(Card, { title: '从 QQ 版导入', desc: '只读预检 → 确认 → 导入。导入前会先把记忆和身份库成组备份；不覆盖现有主人的数据。' },
           h('div', { className: 'ab-flex', style: { gap: 6, flexWrap: 'wrap' } },
             h('input', { className: 'ab-input', style: { minWidth: 260, flex: 1 }, placeholder: 'QQ 版数据目录，例如 D:\\Aurabot\\data', value: importPath, onChange: (e) => setImportPath(e.target.value) }),
@@ -2085,14 +2092,22 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
 
     function GroupPermissions({ st, toast, reload }) {
       const [input, setInput] = useState('')
+      const [knownChats, setKnownChats] = useState([])
+      useEffect(() => { get('/platforms/chats').then((r) => setKnownChats((r.list || []).filter((c) => c.kind === 'group'))).catch(() => {}) }, [])
       const { busy, apply } = usePermissionSave(toast, reload)
       const id = input.trim()
       const groups = st.config.allow.groups
+      const groupChats = knownChats.filter((c) => !groups.includes(c.chatId))
+      const valid = /^\d{5,}$/.test(id) || /^[a-z][a-z0-9-]*:group:/.test(id)
       return h('div', { className: 'ab-grid' },
-        h(Card, { title: '群白名单', desc: '机器人只在白名单中的群聊响应消息。' },
+        h(Card, { title: '群白名单', desc: '机器人只在白名单中的群聊响应消息。支持旧 QQ 群号，也支持「平台:group:id」。' },
+          groupChats.length ? h('div', { className: 'ab-flex', style: { marginBottom: 6, flexWrap: 'wrap' } },
+            h('select', { className: 'ab-select', value: '', onChange: (e) => e.target.value && setInput(e.target.value) },
+              h('option', { value: '' }, '从已知群聊选择'),
+              groupChats.map((c) => h('option', { key: c.chatId, value: c.chatId }, platformLabel(c.platform) + ' · ' + (c.name || c.chatId))))) : null,
           h('div', { className: 'ab-flex' },
-            h('input', { className: 'ab-input', 'aria-label': '群号', placeholder: '输入群号', inputMode: 'numeric', value: input, onChange: (e) => setInput(e.target.value) }),
-            h(Btn, { kind: 'primary', disabled: busy || !/^\d{5,}$/.test(id) || groups.includes(id), onClick: async () => { if (await apply(id, 'group', { chat: true })) setInput('') } }, '添加群聊')),
+            h('input', { className: 'ab-input', 'aria-label': '群号或平台群 ChatId', placeholder: '输入群号，或平台:group:id', value: input, onChange: (e) => setInput(e.target.value) }),
+            h(Btn, { kind: 'primary', disabled: busy || !valid || groups.includes(id), onClick: async () => { if (await apply(id, 'group', { chat: true })) setInput('') } }, '添加群聊')),
           groups.map((qq) => h(Row, { key: qq, label: qq }, h(Btn, { small: true, disabled: busy, onClick: () => apply(qq, 'group', { chat: false }) }, '移除'))),
         ),
         modOn(st, 'group-admin') ? h(GroupRoles, null) : null,
