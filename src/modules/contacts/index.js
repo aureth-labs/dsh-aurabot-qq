@@ -7,6 +7,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { defineTool, str, bool } from '../../tools/tools.js'
 import { profileToolVisible, profilePermits } from '../../chat/access.js'
+import { groupSettingsTool } from './group-settings.js'
 
 const PENDING_MAX = 50
 const ID_RE = /^\d{5,12}$/
@@ -47,7 +48,7 @@ export default {
   id: 'contacts',
   name: '好友申请与白名单',
   version: '1.0.0',
-  description: '处理好友申请、加群申请和邀请，改私聊 / 群白名单；权限在「权限」页',
+  description: '处理好友申请、加群申请和邀请，改私聊 / 群白名单；主人私聊可管理群接话与旁听；权限在「权限」页',
   setup(api) {
     const { hub, onebot } = api.core
     const pendingFile = () => api.dataDir('friend-requests.json')
@@ -234,6 +235,8 @@ export default {
           return { ok: result.ok, message: result.message }
         }),
       }))
+      const groupSettings = groupSettingsTool(api, { chat, sessionId })
+      if (groupSettings) tools.push(groupSettings)
       return tools
     })
     return {}
