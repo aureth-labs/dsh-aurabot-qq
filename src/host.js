@@ -2521,6 +2521,52 @@ export function apply(ctx) {
       ],
     }
   })
+  // U1：平台页。instances() 已包含平台端声明的 settings，前端按模块表单的写法渲染。
+  const platformView = () => {
+    const list = platformGateway?.instances?.() || []
+    return {
+      ok: true,
+      owner: identity.owner(),
+      instances: list,
+      configs: Object.fromEntries(list.map((x) => [x.instance, (getConfig().platforms || {})[x.instance] || {}])),
+    }
+  }
+  route('/platforms', async () => platformView())
+  route('/platforms/toggle', async (req) => {
+    const b = await readBody(req)
+    const instance = String(b.instance || '').trim()
+    const current = getConfig().platforms || {}
+    if (!instance || !current[instance]) return { ok: false, message: '没有这个平台实例' }
+    const enabled = b.enabled !== false
+    setConfig(mergeFromPanel(getConfig(), { platforms: { [instance]: { ...(current[instance] || {}), enabled } } }))
+    try { await platformGateway?.sync?.() } catch (error) { log.warn('切换平台后同步失败：', error.message) }
+    return { ...platformView(), message: enabled ? '平台已启用' : '平台已停用' }
+  })
+  route('/platforms/settings', async (req) => {
+    const b = await readBody(req)
+    const instance = String(b.instance || '').trim()
+    const current = getConfig().platforms || {}
+    if (!instance || !current[instance]) return { ok: false, message: '没有这个平台实例' }
+    const patch = b.patch && typeof b.patch === 'object' ? b.patch : {}
+    const next = { ...(current[instance] || {}) }
+    for (const [key, value] of Object.entries(patch)) {
+      if (key === 'enabled') continue
+      next[key] = value
+    }
+    setConfig(mergeFromPanel(getConfig(), { platforms: { [instance]: next } }))
+    try { await platformGateway?.sync?.() } catch (error) { log.warn('保存平台设置后同步失败：', error.message) }
+    return { ...platformView(), message: '平台设置已保存' }
+  })
+  route('/platforms/claim', async (req) => {
+    const b = await readBody(req)
+    const instance = String(b.instance || '').trim()
+    const status = (platformGateway?.instances?.() || []).find((x) => x.instance === instance)
+    if (!status?.self?.account) return { ok: false, message: '这个平台还没有登录账号，先连上再认主' }
+    if (identity.owner()) return { ok: false, message: '已经有主人了' }
+    const person = identity.claimOwner(status.platform, status.self.account)
+    return { ...platformView(), ok: true, person, message: '已把这个平台的账号认成主人' }
+  })
+
   route('/modules/reload', async (req) => {
     const id = String((await readBody(req)).id || '')
     if (!id) { await mods.sync(); return { ok: true, message: '检查过了', list: mods.status() } }

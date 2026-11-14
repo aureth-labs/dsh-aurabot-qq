@@ -91,6 +91,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
   const platformsConfig = () => (config && config.platforms && typeof config.platforms === 'object' ? config.platforms : {})
 
   const factories = new Map() // 平台端 id → factory
+  const probes = new Map() // 平台端 id → 首个 adapter（只读 settings/caps 给面板）
   const runs = new Map() // 实例名 → runtime
   const idle = new Map() // 实例名 → { state, detail }（配置了但没跑起来的状态记录）
   const msgSubs = new Set()
@@ -126,6 +127,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
       detail: run.detail,
       self: run.self,
       caps: run.caps,
+      settings: run.adapter?.settings || [],
     }
   }
 
@@ -604,7 +606,8 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
       if (!probe?.id) throw new Error('平台端工厂必须返回带 id 的 PlatformAdapter')
       if (probe.contract !== 1) throw new Error(`平台端 ${probe.id} 的 contract 必须是 1`)
       factories.set(probe.id, factory)
-      return () => factories.delete(probe.id)
+      probes.set(probe.id, probe)
+      return () => { factories.delete(probe.id); probes.delete(probe.id) }
     },
 
     sync,
@@ -640,6 +643,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
           detail: record?.detail || (want?.enabled ? '尚未启动' : '实例已停用'),
           self: null,
           caps: null,
+          settings: probes.get(prefixOf(instanceName))?.settings || [],
         })
       }
       // 运行中但配置里没有的（理论不该有），也报出来便于排障

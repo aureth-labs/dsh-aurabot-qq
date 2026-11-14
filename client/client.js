@@ -909,7 +909,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       { id: 'self', label: '人设', icon: 'M12 12.5a4.25 4.25 0 1 0 0-8.5 4.25 4.25 0 0 0 0 8.5zM4.5 20.5c.9-3.6 3.9-5.5 7.5-5.5s6.6 1.9 7.5 5.5', tabs: ['character', 'group', 'speakup', 'autotelic', 'mood', 'memory', 'persona'] },
       { id: 'express', label: '表达', icon: 'M20.5 11.5a8 8 0 0 1-11.7 7.1L4 20l1.4-4.4A8 8 0 1 1 20.5 11.5zM9 13.2s1.1 1.5 3 1.5 3-1.5 3-1.5M9.5 9.6h.01M14.5 9.6h.01', tabs: ['voice', 'asr', 'stickers', 'imagegen', 'song', 'pet'] },
       { id: 'platform', label: '平台', icon: 'M3.5 6.5h17v11h-17zM10.5 9.8v4.4l3.8-2.2z', tabs: ['diary', 'bili', 'douyin', 'heybox'] },
-      { id: 'system', label: '系统', icon: 'M4 7h9M17 7h3M4 12h3M11 12h9M4 17h11M19 17h1M15 5v4M9 10v4M17 15v4', tabs: ['connect', 'model', 'access', 'browser', 'security', 'backup', 'about', 'logs'] },
+      { id: 'system', label: '系统', icon: 'M4 7h9M17 7h3M4 12h3M11 12h9M4 17h11M19 17h1M15 5v4M9 10v4M17 15v4', tabs: ['platforms', 'connect', 'model', 'access', 'browser', 'security', 'backup', 'about', 'logs'] },
       { id: 'market', label: '模块', icon: 'M4 9.5 5.5 4h13L20 9.5M4 9.5a2.7 2.7 0 0 0 5.3 0 2.7 2.7 0 0 0 5.4 0 2.7 2.7 0 0 0 5.3 0M5.5 12.5V20h13v-7.5M10 20v-4.5h4V20', tabs: ['market', 'modules', 'local'] },
     ]
     // 自己写的模块：名字像逛平台的放「平台」，其余放「系统」（排在「日志」前面）
@@ -1382,6 +1382,91 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         h(Row, { label: 'WebSocket 令牌', hint: '对方设了 access_token 就填，没设留空' }, f.text('snowluma.wsToken', { type: 'password', placeholder: draft.snowluma.wsTokenSet ? '已保存' : '没有就留空' })),
         h(Row, { label: 'HTTP 地址', hint: '可选。填了就用 HTTP 调接口，不填就都走 WebSocket' }, f.text('snowluma.httpUrl', { size: 'wide', placeholder: 'http://127.0.0.1:3000' })),
         h(Row, { label: 'HTTP 令牌' }, f.text('snowluma.httpToken', { type: 'password', placeholder: draft.snowluma.httpTokenSet ? '已保存' : '没有就留空' })))
+    }
+
+    const PLATFORM_NAMES = { qq: 'QQ', feishu: '飞书', qqbot: 'QQ 官方机器人', bridge: '通用桥' }
+    const platformLabel = (name) => PLATFORM_NAMES[name] || name || '平台'
+
+    /** U1：平台页。平台端声明的 settings 自动生成表单；开关即时生效，不需要重启。 */
+    function Platforms({ st, draft, setDraft, toast, reload, go }) {
+      const f = useField(draft, setDraft)
+      const [data, setData] = useState(null)
+      const [busy, setBusy] = useState('')
+      const load = () => get('/platforms').then((r) => setData(r)).catch(() => {})
+      useEffect(() => { load() }, [])
+      const list = (data && data.instances) || []
+      const owner = data && data.owner
+      const toggle = async (inst) => {
+        setBusy(inst.instance)
+        try {
+          const r = await post('/platforms/toggle', { instance: inst.instance, enabled: !inst.enabled })
+          toast(r.message || (r.ok ? '已切换' : '没成功'), r.ok === false ? 'err' : 'ok')
+          if (r.instances) setData(r)
+          reload()
+        } finally { setBusy('') }
+      }
+      const save = async (inst) => {
+        const patch = {}
+        for (const s of inst.settings || []) {
+          const path = 'platforms.' + inst.instance + '.' + s.key
+          const value = getPath(draft, path)
+          if (s.type === 'password' && (value == null || value === '')) continue
+          patch[s.key] = s.type === 'number' ? Number(value) : value
+        }
+        setBusy(inst.instance)
+        try {
+          const r = await post('/platforms/settings', { instance: inst.instance, patch })
+          toast(r.message || (r.ok ? '已保存' : '没成功'), r.ok === false ? 'err' : 'ok')
+          if (r.instances) setData(r)
+          reload()
+        } finally { setBusy('') }
+      }
+      const field = (inst, s) => {
+        const p = 'platforms.' + inst.instance + '.' + s.key
+        if (s.type === 'switch') return f.sw(p)
+        if (s.type === 'number') return f.num(p, { min: s.min, max: s.max, step: s.step })
+        if (s.type === 'select') return f.select(p, (s.options || []).map((o) => (typeof o === 'string' ? { value: o, label: o } : o)))
+        if (s.type === 'textarea') return h('textarea', { className: 'ab-textarea', value: getPath(draft, p) ?? '', placeholder: s.placeholder, onChange: (e) => setDraft(setPath(draft, p, e.target.value)) })
+        if (s.type === 'password') return f.text(p, { type: 'password', placeholder: getPath(draft, p + 'Set') ? '已保存（不改就留空）' : s.placeholder || '' })
+        return f.text(p, { placeholder: s.placeholder })
+      }
+      const capsText = (caps) => {
+        if (!caps) return '未连接，能力未知'
+        const labels = { image: '图片', sticker: '表情', video: '视频', file: '文件', voice: '语音', quoteReply: '引用', mention: '@', poke: '戳一戳', card: '卡片', history: '历史', memberList: '成员', forwardExpand: '合并转发' }
+        return Object.entries(labels).filter(([k]) => caps[k] && caps[k] !== 'none' && caps[k] !== 0).map(([k]) => labels[k]).join(' · ') || '基础文字'
+      }
+      const claim = async (inst) => {
+        setBusy(inst.instance)
+        try {
+          const r = await post('/platforms/claim', { instance: inst.instance })
+          toast(r.message || (r.ok ? '好了' : '没成功'), r.ok === false ? 'err' : 'ok')
+          if (r.instances) setData(r)
+          reload()
+        } finally { setBusy('') }
+      }
+      return h('div', { className: 'ab-grid' },
+        h(Card, { title: '平台', desc: '这里列出所有已注册的平台实例。开关即时生效；填错凭证时看卡片上的状态和原因，密钥不会回显。' },
+          !owner ? h('div', { className: 'ab-note warn', style: { marginBottom: 10 } }, '还没有主人。先连上一个平台，用那个账号给她发一句话，再点下面的「确认这是我」。') : null,
+          h('div', { className: 'ab-small ab-muted' }, owner ? '当前主人：' + owner : '当前主人：未设置')),
+        list.length ? list.map((inst) => h(Card, {
+          key: inst.instance,
+          title: platformLabel(inst.platform) + (inst.name && inst.name !== inst.platform ? ' · ' + inst.name : ''),
+          right: h('span', { className: 'ab-flex' },
+            h('i', { className: cx('ab-dot', inst.state === 'connected' ? 'ok' : inst.state === 'connecting' ? 'warn' : inst.enabled ? 'err' : '') }),
+            h('span', { className: 'ab-small ab-muted' }, inst.enabled ? inst.state : '已停用')),
+        },
+          h(Row, { label: '启用这个实例' }, h(Switch, { on: Boolean(inst.enabled), disabled: busy === inst.instance, onChange: () => toggle(inst) })),
+          inst.self ? h(Row, { label: '登录账号' }, h('span', null, inst.self.name + '（' + inst.self.account + '）')) : null,
+          inst.detail ? h('div', { className: cx('ab-small', inst.state === 'connected' ? 'ab-muted' : 'ab-note warn'), style: { marginBottom: 8 } }, inst.detail) : null,
+          (inst.settings || []).length ? h('div', null,
+            inst.settings.map((s) => h(Row, { key: s.key, label: s.label || s.key, hint: s.hint }, field(inst, s))),
+            h('div', { className: 'ab-flex', style: { marginTop: 8 } }, h(Btn, { small: true, kind: 'primary', disabled: busy === inst.instance, onClick: () => save(inst) }, '保存平台设置')),
+          ) : h('div', { className: 'ab-small ab-muted' }, '这个平台端没有可填的设置。'),
+          h('div', { className: 'ab-small ab-muted', style: { marginTop: 8 } }, '能力：' + capsText(inst.caps)),
+          h('div', { className: 'ab-flex', style: { marginTop: 8 } }, inst.platform === 'qq' && go ? h(Btn, { small: true, onClick: () => go('connect') }, '打开 QQ 详细设置') : null),
+          !owner && inst.self ? h('div', { style: { marginTop: 8 } }, h(Btn, { small: true, kind: 'primary', disabled: busy === inst.instance, onClick: () => claim(inst) }, '确认这是我')) : null,
+        )) : h(Card, { title: '还没有平台' }, h(Empty, { icon: '📡', text: '在「QQ 网关」里先接上一个平台；接好后这里会出现卡片。' })),
+      )
     }
 
     function Connect({ st, draft, setDraft, toast, reload, openWizard }) {
@@ -8683,11 +8768,11 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       tabs.splice(tabs.findIndex((t) => t.id === 'logs'), 0, ...extTabs)
       const curTab = tabs.find((t) => t.id === tab) || tabs[0]
       const body = curTab.ext ? ExtPage : {
-        overview: Overview, connect: Connect, character: Persona, access: Access, group: Group, model: Model, voice: Voice, asr: Asr,
+        overview: Overview, platforms: Platforms, connect: Connect, character: Persona, access: Access, group: Group, model: Model, voice: Voice, asr: Asr,
         stickers: Stickers, imagegen: ImageGen, diary: Diary, speakup: SpeakUp, autotelic: Autotelic, pet: PetPanel, mood: Mood, memory: MemoryPage, persona: PersonaMemory, song: Song, bili: Bili, douyin: Douyin, heybox: Heybox, local: LocalApi, browser: Browser, security: Security, market: Market, modules: Modules, logs: Logs, about: About, backup: Backup,
       }[curTab.id] || Overview
       // 哪些标签有没保存的改动
-      const TAB_KEYS = { connect: ['snowluma', 'botQQ'], access: ['ownerQQ', 'ownerName', 'ownerLevel', 'approvalNotify', 'approvalViaQQ', 'qqApi', 'longTasks', 'profilePerms', 'subagentBackground'], group: ['group', 'merge', 'titleFilter', 'chat'], model: ['model', 'chatModels'], voice: ['voice'], asr: ['voice'], stickers: ['stickers'], imagegen: ['imageGen'], diary: ['diary', 'qzoneSocial'], speakup: ['speakUp'], autotelic: [], pet: [], mood: ['mood', 'memory'], song: ['song'], bili: ['bili'], douyin: ['douyin'], heybox: ['heybox'], local: ['local'], browser: ['browser'], security: ['security', 'update'] }
+      const TAB_KEYS = { platforms: ['platforms'], connect: ['snowluma', 'botQQ'], access: ['ownerQQ', 'ownerName', 'ownerLevel', 'approvalNotify', 'approvalViaQQ', 'qqApi', 'longTasks', 'profilePerms', 'subagentBackground'], group: ['group', 'merge', 'titleFilter', 'chat'], model: ['model', 'chatModels'], voice: ['voice'], asr: ['voice'], stickers: ['stickers'], imagegen: ['imageGen'], diary: ['diary', 'qzoneSocial'], speakup: ['speakUp'], autotelic: [], pet: [], mood: ['mood', 'memory'], song: ['song'], bili: ['bili'], douyin: ['douyin'], heybox: ['heybox'], local: ['local'], browser: ['browser'], security: ['security', 'update'] }
       const tabDirty = (id) => {
         if (!dirty) return false
         if (id.startsWith('ext:')) { const k = id.slice(4); return JSON.stringify((draft.ext || {})[k]) !== JSON.stringify((cfg.ext || {})[k]) }
