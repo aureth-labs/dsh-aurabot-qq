@@ -869,6 +869,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     // ---------------- 标签页 ----------------
     const TABS = [
       { id: 'overview', label: '概览' },
+      { id: 'platforms', label: '平台' },
       { id: 'connect', label: '连接' },
       { id: 'character', label: '人格' },
       { id: 'access', label: '权限' },
