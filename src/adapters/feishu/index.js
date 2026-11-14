@@ -1137,19 +1137,27 @@ export function createFeishuAdapter(options = {}) {
     let payload = null
     try { payload = frame.Payload ? JSON.parse(frame.Payload.toString('utf8')) : null } catch { payload = null }
 
-    // 先应答再处理：官方要求 3 秒内响应，超时会触发重推
+    // 官方 WS SDK 会把原事件的 headers（message_id / trace_id / sum / seq / timestamp）
+    // 原样带回，并补 biz_rt；只回 type=event 会被服务端当成对不上号，3 秒后记 timeout。
+    const startedAt = Date.now()
+    let handled = true
+    try { if (payload) handleEventBody(payload) } catch (error) {
+      handled = false
+      log().warn('飞书长连接事件处理失败：', error?.message || error)
+    }
+    const responseHeaders = (frame.Headers || []).map((h) => ({ key: h.key, value: h.value }))
+    responseHeaders.push({ key: 'biz_rt', value: String(Date.now() - startedAt) })
+
     sendFrame({
       SeqID: frame.SeqID,
       LogID: frame.LogID,
       Service: frame.Service,
       Method: frame.Method,
-      Headers: [{ key: 'type', value: 'event' }],
+      Headers: responseHeaders,
       PayloadEncoding: 'json',
       PayloadType: 'json',
-      Payload: JSON.stringify({ code: 200, headers: {}, data: null }),
+      Payload: JSON.stringify({ code: handled ? 200 : 500, headers: {}, data: null }),
     })
-
-    if (payload) handleEventBody(payload)
   }
 
   /** 建长连接；握手失败抛错（start 记启动失败） */

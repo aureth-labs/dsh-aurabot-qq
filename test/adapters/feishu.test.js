@@ -417,6 +417,9 @@ test('长连接：收到数据帧 → emit 一条；并回一个同 SeqID 的应
   assert.equal(Number(ack.Method), 1)
   const ackPayload = JSON.parse(ack.Payload.toString('utf8'))
   assert.equal(ackPayload.code, 200, '应答 payload 的 code 应是 200')
+  const ackHeaders = Object.fromEntries((ack.Headers || []).map((h) => [h.key, h.value]))
+  assert.equal(ackHeaders.message_id, 'msg-1', '应答要带回原事件 message_id')
+  assert.ok(ackHeaders.biz_rt, '应答要带 biz_rt')
 
   await adapter.stop()
 })
