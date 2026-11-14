@@ -25,7 +25,7 @@ export function checkAllowed(cfg, msg) {
 
 /** 只旁听指定的非白名单群：不开放回复、命令、工具或媒体下载。 */
 export function shouldObserveGroup(cfg, msg) {
-  return cfg.enabled === true && cfg.memory?.enabled === true &&
+  return cfg.enabled === true && !cfg.debug && cfg.memory?.enabled === true &&
     msg.kind === 'group' && !checkAllowed(cfg, msg).allowed &&
     Array.isArray(cfg.memory.passiveGroups) && cfg.memory.passiveGroups.includes(String(msg.groupId))
 }
