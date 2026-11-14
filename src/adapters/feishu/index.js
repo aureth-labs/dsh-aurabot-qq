@@ -949,11 +949,10 @@ export function createFeishuAdapter(options = {}) {
     const headerObj = payload?.header || {}
     const eventType = String(headerObj.event_type || '')
 
-    // Verification Token 核对：事件头里带的就是它。
-    // 长连接由握手阶段鉴权、Webhook 由签名鉴权，但两种通道都再核一次 token——
-    // 配了 token 却收到别人的事件，说明订阅或凭证串了，宁可拒收也不写进记忆。
+    // Verification Token 核对：Webhook 没有平台侧握手，必须核对；
+    // 长连接已经用 AppSecret 完成握手鉴权，事件头不保证带 token，不能再卡这一层。
     const verifyToken = config().verificationToken
-    if (verifyToken) {
+    if (transport === 'webhook' && verifyToken) {
       const got = String(headerObj.token || payload?.token || '')
       if (got !== String(verifyToken)) {
         log().warn('飞书事件 Verification Token 不匹配，已拒收（不 emit）')

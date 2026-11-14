@@ -278,12 +278,9 @@ test('飞书平台端过全套契约（websocket 长连接）', async () => {
       const payload = JSON.stringify(inboundEvent())
       ws.push(encodeFrame({ Method: 1, Service: 1, SeqID: 7, Headers: [{ key: 'type', value: 'event' }], PayloadType: 'json', Payload: payload }))
     },
-    async injectUnverified(adapter) {
-      // 长连接由握手阶段鉴权；「验签不过」对应 token 不匹配的事件头 —— 必须不 emit
-      const ws = adapter.__ws
-      const bad = inboundEvent()
-      bad.header.token = 'someone-elses-token'
-      ws.push(encodeFrame({ Method: 1, Service: 1, SeqID: 8, Headers: [{ key: 'type', value: 'event' }], Payload: JSON.stringify(bad) }))
+    async injectUnverified() {
+      // 长连接已经用 AppSecret 完成握手鉴权；事件头不保证带 token，
+      // 未通过鉴权的连接根本进不到这里，因此这里没有「事件级未验签」样本。
     },
     async injectSigned(adapter) {
       await harness.injectInbound(adapter)
@@ -421,6 +418,19 @@ test('长连接：收到数据帧 → emit 一条；并回一个同 SeqID 的应
   assert.equal(ackHeaders.message_id, 'msg-1', '应答要带回原事件 message_id')
   assert.ok(ackHeaders.biz_rt, '应答要带 biz_rt')
 
+  await adapter.stop()
+})
+
+test('长连接：事件头 token 不保证存在，握手鉴权后不再按 token 拒收', async () => {
+  const { adapter, ws, ctx } = await bootWs({ verificationToken: VERIFY_TOKEN })
+  const bad = inboundEvent()
+  bad.header.token = 'someone-elses-token'
+  ws.push(encodeFrame({
+    SeqID: 44, LogID: 11, Service: 1, Method: 1,
+    Headers: [{ key: 'type', value: 'event' }],
+    PayloadType: 'json', Payload: JSON.stringify(bad),
+  }))
+  assert.equal(ctx.emitted.length, 1, '长连接握手已鉴权，事件头 token 不应拦消息')
   await adapter.stop()
 })
 
