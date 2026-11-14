@@ -23,6 +23,13 @@ export function checkAllowed(cfg, msg) {
     : { allowed: false, reason: '不在群白名单' }
 }
 
+/** 只旁听指定的非白名单群：不开放回复、命令、工具或媒体下载。 */
+export function shouldObserveGroup(cfg, msg) {
+  return cfg.enabled === true && !cfg.debug && cfg.memory?.enabled === true &&
+    msg.kind === 'group' && !checkAllowed(cfg, msg).allowed &&
+    Array.isArray(cfg.memory.passiveGroups) && cfg.memory.passiveGroups.includes(String(msg.groupId))
+}
+
 /** 群聊里给不给本机工具：off = 不给；owner = 只有主人说话那一轮给。
  * 没有「谁问都给」这一档——群里任何人都能驱动本机读写，权限面太大，明确不做。 */
 export const GROUP_OWNER_TOOLS = ['off', 'owner']

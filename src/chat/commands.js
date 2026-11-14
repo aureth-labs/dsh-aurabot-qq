@@ -1,6 +1,7 @@
 // QQ 里的主人命令：/silent /active 之类，直接在 QQ 上管她。只认主人；在总开关关着时也能用（所以 /on 才有用）。
 
 import { runEffortCommand } from './effort-command.js'
+import { policyFor } from './group-policy.js'
 import { dataDir, readJson, writeJson } from '../core/store.js'
 import { runPermissionsCommand } from './permissions-command.js'
 
@@ -134,7 +135,7 @@ export async function runCommand(cmd, msg, deps) {
       return inGroup ? '我回来啦' : '在呢'
     case 'quiet':
       if (!inGroup) return '这个命令要在群里用'
-      setGroup({ interjectChance: 0 })
+      setGroup({ interjectChance: 0, proactiveEnabled: false, engagedEnabled: false })
       return '好，这个群里没人叫我我就不插话'
     case 'speak': {
       const c = getConfig()
@@ -155,7 +156,7 @@ export async function runCommand(cmd, msg, deps) {
     }
     case 'chatty':
       if (!inGroup) return '这个命令要在群里用'
-      setGroup({ interjectChance: 0.4, minRelevance: 0.1 })
+      setGroup({ interjectChance: 0.4, minRelevance: 0.1, proactiveEnabled: true, engagedEnabled: true })
       return '好耶，那我在这个群多说两句'
     case 'normal':
       if (!inGroup) return '这个命令要在群里用'
@@ -171,8 +172,10 @@ export async function runCommand(cmd, msg, deps) {
         `${here}：${mu === undefined ? '正常说话' : mu === 0 ? '闭嘴中' : '闭嘴到 ' + new Date(mu).toLocaleTimeString().slice(0, 5)}`,
       ]
       if (inGroup) {
-        const o = (cfg.group.overrides || {})[msg.groupId] || {}
-        lines.push(`插话：${o.interjectChance === 0 ? '不插话' : o.interjectChance >= 0.4 ? '话多' : '默认'}`)
+        const p = policyFor(cfg.group, cfg.group.overrides, msg.groupId)
+        const proactive = p.proactiveEnabled !== false && p.interjectChance > 0
+        const engaged = typeof p.engagedEnabled === 'boolean' ? p.engagedEnabled : p.interjectChance > 0
+        lines.push(`主动加入话题：${proactive ? '开' : '关'}；窗口内接话：${engaged ? '开' : '关'}`)
       }
       return lines.join('\n')
     }

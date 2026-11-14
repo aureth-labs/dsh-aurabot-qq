@@ -2,6 +2,8 @@
 
 export const DEFAULT_GROUP_POLICY = {
   wakeWords: ['大肥鱼', '肥鱼'],
+  proactiveEnabled: true, // 无人叫时主动加入话题
+  engagedEnabled: null, // null 保留旧设置：插话概率 > 0 时才允许窗口内接话
   interjectChance: 0.15, // 普通消息的基础插话概率（话题越相关越高，最高 80%）
   cooldownSec: 90, // 两次插话至少间隔
   maxPerHour: 6, // 每群每小时插话上限
@@ -93,14 +95,17 @@ export function decideGroupReply(p) {
   if (shortAsk) return { reply: true, mode: 'must', reason: '刚说完被追问' }
   const rel = typeof p.relevance === 'number' ? p.relevance : 1
 
-  if (!(pol.interjectChance > 0)) return { reply: false, mode: 'none', reason: '插话关着' }
+  const engagedEnabled = typeof pol.engagedEnabled === 'boolean' ? pol.engagedEnabled : pol.interjectChance > 0
+  const proactiveEnabled = pol.proactiveEnabled !== false && pol.interjectChance > 0
+  if (!engagedEnabled && !proactiveEnabled) return { reply: false, mode: 'none', reason: '插话关着' }
   if (inQuietHours(p.hour, pol.quietHours)) return { reply: false, mode: 'none', reason: '静默时段' }
   const minRel = Number(pol.minRelevance) || 0
   // 已经加入了这个话题：接着聊（每段看完再回，不受冷却和每小时上限限制）。她说话会续上这个状态，
   // 她会看到自己接了几次、自己决定停不停，engagedMax 只是兜底
-  if (p.engagedUntil && p.now < p.engagedUntil && rel >= minRel && (p.engagedRun || 0) < (pol.engagedMax ?? 2)) {
+  if (engagedEnabled && p.engagedUntil && p.now < p.engagedUntil && rel >= minRel && (p.engagedRun || 0) < (pol.engagedMax ?? 2)) {
     return { reply: true, mode: 'engaged', reason: `正聊得起劲，接着说（相关度 ${rel.toFixed(2)}）` }
   }
+  if (!proactiveEnabled) return { reply: false, mode: 'none', reason: '主动加入话题关着' }
   const times = p.interjectTimes || []
   const lastHour = times.filter((t) => p.now - t < 3600_000).length
   if (lastHour >= pol.maxPerHour) return { reply: false, mode: 'none', reason: '这小时插话够多了' }

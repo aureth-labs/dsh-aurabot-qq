@@ -326,6 +326,7 @@ export const DEFAULTS = {
   // 原话档案独立于摘要记忆；默认关闭，由使用者明确开启并管理保留期限。
   conversationContext: { enabled: false },
   memory: {
+    passiveGroups: [], // 非白名单群：仅记录文字供记忆整理，不开放聊天；留空不旁听
     enabled: true, recallCount: 6, recallMinRelevance: 0, recallMode: 'always', recallTriggers: ['上次', '上回', '之前', '以前', '那天', '那次', '还记得', '记不记得', '说过', '提过', '答应', '约好', '那时候'],
     dailyConsolidate: true, consolidateTimes: ['04:00', '16:00'], keepChatlogDays: 7, keepChatlogSet: false, mergeGroups: false, compress: true, compressAfterDays: 14, instantCommands: true, groupMemory: true, searchRrf: true,
     profileOnlyAcquainted: true, profileFieldChars: 40, profilePeople: 2, profileChars: 240, chatImpression: true, chatImpressionChars: 120, dislikeSilence: 0.85,
@@ -546,6 +547,8 @@ export function normalize(raw) {
     .map((s) => String(s).trim()).filter((s) => /^([a-zA-Z]:[\\/]|\/)/.test(s)).slice(0, 20)
   const g = c.group
   g.wakeWords = (Array.isArray(g.wakeWords) ? g.wakeWords : String(g.wakeWords || '').split(/[\s,，]+/)).map((s) => String(s).trim()).filter(Boolean)
+  g.proactiveEnabled = bool(g.proactiveEnabled, true)
+  g.engagedEnabled = typeof g.engagedEnabled === 'boolean' ? g.engagedEnabled : null
   g.interjectChance = num(g.interjectChance, 0.15, 0, 1)
   g.cooldownSec = num(g.cooldownSec, 90, 0, BIG)
   g.maxPerHour = num(g.maxPerHour, 6, 0, BIG)
@@ -555,6 +558,12 @@ export function normalize(raw) {
   if (!Array.isArray(g.quietHours) || g.quietHours.length !== 2) g.quietHours = DEFAULT_GROUP_POLICY.quietHours
   g.quietHours = g.quietHours.map((h) => num(h, 0, 0, 23))
   if (!isObj(g.overrides)) g.overrides = {}
+  for (const o of Object.values(g.overrides)) {
+    if (!isObj(o)) continue
+    for (const key of ['proactiveEnabled', 'engagedEnabled']) {
+      if (typeof o[key] !== 'boolean') delete o[key] // 没写 / 非法值跟随全局，不把 'false' 当开
+    }
+  }
   if (!isObj(g.ownerBrief)) g.ownerBrief = { enabled: true, lines: 24, groups: [] }
   g.ownerBrief.enabled = bool(g.ownerBrief.enabled, true)
   g.ownerBrief.lines = num(g.ownerBrief.lines, 24, 1, 30)
@@ -792,6 +801,7 @@ export function normalize(raw) {
   if (!isObj(c.memory.tierDays)) c.memory.tierDays = {}
   for (const k of Object.keys(DEFAULT_TIER_DAYS)) c.memory.tierDays[k] = Math.round(num(c.memory.tierDays[k], DEFAULT_TIER_DAYS[k], 0, BIG))
   // 老版本的 0 是当时的默认值，不是谁选的：升级后改成留 7 天，以后面板里再选 0 才算数
+  c.memory.passiveGroups = qqList(c.memory.passiveGroups)
   const keepUnset = raw?.memory?.keepChatlogDays === 0 && !raw.memory.keepChatlogSet
   c.memory.keepChatlogDays = keepUnset ? 7 : num(c.memory.keepChatlogDays, 7, -1, 3650)
   c.memory.keepChatlogSet = true
