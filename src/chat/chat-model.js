@@ -26,7 +26,8 @@ function normalizeMap(v) {
   const out = {}
   if (!isObj(v)) return out
   for (const [k, sel] of Object.entries(v)) {
-    const id = String(k).replace(/\D/g, '')
+    const raw = String(k).trim()
+    const id = /^[a-z][a-z0-9-]*:(private|group):/.test(raw) ? raw : raw.replace(/\D/g, '')
     const s = normalizeSelection(sel)
     if (id && s) out[id] = s
   }
@@ -58,8 +59,13 @@ export function resolveChatModel(cfg, chat, available = null) {
   const c = normalizeChatModels(cfg?.chatModels)
   const ok = (s) => Boolean(s) && (!Array.isArray(available) || available.length === 0 || available.some((m) => m.provider === s.provider && m.model === s.model))
   let order = []
-  if (chat.kind === 'private') order = [['private', c.privates[String(chat.userId ?? '')]], ['privateDefault', normalizeSelection(c.privateDefault)]]
-  else if (chat.kind === 'group') order = [['group', c.groups[String(chat.groupId ?? '')]], ['groupDefault', normalizeSelection(c.groupDefault)]]
+  if (chat.kind === 'private') {
+    const keys = [String(chat.chatId || ''), String(chat.userId ?? '')].filter(Boolean)
+    order = [['private', keys.map((k) => c.privates[k]).find(Boolean)], ['privateDefault', normalizeSelection(c.privateDefault)]]
+  } else if (chat.kind === 'group') {
+    const keys = [String(chat.chatId || ''), String(chat.groupId ?? '')].filter(Boolean)
+    order = [['group', keys.map((k) => c.groups[k]).find(Boolean)], ['groupDefault', normalizeSelection(c.groupDefault)]]
+  }
   for (const [source, sel] of order) if (ok(sel)) return { ...sel, source }
   return null
 }

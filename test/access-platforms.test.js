@@ -3,6 +3,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { checkAllowed } from '../src/chat/access.js'
 import { changePermissions } from '../src/chat/permission-policy.js'
+import { resolveChatModel } from '../src/chat/chat-model.js'
 
 const OWNER = 'p-owner'
 const identity = {
@@ -38,6 +39,12 @@ test('QQ 旧裸号白名单继续可用', () => {
   const qq = { kind: 'private', platform: 'qq', chatId: 'qq:private:10001', userId: '10001' }
   assert.equal(checkAllowed({ allow: { private: ['10001'] } }, qq, identity).allowed, true)
   assert.equal(checkAllowed({ allow: { private: ['feishu:private:10001'] } }, qq, identity).allowed, false)
+})
+
+test('按聊天选模型支持规范 ChatId', () => {
+  const cfg = { chatModels: { privates: { 'feishu:private:ou_x': { provider: 'p', model: 'm' } }, groups: {} } }
+  assert.equal(resolveChatModel(cfg, { kind: 'private', chatId: 'feishu:private:ou_x', userId: 'ou_x' })?.model, 'm')
+  assert.equal(resolveChatModel(cfg, { kind: 'private', chatId: 'feishu:private:ou_y', userId: 'ou_y' }), null)
 })
 
 test('权限修改接受规范 ChatId，不接受跨 kind 的地址', () => {

@@ -2353,6 +2353,8 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const cm = draft.chatModels || { privateDefault: {}, groupDefault: {}, privates: {}, groups: {} }
       const [open, setOpen] = useState(false)
       const [add, setAdd] = useState({ kind: 'private', id: '', sel: '' })
+      const [knownChats, setKnownChats] = useState([])
+      useEffect(() => { get('/platforms/chats').then((r) => setKnownChats(r.list || [])).catch(() => {}) }, [])
       const key = (m) => m.provider + '::' + m.model
       const val = (s) => (s && s.provider && s.model ? s.provider + '::' + s.model : '')
       const toSel = (v) => { const [p, ...m] = v.split('::'); return v ? { provider: p, model: m.join('::'), reasoningEffort: '' } : { provider: '', model: '', reasoningEffort: '' } }
@@ -2407,7 +2409,10 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
               h(Btn, { small: true, kind: 'ghost', onClick: () => remove(r.kind, r.id) }, '移除'))),
           h('div', { className: 'ab-flex' },
             h(Seg, { value: add.kind, onChange: (v) => setAdd({ ...add, kind: v }), options: [{ value: 'private', label: '私聊' }, { value: 'group', label: '群' }] }),
-            h('input', { className: 'ab-input', placeholder: add.kind === 'private' ? 'QQ 号' : '群号', value: add.id, onChange: (e) => setAdd({ ...add, id: e.target.value.replace(/\D/g, '') }) }),
+            knownChats.some((c) => c.kind === add.kind) ? h('select', { className: 'ab-select', value: '', onChange: (e) => e.target.value && setAdd({ ...add, id: e.target.value }) },
+              h('option', { value: '' }, '从最近聊天选择'),
+              knownChats.filter((c) => c.kind === add.kind).map((c) => h('option', { key: c.chatId, value: c.chatId }, platformLabel(c.platform) + ' · ' + (c.name || c.chatId)))) : null,
+            h('input', { className: 'ab-input', placeholder: add.kind === 'private' ? 'QQ 号或平台私聊 ChatId' : '群号或平台群 ChatId', value: add.id, onChange: (e) => setAdd({ ...add, id: e.target.value }) }),
             h(Select, { value: add.sel, width: 220, options: base.filter((o) => o.value), placeholder: '选模型', onChange: (v) => setAdd({ ...add, sel: v }) }),
             h(Btn, { small: true, disabled: !add.id || !add.sel, onClick: addRow }, '添加'))) : null)
     }
