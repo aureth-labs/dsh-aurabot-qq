@@ -22,7 +22,9 @@ const waitFor = async (pred, ms = 2000) => {
 
 test('非 QQ 平台私聊进入中枢并回到原平台', async (t) => {
   const dataDir = mkdtempSync(join(tmpdir(), 'f2-inbound-'))
+  const prevDataDir = process.env.AURABOT_DATA_DIR
   process.env.AURABOT_DATA_DIR = dataDir
+  t.after(() => { if (prevDataDir === undefined) delete process.env.AURABOT_DATA_DIR; else process.env.AURABOT_DATA_DIR = prevDataDir })
   const identity = createIdentity({ dataDir: join(dataDir, 'gw'), log: noopLog })
   const owner = identity.claimOwner('feishu', 'ou_owner')
   const cfg = normalize({
@@ -64,7 +66,9 @@ test('非 QQ 平台私聊进入中枢并回到原平台', async (t) => {
 
 test('listenAllInGroup=false 时，群里没被 @ 不回复，@ 了才回复', async (t) => {
   const dataDir = mkdtempSync(join(tmpdir(), 'f2-group-'))
+  const prevDataDir = process.env.AURABOT_DATA_DIR
   process.env.AURABOT_DATA_DIR = dataDir
+  t.after(() => { if (prevDataDir === undefined) delete process.env.AURABOT_DATA_DIR; else process.env.AURABOT_DATA_DIR = prevDataDir })
   const identity = createIdentity({ dataDir: join(dataDir, 'gw'), log: noopLog })
   identity.claimOwner('feishu', 'ou_owner')
   const cfg = normalize({
