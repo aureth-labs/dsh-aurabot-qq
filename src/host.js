@@ -1252,6 +1252,13 @@ export function apply(ctx) {
     const body = await readBody(req)
     // 面板草稿可能早于 QQ 的 /quiet /chatty；拒绝覆盖期间改过的群设置。
     // 只检查新版面板显式附带的基线，旧版和模块的局部保存维持原约定。
+    if (body?.memory && Object.hasOwn(body.memory, 'passiveGroups')) {
+      const raw = body.memory.passiveGroups
+      const ids = Array.isArray(raw) ? raw : typeof raw === 'string' ? raw.split(/[\s,，;；]+/).filter(Boolean) : null
+      if (!ids || ids.some(id => !/^[1-9]\d{4,11}$/.test(String(id).trim()))) return {
+        ok: false, code: 'invalid_passive_groups', message: '旁听名单请填 5～12 位数字群号，用换行或逗号分隔，不要混入文字。本次没有保存。',
+      }
+    }
     const expected = body?._groupSettingsBase
     if (body) delete body._groupSettingsBase
     if (expected && (
