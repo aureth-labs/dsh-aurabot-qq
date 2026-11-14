@@ -344,6 +344,7 @@ export function apply(ctx) {
   //  ② 现有直连 OneBot 的路径必须保持行为不变——网关存在本身就会让 sendSegments 改走
   //     gateway.send，而 e2e 的既有断言是照直连路径写的。
   let platformGateway = null
+  const platformCandidates = new Map() // 私聊里最近发话的人：首次向导用它认主
   const defaultPlatform = parseChatId('private:0')?.platform || ''
   function routeOwner() {
     const owner = identity.owner()
@@ -609,7 +610,10 @@ export function apply(ctx) {
   // 网关建好之后再接线（惰性创建，见上面 ensureGateway 的说明）
   gatewayReady = (gw) => {
     const offMsg = gw.onMessage((m) => {
-      if (m && m.kind === 'private') {
+      if (m && m.kind === 'private' && m.sender?.account) {
+        const key = `${m.platform}:${m.sender.account}`
+        platformCandidates.set(key, { platform: m.platform, account: m.sender.account, name: m.sender.name || '', at: Number(m.at) || Date.now() })
+        if (platformCandidates.size > 50) platformCandidates.delete(platformCandidates.keys().next().value)
         if (dangerGuard?.handleReply(m.chatId, m.sender?.account, m.text)) return
         if (approvalRelay?.handleReply(m.chatId, m.sender?.account, m.text)) return
       }
@@ -2118,6 +2122,12 @@ export function apply(ctx) {
     const body = await readBody(req)
     const ownerId = identity.owner()
     if (!ownerId) return { ok: false, message: '先认领主人身份' }
+    if (body.platformOnly) {
+      if (!hasAnyPlatform()) return { ok: false, message: '还没有启用的平台' }
+      setConfig({ ...cfg, setupDone: true })
+      log.info('首次使用向导完成（仅平台）')
+      return { ...(await overview()), message: '设置完成，可以从平台页继续' }
+    }
     const qqOwner = defaultPlatform ? identity.accountOn(ownerId, defaultPlatform) : ''
     if ((body.existingConnection || !hasAnyPlatform()) && (!cfg.botQQ || !qqOwner || cfg.botQQ === qqOwner)) {
       return { ok: false, message: '先填好不同的机器人 QQ 和你的 QQ' }
@@ -2530,6 +2540,7 @@ export function apply(ctx) {
       ok: true,
       owner: identity.owner(),
       instances: list,
+      candidates: [...platformCandidates.values()].sort((a, b) => b.at - a.at).slice(0, 10),
       configs: Object.fromEntries(list.map((x) => [x.instance, (getConfig().platforms || {})[x.instance] || {}])),
     }
   }
@@ -2561,12 +2572,18 @@ export function apply(ctx) {
   })
   route('/platforms/claim', async (req) => {
     const b = await readBody(req)
-    const instance = String(b.instance || '').trim()
-    const status = (platformGateway?.instances?.() || []).find((x) => x.instance === instance)
-    if (!status?.self?.account) return { ok: false, message: '这个平台还没有登录账号，先连上再认主' }
     if (identity.owner()) return { ok: false, message: '已经有主人了' }
-    const person = identity.claimOwner(status.platform, status.self.account)
-    return { ...platformView(), ok: true, person, message: '已把这个平台的账号认成主人' }
+    let platform = String(b.platform || '').trim()
+    let account = String(b.account || '').trim()
+    if (!platform || !account) {
+      const latest = [...platformCandidates.values()].sort((a, b) => b.at - a.at)[0]
+      if (!latest) return { ok: false, message: '先让要当主人的账号给机器人发一条私聊' }
+      platform = latest.platform
+      account = latest.account
+    }
+    if (!platform || !account) return { ok: false, message: '这个账号还不完整，先让它发一条私聊' }
+    const person = identity.claimOwner(platform, account)
+    return { ...platformView(), ok: true, person, message: '已把这个账号认成主人' }
   })
 
   route('/platforms/people', async () => {

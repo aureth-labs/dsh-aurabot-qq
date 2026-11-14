@@ -1435,10 +1435,10 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         const labels = { image: '图片', sticker: '表情', video: '视频', file: '文件', voice: '语音', quoteReply: '引用', mention: '@', poke: '戳一戳', card: '卡片', history: '历史', memberList: '成员', forwardExpand: '合并转发' }
         return Object.entries(labels).filter(([k]) => caps[k] && caps[k] !== 'none' && caps[k] !== 0).map(([k]) => labels[k]).join(' · ') || '基础文字'
       }
-      const claim = async (inst) => {
-        setBusy(inst.instance)
+      const claim = async (candidate) => {
+        setBusy('claim')
         try {
-          const r = await post('/platforms/claim', { instance: inst.instance })
+          const r = await post('/platforms/claim', { platform: candidate.platform, account: candidate.account })
           toast(r.message || (r.ok ? '好了' : '没成功'), r.ok === false ? 'err' : 'ok')
           if (r.instances) setData(r)
           reload()
@@ -1502,6 +1502,13 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         h(Card, { title: '平台', desc: '这里列出所有已注册的平台实例。开关即时生效；填错凭证时看卡片上的状态和原因，密钥不会回显。' },
           !owner ? h('div', { className: 'ab-note warn', style: { marginBottom: 10 } }, '还没有主人。先连上一个平台，用那个账号给她发一句话，再点下面的「确认这是我」。') : null,
           h('div', { className: 'ab-small ab-muted' }, owner ? '当前主人：' + owner : '当前主人：未设置')),
+        !owner ? h(Card, { title: '确认主人', desc: '用要当主人的账号给机器人发一条私聊，下面会出现这个账号；确认后它就是这个实例的主人。' },
+          (data && data.candidates || []).length
+            ? (data.candidates).map((c) => h('div', { key: c.platform + ':' + c.account, className: 'ab-flex', style: { alignItems: 'center', gap: 8, padding: '6px 0', borderBottom: '1px solid var(--ab-line)' } },
+              h('span', null, platformLabel(c.platform) + ' · ' + (c.name || c.account) + '（' + c.account + '）'),
+              h('div', { className: 'ab-spacer' }),
+              h(Btn, { small: true, kind: 'primary', disabled: busy === 'claim', onClick: () => claim(c) }, '确认这是我')))
+            : h('div', { className: 'ab-small ab-muted' }, '还没有收到私聊。先让账号给机器人发一句话，再刷新本页。')) : null,
         list.length ? list.map((inst) => h(Card, {
           key: inst.instance,
           title: platformLabel(inst.platform) + (inst.name && inst.name !== inst.platform ? ' · ' + inst.name : ''),
@@ -1518,7 +1525,6 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           ) : h('div', { className: 'ab-small ab-muted' }, '这个平台端没有可填的设置。'),
           h('div', { className: 'ab-small ab-muted', style: { marginTop: 8 } }, '能力：' + capsText(inst.caps)),
           h('div', { className: 'ab-flex', style: { marginTop: 8 } }, inst.platform === 'qq' && go ? h(Btn, { small: true, onClick: () => go('connect') }, '打开 QQ 详细设置') : null),
-          !owner && inst.self ? h('div', { style: { marginTop: 8 } }, h(Btn, { small: true, kind: 'primary', disabled: busy === inst.instance, onClick: () => claim(inst) }, '确认这是我')) : null,
         )) : h(Card, { title: '还没有平台' }, h(Empty, { icon: '📡', text: '在「QQ 网关」里先接上一个平台；接好后这里会出现卡片。' })),
         h(Card, { title: '人', desc: '每个人可以挂多个平台账号。合并前先预览；解绑只解除这个平台账号，不删记忆。' },
           people.length ? people.map((p) => h('div', { key: p.person, style: { padding: '8px 0', borderBottom: '1px solid var(--ab-line)' } },
@@ -8569,6 +8575,18 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [slowAttach, setSlowAttach] = useState(false)
       const [diag, setDiag] = useState(null)
       const [diagBusy, setDiagBusy] = useState(false)
+      const [pdata, setPdata] = useState(null)
+      useEffect(() => { get('/platforms').then(setPdata).catch(() => {}) }, [])
+      const claimPlatform = async (c) => {
+        const r = await post('/platforms/claim', { platform: c.platform, account: c.account })
+        toast(r.message || (r.ok ? '好了' : '没成功'), r.ok === false ? 'err' : 'ok')
+        if (r.ok) { setPdata(r); reload() }
+      }
+      const finishPlatform = async () => {
+        const r = await post('/setup/done', { platformOnly: true })
+        toast(r.message || (r.ok ? '完成' : '没成功'), r.ok === false ? 'err' : 'ok')
+        if (r.ok) { reload(); onClose && onClose() }
+      }
       const qqOk = /^\d{5,11}$/.test(draft.botQQ || '') && /^\d{5,11}$/.test(draft.ownerQQ || '') && draft.botQQ !== draft.ownerQQ
       const external = draft.gateway === 'onebot'
       const verified = conn && login && String(login.uin) === String(st.config.botQQ) && !st.onebot.problem
@@ -8620,6 +8638,16 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h(Row, { label: 'ta怎么称呼你' }, f.text('ownerName', { placeholder: '主人' })),
           h(Row, { label: '工作区文件夹', hint: 'ta在 QQ 会话里读写文件的地方，C 盘空间紧就放到别的盘，比如 D:\\Aurabot\\qq-chats。填完整路径，留空用默认位置。以后想换，在「连接」页能搬。聊天记录和记忆在用户目录的 .dsh 里，不在这个文件夹' }, f.text('workspaceDir', { size: 'wide', placeholder: st.workspaceDir || '' })),
           draft.botQQ && draft.ownerQQ && draft.botQQ === draft.ownerQQ ? h('div', { className: 'ab-note err' }, '机器人号和主人号不能是同一个。') : null),
+        h(Card, { title: '不用 QQ？也可以先接其他平台', desc: '接飞书、QQ 官方机器人或通用桥时，不需要填机器人 QQ。让要当主人的账号给机器人发一条私聊，在下面确认，然后直接进入面板。' },
+          pdata?.owner
+            ? h('div', null, h('div', { className: 'ab-small ab-muted' }, '当前主人：' + pdata.owner),
+              h('div', { style: { marginTop: 8 } }, h(Btn, { small: true, kind: 'primary', onClick: finishPlatform }, '用这个平台进入面板')))
+            : (pdata?.candidates || []).length
+              ? (pdata.candidates).map((c) => h('div', { key: c.platform + ':' + c.account, className: 'ab-flex', style: { alignItems: 'center', gap: 8, padding: '6px 0', borderBottom: '1px solid var(--ab-line)' } },
+                h('span', null, platformLabel(c.platform) + ' · ' + (c.name || c.account) + '（' + c.account + '）'),
+                h('div', { className: 'ab-spacer' }),
+                h(Btn, { small: true, kind: 'primary', onClick: () => claimPlatform(c) }, '确认这是我')))
+              : h('div', { className: 'ab-small ab-muted' }, '还没有收到私聊。先让账号给机器人发一句话，再刷新面板。')),
         // 1. SnowLuma，或接已有的 OneBot 机器人
         external ? h('div', null,
           h(GatewayChoice, { draft, setDraft }),
