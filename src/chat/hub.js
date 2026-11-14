@@ -100,7 +100,7 @@ export function reallySent (r) {
   return Boolean(r) && r.message_id !== undefined && !String(r.message_id).startsWith('sim-')
 }
 
-export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, buildTools, contextProviders, onActivity, memoryScore, onMemoryCommand, onCommand, isMuted, dislikes, random = Math.random, moodEffects, localApi, hooks, availableModels, toolsGeneration, capabilitiesOf, gateway = null, identity = null, routeOwner: routeOwnerInjected = null }) {
+export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, buildTools, contextProviders, onActivity, memoryScore, onMemoryCommand, onCommand, isMuted, dislikes, random = Math.random, moodEffects, localApi, hooks, availableModels, toolsGeneration, capabilitiesOf, gateway = null, identity = null, handover = null, routeOwner: routeOwnerInjected = null }) {
   const ownerRef = () => identity
   const ownerId = () => identity?.owner?.() || null
   const defaultPlatform = () => parseChatId('private:0')?.platform || ''
@@ -1135,7 +1135,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   // quiet：这一条是额外的（比如语音后面补发的表情），失败了不算到这一轮头上（deliver 按 failStore 里的条数判断整条有没有发出去）。
   // queueKind / queueTtlMs：网关短暂不可达时，确定没发出去的消息进入本地补发队列。
   async function sendSegments(chatId, message, note, opts = {}) {
-    const { force = false, isCurrent = null, throwOnError = false, timeoutMs, quiet = false, queueKind = 'reply', queueTtlMs, sensitive = false } = opts
+    const { force = false, isCurrent = null, throwOnError = false, timeoutMs, quiet = false, queueKind = 'reply', queueTtlMs, sensitive = false, proactive = false } = opts
+    if (proactive && gateway?.caps?.(chatId)?.proactive === 'none') return null
     if (disposed) return null
     // 出口层第二道保险：模块直接调 scopedHub.sendSegments/sendImage/sendFile/sendFile 时也要过门闸。
     // 只认带 sourceModule（模块发起）或 enginePolicy（引擎路径）的请求；hub 内部发送不带这两个标记，行为不变。
@@ -2532,6 +2533,13 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (disposed || !m) return
     try { gateway?.noteSeen?.(m.sender.person, m.chatId, Number(m.at) || Date.now()) } catch {}
     const event = inboundToOneBotEvent(m)
+    // F2：新平台第一次私聊，带一段从别处来的交接摘要（只对主人、只做一次）。
+    if (handover && m.chat?.kind === 'private' && m.platform && m.platform !== defaultPlatform()) {
+      try {
+        const context = await handover.contextFor(m.sender?.person, m.platform, m.chatId)
+        if (context) event.message = [{ type: 'text', data: { text: context } }, ...event.message]
+      } catch (error) { log.warn('生成交接摘要失败：', error.message) }
+    }
     return onMessage(event)
   }
 
@@ -2546,6 +2554,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (gw?.person || gw?.isOwner !== undefined) {
       msg.sender = { ...(msg.sender || {}), person: gw.person, isOwner: gw.isOwner }
     }
+    // F2：收不到群里非 @ 消息的平台，只处理被叫到的消息，不建立群缓冲和群记忆。
+    if (msg.kind === 'group' && gateway?.caps?.(msg.chatId)?.listenAllInGroup === false && !msg.mentionedMe) return
     if (msg.userId === selfId) return
     const now = Date.now()
     const wasCleared = () => isBeforeMemoryReset(msg.chatId, msg.userId, now)

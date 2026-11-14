@@ -62,6 +62,7 @@ import { createFeishuAdapter } from './adapters/feishu/index.js'
 import { createQqbotAdapter } from './adapters/qqbot/index.js'
 import { createBridgeAdapter } from './adapters/bridge/index.js'
 import { ensureUpgradedStorage } from './features/import-qq.js'
+import { createHandover } from './features/handover.js'
 
 export const name = 'aurabot'
 export const inject = ['agents', 'sessions', 'webServer', 'timer', 'workspaceRegistry', 'attachments', 'systemPrompt', 'llm']
@@ -545,6 +546,7 @@ export function apply(ctx) {
     // 惰性：只有配置里真开了平台才把它给 hub（见 ensureGateway），QQ 单平台时行为与改动前完全一致。
     gateway: platformGateway,
     identity,
+    handover: createHandover({ dsh: ctx, getConfig, identity, log: logger.child('handover') }),
     routeOwner,
     stickers,
     tts,
