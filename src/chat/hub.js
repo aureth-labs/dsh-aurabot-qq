@@ -930,6 +930,18 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (sid) {
       const mm = map()
       const rec = mm.chats[chat.chatId] || {}
+      const wantedTitle = titleFor(chat)
+      // 旧版本把非 QQ 会话也标成「QQ · …」；不动用户自己改过的标题，
+      // 只迁移明显的旧前缀，迁移后下次启动也不会反复改名。
+      if (rec.title && rec.title !== wantedTitle && chatPlatform(chat.chatId) !== defaultPlatform() && /^QQ(?:\s|·)/.test(rec.title)) {
+        try {
+          await controller().rename({ sessionId: sid, title: wantedTitle })
+          rec.title = wantedTitle
+          log.info(`会话 ${sid.slice(-8)} 的标题从旧 QQ 前缀改为 ${wantedTitle}`)
+        } catch (error) {
+          log.debug(`会话 ${sid.slice(-8)} 改标题失败：${error.message}`)
+        }
+      }
       mm.chats[chat.chatId] = {
         ...rec,
         sessionId: sid,
@@ -937,7 +949,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         sessions: { ...(rec.sessions || {}), [mode]: sid },
         preset,
         level,
-        title: rec.title || titleFor(chat),
+        title: rec.title || wantedTitle,
       }
       saveMap(mm)
     }
