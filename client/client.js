@@ -1517,7 +1517,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             h('i', { className: cx('ab-dot', inst.state === 'connected' ? 'ok' : inst.state === 'connecting' ? 'warn' : inst.enabled ? 'err' : '') }),
             h('span', { className: 'ab-small ab-muted' }, inst.enabled ? inst.state : '已停用')),
         },
-          h(Row, { label: '启用这个实例' }, h(Switch, { on: Boolean(inst.enabled), disabled: busy === inst.instance, onChange: () => toggle(inst) })),
+          h(Row, { label: '启用这个实例' }, inst.legacy
+            ? h('span', { className: 'ab-small ab-muted' }, '旧版直连模式：请到「QQ 网关」页启停')
+            : h(Switch, { on: Boolean(inst.enabled), disabled: busy === inst.instance, onChange: () => toggle(inst) })),
           inst.self ? h(Row, { label: '登录账号' }, h('span', null, inst.self.name + '（' + inst.self.account + '）')) : null,
           inst.detail ? h('div', { className: cx('ab-small', inst.state === 'connected' ? 'ab-muted' : 'ab-note warn'), style: { marginBottom: 8 } }, inst.detail) : null,
           (inst.settings || []).length ? h('div', null,

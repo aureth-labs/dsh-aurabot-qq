@@ -2535,7 +2535,23 @@ export function apply(ctx) {
   })
   // U1：平台页。instances() 已包含平台端声明的 settings，前端按模块表单的写法渲染。
   const platformView = () => {
-    const list = platformGateway?.instances?.() || []
+    let list = platformGateway?.instances?.() || []
+    // 旧版直连 QQ 没有网关实例，但面板仍要能看到这张卡；它由「QQ 网关」页管理，
+    // 这里只读展示，不能通过平台页开关（否则会以为关了，实际直连还在跑）。
+    if (!list.length && legacyQqActive()) {
+      list = [{
+        instance: defaultPlatform || 'qq',
+        platform: defaultPlatform || 'qq',
+        name: defaultPlatform || 'qq',
+        enabled: true,
+        legacy: true,
+        state: onebotState,
+        detail: onebotState === 'connected' ? '旧版直连 QQ（由连接页管理）' : (onebot.problem || '旧版直连 QQ'),
+        self: onebot.login ? { account: String(onebot.login.uin || ''), name: onebot.login.nickname || '' } : null,
+        caps: null,
+        settings: [],
+      }]
+    }
     return {
       ok: true,
       owner: identity.owner(),
