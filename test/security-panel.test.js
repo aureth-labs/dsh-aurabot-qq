@@ -10,7 +10,7 @@ const config = readFileSync(new URL('../src/core/config.js', import.meta.url), '
 
 test('安全防护页接上了页签、组件、搜索和 SSRF 模式配置', () => {
   assert.ok(client.includes("{ id: 'security', label: '安全防护' }"), '缺安全防护页签')
-  assert.ok(client.includes("tabs: ['connect', 'model', 'access', 'browser', 'security', 'backup', 'about', 'logs']"), '安全防护要注册在系统组')
+  assert.ok(client.includes("tabs: ['platforms', 'connect', 'model', 'access', 'browser', 'security', 'backup', 'about', 'logs']"), '安全防护要注册在系统组')
   assert.ok(client.includes('security: Security'), '组件表缺 security → Security')
   assert.ok(client.includes('function Security({ st, draft, setDraft })'), '缺 Security 组件')
   assert.ok(client.includes("security: '安全 防护 ssrf 内网 图片"), '搜索索引缺安全防护关键词')

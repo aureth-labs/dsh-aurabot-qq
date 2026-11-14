@@ -2655,6 +2655,7 @@ export function apply(ctx) {
     const addr = ownerCid ? parseChatId(ownerCid) : null
     const requested = String(b.platform || '').trim()
     const plat = requested || (owner && addr?.platform ? addr.platform : defaultPlatform)
+    const canonical = Boolean(requested) || (plat && plat !== defaultPlatform)
     const account = owner ? (identity.accountOn(identity.owner(), plat) || addr?.id || String(identity.owner() || 'owner')) : '10001'
     const userId = account
     const group = b.kind === 'group'
@@ -2663,8 +2664,8 @@ export function apply(ctx) {
       owner,
       userId,
       chat: group
-        ? { chatId: plat && plat !== defaultPlatform ? `${plat}:group:${groupId}` : `group:${groupId}`, ...(plat ? { platform: plat } : {}), kind: 'group', groupId, userId }
-        : { chatId: plat ? `${plat}:private:${account}` : `private:${account}`, ...(plat ? { platform: plat } : {}), kind: 'private', userId },
+        ? { chatId: canonical ? `${plat}:group:${groupId}` : `group:${groupId}`, ...(plat ? { platform: plat } : {}), kind: 'group', groupId, userId }
+        : { chatId: canonical ? `${plat}:private:${account}` : `private:${account}`, ...(plat ? { platform: plat } : {}), kind: 'private', userId },
     }
   }
   // 没有文字的（语音条、表情、图片）显示发送备注，比如「[语音·edge] 早呀」
