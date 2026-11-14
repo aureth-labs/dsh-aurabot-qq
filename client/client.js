@@ -1974,8 +1974,10 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [quickQQ, setQuickQQ] = useState('')
       const [batchOpen, setBatchOpen] = useState(false)
       const [batchText, setBatchText] = useState('')
+      const [knownChats, setKnownChats] = useState([])
       const [permissionGroupsOpen, setPermissionGroupsOpen] = useState({ 功能: true })
       const { busy, apply, applyMany } = usePermissionSave(toast, reload)
+      useEffect(() => { get('/platforms/chats').then((r) => setKnownChats(r.list || [])).catch(() => {}) }, [])
       const modules = (st.modules || []).map(({ id, running, commands }) => [id, running, commands])
       const catalogVersion = JSON.stringify(modules)
       useEffect(() => {
@@ -1995,23 +1997,25 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const owner = String(cfg.ownerQQ)
       const privateAllow = (cfg.allow.private || []).map(String)
       const isOpen = (qq) => privateAllow.includes(String(qq))
+      const validPrivate = (v) => /^\d{5,12}$/.test(String(v)) || /^[a-z][a-z0-9-]*:private:/.test(String(v))
+      const knownPrivate = knownChats.filter((c) => c.kind === 'private')
       const saved = [cfg.allow.private, ...Object.values(cfg.capabilityAllow || {}), ...Object.values(cfg.commandAllow || {})]
-      const ids = [...new Set(saved.flat().map(String))].filter((id) => id !== owner)
-      const names = new Map(friends.map(({ id, name }) => [id, name]))
+      const ids = [...new Set([...saved.flat().map(String), ...knownPrivate.map((c) => c.chatId)])].filter((id) => id !== owner)
+      const names = new Map([...friends.map(({ id, name }) => [id, name]), ...knownPrivate.map((c) => [c.chatId, c.name || c.chatId])])
       const q = query.trim().toLowerCase()
       const matching = [...new Set([...ids, ...names.keys()])].filter((id) => id !== owner && (!q ? ids.includes(id) || names.has(id) : id.includes(q) || names.get(id)?.toLowerCase().includes(q)))
       const entries = matching.slice(0, 50)
       const id = selected || (!q ? entries[0] : '')
       const open = Boolean(id && isOpen(id))
       const has = (key) => key === 'chat' ? open : (cfg.capabilityAllow?.[key] || cfg.commandAllow?.[key] || []).includes(id)
-      const canOpen = /^\d{5,12}$/.test(q) && q !== owner && !entries.includes(q)
+      const canOpen = validPrivate(q) && q !== owner && !entries.includes(q)
       const permissions = catalog?.list || []
       const known = new Set(permissions.map(({ key }) => key))
       const inactive = Object.keys(cfg.commandAllow || {}).filter((key) => has(key) && !known.has(key))
       const quickId = quickQQ.trim()
-      const canQuickAdd = /^\d{5,12}$/.test(quickId) && quickId !== owner && !isOpen(quickId)
+      const canQuickAdd = validPrivate(quickId) && quickId !== owner && !isOpen(quickId)
       const addPrivate = async (qq) => {
-        if (!/^\d{5,12}$/.test(String(qq)) || String(qq) === owner) return
+        if (!validPrivate(qq) || String(qq) === owner) return
         if (await apply(String(qq), 'private', { chat: true })) { setSelected(String(qq)); setQuickQQ('') }
       }
       const batchTokens = batchText.split(/[\s,，;；、]+/).filter(Boolean)
@@ -2034,6 +2038,10 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h(Btn, { small: true, kind: 'ghost', onClick: loadFriends }, friends.length ? '刷新好友' : '读取 QQ 好友'),
           h(Btn, { small: true, kind: 'primary', onClick: () => setBatchOpen(!batchOpen) }, batchOpen ? '收起' : '批量添加')) },
           h('input', { className: 'ab-input wide', value: query, 'aria-label': '搜索已授权用户或好友昵称', placeholder: '搜索已授权用户或好友昵称', onChange: (e) => setQuery(e.target.value) }),
+          knownPrivate.length ? h('div', { className: 'ab-flex', style: { marginTop: 6 } },
+            h('select', { className: 'ab-select', value: '', onChange: (e) => { if (e.target.value) setSelected(e.target.value) } },
+              h('option', { value: '' }, '从最近私聊选择'),
+              knownPrivate.filter((c) => !isOpen(c.chatId)).map((c) => h('option', { key: c.chatId, value: c.chatId }, platformLabel(c.platform) + ' · ' + (c.name || c.chatId))))) : null,
           h('div', { className: 'ab-flex', style: { marginTop: 6, flexWrap: 'wrap' } },
             h('input', { className: 'ab-input', style: { flex: 1, minWidth: 140 }, inputMode: 'numeric', value: quickQQ, 'aria-label': '直接输入 QQ 号添加私聊', placeholder: '输入 QQ 号（5～12 位）', onChange: (e) => setQuickQQ(e.target.value) }),
             h(Btn, { kind: 'primary', disabled: busy || !canQuickAdd, onClick: () => addPrivate(quickId) }, '添加私聊'),

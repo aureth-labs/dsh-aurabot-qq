@@ -27,10 +27,13 @@ function permissionLocation(key, kind) {
 
 /** 只更新指定对象、指定权限，保留同时来自 QQ 或设置页的其他改动。 */
 export function changePermissions(cfg, { id, kind = 'private', changes } = {}, commands, identity = null) {
-  if (!['private', 'group'].includes(kind) || typeof id !== 'string' || !/^\d{5,}$/.test(id)) {
-    return { ok: false, message: '请输入完整的 QQ 号或群号' }
+  const parsed = typeof id === 'string' ? parseChatId(id) : null
+  const validId = typeof id === 'string' && (/^\d{5,}$/.test(id) || (parsed && parsed.kind === kind && parsed.platform && parsed.id))
+  if (!['private', 'group'].includes(kind) || !validId) {
+    return { ok: false, message: '请输入完整的 QQ 号、群号或平台会话地址' }
   }
-  if (kind === 'private' && isOwner(identity, id, defaultPlatform())) return { ok: false, message: '主人权限请在主人设置中管理' }
+  const plat = parsed?.platform || defaultPlatform()
+  if (kind === 'private' && isOwner(identity, id, plat)) return { ok: false, message: '主人权限请在主人设置中管理' }
   if (!changes || typeof changes !== 'object' || Array.isArray(changes) || !Object.keys(changes).length) {
     return { ok: false, message: '请选择要修改的权限' }
   }
