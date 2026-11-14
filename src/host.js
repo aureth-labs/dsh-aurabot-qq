@@ -2598,9 +2598,15 @@ export function apply(ctx) {
     const current = getConfig().platforms || {}
     if (!instance || !current[instance]) return { ok: false, message: '没有这个平台实例' }
     const patch = b.patch && typeof b.patch === 'object' ? b.patch : {}
+    const entry = (platformGateway?.catalog?.() || []).find((x) => x.id === (current[instance]?.platform || instance))
+    const specs = new Map((entry?.settings || []).map((s) => [s.key, s]))
     const next = { ...(current[instance] || {}) }
-    for (const [key, value] of Object.entries(patch)) {
+    for (const [key, raw] of Object.entries(patch)) {
       if (key === 'enabled') continue
+      const spec = specs.get(key)
+      let value = raw
+      if (spec?.type === 'boolean') value = raw === true || raw === 'true'
+      else if (spec?.type === 'number') value = Number(raw)
       next[key] = value
     }
     setConfig(mergeFromPanel(getConfig(), { platforms: { [instance]: next } }))

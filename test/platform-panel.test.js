@@ -24,6 +24,11 @@ test('平台页可以添加尚未配置的平台', () => {
   assert.ok(host.includes("route('/platforms/add'"), '宿主缺添加平台路由')
 })
 
+test('平台设置支持 boolean 类型（飞书群消息开关）', () => {
+  assert.ok(client.includes("s.type === 'boolean'"), '面板没有把 boolean 渲染成开关')
+  assert.ok(host.includes("spec?.type === 'boolean'"), '宿主没有归一化 boolean 设置')
+})
+
 test('平台页宿主路由存在', () => {
   for (const route of ['/platforms', '/platforms/add', '/platforms/toggle', '/platforms/settings', '/platforms/people', '/platforms/chats']) {
     assert.ok(host.includes(`route('${route}'`), `缺路由 ${route}`)

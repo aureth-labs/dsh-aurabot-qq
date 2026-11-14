@@ -1443,6 +1443,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const field = (inst, s) => {
         const p = 'platforms.' + inst.instance + '.' + s.key
         if (s.type === 'switch') return f.sw(p)
+        if (s.type === 'boolean') return h(Switch, { on: Boolean(getPath(draft, p)), onChange: (v) => setDraft(setPath(draft, p, v)) })
         if (s.type === 'number') return f.num(p, { min: s.min, max: s.max, step: s.step })
         if (s.type === 'select') return f.select(p, (s.options || []).map((o) => (typeof o === 'string' ? { value: o, label: o } : o)))
         if (s.type === 'textarea') return h('textarea', { className: 'ab-textarea', value: getPath(draft, p) ?? '', placeholder: s.placeholder, onChange: (e) => setDraft(setPath(draft, p, e.target.value)) })

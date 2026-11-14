@@ -1373,7 +1373,7 @@ export function createFeishuAdapter(options = {}) {
 
       // 用户配置只能把能力改小
       capsOverride = { ...(capsOverride || {}) }
-      if (cfg.listenAllInGroup != null) capsOverride.listenAllInGroup = Boolean(cfg.listenAllInGroup)
+      if (cfg.listenAllInGroup != null) capsOverride.listenAllInGroup = cfg.listenAllInGroup === true || cfg.listenAllInGroup === 'true'
       if (cfg.proactive === 'none' || cfg.proactive === 'limited') capsOverride.proactive = cfg.proactive
 
       transport = String(cfg.transport || 'websocket') === 'webhook' ? 'webhook' : 'websocket'
