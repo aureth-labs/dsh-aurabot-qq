@@ -48,7 +48,7 @@ const friendEv = (over = {}) => ({ post_type: 'request', request_type: 'friend',
 
 test('权限：默认仅主人私聊；所有人含群；关了谁都不挂', () => {
   const t = setup()
-  assert.deepEqual(Object.keys(t.tools(ownerPm)).sort(), ['qq_handle_friend_request', 'qq_handle_group_request', 'qq_list_group_requests', 'qq_whitelist'])
+  assert.deepEqual(Object.keys(t.tools(ownerPm)).sort(), ['qq_group_settings', 'qq_handle_friend_request', 'qq_handle_group_request', 'qq_list_group_requests', 'qq_whitelist'])
   assert.deepEqual(Object.keys(t.tools(otherPm)), [])
   assert.deepEqual(Object.keys(t.tools(group)), [])
   assert.deepEqual(Object.keys(t.tools({ kind: 'system' })), [])
