@@ -13,6 +13,11 @@ test('平台页接上了 TABS、组件表和系统分组', () => {
   assert.ok(client.includes('function Platforms({ st, draft, setDraft, toast, reload, go })'), '缺 Platforms 组件')
 })
 
+test('平台页状态每 5 秒自动刷新，旧版能力提示明确', () => {
+  assert.ok(client.includes('setInterval(tick, 5000)'), '平台页缺状态轮询')
+  assert.ok(client.includes('旧版直连（由 QQ 网关页管理）'), '旧版直连能力提示缺失')
+})
+
 test('平台页宿主路由存在', () => {
   for (const route of ['/platforms', '/platforms/toggle', '/platforms/settings', '/platforms/people', '/platforms/chats']) {
     assert.ok(host.includes(`route('${route}'`), `缺路由 ${route}`)

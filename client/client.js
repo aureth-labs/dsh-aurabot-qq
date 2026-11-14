@@ -1393,8 +1393,13 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const f = useField(draft, setDraft)
       const [data, setData] = useState(null)
       const [busy, setBusy] = useState('')
-      const load = () => get('/platforms').then((r) => setData(r)).catch(() => {})
-      useEffect(() => { load() }, [])
+      useEffect(() => {
+        let alive = true
+        const tick = () => get('/platforms').then((r) => { if (alive) setData(r) }).catch(() => {})
+        tick()
+        const timer = setInterval(tick, 5000)
+        return () => { alive = false; clearInterval(timer) }
+      }, [])
       const list = (data && data.instances) || []
       const owner = data && data.owner
       const toggle = async (inst) => {
@@ -1521,13 +1526,13 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h(Row, { label: '启用这个实例' }, inst.legacy
             ? h('span', { className: 'ab-small ab-muted' }, '旧版直连模式：请到「QQ 网关」页启停')
             : h(Switch, { on: Boolean(inst.enabled), disabled: busy === inst.instance, onChange: () => toggle(inst) })),
-          inst.self ? h(Row, { label: '登录账号' }, h('span', null, inst.self.name + '（' + inst.self.account + '）')) : null,
+          inst.self ? h(Row, { label: '登录账号' }, h('span', null, inst.self.name ? inst.self.name + '（' + inst.self.account + '）' : inst.self.account)) : null,
           inst.detail ? h('div', { className: cx('ab-small', inst.state === 'connected' ? 'ab-muted' : 'ab-note warn'), style: { marginBottom: 8 } }, inst.detail) : null,
           (inst.settings || []).length ? h('div', null,
             inst.settings.map((s) => h(Row, { key: s.key, label: s.label || s.key, hint: s.hint }, field(inst, s))),
             h('div', { className: 'ab-flex', style: { marginTop: 8 } }, h(Btn, { small: true, kind: 'primary', disabled: busy === inst.instance, onClick: () => save(inst) }, '保存平台设置')),
           ) : h('div', { className: 'ab-small ab-muted' }, '这个平台端没有可填的设置。'),
-          h('div', { className: 'ab-small ab-muted', style: { marginTop: 8 } }, '能力：' + capsText(inst.caps)),
+          h('div', { className: 'ab-small ab-muted', style: { marginTop: 8 } }, '能力：' + (inst.legacy ? '旧版直连（由 QQ 网关页管理）' : capsText(inst.caps))),
           h('div', { className: 'ab-flex', style: { marginTop: 8 } }, inst.platform === 'qq' && go ? h(Btn, { small: true, onClick: () => go('connect') }, '打开 QQ 详细设置') : null),
         )) : h(Card, { title: '还没有平台' }, h(Empty, { icon: '📡', text: '在「QQ 网关」里先接上一个平台；接好后这里会出现卡片。' })),
         h(Card, { title: '人', desc: '每个人可以挂多个平台账号。合并前先预览；解绑只解除这个平台账号，不删记忆。' },
