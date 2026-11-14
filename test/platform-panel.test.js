@@ -18,8 +18,14 @@ test('平台页状态每 5 秒自动刷新，旧版能力提示明确', () => {
   assert.ok(client.includes('旧版直连（由 QQ 网关页管理）'), '旧版直连能力提示缺失')
 })
 
+test('平台页可以添加尚未配置的平台', () => {
+  assert.ok(client.includes("post('/platforms/add'"), '面板缺添加平台请求')
+  assert.ok(client.includes("{ title: '添加平台'"), '面板缺添加平台卡片')
+  assert.ok(host.includes("route('/platforms/add'"), '宿主缺添加平台路由')
+})
+
 test('平台页宿主路由存在', () => {
-  for (const route of ['/platforms', '/platforms/toggle', '/platforms/settings', '/platforms/people', '/platforms/chats']) {
+  for (const route of ['/platforms', '/platforms/add', '/platforms/toggle', '/platforms/settings', '/platforms/people', '/platforms/chats']) {
     assert.ok(host.includes(`route('${route}'`), `缺路由 ${route}`)
   }
 })

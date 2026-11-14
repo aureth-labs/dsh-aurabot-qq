@@ -1393,6 +1393,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const f = useField(draft, setDraft)
       const [data, setData] = useState(null)
       const [busy, setBusy] = useState('')
+      const [addPlatform, setAddPlatform] = useState('')
       useEffect(() => {
         let alive = true
         const tick = () => get('/platforms').then((r) => { if (alive) setData(r) }).catch(() => {})
@@ -1402,6 +1403,18 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       }, [])
       const list = (data && data.instances) || []
       const owner = data && data.owner
+      const available = (data?.catalog || []).filter((c) => !list.some((x) => x.platform === c.id || x.instance === c.id))
+      const add = async () => {
+        if (!addPlatform) return
+        setBusy('add')
+        try {
+          const r = await post('/platforms/add', { platform: addPlatform })
+          toast(r.message || (r.ok ? '已添加' : '没成功'), r.ok === false ? 'err' : 'ok')
+          if (r.instances) setData(r)
+          setAddPlatform('')
+          reload()
+        } finally { setBusy('') }
+      }
       const toggle = async (inst) => {
         setBusy(inst.instance)
         try {
@@ -1509,6 +1522,12 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         h(Card, { title: '平台', desc: '这里列出所有已注册的平台实例。开关即时生效；填错凭证时看卡片上的状态和原因，密钥不会回显。' },
           !owner ? h('div', { className: 'ab-note warn', style: { marginBottom: 10 } }, '还没有主人。先连上一个平台，用那个账号给她发一句话，再点下面的「确认这是我」。') : null,
           h('div', { className: 'ab-small ab-muted' }, owner ? '当前主人：' + owner : '当前主人：未设置')),
+        available.length ? h(Card, { title: '添加平台', desc: '还没有配置的平台可以在这里加。添加后再填 App ID / Secret 等凭证。' },
+          h('div', { className: 'ab-flex', style: { flexWrap: 'wrap' } },
+            h('select', { className: 'ab-select', value: addPlatform, onChange: (e) => setAddPlatform(e.target.value) },
+              h('option', { value: '' }, '选择平台'),
+              available.map((c) => h('option', { key: c.id, value: c.id }, platformLabel(c.id) + (c.name && c.name !== c.id ? ' · ' + c.name : '')))),
+            h(Btn, { kind: 'primary', small: true, disabled: busy === 'add' || !addPlatform, onClick: add }, '添加平台'))) : null,
         !owner ? h(Card, { title: '确认主人', desc: '用要当主人的账号给机器人发一条私聊，下面会出现这个账号；确认后它就是这个实例的主人。' },
           (data && data.candidates || []).length
             ? (data.candidates).map((c) => h('div', { key: c.platform + ':' + c.account, className: 'ab-flex', style: { alignItems: 'center', gap: 8, padding: '6px 0', borderBottom: '1px solid var(--ab-line)' } },

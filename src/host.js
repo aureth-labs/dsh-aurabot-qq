@@ -2535,10 +2535,13 @@ export function apply(ctx) {
   })
   // U1：平台页。instances() 已包含平台端声明的 settings，前端按模块表单的写法渲染。
   const platformView = () => {
-    let list = platformGateway?.instances?.() || []
+    if (!platformGateway) ensureGateway()
+    // 旧版直连 QQ 的实例由宿主管理，网关里即使有同名 idle 记录也不显示，
+    // 下面单独合成一张 legacy 卡片，避免出现「已停用 / 未连接」的假状态。
+    let list = (platformGateway?.instances?.() || []).filter((x) => !(x.platform === defaultPlatform && legacyQqActive()))
     // 旧版直连 QQ 没有网关实例，但面板仍要能看到这张卡；它由「QQ 网关」页管理，
     // 这里只读展示，不能通过平台页开关（否则会以为关了，实际直连还在跑）。
-    if (!list.length && legacyQqActive()) {
+    if (legacyQqActive()) {
       list = [{
         instance: defaultPlatform || 'qq',
         platform: defaultPlatform || 'qq',
@@ -2550,17 +2553,35 @@ export function apply(ctx) {
         self: (onebot.login?.uin || cfg.botQQ) ? { account: String(onebot.login?.uin || cfg.botQQ), name: onebot.login?.nickname || '' } : null,
         caps: null,
         settings: [],
-      }]
+      }, ...list]
     }
     return {
       ok: true,
       owner: identity.owner(),
       instances: list,
+      catalog: platformGateway?.catalog?.() || [],
       candidates: [...platformCandidates.values()].sort((a, b) => b.at - a.at).slice(0, 10),
       configs: Object.fromEntries(list.map((x) => [x.instance, (getConfig().platforms || {})[x.instance] || {}])),
     }
   }
   route('/platforms', async () => platformView())
+  route('/platforms/add', async (req) => {
+    const b = await readBody(req)
+    const platform = String(b.platform || '').trim()
+    if (!platform) return { ok: false, message: '先选要添加的平台' }
+    if (!platformGateway) ensureGateway()
+    const entry = (platformGateway?.catalog?.() || []).find((x) => x.id === platform)
+    if (!entry) return { ok: false, message: '这个平台端没有注册' }
+    const current = getConfig().platforms || {}
+    if (current[platform]) return { ...platformView(), ok: true, message: '这个平台已经添加过了' }
+    const defaults = { enabled: true }
+    for (const setting of entry.settings || []) {
+      if (setting.default !== undefined) defaults[setting.key] = setting.default
+    }
+    setConfig(mergeFromPanel(getConfig(), { platforms: { [platform]: defaults } }))
+    try { await platformGateway?.sync?.() } catch (error) { log.warn('添加平台后同步失败：', error.message) }
+    return { ...platformView(), ok: true, message: '平台已添加，请填凭证' }
+  })
   route('/platforms/toggle', async (req) => {
     const b = await readBody(req)
     const instance = String(b.instance || '').trim()

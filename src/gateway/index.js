@@ -625,6 +625,15 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
       }
     },
 
+    /** 已注册的平台端目录；面板用它发现还没配置的平台（如飞书）。 */
+    catalog() {
+      return [...probes.values()].filter((probe) => probe?.id).map((probe) => ({
+        id: probe.id,
+        name: probe.name || probe.id,
+        settings: probe.settings || [],
+      }))
+    },
+
     instances() {
       const list = []
       for (const [instanceName, want] of Object.entries(platformsConfig())) {
