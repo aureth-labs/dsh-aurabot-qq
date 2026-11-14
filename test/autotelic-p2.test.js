@@ -12,6 +12,7 @@ import {
   reflectionText, writeReflection, reviewDue, buildDailyPage, dreamDue, distillDream, createJournal, dayKey,
 } from '../src/autotelic/reflect.js'
 import { createRuntime } from '../src/autotelic/runtime.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
 const task = { id: 't1', title: '查竖屏转法', reason: '主人提到想批量转竖屏', status: 'active' }
 const step = { desc: '只读了解「查竖屏转法」', level: 'L0' }
@@ -181,7 +182,8 @@ const fakeHub = {
   chatLogDays: () => ['2026-11-04'],
   chatLogOf: () => [{ chatId: 'private:123', who: 'owner', uid: '123', text: '想学一下用 ffmpeg 把横屏视频批量转竖屏，有什么省事的办法', t: chatAt }],
 }
-const fakeCfg = { ownerQQ: '123' }
+const identity123 = makeTestIdentity('123')
+const fakeCfg = {}
 const fakeSettings = (over = {}) => ({
   enabled: true, minCuriosity: 0.1, maxCandidates: 3, maxTasksActive: 8, maxSteps: 8, budgetActionsPerHour: 99,
   evalModel: '', allowAct: true, presetIdOverride: true, actTimeoutMs: 60000,
@@ -198,6 +200,7 @@ function mkRuntime(t, { settings = {}, act, memory, auditNote, auditStat, evalTu
     settings: () => fakeSettings(settings),
     cfg: fakeCfg,
     hub: fakeHub,
+    identity: identity123,
     memoryOf: () => memStore,
     ledgerFile,
     evalTurn: evalTurn || null,

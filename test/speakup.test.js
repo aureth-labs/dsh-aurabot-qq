@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { makeTestIdentity } from './helpers/identity.js'
 
 let createSpeakUp
 let normalize
@@ -17,9 +18,10 @@ before(async () => {
 
 function setup(hubState, speakUp = {}) {
   const pushed = []
-  const cfg = normalize({ enabled: true, ownerQQ: OWNER, speakUp: { awakeFrom: 0, awakeTo: 24, minIntervalMinutes: 5, maxIntervalMinutes: 5, ...speakUp } })
+  const cfg = normalize({ enabled: true, speakUp: { awakeFrom: 0, awakeTo: 24, minIntervalMinutes: 5, maxIntervalMinutes: 5, ...speakUp } })
+  const identity = makeTestIdentity(OWNER)
   const hub = { ...hubState, pushToSession: async (chat, content) => pushed.push({ chat, text: content[0].text }) }
-  const s = createSpeakUp({ getConfig: () => cfg, hub, log: { info() {} } })
+  const s = createSpeakUp({ getConfig: () => cfg, hub, log: { info() {} }, identity, routeOwner: () => identity.routeOwner() })
   return { s, pushed }
 }
 const min = 60_000

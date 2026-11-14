@@ -1,6 +1,7 @@
 // 危险命令确认：命中规则才问主人；确认放行、取消/超时/陌生人都不执行。
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { makeTestIdentity } from './helpers/identity.js'
 
 const { isDangerousCommand, createDangerGuard } = await import('../src/security/danger.js')
 
@@ -11,11 +12,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 function makeGuard ({ enabled = true, timeoutMs = 5000 } = {}) {
   const delivered = []
   const cfg = { security: { dangerConfirm: enabled } }
+  const identity = makeTestIdentity(owner)
   const guard = createDangerGuard({
     getConfig: () => cfg,
     deliver: async (chatId, text) => { delivered.push({ chatId, text }) },
     chatOfSession: (sid) => (sid === 'sid-owner' ? ownerChat : sid === 'sid-other' ? 'private:999' : ''),
-    ownerQQ: () => owner,
+    identity,
+    routeOwner: () => identity.routeOwner(),
     timeoutMs,
   })
   return { guard, delivered, cfg }
@@ -86,7 +89,7 @@ test('主人回复「确认」才执行；命令原文发到主人私聊', async
   const p = guard.preExecute(execOf('Remove-Item -Recurse -Force C:\\'), () => 'NEXT')
   await sleep(10)
   assert.equal(delivered.length, 1)
-  assert.equal(delivered[0].chatId, ownerChat)
+  assert.equal(delivered[0].chatId, `qq:${ownerChat}`)
   assert.match(delivered[0].text, /危险命令确认/)
   assert.match(delivered[0].text, /Remove-Item/)
   assert.equal(guard.pendingCount, 1)
@@ -147,12 +150,14 @@ test('H04：等待确认期间关闭 dangerConfirm，旧确认不能执行', asy
 function makeScopedGuard ({ enabled = true, timeoutMs = 5000, owned = () => true } = {}) {
   const delivered = []
   const cfg = { security: { dangerConfirm: enabled } }
+  const identity = makeTestIdentity(owner)
   const guard = createDangerGuard({
     getConfig: () => cfg,
     deliver: async (chatId, text) => { delivered.push({ chatId, text }) },
     chatOfSession: (sid) => (sid === 'sid-owner' ? ownerChat : sid === 'sid-other' ? 'private:999' : ''),
     isOwnedSession: (sid) => owned(sid),
-    ownerQQ: () => owner,
+    identity,
+    routeOwner: () => identity.routeOwner(),
     timeoutMs,
   })
   return { guard, delivered, cfg }

@@ -552,7 +552,7 @@ export async function importFromQQ({ source, dryRun = false, targetDir, qqPlugin
     }
     copyTree(join(source, 'personas'), join(staging, 'personas'))
 
-    // 4. 配置（只拷贝平台无关字段 + ownerQQ；绝不带旧网关配置与密码令牌）
+    // 4. 配置（只拷贝平台无关字段与旧主人标识，启动后迁移进身份库；绝不带旧网关配置与密码令牌）
     if (srcConfig && typeof srcConfig === 'object' && !Array.isArray(srcConfig)) {
       const neutral = pickPlatformNeutralConfig(srcConfig)
       if (mode === 'initial' || !existsSync(join(target, 'config.json'))) {

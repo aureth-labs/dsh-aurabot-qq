@@ -1,14 +1,18 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createApprovalRelay } from '../src/security/approval.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
-function setup({ over = {}, timeoutMs = 60_000 } = {}) {
+function setup({ over = {}, timeoutMs = 60_000, owner = '1' } = {}) {
   const sent = []
-  const cfg = { enabled: true, dryRun: false, approvalViaQQ: true, ownerQQ: '1', ...over }
+  const cfg = { enabled: true, dryRun: false, approvalViaQQ: true, ...over }
+  const identity = makeTestIdentity(owner)
   const relay = createApprovalRelay({
     getConfig: () => cfg,
     deliver: async (chatId, text) => { sent.push({ chatId, text }) },
     chatOfSession: (id) => ({ own: 'private:1', group: 'group:9', other: 'private:2' })[id] || '',
+    identity,
+    routeOwner: () => identity.routeOwner(),
     timeoutMs,
   })
   const req = (session = 'own', extra = {}) => ({ agent: { session: { id: session } }, toolName: 'bash', reason: '写工作区外的文件', ...extra })
@@ -22,7 +26,7 @@ test('主人私聊回复「确认」批准这一次，消息不再交给她', as
   const { relay, sent, req, unavailable } = setup()
   const p = relay.onRequest(req(), unavailable)
   await tick()
-  assert.equal(sent[0].chatId, 'private:1')
+  assert.equal(sent[0].chatId, 'qq:private:1')
   assert.match(sent[0].text, /bash[\s\S]*写工作区外的文件[\s\S]*确认/)
   assert.equal(relay.handleReply('private:1', '1', ' 确认 '), true)
   assert.equal(await p, 'allowed-once')
@@ -124,7 +128,8 @@ test('问过才算 askedRecently：没走到插件时通知照常发', async () 
 
 test('QQ 不问的 QQ 会话：网页一直没人点，到时间按没批准处理', async () => {
   const relay = createApprovalRelay({
-    getConfig: () => ({ enabled: true, ownerQQ: '1', approvalViaQQ: false }),
+    getConfig: () => ({ enabled: true, approvalViaQQ: false }),
+    identity: makeTestIdentity('1'),
     deliver: async () => {}, chatOfSession: (id) => (id === 'dsh' ? '' : 'group:9'), timeoutMs: 20,
   })
   const never = () => new Promise(() => {})

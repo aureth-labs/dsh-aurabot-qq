@@ -8,6 +8,7 @@ import { Script } from 'node:vm'
 import { normalize } from '../src/core/config.js'
 import { createMemoryStore, buildIndex, search, memoryLine, parseValidityDate, pastWindow, compressionClusters, shouldForget, SEEN_META_LIMITS, RELATED_LIMIT } from '../src/features/memory.js'
 import memoryModule from '../src/modules/memory/index.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
 const OWNER = '10000001'
 const GUEST = '10000002'
@@ -38,7 +39,8 @@ function setup(t, options = {}) {
     deleteChatLog: (day) => { for (let i = rows.length - 1; i >= 0; i--) if (dayKey(rows[i].t) === day) rows.splice(i, 1) },
     speakersOf: () => [], groupNames: new Map(), forgetChatLog: () => 0,
   }
-  const make = () => createMemoryStore({ dsh, getConfig: () => cfg, hub, log })
+  const identity = makeTestIdentity(OWNER, 'qq', { legacyIds: [OWNER, GUEST] })
+  const make = () => createMemoryStore({ dsh, getConfig: () => cfg, hub, log, identity })
   const mem = make()
   const state = () => readMemoryState(dir)
   const seed = (items, extra = {}) => writeMemoryState(dir, { items, ...extra })
@@ -47,7 +49,7 @@ function setup(t, options = {}) {
     else process.env.AURABOT_DATA_DIR = previous
     rmSync(dir, { recursive: true, force: true })
   })
-  return { mem, make, cfg, calls, rows, hub, dsh, state, seed }
+  return { mem, make, cfg, calls, rows, hub, dsh, identity, state, seed }
 }
 
 const addPair = (mem, about = OWNER, chatId = `private:${OWNER}`) => {
@@ -263,7 +265,7 @@ test('只有 seen 的流水直接推进进度，不调用提炼、画像或经�
 })
 
 test('时间轴类型和平台筛选使用 meta.platform / via 汇总，路由沿用同一个 store', async (t) => {
-  const { mem, seed, cfg, hub, dsh } = setup(t)
+  const { mem, seed, cfg, hub, dsh, identity } = setup(t)
   seed([], { gists: [
     { id: 'qq', kind: 'gist', chatId: ownerChat.chatId, level: 1, text: '聊了天气', at: Date.now(), via: ['custom-chat', 'other-chat'] },
     { id: 'old-via', kind: 'gist', chatId: 'group:999', level: 2, text: '相处愉快', at: Date.now() - 1000, via: 'legacy-platform' },
@@ -277,7 +279,7 @@ test('时间轴类型和平台筛选使用 meta.platform / via 汇总，路由�
   const platforms = new Set(mem.timeline().flatMap((m) => m.platforms))
   assert.deepEqual(platforms, new Set(['custom-chat', 'other-chat', 'legacy-platform', 'custom-video']))
   const routes = new Map()
-  memoryModule.setup({ config: () => cfg, dsh, log, core: { hub, http: { query: (req) => req.query || {} } }, context() {}, on() {}, every() {}, tool() {}, route: (path, handler) => routes.set(path, handler) })
+  memoryModule.setup({ config: () => cfg, dsh, log, core: { hub, identity, routeOwner: identity.routeOwner, http: { query: (req) => req.query || {} } }, context() {}, on() {}, every() {}, tool() {}, route: (path, handler) => routes.set(path, handler) })
   const response = await routes.get('/memory/timeline')({ query: { kind: 'seen', platform: 'custom-video' } })
   assert.deepEqual(response.list.map((m) => m.id), [seen.id])
   assert.match(response.list[0].displayText, /看过《候鸟》/)

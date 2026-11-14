@@ -322,8 +322,8 @@ export interface Api {
   sendText(chatId: ChatId | string, text: string): Promise<any>
   /** 回某一条消息：群里以「引用回复」发出（对方能看到在回他），私聊直接发 */
   reply(msg: Message, text: string): Promise<any>
-  /** 这个 QQ 号是不是主人 */
-  isOwner(userId: string | number): boolean
+  /** 这个账号（按当前平台上下文）或 PersonId 是不是主人 */
+  isOwner(userId: string | number | Record<string, any>, platform?: Platform): boolean
   sendImage(chatId: ChatId | string, src: string): Promise<any>
   /** 发文件：本机绝对路径，或网关能取到的网址 / base64://（网关看不到本机路径时，小文件会自动改用 base64） */
   sendFile(chatId: ChatId | string, file: string, name?: string): Promise<any>

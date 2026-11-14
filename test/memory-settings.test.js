@@ -9,11 +9,12 @@ process.env.AURABOT_DATA_DIR = mkdtempSync(join(tmpdir(), 'aurabot-memory-settin
 
 const { normalize } = await import('../src/core/config.js')
 const { createMemoryStore } = await import('../src/features/memory.js')
+const { makeTestIdentity } = await import('./helpers/identity.js')
 
 const owner = '10000001'
 const log = { info () {}, warn () {}, debug () {} }
 const mk = (memory = {}) => normalize({ enabled: true, ownerQQ: owner, memory: { enabled: true, recallCount: 4, ...memory } })
-const store = (cfg) => createMemoryStore({ dsh: null, getConfig: () => cfg, hub: null, log })
+const store = (cfg) => createMemoryStore({ dsh: null, getConfig: () => cfg, hub: null, log, identity: makeTestIdentity(cfg?.ownerQQ || owner, 'qq', { legacyIds: [owner] }) })
 
 test('配置：常驻上限默认 1200、范围 200~4000；私人记忆优先默认开', () => {
   const c = normalize({})

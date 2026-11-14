@@ -82,7 +82,7 @@ export function mergeCaps(adapterCaps, userCaps, instance, log = noopLog) {
  * @param {() => number=} opts.now 时钟（测试注入以验证过期）
  * @param {number=} opts.replyHoldMs 被动回复合并的挂起时长（默认 300）
  */
-export function createGateway({ config, dataDir, http, identity, log, now = Date.now, replyHoldMs = 300 } = {}) {
+export function createGateway({ config, dataDir, http, identity, log, now = Date.now, replyHoldMs = 300, isExternalInstance = null } = {}) {
   if (!identity || typeof identity.resolve !== 'function' || typeof identity.accountOn !== 'function') {
     throw new Error('createGateway 需要一个实现 Identity 形状的对象（identity.resolve / accountOn 等）；测试可传内存假实现，I1 合并后换真的')
   }
@@ -390,6 +390,11 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
     for (const [instanceName, want] of Object.entries(desired)) {
       if (!want || want.enabled === false) {
         if (!runs.has(instanceName) && !idle.has(instanceName)) idle.set(instanceName, { state: 'stopped', detail: '实例已停用' })
+        continue
+      }
+      if (typeof isExternalInstance === 'function' && isExternalInstance(instanceName)) {
+        if (runs.has(instanceName)) await stopInstance(instanceName, '由宿主直连托管')
+        idle.set(instanceName, { state: 'connected', detail: '由宿主直连托管', cfgJson: JSON.stringify(want) })
         continue
       }
       if (runs.has(instanceName)) continue

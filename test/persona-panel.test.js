@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { Script } from 'node:vm'
 import { normalize } from '../src/core/config.js'
 import { createMemoryStore } from '../src/features/memory.js'
+import { makeTestIdentity } from './helpers/identity.js'
 import { readMemoryState } from './helpers/memory-state.js'
 import { createFakeDsh } from './helpers/fake-dsh.js'
 import { createConversationArchive } from '../src/chat/conversation-context.js'
@@ -64,14 +65,15 @@ function setup(t) {
     ],
   }
   const cfg = normalize({ ownerQQ: OWNER, allow: { private: [ALICE, BOB, '424242'] }, memory: { dailyConsolidate: false } })
-  const make = () => createMemoryStore({ getConfig: () => cfg, hub, log })
+  const identity = makeTestIdentity(OWNER, 'qq', { legacyIds: [OWNER, ALICE, BOB, CHARLIE, '424242'] })
+  const make = () => createMemoryStore({ getConfig: () => cfg, hub, log, identity })
   const state = () => readMemoryState(dir)
   t.after(() => {
     if (previous === undefined) delete process.env.AURABOT_DATA_DIR
     else process.env.AURABOT_DATA_DIR = previous
     rmSync(dir, { recursive: true, force: true })
   })
-  return { cfg, hub, make, state, now }
+  return { cfg, hub, identity, make, state, now }
 }
 
 test('人物墙包含画像、事实及个人梗概，主人优先，详情按 QQ 精确关联', (t) => {
@@ -171,7 +173,7 @@ test('人物和记忆面板路由接到同一份 store', async (t) => {
   const routes = new Map()
   const api = {
     config: () => s.cfg,
-    core: { hub: s.hub, http: { query: (req) => req.query || {}, body: async (req) => req.body || {} } },
+    core: { hub: s.hub, identity: s.identity, routeOwner: s.identity.routeOwner, http: { query: (req) => req.query || {}, body: async (req) => req.body || {} } },
     log, context() {}, on() {}, every() {}, tool() {}, route: (path, handler) => routes.set(path, handler),
   }
   memoryModule.setup(api)

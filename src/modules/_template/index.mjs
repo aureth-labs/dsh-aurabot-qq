@@ -26,7 +26,7 @@ export default {
 
     // 1. 收到消息时先问模块：返回 true 就是「这条我处理了」，她不会再回
     api.on('message', async (msg) => {
-      if (api.settings().onlyOwner && msg.userId !== api.config().ownerQQ) return false
+      if (api.settings().onlyOwner && !api.isOwner(msg.userId)) return false
       const reply = table()[msg.text.trim()]
       if (!reply) return false
       await api.send(msg.chatId, reply)

@@ -5,6 +5,7 @@ import { defineTool, str } from '../../tools/tools.js'
 import { QQ_API, paramsOf } from './actions.js'
 import { clipText } from '../../core/text.js'
 import { cleanOutboundText } from '../../chat/reply.js'
+import { isOwnerPrivateChat } from '../../chat/access.js'
 
 const RESULT_CHARS = 3000
 
@@ -149,7 +150,7 @@ export default {
             // 原始动作里的文本/转发/卡片参数也过出站清洗（和 QQ 投递同一套），别让工具文字走旁路露出。
             const clean = typeof hub.cleanOutbound === 'function'
               ? (text) => hub.cleanOutbound(chat.chatId, text)
-              : (text) => cleanOutboundText(text, { ownerPrivate: chat.chatId === `private:${api.config().ownerQQ}` })
+              : (text) => cleanOutboundText(text, { ownerPrivate: isOwnerPrivateChat(api.core.identity, chat) })
             const cleaned = cleanOutboundParams(name, pickParams(name, params), clean)
             if (!cleaned.ok) return { ok: false, message: cleaned.message }
             if (cleaned.changed) api.log.info(`qq_api：${chat.chatId} 调用 ${name} 前清洗了外显文本`)

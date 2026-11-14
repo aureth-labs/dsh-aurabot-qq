@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { createOutboundPolicy } from '../src/chat/outbound-policy.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
 // ── 测试夹具 ──────────────────────────────────────────────────────────────
 
@@ -54,10 +55,12 @@ function fakePolicy(name = 'purpose', opts = {}) {
 /** 造一份可控配置。 */
 function makeConfig({ tier = 'pass', ownerQQ = '10001' } = {}) {
   let cfg = { ownerQQ, outboundPolicy: { tier, ownerQQ } }
+  const identity = makeTestIdentity(ownerQQ, 'qq')
   return {
+    identity,
     get: () => cfg,
     setTier: (t) => { cfg = { ...cfg, outboundPolicy: { ...cfg.outboundPolicy, tier: t } } },
-    setOwner: (qq) => { cfg = { ...cfg, ownerQQ: qq, outboundPolicy: { ...cfg.outboundPolicy, ownerQQ: qq } } },
+    setOwner: (qq) => { cfg = { ...cfg, ownerQQ: qq, outboundPolicy: { ...cfg.outboundPolicy, ownerQQ: qq } }; identity.setOwner(qq, 'qq') },
   }
 }
 
@@ -66,6 +69,8 @@ function makeService(over = {}) {
   const conf = over.config || makeConfig()
   const svc = createOutboundPolicy({
     getConfig: conf.get,
+    identity: conf.identity,
+    owner: () => conf.identity.owner() || '',
     dataDir: over.dataDir || null,
     now: over.now || (() => 1_700_000_000_000),
     log: () => {},
@@ -289,7 +294,7 @@ test('账本落盘到 dataDir，重建实例后能读回', async () => {
 test('TTL 24h 到期：pending 置 expired', async () => {
   let t = 1_700_000_000_000
   const conf = makeConfig({ tier: 'broker' })
-  const svc = createOutboundPolicy({ getConfig: conf.get, now: () => t, log: () => {} })
+  const svc = createOutboundPolicy({ getConfig: conf.get, identity: conf.identity, owner: () => conf.identity.owner() || '', now: () => t, log: () => {} })
   const sub = await svc.submit({ moduleId: 'm1', itemId: 'i1', to: 'private:10001', text: 'x' })
   assert.equal(svc.statusOf(sub.deliveryId).state, 'pending')
   t += 24 * 60 * 60 * 1000 + 1
@@ -315,7 +320,7 @@ test('submit 在非 broker 档返回 unsupported（不抛错，便于模块降�
 test('账本上限 200 条：超限按最老优先清理', async () => {
   let t = 1_700_000_000_000
   const conf = makeConfig({ tier: 'broker' })
-  const svc = createOutboundPolicy({ getConfig: conf.get, now: () => t, log: () => {} })
+  const svc = createOutboundPolicy({ getConfig: conf.get, identity: conf.identity, owner: () => conf.identity.owner() || '', now: () => t, log: () => {} })
   for (let i = 0; i < 205; i++) {
     t += 1
     await svc.submit({ moduleId: 'm', itemId: `i${i}`, to: 'private:10001', text: 'x' })

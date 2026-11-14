@@ -2,6 +2,8 @@
 // 导出 createMood 的返回值：nudge(变化, 原因)、label()、state()、effects()、contextLine()、observe()、judge()。
 
 import { createMood } from '../../features/companion.js'
+import { isOwnerPrivateChat } from '../../chat/access.js'
+import { parseChatId } from '../../gateway/address.js'
 
 export default {
   id: 'mood',
@@ -27,7 +29,7 @@ export default {
       // 模型判心情（开了才判）：系统提醒开头的是她自己主动找人
       if (a.kind === 'out' && a.reply && !String(a.chatId).startsWith('system:')) {
         const speakUp = String(a.userText).startsWith('【系统提醒')
-        mood.judge({ userText: a.userText, reply: a.reply, who: String(a.chatId).startsWith('group:') ? '群里的人' : String(a.chatId) === `private:${cfg.ownerQQ}` ? cfg.ownerName || '主人' : '对方', origin: speakUp ? 'speak-up' : 'user' }).catch(() => {})
+        mood.judge({ userText: a.userText, reply: a.reply, who: parseChatId(a.chatId)?.kind === 'group' ? '群里的人' : isOwnerPrivateChat(api.core.identity, a.chatId) ? cfg.ownerName || '主人' : '对方', origin: speakUp ? 'speak-up' : 'user' }).catch(() => {})
       }
     })
     // 心情历史单独取：/state 只带摘要，避免面板轮询把最多 200 条历史一起传

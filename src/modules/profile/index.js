@@ -89,7 +89,7 @@ export default {
     // 统一套路：dryRun 只说不做；执行前再按最新配置查一遍权限
     const guarded = (key, chat, sessionId, run) => async (args) => {
       const cfg = api.config()
-      const p = profilePermits(cfg, key, chat, hub.turnSendersAllOwner(sessionId))
+      const p = profilePermits(cfg, key, chat, hub.turnSendersAllOwner(sessionId), api.core.identity)
       if (!p.ok) return p
       return run(args, cfg)
     }
@@ -98,9 +98,9 @@ export default {
       if (chat.kind !== 'private' && chat.kind !== 'group') return []
       const cfg = api.config()
       const tools = []
-      const allowed = () => chat.kind === 'private' && isOwner(api.config(), chat.userId) && hub.turnSendersAllOwner(sessionId)
+      const allowed = () => chat.kind === 'private' && isOwner(api.core.identity, chat) && hub.turnSendersAllOwner(sessionId)
       // 查询权限独立于修改权限，始终只给主人私聊，读取对象固定为机器人自己。
-      if (chat.kind === 'private' && isOwner(cfg, chat.userId)) tools.push(defineTool({
+      if (chat.kind === 'private' && isOwner(api.core.identity, chat)) tools.push(defineTool({
         name: 'qq_get_profile',
         description: '查看你自己的当前 QQ 昵称、个性签名和头像地址。主人私聊谈到资料时可主动查询；需要看头像长什么样、评价头像时传 view_avatar=true，返回实际头像图片附件及辅助描述。只读，不发送图片或修改资料；主人要你发头像时用 qq_send_avatar。',
         properties: { view_avatar: { type: 'boolean', description: '是否实际查看头像画面；讨论头像外观时填 true，默认 false' } },
@@ -112,7 +112,7 @@ export default {
           return result
         },
       }))
-      if (chat.kind === 'private' && isOwner(cfg, chat.userId)) tools.push(defineTool({
+      if (chat.kind === 'private' && isOwner(api.core.identity, chat)) tools.push(defineTool({
         name: 'qq_send_avatar',
         description: '主人明确要求“把现在头像发出来”“发你的头像给我”时，发送你自己的当前 QQ 头像图片到本次主人私聊。无需先识图，不接受地址、QQ 号或发送目标。发送成功后不要再重复发图。',
         execute: async () => {
@@ -138,7 +138,7 @@ export default {
           }
         },
       }))
-      if (profileToolVisible(cfg, 'qqNickname', chat)) tools.push(defineTool({
+      if (profileToolVisible(cfg, 'qqNickname', chat, api.core.identity)) tools.push(defineTool({
         name: 'qq_set_nickname',
         description: `改你自己的 QQ 昵称（最多 ${NICK_MAX} 字）。有人让你改名时用。`,
         properties: { name: str('新昵称') },
@@ -157,7 +157,7 @@ export default {
           return { ok: true, message: `QQ 昵称改好了：${nick}` }
         }),
       }))
-      if (profileToolVisible(cfg, 'qqSignature', chat)) tools.push(defineTool({
+      if (profileToolVisible(cfg, 'qqSignature', chat, api.core.identity)) tools.push(defineTool({
         name: 'qq_set_signature',
         description: `改你自己的 QQ 个性签名（最多 ${SIGN_MAX} 字）。有人让你改签名时用。`,
         properties: { text: str('新签名') },
@@ -176,7 +176,7 @@ export default {
           return { ok: true, message: `QQ 签名改好了：${sign}` }
         }),
       }))
-      if (profileToolVisible(cfg, 'qqAvatar', chat)) tools.push(defineTool({
+      if (profileToolVisible(cfg, 'qqAvatar', chat, api.core.identity)) tools.push(defineTool({
         name: 'qq_set_avatar',
         description: '换你自己的 QQ 头像。image 填图片网址；主人刚发来一张图、说「用我刚才发的 / 刚才那张」换头像时，填 last（不是画作编号）；填「画作 #1」才是用你自己画的那张（画完时会告诉你编号）。图太大会自动缩小。',
         properties: { image: str('图片网址（http/https）／last（刚才那张图）／画作编号（如 #1）') },

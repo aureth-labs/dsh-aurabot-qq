@@ -10,6 +10,7 @@ import { createFakeDsh } from './helpers/fake-dsh.js'
 import { createSpeakUp } from '../src/features/companion.js'
 import { createPurpose } from '../src/purpose/module.js'
 import { existsSync } from 'node:fs'
+import { makeTestIdentity } from './helpers/identity.js'
 
 const owner = '10000001', a = '10000002', b = '10000003', bot = '20000001'
 const log = { info() {}, debug() {}, warn() {}, error() {} }
@@ -23,8 +24,9 @@ function fixture(t, output = { facts: [] }) {
   const rows = []
   const hub = { chatLogDays: () => [day()], chatLogOf: () => rows, speakersOf: () => [a], groupNames: new Map([['777', '测试群']]) }
   const dsh = { get: () => null, llm: { async *stream({ system }) { yield { type: 'text-delta', text: system.includes('整理长期记忆') ? JSON.stringify(output) : '{"insights":[],"style":[]}' }; yield { type: 'finish', reason: { kind: 'completed' } } } } }
-  const memory = createMemoryStore({ dsh, getConfig: () => cfg, hub, log })
-  return { cfg, memory, rows, dir }
+  const identity = makeTestIdentity(owner, 'qq', { legacyIds: [owner, a, b] })
+  const memory = createMemoryStore({ dsh, getConfig: () => cfg, hub, log, identity })
+  return { cfg, memory, rows, dir, identity }
 }
 
 test('标签校验、主人保护、旧画像和筛选数据', (t) => {
@@ -70,13 +72,13 @@ test('模型形成喜恶并替换原来的喜恶，其他标签保留', async (t
 })
 
 test('讨厌者静默仍记流水；概率为零和主人不拦', async (t) => {
-  const { cfg } = fixture(t)
+  const { cfg, identity } = fixture(t)
   Object.assign(cfg, { enabled: true, dryRun: true })
   cfg.allow.private = [a]
   cfg.merge.enabled = false
   cfg.memory.dislikeSilence = 1
   const fake = createFakeDsh({ brain: async () => '好' })
-  const hub = createHub({ dsh: fake.ctx, getConfig: () => cfg, log, onebot: { connected: true, call: async () => ({}) }, dislikes: () => true, random: () => 0 })
+  const hub = createHub({ dsh: fake.ctx, getConfig: () => cfg, log, identity, routeOwner: identity.routeOwner, defaultPlatform: 'qq', onebot: { connected: true, call: async () => ({}) }, dislikes: () => true, random: () => 0 })
   t.after(() => { hub.dispose(); fake.dispose() })
   const event = (uid) => ({ post_type: 'message', message_type: 'private', sub_type: 'friend', self_id: Number(bot), user_id: Number(uid), message_id: 1, sender: { user_id: Number(uid), nickname: uid }, message: [{ type: 'text', data: { text: '你好' } }] })
   await hub.onMessage(event(a))
@@ -94,14 +96,14 @@ test('讨厌者静默仍记流水；概率为零和主人不拦', async (t) => {
 })
 
 test('群聊合批中混入其他人时不拦', async (t) => {
-  const { cfg } = fixture(t)
+  const { cfg, identity } = fixture(t)
   cfg.enabled = true
   cfg.dryRun = true
   cfg.allow.groups = ['777']
   cfg.memory.dislikeSilence = 1
   Object.assign(cfg.merge, { enabled: true, groupWaitSec: 0.1, groupMaxSec: 1 })
   const fake = createFakeDsh({ brain: async () => '好' })
-  const hub = createHub({ dsh: fake.ctx, getConfig: () => cfg, log, onebot: { connected: true, call: async () => ({ group_name: '群' }) }, dislikes: (qq) => qq === a, random: () => 0 })
+  const hub = createHub({ dsh: fake.ctx, getConfig: () => cfg, log, identity, routeOwner: identity.routeOwner, defaultPlatform: 'qq', onebot: { connected: true, call: async () => ({ group_name: '群' }) }, dislikes: (qq) => qq === a, random: () => 0 })
   t.after(() => { hub.dispose(); fake.dispose() })
   const event = (uid) => ({ post_type: 'message', message_type: 'group', group_id: 777, self_id: Number(bot), user_id: Number(uid), message_id: Number(uid), sender: { user_id: Number(uid), nickname: uid }, message: [{ type: 'at', data: { qq: bot } }, { type: 'text', data: { text: '你好' } }] })
   await hub.onMessage(event(a))
@@ -114,22 +116,22 @@ test('群聊合批中混入其他人时不拦', async (t) => {
 })
 
 test('目的引擎跳过讨厌的人', async (t) => {
-  const { cfg, dir } = fixture(t)
+  const { cfg, dir, identity } = fixture(t)
   cfg.enabled = true
   cfg.speakUp.allow = [a]
   cfg.ext.purpose = { enabled: true, initialDelayMinutes: 1 }
-  const p = createPurpose({ getConfig: () => cfg, hub: {}, log, isMuted: (id) => id === `private:${owner}`, memory: () => ({ dislikes: (qq) => qq === a }) })
+  const p = createPurpose({ getConfig: () => cfg, hub: {}, log, identity, routeOwner: identity.routeOwner, isMuted: (id) => id === `private:${owner}`, memory: () => ({ dislikes: (qq) => qq === a }) })
   await p.tick()
   assert.equal(existsSync(join(dir, 'purpose', 'friends', `${a}.json`)), false)
 })
 
 test('主动搭话跳过讨厌的人', async (t) => {
-  const { cfg } = fixture(t)
+  const { cfg, identity } = fixture(t)
   cfg.enabled = true
   Object.assign(cfg.speakUp, { enabled: true, allow: [a], minIntervalMinutes: 0, maxIntervalMinutes: 0, idleMinutes: 0, maxPerDay: 1, awakeFrom: 0, awakeTo: 24 })
   const sent = []
   const hub = { lastOwnerChatAt: Date.now(), lastBotToOwner: { at: 0, text: '' }, lastPrivateAt: () => 0, pushToSession: async (chat) => sent.push(chat) }
-  const speak = createSpeakUp({ getConfig: () => cfg, hub, log, memory: () => ({ dislikes: (qq) => qq === a }) })
+  const speak = createSpeakUp({ getConfig: () => cfg, hub, log, identity, routeOwner: identity.routeOwner, memory: () => ({ dislikes: (qq) => qq === a }) })
   await speak.tick()
   assert.ok(!sent.some((chat) => String(chat.userId) === a), `不该找讨厌的人：${sent.map((c) => c.chatId)}`)
 })

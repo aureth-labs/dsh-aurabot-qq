@@ -10,6 +10,7 @@ import { createMemoryStore, buildIndex, search, memoryLine } from '../src/featur
 import { FACT_TIERS, tierDays, strongerTier, memoryPlatforms } from '../src/features/memory-rules.js'
 import memoryModule from '../src/modules/memory/index.js'
 import { readMemoryState, writeMemoryState } from './helpers/memory-state.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
 const OWNER = '10000001', A = '30000001', B = '30000002', C = '30000003'
 const DAY = 86400_000
@@ -37,20 +38,21 @@ function setup(t, memory = {}) {
     deleteChatLog: (day) => { for (let i = rows.length - 1; i >= 0; i--) if (dayKey(rows[i].t) === day) rows.splice(i, 1) },
     groupNames: new Map(), speakersOf: () => [], forgetChatLog: () => 0,
   }
-  const make = () => createMemoryStore({ getConfig: () => cfg, dsh, hub, log })
+  const identity = makeTestIdentity(OWNER, 'qq', { legacyIds: [OWNER, A, B, C] })
+  const make = () => createMemoryStore({ getConfig: () => cfg, dsh, hub, log, identity })
   const mem = make()
   t.after(() => {
     if (previous === undefined) delete process.env.AURABOT_DATA_DIR
     else process.env.AURABOT_DATA_DIR = previous
     rmSync(dir, { recursive: true, force: true })
   })
-  return { dir, cfg, mem, make, hub, dsh, rows, calls, answer: (fn) => { answer = fn },
+  return { dir, cfg, mem, make, hub, dsh, identity, rows, calls, answer: (fn) => { answer = fn },
     seed: (items, extra = {}) => writeMemoryState(dir, { items, ...extra }), state: () => readMemoryState(dir) }
 }
 
 function routes(s) {
   const handlers = new Map()
-  memoryModule.setup({ config: () => s.cfg, dsh: s.dsh, log, core: { hub: s.hub, http: { query: (req) => req.query || {}, body: async (req) => req.body || {} } },
+  memoryModule.setup({ config: () => s.cfg, dsh: s.dsh, log, core: { hub: s.hub, identity: s.identity, routeOwner: s.identity.routeOwner, http: { query: (req) => req.query || {}, body: async (req) => req.body || {} } },
     context() {}, on() {}, every() {}, tool() {}, route: (path, fn) => handlers.set(path, fn) })
   return handlers
 }

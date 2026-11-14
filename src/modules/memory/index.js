@@ -9,6 +9,8 @@ export { looksLikeRuleMemory } from '../../features/memory.js'
 import { buildEdges, layoutGraph3d, brightness, regionOf, FADING_THRESHOLD, LAYOUT_VERSION, toStarTier, toHostTier, STAR_TIER_LABEL } from '../../features/memory-graph.js'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { defineTool, str } from '../../tools/tools.js'
+import { isOwnerPrivateChat } from '../../chat/access.js'
+import { parseChatId } from '../../gateway/address.js'
 
 /** 把「2026-03-05」或「2026-03-01..2026-03-31」解析成检索用的时间窗；裸的年月算整月。 */
 function parsePeriod(text) {
@@ -36,8 +38,8 @@ export default {
   tab: 'memory',
   files: ['features/memory.js', 'features/memory-rules.js', 'features/memory-store.js', 'features/memory-vector.js'],
   setup(api, { fetchImpl } = {}) {
-    const { hub, http } = api.core
-    const memory = createMemoryStore({ dsh: api.dsh, getConfig: api.config, hub, log: api.log, fetchImpl, setConfig: api.setConfig })
+    const { hub, http, identity, routeOwner } = api.core
+    const memory = createMemoryStore({ dsh: api.dsh, getConfig: api.config, hub, log: api.log, fetchImpl, setConfig: api.setConfig, identity })
     memory.list('') // 启动时完成旧 JSON 迁移，不必等第一条聊天或打开面板。
 
     api.context(({ chat, sessionId }) => (chat.kind === 'system' ? '' : memory.contextFor(chat, sessionId)))
@@ -65,7 +67,7 @@ export default {
           required: ['who'],
           execute: async ({ who }) => memory.lookupPerson(chat, who, senders()),
         }),
-        ...(chat.kind === 'group' || String(chat.userId) === String(api.config().ownerQQ || '') ? [defineTool({
+        ...(chat.kind === 'group' || isOwnerPrivateChat(identity, chat) ? [defineTool({
           name: 'chat_impression',
           description: chat.kind === 'group' ? '想一想你对这个群的印象：气氛、常聊什么、怎么相处。' : '查你对某个群的印象。group 写群号或群名，不写就列出有印象的群。',
           properties: chat.kind === 'group' ? {} : { group: str('群号或群名，可选') },
@@ -87,7 +89,9 @@ export default {
             // 非主人不能用 about 参数冒充「主人」：标签固定为「群名片(QQ)」，避免只显示 [主人]
             const senderLabel = chat.userId ? `${chat.nickname || '群友'}(${chat.userId})` : (chat.nickname || '')
             const aboutName = owner ? (about || chat.nickname || '') : senderLabel
-            return memory.add({ text: raw, aboutName, about: chat.userId || '', importance: importance ?? 0.5, source: 'tool', chatId: current, acquaintedOnly: true })
+            const plat = chat.platform || parseChatId(current)?.platform || ''
+            const aboutId = chat.sender?.person || (chat.userId && plat && identity?.lookup?.(plat, String(chat.userId))) || chat.userId || ''
+            return memory.add({ text: raw, aboutName, about: aboutId, importance: importance ?? 0.5, source: 'tool', chatId: current, acquaintedOnly: true })
           },
         }),
         defineTool({
@@ -98,7 +102,7 @@ export default {
           execute: async ({ query, period }) => {
             // 群聊 / 非主人私聊里只翻「这个人自己」的记忆，不能把主人的私事翻出来。
             // F2：群聊的 onlyAbout 必须是本轮说话的人（以前 chat.userId 为空 → 完全不按人物过滤，能翻到不在场的人）。
-            const owner = chat.kind === 'private' && String(chat.userId) === String(api.config().ownerQQ || '')
+            const owner = isOwnerPrivateChat(identity, chat)
             const speakers = owner ? []
               : chat.kind === 'group'
                 // 群聊 = 本轮所有说话人；拿不到本轮记录就退回 hub 能提供的说话人（都拿不到时 fail closed）
@@ -111,7 +115,7 @@ export default {
             const window = period ? parsePeriod(period) : null
             if (period && !window) return { ok: false, message: 'period 没认出来，写 2026-03-05 或 2026-03-01..2026-03-31' }
             const vectorHits = await memory.vectorHits(query)
-            const hits = await memory.recallAsync(String(query || ''), { about, onlyAbout, requireAbout: !owner, excludeAbout: owner ? '' : api.config().ownerQQ, includeGroup: owner, groupChatId: chat.kind === 'group' ? current : '', limit: 8, where: current + '（翻记忆）', vectorHits, period: window ?? undefined })
+            const hits = await memory.recallAsync(String(query || ''), { about, onlyAbout, requireAbout: !owner, excludeAbout: owner ? '' : (identity?.owner?.() || ''), includeGroup: owner, groupChatId: chat.kind === 'group' ? current : '', limit: 8, where: current + '（翻记忆）', vectorHits, period: window ?? undefined })
             return hits.length ? { ok: true, message: hits.map((h) => memoryLine(h.it)).join('；') } : { ok: true, message: '没想起相关的事' }
           },
         }),
@@ -136,8 +140,8 @@ export default {
     api.route('/memory/assoc/preview', async (req) => {
       const q = String(http.query(req).q || '').trim()
       if (!q) return { ok: false, message: '给个查询词' }
-      const owner = String(api.config().ownerQQ || '')
-      const chatId = owner ? `private:${owner}` : ''
+      const owner = identity?.owner?.() || ''
+      const chatId = (typeof routeOwner === 'function' ? routeOwner() : '') || hub.ownerChat?.() || ''
       let vec = []
       try { vec = await memory.vectorHits(q) } catch (error) {}
       // shown: false —— 预览不能算「真想起过」，否则你点几下预览就把记忆加深了、还乱涨 critical 计数

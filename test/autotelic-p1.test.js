@@ -10,6 +10,9 @@ import { curiosityOf, proposeTasks, mergeModelScores } from '../src/autotelic/en
 import { createBook, MAX_TOTAL } from '../src/autotelic/book.js'
 import { createRuntime, isQuietNow, parseEvalModel } from '../src/autotelic/runtime.js'
 import { readJson } from '../src/core/store.js'
+import { makeTestIdentity } from './helpers/identity.js'
+
+const identity123 = makeTestIdentity('123')
 
 const mat = (over = {}) => ({
   id: 'qq:test:1', source: 'qq', kind: 'owner', at: Date.now(), who: '主人',
@@ -185,7 +188,7 @@ const fakeHub = {
     { chatId: 'private:123', who: 'owner', uid: '123', text: '想学一下用 ffmpeg 把横屏视频批量转竖屏，有什么省事的办法', t: chatAt },
   ],
 }
-const fakeCfg = { ownerQQ: '123' }
+const fakeCfg = {}
 const fakeSettings = (over = {}) => ({ enabled: true, minCuriosity: 0.1, maxTasksActive: 8, maxSteps: 8, budgetActionsPerHour: 12, evalModel: '', ...over })
 
 function mkRuntime(t, { settings = {}, evalTurn = null, screenTurn } = {}) {
@@ -197,6 +200,7 @@ function mkRuntime(t, { settings = {}, evalTurn = null, screenTurn } = {}) {
     settings: () => fakeSettings(settings),
     cfg: fakeCfg,
     hub: fakeHub,
+    identity: identity123,
     memoryOf: () => ({ list: () => [] }),
     ledgerFile,
     evalTurn,
@@ -225,7 +229,7 @@ test('预览零副作用（P1.5）：不落盘、给出分数与落选原因', a
   const root2 = mkdtempSync(join(tmpdir(), 'aurabot-runtime-'))
   const rt2 = createRuntime({
     settings: () => fakeSettings({ minCuriosity: 0.99 }),
-    cfg: fakeCfg, hub: fakeHub, memoryOf: () => ({ list: () => [] }),
+    cfg: fakeCfg, hub: fakeHub, identity: identity123, memoryOf: () => ({ list: () => [] }),
     ledgerFile: join(root2, 'ledger.json'), log: { debug: () => {} },
   })
   const p2 = rt2.preview()
@@ -270,7 +274,7 @@ test('书签：settings 上限改了账本重建但不丢账（同一文件续�
   writeFileSync(ledgerFile, JSON.stringify(readJson(ledgerFile)), 'utf8')
   const rt2 = createRuntime({
     settings: () => fakeSettings({ maxTasksActive: 4 }), // 上限变了
-    cfg: fakeCfg, hub: fakeHub, memoryOf: () => ({ list: () => [] }),
+    cfg: fakeCfg, hub: fakeHub, identity: identity123, memoryOf: () => ({ list: () => [] }),
     ledgerFile, log: { debug: () => {} },
   })
   assert.equal(rt2.book().list().length, before, '换了上限账还在')

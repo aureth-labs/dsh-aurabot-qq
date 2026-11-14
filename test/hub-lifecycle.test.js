@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { createFakeDsh } from './helpers/fake-dsh.js'
 import { normalize, ownerAuthorizationRevision, saveConfig } from '../src/core/config.js'
 import { OneBotError } from '../src/onebot/client.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
 const root = mkdtempSync(join(tmpdir(), 'aurabot-lifecycle-'))
 process.env.AURABOT_WORKSPACE = join(root, 'workspace')
@@ -108,14 +109,15 @@ function config(patch = {}) {
 function setup(t, { cfg = config(), brain = async () => '', hooks, buildTools, onebot, outbox, onCommand, onActivity } = {}) {
   process.env.AURABOT_DATA_DIR = mkdtempSync(join(root, 'data-'))
   const fake = createFakeDsh({ brain })
+  const identity = makeTestIdentity(cfg.ownerQQ || OWNER)
   const calls = []
-  const hub = createHub({ dsh: fake.ctx, getConfig: () => cfg, outbox,
+  const hub = createHub({ dsh: fake.ctx, getConfig: () => cfg, outbox, identity, routeOwner: identity.routeOwner, defaultPlatform: 'qq',
     log: Object.fromEntries(['info', 'warn', 'error', 'debug'].map((k) => [k, (...v) => fake.logs.push(v.join(' '))])),
     onebot: onebot || { connected: true, async call(action, params) { calls.push({ action, params }); return { message_id: calls.length } } },
     hooks, buildTools, onCommand, onActivity })
   fake.ctx.effect(() => fake.ctx.on('session/event', hub.onSessionEvent))
   t.after(() => { try { hub.dispose?.() } finally { fake.dispose() } })
-  return { hub, fake, calls }
+  return { hub, fake, calls, identity }
 }
 
 test('同一会话连续重载两轮：工具、上下文、限制全部清理，并读取新主人状态和新表情', { timeout: 5000 }, async (t) => {
@@ -217,7 +219,7 @@ test('旧实例建会话或改名期间卸载，不能覆盖新实例的会话�
     const oldWork = oldHub.pushToSession(ownerChat, [{ type: 'text', text: '旧会话' }], OWNER).catch((error) => error)
     await entered.promise
     oldHub.dispose()
-    const newHub = createHub({ dsh: fake.ctx, getConfig: () => config(), log: { info() {}, warn() {}, debug() {}, error() {} },
+    const newHub = createHub({ dsh: fake.ctx, getConfig: () => config(), identity: makeTestIdentity(OWNER), routeOwner: makeTestIdentity(OWNER).routeOwner, defaultPlatform: 'qq', log: { info() {}, warn() {}, debug() {}, error() {} },
       onebot: { async call() { return {} } } })
     t.after(() => newHub.dispose())
     await newHub.pushToSession(ownerChat, [{ type: 'text', text: '新会话' }], OWNER)
@@ -346,7 +348,8 @@ test('回复拆条发送中卸载，已开始的请求结束后不再发送下�
   const sends = []
   process.env.AURABOT_DATA_DIR = mkdtempSync(join(root, 'deliver-'))
   const fake = createFakeDsh({ brain: async () => '' })
-  const hub = createHub({ dsh: fake.ctx, getConfig: () => config({ dryRun: false }),
+  const identity = makeTestIdentity(OWNER)
+  const hub = createHub({ dsh: fake.ctx, getConfig: () => config({ dryRun: false }), identity, routeOwner: identity.routeOwner, defaultPlatform: 'qq',
     log: { info() {}, debug() {}, warn() {}, error() {} },
     onebot: { async call(action, params) { sends.push({ action, params }); entered.resolve(); await gate.promise; return { message_id: 1 } } } })
   t.after(() => { try { hub.dispose?.() } finally { fake.dispose() } })
@@ -496,7 +499,7 @@ for (const [label, owners, shouldSend] of [
     const resume = deferred()
     t.after(() => resume.resolve())
     const cfg = config({ dryRun: false })
-    const { hub, calls } = setup(t, {
+    const { hub, calls, identity } = setup(t, {
       cfg,
       hooks: { send: async (message) => { entered.resolve(); await resume.promise; return message } },
       onCommand: async (_msg, markSensitive) => {
@@ -512,6 +515,7 @@ for (const [label, owners, shouldSend] of [
       const previousRevision = ownerAuthorizationRevision(cfg)
       const sameOwner = cfg.ownerQQ === ownerQQ
       Object.assign(cfg, saveConfig({ ...cfg, ownerQQ, ownerName: '保存后的昵称' }, cfg))
+      identity.setOwner(ownerQQ, 'qq')
       assert.equal(ownerAuthorizationRevision(cfg) === previousRevision, sameOwner)
     }
     resume.resolve()
@@ -526,7 +530,7 @@ test('敏感命令执行前发现授权代次已变化', async (t) => {
   t.after(() => resume.resolve())
   const cfg = config({ dryRun: false })
   let executed = false
-  const { hub } = setup(t, {
+  const { hub, identity } = setup(t, {
     cfg,
     onebot: {
       connected: true,
@@ -546,7 +550,10 @@ test('敏感命令执行前发现授权代次已变化', async (t) => {
   Object.assign(cfg, saveConfig(cfg, cfg))
   const work = hub.onMessage(event('/events'))
   await entered.promise
-  for (const ownerQQ of [OTHER, OWNER]) Object.assign(cfg, saveConfig({ ...cfg, ownerQQ }, cfg))
+  for (const ownerQQ of [OTHER, OWNER]) {
+    Object.assign(cfg, saveConfig({ ...cfg, ownerQQ }, cfg))
+    identity.setOwner(ownerQQ, 'qq')
+  }
   resume.resolve()
   await work
   assert.equal(executed, false)

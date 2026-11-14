@@ -5,6 +5,7 @@ import { mkdtempSync, readFileSync, existsSync, readdirSync, writeFileSync } fro
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { dataDir } from '../src/core/store.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
 // dataDir() 每次调用都读这个环境变量，所以测试之间换目录就能隔离
 process.env.AURABOT_DATA_DIR = mkdtempSync(join(tmpdir(), 'aurabot-shots-'))
@@ -236,8 +237,9 @@ function browsing({ dryRun = false, sendResult = { message_id: 1 }, failVision =
   const cfg = normalize({ enabled: true, dryRun, ownerQQ: '10000001', bili: { enabled: true, vision: true, shotChance: 1, perRun: 1 } })
   const sent = []
   const info = { bvid: 'BV1aaaaaaaaa', cid: 1, aid: 1, title: '猫的视频', duration: 60 }
+  const biliIdentity = makeTestIdentity('10000001', 'qq')
   const bili = createBili({
-    getConfig: () => cfg, log: { info() {}, debug() {}, warn() {} },
+    getConfig: () => cfg, identity: biliIdentity, routeOwner: biliIdentity.routeOwner, log: { info() {}, debug() {}, warn() {} },
     api: { view: async () => info, subtitle: async () => '文本字幕', comments: async () => [], search: async () => [{ ...info, play: 100000 }], popular: async () => [] },
     vision: async () => { if (failVision) throw new Error('坏流'); return { text: '猫在吃饭', frames: [{ sec: 10, buf: Buffer.from('frame') }] } },
     hub: {

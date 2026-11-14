@@ -15,7 +15,7 @@ import { isDefiniteFailure } from '../onebot/client.js'
 import { parseMessageEvent, gifFrames, segmentsOf } from './inbound.js'
 import { parseReply, bubbleDelay, wantsVoice, itemsToLine, cleanOutboundText, cleanOutboundSegments, clockLabel } from './reply.js'
 import { decideGroupReply, engagedHint, pickAutoReply, pickDirectRequester, policyFor, sameNameNote, topicRelevance } from './group-policy.js'
-import { checkAllowed, levelFor, presetFor, isOwner, groupOwnerTools } from './access.js'
+import { checkAllowed, levelFor, presetFor, isOwner, isOwnerPrivateChat, isOwnerChatMuted, groupOwnerTools } from './access.js'
 import { fetchImage, segmentBytes } from '../core/net.js'
 import { toMono16k } from '../voice/wav.js'
 import { asrConfigured, transcribeAudio } from '../voice/asr.js'
@@ -100,7 +100,41 @@ export function reallySent (r) {
   return Boolean(r) && r.message_id !== undefined && !String(r.message_id).startsWith('sim-')
 }
 
-export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, buildTools, contextProviders, onActivity, memoryScore, onMemoryCommand, onCommand, isMuted, dislikes, random = Math.random, moodEffects, localApi, hooks, availableModels, toolsGeneration, capabilitiesOf, gateway = null }) {
+export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, buildTools, contextProviders, onActivity, memoryScore, onMemoryCommand, onCommand, isMuted, dislikes, random = Math.random, moodEffects, localApi, hooks, availableModels, toolsGeneration, capabilitiesOf, gateway = null, identity = null, routeOwner: routeOwnerInjected = null }) {
+  const ownerRef = () => identity
+  const ownerId = () => identity?.owner?.() || null
+  const defaultPlatform = () => parseChatId('private:0')?.platform || ''
+  const chatPlatform = (chatOrId) => {
+    if (chatOrId && typeof chatOrId === 'object') {
+      if (chatOrId.platform) return String(chatOrId.platform)
+      if (chatOrId.chatId) return parseChatId(chatOrId.chatId)?.platform || defaultPlatform()
+    }
+    return parseChatId(String(chatOrId || ''))?.platform || defaultPlatform()
+  }
+  function resolveOwnerChat() {
+    if (typeof routeOwnerInjected === 'function') {
+      const hit = routeOwnerInjected()
+      if (hit) return String(hit)
+    }
+    const owner = ownerId()
+    if (owner && gateway?.routeTo) {
+      const route = gateway.routeTo(owner)
+      if (route?.chatId) return String(route.chatId)
+    }
+    const defPlat = defaultPlatform()
+    const defAcc = owner && defPlat && identity?.accountOn?.(owner, defPlat)
+    if (defAcc) return `private:${defAcc}`
+    const accounts = (owner && identity?.accountsOf?.(owner)) || []
+    const first = accounts.find((a) => a?.platform && a?.account)
+    if (first) return formatChatId({ instance: first.platform, kind: 'private', id: first.account })
+    return ''
+  }
+  function ownerAccountForChat(chatId) {
+    const owner = ownerId()
+    if (!owner) return ''
+    const plat = chatPlatform(chatId)
+    return (plat && identity?.accountOn?.(owner, plat)) || String(owner)
+  }
   const archives = new Map()
   let forgottenRules = null
   const forgottenFile = () => join(dataDir('conversation-context'), 'forgotten.json')
@@ -377,7 +411,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       allowPromptEcho: outputScope.getStore()?.chatId === chatId && outputScope.getStore().allowPromptEcho,
       promptSources: [...(sources?.system.size ? sources.system.values() : hooks?.secrets?.({ chatId }) || []), sources?.context || '', ...(sources?.memory || [])],
       userText: sources?.userText || '',
-      ownerPrivate: chatId === `private:${getConfig().ownerQQ}`,
+      ownerPrivate: isOwnerPrivateChat(ownerRef(), chatId),
     }
   }
 
@@ -476,7 +510,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   let selfId = ''
   let lastChatAt = 0
   let lastOwnerChatAt = 0
-  const lastPrivateAt = new Map() // QQ 号 → 最后一次和这个人私聊的时间（主动搭话白名单用）
+  let lastOwnerChatId = ''
+  const lastPrivateAt = new Map() // 账号 id → 最后一次和这个人私聊的时间（主动搭话白名单用）
   let lastBotToOwner = { at: 0, text: '' } // 她在主人私聊里最后说的话
 
   function bump(k) {
@@ -553,7 +588,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   async function onNotice(ev) {
     const cfg = getConfig()
     const groupId = ev.group_id ? String(ev.group_id) : ''
-    if (groupId ? !cfg.allow.groups.map(String).includes(groupId) : !cfg.allow.private.map(String).includes(String(ev.user_id)) && String(ev.user_id) !== String(cfg.ownerQQ)) return
+    if (groupId ? !cfg.allow.groups.map(String).includes(groupId) : !cfg.allow.private.map(String).includes(String(ev.user_id)) && !isOwner(ownerRef(), String(ev.user_id), defaultPlatform())) return
     const names = new Map()
     for (const qq of new Set([ev.user_id, ev.operator_id, ev.sender_id].filter(Boolean))) {
       try {
@@ -684,7 +719,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       return t.startsWith('QQ · ') ? t : `QQ · ${t}`
     }
     if (chat.kind === 'group') return `QQ 群 · ${groupNames.get(chat.groupId) || chat.groupId}`
-    return chat.userId === getConfig().ownerQQ ? `QQ · ${owner}私聊` : `QQ 私聊 · ${chat.nickname || chat.userId}`
+    return isOwnerPrivateChat(ownerRef(), chat) ? `QQ · ${owner}私聊` : `QQ 私聊 · ${chat.nickname || chat.userId}`
   }
 
   // 后台会话点名 preset（自驱引擎 P0.2，docs/AUTOTELIC-PLAN.md §3/§4.2）：
@@ -833,7 +868,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (failure && Date.now() < failure.until) throw backoffError(chat.chatId, failure)
     const cfg = getConfig()
     // 后台会话默认 social（没工具）；要「主人私聊」那档（完整权限 + 她本人预设）时显式传 level: 'full'
-    const level = chat.kind === 'system' ? (chat.level || (chat.noTools ? 'chat' : 'social')) : levelFor(cfg, chat)
+    const level = chat.kind === 'system' ? (chat.level || (chat.noTools ? 'chat' : 'social')) : levelFor(cfg, chat, ownerRef())
     // 复用键是 entry.preset（resolved 后的值）：presetId 变了 preset 就变，自然触发一次重建（预期行为）
     const preset = presetForChat(chat, level)
     const entry = map().chats[chat.chatId]
@@ -1158,14 +1193,29 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const action = tgt.kind === 'group' ? 'send_group_msg' : 'send_private_msg'
     const sourceGroupId = tgt.kind === 'private' ? privateSources.get(tgt.id) : ''
     const params = tgt.kind === 'group' ? { group_id: Number(tgt.id), message } : { user_id: Number(tgt.id), ...(sourceGroupId ? { group_id: Number(sourceGroupId) } : {}), message }
-    // G3：有网关就走网关（多平台、降级、补发队列都在网关一侧统一处理）；
-    // 没有网关时（未迁移的宿主、回放测试的旧驱动桩）保留原来直连 OneBot 的路径，
-    // 这样回放结果才能逐条比对——见包-G3「只搬不改」。
-    if (gateway) {
+    const normSegId = normalizeChatId(chatId) || String(chatId || '')
+    const addrSeg = normSegId ? parseChatId(normSegId) : null
+    const useGatewaySeg = Boolean(gateway && (addrSeg?.platform !== defaultPlatform() || gateway.caps?.(normSegId) !== null || !onebot))
+    // G3：有网关且由网关托管该实例时走网关（多平台、降级、补发队列统一处理）；
+    // 宿主直连 OneBot 托管 qq 或无网关时保留原直连路径——见包-G3「只搬不改」。
+    if (useGatewaySeg) {
       try {
+        let parts
+        let replyTo
+        if (addrSeg?.platform === defaultPlatform()) {
+          try { parts = gateway.toParts(chatId, message) } catch (err) {
+            if (!/没有实现 toParts/.test(err?.message || '')) throw err
+          }
+        }
+        if (!parts) {
+          const conv = segmentsToGatewayParts(message)
+          parts = conv.parts
+          replyTo = conv.replyTo
+        }
         const sent = await gateway.send({
-          chatId: normalizeChatId(chatId) || chatId,
-          parts: gateway.toParts(chatId, message),
+          chatId: normSegId,
+          parts,
+          ...(replyTo ? { replyTo } : {}),
           kind: queueKind === 'proactive' ? 'proactive' : queueKind === 'diary' ? 'diary' : 'reply',
           note: sensitive ? '敏感命令回执' : (note || ''),
           force: Boolean(force),
@@ -1227,6 +1277,41 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       if (!quiet) failStore.getStore()?.push(detail)
       return null
     }
+  }
+
+  function mediaFromSeg(d = {}, defaultMime = '') {
+    const media = {}
+    const file = String(d.file || '')
+    if (d.url) media.url = String(d.url)
+    else if (/^https?:\/\//i.test(file)) media.url = file
+    else if (file.startsWith('base64://')) media.bytes = Buffer.from(file.slice(9), 'base64')
+    else if (file.startsWith('file://')) media.path = file.replace(/^file:\/+(?=[A-Za-z]:)/, '').replace(/^file:\/\//, '')
+    else if (file) media.id = file
+    if (d.name) media.name = String(d.name)
+    if (d.mime || defaultMime) media.mime = String(d.mime || defaultMime)
+    return media
+  }
+
+  function segmentsToGatewayParts(segs = []) {
+    const parts = []
+    let replyTo
+    for (const seg of Array.isArray(segs) ? segs : []) {
+      const d = seg?.data || {}
+      switch (seg?.type) {
+        case 'reply': if (d.id != null) replyTo = String(d.id); break
+        case 'text': parts.push({ type: 'text', text: String(d.text ?? '') }); break
+        case 'at': parts.push({ type: 'mention', account: String(d.qq ?? ''), ...(d.name ? { name: String(d.name) } : {}) }); break
+        case 'face': parts.push({ type: 'face', name: faces.nameOf?.(d.id) || String(d.id ?? '表情') }); break
+        case 'image':
+        case 'mface': parts.push({ type: d.sub_type === 1 || seg.type === 'mface' ? 'sticker' : 'image', media: mediaFromSeg(d), ...(d.summary ? { label: String(d.summary) } : {}) }); break
+        case 'record': parts.push({ type: 'voice', media: mediaFromSeg(d, 'audio/amr') }); break
+        case 'video': parts.push({ type: 'video', media: mediaFromSeg(d) }); break
+        case 'file': parts.push({ type: 'file', media: mediaFromSeg(d) }); break
+        case 'poke': parts.push({ type: 'poke' }); break
+        default: if (d.text) parts.push({ type: 'text', text: String(d.text) }); break
+      }
+    }
+    return { parts, replyTo }
   }
 
   function partsToSegmentsFallback(parts = []) {
@@ -1584,7 +1669,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   /** 她回复里写的本机图片：主人私聊之外只认工作区、允许目录和插件数据目录，防止被人诱导发出电脑上的图。 */
   function localImageBlocked(chatId, src) {
     const cfg = getConfig()
-    if (chatId === `private:${cfg.ownerQQ}`) return false
+    if (isOwnerPrivateChat(ownerRef(), chatId)) return false
     const s = String(src ?? '').trim()
     if (!isAbsolute(s) && !/^file:/i.test(s)) return false
     try {
@@ -1848,7 +1933,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (!opts.own && sentTexts.length && !cfg.dryRun) saidElsewhere.set(chatId, [...(saidElsewhere.get(chatId) || []), { at: Date.now(), text: sentTexts.join(' ').slice(0, 300) }].slice(-5))
     lastChatAt = Date.now()
     if (chatId.startsWith('private:')) lastPrivateAt.set(chatId.slice(8), Date.now())
-    if (chatId === `private:${cfg.ownerQQ}`) lastBotToOwner = { at: Date.now(), text: items.filter((i) => i.kind === 'text' || i.kind === 'voice').map((i) => i.value).join('\n') }
+    if (isOwnerPrivateChat(ownerRef(), chatId)) lastBotToOwner = { at: Date.now(), text: items.filter((i) => i.kind === 'text' || i.kind === 'voice').map((i) => i.value).join('\n') }
     onActivity?.({ kind: 'out', chatId, reply: text, userText: opts.userText || '' })
     return { missedAt, failed: failures.length, errors: failures, sent: sentTexts.join(' ') }
   }
@@ -1876,8 +1961,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       if (direct) {
         if (st.lastText) st.prevText = st.lastText
         st.lastText = direct.slice(-600)
-        st.speakers = [String(getConfig().ownerQQ)]
-        st.senders = new Set([String(getConfig().ownerQQ)])
+        const acc = ownerAccountForChat(chatId)
+        st.speakers = acc ? [acc] : []
+        st.senders = new Set(acc ? [acc] : [])
       }
       return
     }
@@ -2394,7 +2480,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         role: m.sender.role || 'member',
       },
       // 网关已经算好的字段直接带上，省得 parseMessageEvent 再算一遍（它认这两个键）
-      __gateway: { chatId: m.chatId, platform: m.platform, instance: m.instance, person: m.sender.person, mentionedMe: m.mentionedMe, parts: m.parts },
+      __gateway: { chatId: m.chatId, platform: m.platform, instance: m.instance, person: m.sender.person, isOwner: Boolean(m.sender?.isOwner), mentionedMe: m.mentionedMe, parts: m.parts },
     }
     if (kind === 'group') {
       event.group_id = Number(id) || id
@@ -2422,11 +2508,19 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     selfId = String(event.self_id || selfId || getConfig().botQQ)
     const cfg = getConfig()
     const msg = parseMessageEvent(event, selfId, { faceName: faces.nameOf })
+    const gw = event.__gateway
+    msg.platform = gw?.platform || defaultPlatform()
+    if (gw?.chatId) msg.chatId = gw.chatId
+    if (gw?.person || gw?.isOwner !== undefined) {
+      msg.sender = { ...(msg.sender || {}), person: gw.person, isOwner: gw.isOwner }
+    }
     if (msg.userId === selfId) return
     const now = Date.now()
     const wasCleared = () => isBeforeMemoryReset(msg.chatId, msg.userId, now)
-    const fromOwner = onCommand && isOwner(cfg, msg.userId)
-    const ownerRevision = fromOwner ? ownerAuthorizationRevision(cfg) : ''
+    const revisionOf = (c) => `${ownerId() || ''}:${ownerAuthorizationRevision(c)}`
+    const msgIsOwner = isOwner(ownerRef(), msg)
+    const fromOwner = Boolean(onCommand && msgIsOwner)
+    const ownerRevision = fromOwner ? revisionOf(cfg) : ''
     // 按群头衔过滤：这条当没看见（不进群聊上下文、不触发回复，@ 她、主人命令也一样）
     if (msg.kind === 'group' && await titleFilter.shouldIgnore(event)) return
     if (disposed || wasCleared()) return
@@ -2443,7 +2537,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       groupBuf.set(msg.groupId, buf)
     }
 
-    const allowed = checkAllowed(cfg, msg)
+    const allowed = checkAllowed(cfg, msg, ownerRef())
     if (msg.kind === 'private' && (allowed.allowed || event.sub_type === 'friend')) {
       privateSources.delete(msg.userId)
       if (allowed.allowed && msg.sourceGroupId) privateSources.set(msg.userId, msg.sourceGroupId)
@@ -2464,7 +2558,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         } else {
           stickerPick = rememberStickers(msg.chatId, msg.stickers)
           // 只听主人的：别人发的先悄悄记着（主人之后说「收下那张」还能用），但不提示她
-          if (collectMode === 'owner' && !isOwner(cfg, msg.userId)) stickerPick = 0
+          if (collectMode === 'owner' && !msgIsOwner) stickerPick = 0
         }
       }
     }
@@ -2506,7 +2600,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       let sensitiveCommand = ''
       const ownerStillCurrent = () => {
         const current = getConfig()
-        return fromOwner && isOwner(current, msg.userId) && ownerAuthorizationRevision(current) === ownerRevision
+        return fromOwner && isOwner(ownerRef(), msg) && revisionOf(current) === ownerRevision
       }
       try {
         const reply = await onCommand(msg, (name) => {
@@ -2549,7 +2643,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       return
     }
     const dislikeChance = Math.max(0, Math.min(1, Number(cfg.memory?.dislikeSilence ?? 0.85) || 0))
-    if (dislikeChance > 0 && !isOwner(cfg, msg.userId) && dislikes?.(msg.userId) && random() < dislikeChance) {
+    if (dislikeChance > 0 && !msgIsOwner && dislikes?.(msg.userId) && random() < dislikeChance) {
       logIncoming()
       onActivity?.({ kind: 'silent', chatId: msg.chatId, text: msg.text, nickname: msg.nickname })
       log.debug(`${msg.chatId}：不想搭理，安静看着`)
@@ -2622,7 +2716,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         atOthersAny: msg.atOthers,
         repliedToBot: quotedBot,
         lastIsBot: Boolean(lastBotAt && (!priorMsg || lastBotAt > priorMsg.t)),
-        fromOwner: isOwner(cfg, msg.userId),
+        fromOwner: msgIsOwner,
         text: msg.wakeText,
         now,
         hour: new Date().getHours(),
@@ -2697,11 +2791,11 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (disposed || wasCleared()) return
     logIncoming(text)
     lastChatAt = now
-    if (msg.kind === 'private' && msg.userId === cfg.ownerQQ) lastOwnerChatAt = now
+    if (msg.kind === 'private' && msgIsOwner) { lastOwnerChatAt = now; lastOwnerChatId = msg.chatId }
     if (msg.kind === 'private') lastPrivateAt.set(msg.userId, now)
-    onActivity?.({ kind: 'in', chatId: msg.chatId, userId: msg.userId, nickname: msg.nickname, text, direct: msg.kind === 'private' || msg.mentioned || mode === 'must', owner: isOwner(cfg, msg.userId) })
+    onActivity?.({ kind: 'in', chatId: msg.chatId, userId: msg.userId, nickname: msg.nickname, text, direct: msg.kind === 'private' || msg.mentioned || mode === 'must', owner: msgIsOwner })
 
-    enqueue({ chatId: msg.chatId, kind: msg.kind, userId: msg.userId, groupId: msg.groupId, nickname: msg.nickname }, content, msg.userId, wantsVoice(msg.text), mode, { stickerPick })
+    enqueue({ chatId: msg.chatId, platform: msg.platform, kind: msg.kind, userId: msg.userId, groupId: msg.groupId, nickname: msg.nickname, sender: msg.sender }, content, msg.userId, wantsVoice(msg.text), mode, { stickerPick })
   }
 
   /** 把消息里的「[合并转发]」换成里面的聊天记录，里面的图片并进这条消息一起给她看。 */
@@ -2893,20 +2987,26 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   const busySessions = new Map() // chatId → 正在计算 / 投递的 sessionKey
   const busyTurns = new Map() // chatId → 本次提交的占位 token
   const running = new Map() // chatId → 仍在模型 / 工具阶段的 sessionKey
+  function chatFromId(chatId) {
+    const addr = parseChatId(chatId)
+    if (!addr) {
+      const [kind, id] = String(chatId).split(':')
+      return { chatId, kind, userId: kind === 'private' ? id : '', groupId: kind === 'group' ? id : '' }
+    }
+    return { chatId, platform: addr.platform, kind: addr.kind, userId: addr.kind === 'private' ? addr.id : '', groupId: addr.kind === 'group' ? addr.id : '' }
+  }
   function turnSignature(chatId) {
     const cfg = getConfig()
-    const [kind, id] = chatId.split(':')
-    const level = levelFor(cfg, { kind, userId: kind === 'private' ? id : '', groupId: kind === 'group' ? id : '' })
+    const level = levelFor(cfg, chatFromId(chatId), ownerRef())
     return `${cfg.debug ? 'debug' : 'live'}:${level}:${presetFor(level, cfg)}`
   }
   function isCurrentSession(chatId, key) {
     const cfg = getConfig()
     const cur = map().chats[chatId]
     if (!cur || sessionKey(cur.sessionId) !== key || (cur.mode || 'live') !== (cfg.debug ? 'debug' : 'live')) return false
-    const [kind, id] = chatId.split(':')
-    if (kind === 'private' || kind === 'group') {
-      const chat = { kind, userId: kind === 'private' ? id : '', groupId: kind === 'group' ? id : '' }
-      const level = levelFor(cfg, chat)
+    const chat = chatFromId(chatId)
+    if (chat.kind === 'private' || chat.kind === 'group') {
+      const level = levelFor(cfg, chat, ownerRef())
       if (cur.level !== level || cur.preset !== presetFor(level, cfg)) return false
     }
     return true
@@ -3049,7 +3149,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         groupInterjects.set(gid, arr)
       }
       // 必回也按小时记账：这段里只要有群友（非主人）@/叫到她就记一次；主人触发的不计入（主人除外）
-      if (p.mode === 'must' && ![...p.senders].some((id) => isOwner(getConfig(), id))) {
+      if (p.mode === 'must' && ![...p.senders].some((id) => isOwner(ownerRef(), id, chatPlatform(p.chat)))) {
         const arr = (groupMusts.get(gid) || []).filter((t) => Date.now() - t < 3600_000)
         arr.push(Date.now())
         groupMusts.set(gid, arr)
@@ -3131,6 +3231,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (disposed) return
     const cfg = getConfig()
     if (chat.kind !== 'private' || !cfg.enabled || cfg.dryRun || typing.has(key)) return
+    const caps = gateway?.caps?.(chat.chatId)
+    if (caps && caps.typing === false) return
+    if (typeof onebot?.call !== 'function') return
     const ping = () => { if (!disposed) onebot.call('set_input_status', { user_id: Number(chat.userId), event_type: 1 }, { timeoutMs: 5000 }).catch(() => {}) }
     ping()
     const started = Date.now()
@@ -3225,6 +3328,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     assertActive(); opts.assertAuthorized?.()
     const key = sessionKey(sessionId)
     const st = turnState.get(key) || { lastTurn: -1, text: '', senders: new Set() }
+    st.platform = chatPlatform(chat)
     // 上一句也带上：相关记忆检索遇到「嗯嗯」这种短句时，用上一句一起找（#79 之后由模块在提示词里加）
     const prevText = st.lastText || st.prevText || ''
     const previousSources = sourcesFor(chat.chatId)
@@ -3293,7 +3397,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     // 告诉同一会话里的其他插件是谁在说（#145）：说话的全是主人才标 owner，混着别人或不知道是谁都是 guest。
     // chat 标私聊还是群聊：群里主人说话也是 owner，但回复全群都看得到，要不要放私事由插件自己判断
     const speakers = [senderId, ...(opts.extraSenders || [])].filter(Boolean).map(String)
-    const speakerRole = speakers.length && speakers.every((u) => isOwner(getConfig(), u)) ? 'owner' : 'guest'
+    const plat = chatPlatform(chat)
+    const speakerRole = speakers.length && speakers.every((u) => isOwner(ownerRef(), u, plat)) ? 'owner' : 'guest'
     const message = { id: randomUUID(), role: 'user', content: admitted, source: { kind: SOURCE_KIND, speaker: { role: speakerRole, chat: chat.kind } } }
     // 所有异步准备完成后，按实际投递路径登记轮次状态；中间不能再 await，
     // 否则上一轮可能先结束，把待登记的回执接走或清掉（#90）。
@@ -3351,34 +3456,35 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
 
   /** 已验证主人身份的外部入口；复用已有聊天、记忆、转写和投递路径。调用方负责鉴权。 */
   async function receiveOwnerMessage(chatId, { text = '', image, wav, via = 'external', originId, assertAuthorized = () => {} } = {}) {
-    const owner = String(getConfig().ownerQQ || '')
+    const owner = ownerId()
     const validate = () => {
       assertActive(); assertAuthorized()
       const cfg = getConfig()
-      if (!cfg.enabled || !owner || String(cfg.ownerQQ || '') !== owner) throw Object.assign(new Error('请先启用 Aurabot 并配置主人身份'), { status: 503, code: 'not_ready' })
-      const match = /^(private|group):(\d+)$/.exec(String(chatId))
-      if (!map().chats[chatId]?.sessionId || !match) throw Object.assign(new Error('会话不存在'), { status: 404, code: 'chat_not_found' })
-      const chat = { chatId, kind: match[1], userId: match[1] === 'private' ? match[2] : owner, groupId: match[1] === 'group' ? match[2] : '', nickname: cfg.ownerName || '主人' }
-      if (!checkAllowed(cfg, chat).allowed || isMuted?.(chatId)) throw Object.assign(new Error('这个聊天未开放或已暂停'), { status: 403, code: 'chat_disabled' })
-      return chat
+      if (!cfg.enabled || !owner || ownerId() !== owner) throw Object.assign(new Error('请先启用 Aurabot 并配置主人身份'), { status: 503, code: 'not_ready' })
+      const addr = parseChatId(String(chatId))
+      if (!map().chats[chatId]?.sessionId || !addr || (addr.kind !== 'private' && addr.kind !== 'group')) throw Object.assign(new Error('会话不存在'), { status: 404, code: 'chat_not_found' })
+      const senderAcc = (addr.platform && identity?.accountOn?.(owner, addr.platform)) || String(owner)
+      const chat = { chatId, platform: addr.platform, kind: addr.kind, userId: addr.kind === 'private' ? addr.id : senderAcc, groupId: addr.kind === 'group' ? addr.id : '', nickname: cfg.ownerName || '主人' }
+      if (!checkAllowed(cfg, chat, ownerRef()).allowed || isMuted?.(chatId)) throw Object.assign(new Error('这个聊天未开放或已暂停'), { status: 403, code: 'chat_disabled' })
+      return { chat, senderAcc }
     }
-    let chat = validate()
+    let { chat, senderAcc } = validate()
     const source = String(via || 'external').replace(/[\r\n【】]/g, '').slice(0, 40)
     if (wav) text = await transcribe({ records: [{ data: {} }], messageId: '' }, wav)
-    const content = [{ type: 'text', text: `【${chat.kind === 'group' ? '群聊' : '私聊'} · ${source}】${chat.nickname}(${owner})：${text || '[图片]'}` }]
+    const content = [{ type: 'text', text: `【${chat.kind === 'group' ? '群聊' : '私聊'} · ${source}】${chat.nickname}(${senderAcc})：${text || '[图片]'}` }]
     if (image) {
       const bytes = await fitForModel(image)
       content.push({ type: 'image', data: bytes.toString('base64'), mediaType: mimeOf(bytes), name: 'external-image' })
     }
-    chat = validate()
-    if (chatId === `private:${owner}` && onMemoryCommand) {
+    ;({ chat, senderAcc } = validate())
+    if (isOwnerPrivateChat(ownerRef(), chatId) && onMemoryCommand) {
       try { onMemoryCommand(chat, text) } catch (error) { log.warn('处理记忆请求失败：', error.message) }
     }
-    logChat(chatId, chat.nickname, text || '[图片]', owner, { via: source, originId })
+    logChat(chatId, chat.nickname, text || '[图片]', senderAcc, { via: source, originId })
     lastChatAt = Date.now()
-    if (chatId === `private:${owner}`) { lastOwnerChatAt = lastChatAt; lastPrivateAt.set(owner, lastChatAt) }
-    onActivity?.({ kind: 'in', chatId, userId: owner, nickname: chat.nickname, text, direct: true, owner: true })
-    await pushToSession(chat, content, owner, { queryText: text || '[图片]', steer: running.has(chatId), assertAuthorized: validate })
+    if (isOwnerPrivateChat(ownerRef(), chatId)) { lastOwnerChatAt = lastChatAt; lastOwnerChatId = chatId; lastPrivateAt.set(senderAcc, lastChatAt) }
+    onActivity?.({ kind: 'in', chatId, userId: senderAcc, nickname: chat.nickname, text, direct: true, owner: true })
+    await pushToSession(chat, content, senderAcc, { queryText: text || '[图片]', steer: running.has(chatId), assertAuthorized: validate })
     return { ok: true }
   }
 
@@ -3425,13 +3531,25 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     log.warn(`${chatId}：卡住的后台轮次已取消并归档，换新会话`)
   }
 
+  function resolveDebugOwnerChat() {
+    const owner = ownerId()
+    if (!owner) return null
+    const cfg = getConfig()
+    const targetChat = resolveOwnerChat()
+    const addr = parseChatId(targetChat)
+    const plat = addr?.platform || defaultPlatform()
+    const acc = (plat && identity?.accountOn?.(owner, plat)) || addr?.id || String(owner)
+    const chatId = targetChat || `private:${acc}`
+    return { kind: 'private', platform: plat, chatId, userId: String(acc), groupId: '', nickname: cfg.ownerName || '主人' }
+  }
+
   /** 调试模式：确保主人私聊有一条调试会话，便于在侧栏直接打开。 */
   async function ensureDebugSession() {
     assertActive()
     const cfg = getConfig()
     if (!cfg.debug) return { ok: false, message: '没开调试模式' }
-    if (!cfg.ownerQQ) return { ok: false, message: '还没填主人 QQ' }
-    const chat = { kind: 'private', chatId: `private:${cfg.ownerQQ}`, userId: String(cfg.ownerQQ), groupId: '', nickname: cfg.ownerName || '主人' }
+    const chat = resolveDebugOwnerChat()
+    if (!chat) return { ok: false, message: '还没配置主人身份' }
     const before = map().chats[chat.chatId]
     const prevId = before ? ((before.sessions && before.sessions.debug) || (before.mode === 'debug' ? before.sessionId : '')) : ''
     const r = await agentFor(chat)
@@ -3444,15 +3562,15 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     }
   }
 
-  /** 面板里的调试对话：走主人私聊链路，不经过 QQ；调试模式不写流水/记忆。 */
+  /** 面板里的调试对话：走主人私聊链路，不经过平台适配器；调试模式不写流水/记忆。 */
   async function debugSay(text, { timeoutMs = 180000 } = {}) {
     assertActive()
     const cfg = getConfig()
     if (!cfg.debug) return { ok: false, message: '没开调试模式' }
-    if (!cfg.ownerQQ) return { ok: false, message: '还没填主人 QQ' }
+    const chat = resolveDebugOwnerChat()
+    if (!chat) return { ok: false, message: '还没配置主人身份' }
     const say = String(text || '').trim().slice(0, 2000)
     if (!say) return { ok: false, message: '说点什么吧' }
-    const chat = { kind: 'private', chatId: `private:${cfg.ownerQQ}`, userId: String(cfg.ownerQQ), groupId: '', nickname: cfg.ownerName || '主人' }
     try {
       const { agent, sessionId } = await agentFor(chat)
       assertActive()
@@ -3461,8 +3579,10 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       if (st.system) return { ok: false, message: '上一轮还没结束' }
       turnState.set(key, st)
       st.lastText = say
-      st.senders = new Set([String(cfg.ownerQQ)])
-      st.speakers = [String(cfg.ownerQQ)]
+      st.platform = chat.platform
+      st.directOwner = true
+      st.senders = new Set([chat.userId])
+      st.speakers = [chat.userId]
       let timer
       let rejectWait
       const base = new Promise((resolve, reject) => {
@@ -3567,17 +3687,23 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   // 主人私聊里只可能是主人说话：就算这一轮的记录丢了（工具是旧闭包、排队轮次被上一轮 turn/end 清掉等，见 #90），
   // 「仅主人」也应当放行；群聊 / 别人私聊不放宽。
   function ownerPrivateChat(sessionId) {
-    try { return chatOfSession(sessionId) === `private:${getConfig().ownerQQ}` } catch (error) { return false }
+    try { return isOwnerPrivateChat(ownerRef(), chatOfSession(sessionId)) } catch (error) { return false }
+  }
+
+  function sessionPlatform(sessionId, st) {
+    if (st?.platform) return st.platform
+    try { return chatPlatform(chatOfSession(sessionId)) } catch { return defaultPlatform() }
   }
 
   function turnHasOwner(sessionId) {
     const st = turnState.get(sessionKey(sessionId))
     if (st && st.directOwner) return true // 主人在 DSH 面板里直接打字
-    if (st && [...st.senders].some((u) => isOwner(getConfig(), u))) return true
+    const plat = sessionPlatform(sessionId, st)
+    if (st && [...st.senders].some((u) => isOwner(ownerRef(), u, plat))) return true
     return ownerPrivateChat(sessionId)
   }
 
-  /** 这一轮说话的人（QQ 号）。 */
+  /** 这一轮说话的人（账号 id）。 */
   function turnSenders(sessionId) {
     return [...(turnState.get(sessionKey(sessionId))?.senders || [])]
   }
@@ -3586,14 +3712,16 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const st = turnState.get(sessionKey(sessionId))
     if (st && st.directOwner) return true // 主人在 DSH 面板里直接打字
     if (!st || !st.senders.size) return ownerPrivateChat(sessionId)
-    return [...st.senders].every((u) => isOwner(getConfig(), u))
+    const plat = sessionPlatform(sessionId, st)
+    return [...st.senders].every((u) => isOwner(ownerRef(), u, plat))
   }
 
   /** 生图的群聊例外：主人是本轮唯一明确 @ / 引用回复的请求者。 */
   function turnDirectFromOwner(sessionId) {
     const st = turnState.get(sessionKey(sessionId))
     const uid = String(st?.directRequester?.uid || '')
-    return Boolean(uid && st?.senders.has(uid) && isOwner(getConfig(), uid))
+    const plat = sessionPlatform(sessionId, st)
+    return Boolean(uid && st?.senders.has(uid) && isOwner(ownerRef(), uid, plat))
   }
 
   function chatOfSession(sessionId) {
@@ -3762,8 +3890,10 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   /** 现在这次调用算不算「主人开口」：最近 5 分钟有主人私聊消息算 owner，否则后台（一审 #177 复审：source 由宿主判断）。 */
   const OWNER_ACTIVE_MS = 5 * 60_000
   function ownerSourceNow() {
-    const qq = String(getConfig().ownerQQ || '')
-    if (qq && lastOwnerChatAt && Date.now() - lastOwnerChatAt <= OWNER_ACTIVE_MS) return { kind: 'owner', chatId: `private:${qq}` }
+    if (lastOwnerChatAt && Date.now() - lastOwnerChatAt <= OWNER_ACTIVE_MS) {
+      const chatId = lastOwnerChatId || resolveOwnerChat()
+      if (chatId) return { kind: 'owner', chatId }
+    }
     return { kind: 'system', reason: 'background' }
   }
 
@@ -3791,9 +3921,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       throw Object.assign(new Error(`模块「${moduleId || '未声明'}」没有 plugin-internals 能力，不能用子智能体委派（在 module.json 的 capabilities 里声明）`), { code: 'CAPABILITY_REQUIRED' })
     }
     const c = getConfig()
-    const ownerQQ = String(c.ownerQQ || '')
     const ownerChat = source && source.kind === 'owner' ? String(source.chatId || '') : ''
-    const fromOwner = Boolean(ownerQQ) && ownerChat === `private:${ownerQQ}`
+    const fromOwner = Boolean(ownerChat && isOwnerPrivateChat(ownerRef(), ownerChat))
     const fromBackground = Boolean(source && source.kind === 'system') && c.subagentBackground === true
     if (!fromOwner && !fromBackground) {
       throw Object.assign(new Error('子智能体委派要主人开口：source 必须是主人私聊，或打开「后台子智能体」开关（没人应答时一律拒绝）'), { code: 'OWNER_REQUIRED' })
@@ -3991,6 +4120,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     stats: () => ({ ...stats }),
     get lastChatAt() { return lastChatAt },
     get lastOwnerChatAt() { return lastOwnerChatAt },
+    ownerChat: resolveOwnerChat,
+    isOwnerMuted: () => isOwnerChatMuted(ownerRef(), isMuted),
     lastPrivateAt: (qq) => lastPrivateAt.get(String(qq)) || 0,
     // 「别处说过」桥接的只读快照（测试/诊断用）：这个聊天待补进上下文的原话列表
     saidElsewhereOf: (chatId) => (saidElsewhere.get(String(chatId)) || []).map((x) => x.text),

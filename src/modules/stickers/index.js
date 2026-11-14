@@ -6,6 +6,7 @@ import { createStickerStore, stickerPath } from '../../features/stickers.js'
 import { defineTool, int, str } from '../../tools/tools.js'
 import { fetchImage, segmentBytes } from '../../core/net.js'
 import { resolvePainting } from '../../features/paintings.js'
+import { isOwner } from '../../chat/access.js'
 
 export default {
   id: 'stickers',
@@ -17,7 +18,7 @@ export default {
   tab: 'stickers',
   files: ['features/stickers.js'],
   setup(api) {
-    const { hub, onebot, http } = api.core
+    const { hub, onebot, http, identity } = api.core
     const qqOnebot = {
       call: (action, params, opts) => (typeof api.native === 'function' ? api.native('qq', action, params, opts) : onebot.call(action, params, opts)),
       get state() { return api.core.onebot?.state },
@@ -156,7 +157,7 @@ export default {
           } else {
             const media = hub.recentMedia(current)
             // 优先主人自己发的，其次这个聊天里最近的
-            const pick = media.filter((x) => x.userId === String(api.config().ownerQQ)).at(-1) || media.at(-1)
+            const pick = media.filter((x) => isOwner(identity, x.userId, chat.platform || 'qq')).at(-1) || media.at(-1)
             if (!pick) return { ok: false, message: '最近半小时这个聊天里没有人发表情或图片，先把那张发过来' }
             buf = await segmentBytes(pick.seg, qqOnebot, { maxBytes: 5 * 1024 * 1024 })
           }

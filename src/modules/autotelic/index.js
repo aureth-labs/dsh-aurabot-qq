@@ -93,6 +93,7 @@ export default {
       settings: () => api.settings(),
       cfg: api.config(),
       hub: api.core.hub,
+      identity: api.core.identity,
       memoryOf: () => { try { return api.use('memory') } catch { return null } },
       personaName: () => '', // 人格名（素材提权重用）；取不到就空着
       ledgerFile: api.dataDir('ledger.json'),

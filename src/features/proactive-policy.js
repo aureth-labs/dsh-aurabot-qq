@@ -13,7 +13,7 @@
 //   给宿主出站策略服务（A 线 `src/chat/outbound-policy.js`）提供两个可注册的策略源：
 //     · purpose —— 目的引擎（src/purpose/module.js 的主动找人）；
 //     · speakup —— 主动搭话（src/features/companion.js 的 tick）。
-//   二者竞争**同一份**按 ownerQQ 的逻辑发言预算域（createSharedBudget），
+//   二者竞争**同一份**按 owner（PersonId）的逻辑发言预算域（createSharedBudget），
 //   同一时刻最多一个逻辑发言获授权；一次逻辑发言的多条气泡不重复扣额度。
 //
 // 契约（CONTRACT §2，逐条对应）：
@@ -38,7 +38,7 @@
 // 落盘（只写 dataDir）：
 //   <dataDir>/purpose-policy.json   目的引擎逻辑发言 + 生成尝试账本
 //   <dataDir>/speakup-policy.json   主动搭话每日次数与 nextAt
-//   <dataDir>/shared-budget.json    两个策略源共享的按 ownerQQ 预算域
+//   <dataDir>/shared-budget.json    两个策略源共享的按 owner 预算域
 //   没给 dataDir（或给空）时全部退化为内存，不碰磁盘。
 // ---------------------------------------------------------------------------
 
@@ -160,15 +160,60 @@ function unlimitedIfZero(value) {
   return Math.round(n)
 }
 
-// ---------------- 共享预算域（按 ownerQQ 唯一） ----------------
+// ---------------- 共享预算域（按 owner PersonId 唯一） ----------------
 
 const BUDGET_REGISTRY = new Map()
 
-function normalizeBudgetState(raw, at, ownerQQ) {
+/** 解析私聊目标字符串：支持 private:<acc> 与 <plat>[:inst]:private:<acc>。 */
+function parsePrivateTarget(to) {
+  const s = String(to ?? '').trim()
+  if (!s) return null
+  const bare = /^private\s*:\s*(.+)$/i.exec(s)
+  if (bare) {
+    const id = bare[1].trim()
+    return id ? { platform: '', id, bare: true } : null
+  }
+  const segs = s.split(':')
+  if (segs.length === 3 && segs[1].trim().toLowerCase() === 'private') {
+    const plat = segs[0].trim()
+    const id = segs[2].trim()
+    return plat && id ? { platform: plat, id, bare: false } : null
+  }
+  if (segs.length >= 4 && segs[2].trim().toLowerCase() === 'private') {
+    const plat = segs[0].trim()
+    const id = segs.slice(3).join(':').trim()
+    return plat && id ? { platform: plat, id, bare: false } : null
+  }
+  return null
+}
+
+function ownerScopeOf(to, identity, { defaultPlatform = '', ownerChat } = {}) {
+  const target = String(to ?? '').trim()
+  if (!target) return { managed: true } // 没给目标：按主人处理（调用方缺省面向主人）
+  const parsed = parsePrivateTarget(target)
+  if (!parsed) return { managed: false, reason: 'out-of-scope' }
+  const extraRaw = typeof ownerChat === 'function' ? ownerChat() : ownerChat
+  const extras = [].concat(extraRaw || []).filter(Boolean).map(String)
+  if (extras.includes(target)) return { managed: true }
+  if (!identity) return { managed: false, reason: 'out-of-scope' }
+  const platform = parsed.platform || String(defaultPlatform || '').trim()
+  if (!platform) return { managed: false, reason: 'out-of-scope' }
+  if (typeof identity.lookup === 'function') {
+    const person = identity.lookup(platform, parsed.id)
+    if (person) return identity.isOwner?.(person) ? { managed: true } : { managed: false, reason: 'out-of-scope' }
+  }
+  const owner = typeof identity.owner === 'function' ? identity.owner() : null
+  if (owner && typeof identity.accountOn === 'function' && identity.accountOn(owner, platform) === parsed.id) {
+    return { managed: true }
+  }
+  return { managed: false, reason: 'out-of-scope' }
+}
+
+function normalizeBudgetState(raw, at, owner) {
   const src = isPlainObject(raw) ? raw : {}
   const s = {
     version: VERSION,
-    ownerQQ: String(ownerQQ ?? ''),
+    owner: String(owner ?? ''),
     day: typeof src.day === 'string' ? src.day : localDateKey(at),
     used: clampInt(src.used, 0, 0, 99999),
     lastSettledAt: Number(src.lastSettledAt) || 0,
@@ -190,7 +235,7 @@ function normalizeBudgetState(raw, at, ownerQQ) {
 }
 
 /**
- * 共享预算域：两个策略源抢同一份「按 ownerQQ 的逻辑发言额度」。
+ * 共享预算域：两个策略源抢同一份「按 owner（PersonId）的逻辑发言额度」。
  *
  * 语义：
  *   · 占用口径 = `used`（已结算的逻辑发言数）+ `inFlight`（已预占未结算）；
@@ -201,12 +246,12 @@ function normalizeBudgetState(raw, at, ownerQQ) {
  *   · 结算：`settle(id, {refund:false})` 记一次占用；`settle(id, {refund:true})` 只退还预占；
  *   · 重启：`used` 保留（额度不被重复授予），`inFlight` 丢弃（在途结果未知，不额外扣也不补发）。
  *
- * 单例：同进程内 `${dataDir}|${ownerQQ}` 唯一，两个策略源各建一次拿到的仍是同一份域。
+ * 单例：同进程内 `${dataDir}|${owner}` 唯一，两个策略源各建一次拿到的仍是同一份域。
  */
-export function createSharedBudget({ ownerQQ, dataDir, now, log, dailyMax, minGapMs } = {}) {
+export function createSharedBudget({ owner: ownerIn, dataDir, now, log, dailyMax, minGapMs } = {}) {
   const clock = clockOf(now)
   const dir = resolveDir(dataDir)
-  const owner = String(ownerQQ ?? '')
+  const owner = String(ownerIn ?? '')
   const regKey = `${dir || '<memory>'}|${owner}`
   if (BUDGET_REGISTRY.has(regKey)) return BUDGET_REGISTRY.get(regKey)
 
@@ -298,7 +343,7 @@ export function createSharedBudget({ ownerQQ, dataDir, now, log, dailyMax, minGa
   function snapshot() {
     const lim = limits()
     return {
-      ownerQQ: owner,
+      owner,
       day: state.day,
       used: state.used,
       inFlight: state.inFlight.map((x) => ({ ...x })),
@@ -310,7 +355,7 @@ export function createSharedBudget({ ownerQQ, dataDir, now, log, dailyMax, minGa
   }
 
   const budget = {
-    ownerQQ: owner,
+    owner,
     kind: 'shared-budget',
     limits,
     setLimits,
@@ -368,7 +413,7 @@ function ensurePurposePolicyDay(s, at) {
  * commit('failed') → 退逻辑发言额度、不退生成尝试额度（契约 §2）。
  * commit('uncertain') → 不退款（到底发没发不知道，保守按已占处理）。
  */
-export function createPurposePolicy({ getConfig, engine, state, now, dataDir, log, budget: injectedBudget } = {}) {
+export function createPurposePolicy({ getConfig, engine, state, now, dataDir, log, identity, owner: ownerOpt, ownerChat, defaultPlatform = '', budget: injectedBudget } = {}) {
   const name = 'purpose'
   const clock = clockOf(now)
   const dir = resolveDir(dataDir)
@@ -424,14 +469,9 @@ export function createPurposePolicy({ getConfig, engine, state, now, dataDir, lo
   // 最近一次拒绝的 reason / detail（面板显示「为什么现在不发」，见 §8.1）
   let lastReason = null
   let lastDetail = null
-  const ownerQQ = (() => {
-    try {
-      return String(cfgOf().ownerQQ ?? '')
-    } catch {
-      return ''
-    }
-  })()
-  const budget = injectedBudget || createSharedBudget({ ownerQQ, dataDir, now: clock, log })
+  const readOwner = () => String((typeof identity?.owner === 'function' ? identity.owner() : '') || (typeof ownerOpt === 'function' ? ownerOpt() : ownerOpt) || '').trim()
+  const owner = readOwner()
+  const budget = injectedBudget || createSharedBudget({ owner, dataDir, now: clock, log })
 
   function enabled() {
     const cfg = cfgOf()
@@ -584,12 +624,7 @@ export function createPurposePolicy({ getConfig, engine, state, now, dataDir, lo
    * 详见 speakup 侧同名函数的注释。
    */
   function scopeOf(to) {
-    const target = String(to ?? '').trim()
-    if (!target) return { managed: true }
-    if (!target.startsWith('private:')) return { managed: false, reason: 'out-of-scope' }
-    const qq = target.slice('private:'.length)
-    if (ownerQQ && qq === ownerQQ) return { managed: true }
-    return { managed: false, reason: 'out-of-scope' }
+    return ownerScopeOf(to, identity, { defaultPlatform, ownerChat })
   }
 
   /** 原子预占：同步返回，内部状态同步变更。 */
@@ -707,7 +742,7 @@ export function createPurposePolicy({ getConfig, engine, state, now, dataDir, lo
     const conf = gateConf()
     return {
       name,
-      ownerQQ,
+      owner: readOwner() || owner,
       state: stateOf(),
       day: s.day,
       attemptCount: s.attemptCount,
@@ -801,7 +836,7 @@ function ensureSpeakupDay(s, at) {
  *   · commit（sent/queued/uncertain/failed 一律不退款，契约 §2）→ count++ 并重排 nextAt；
  *   · release（未发送）→ 退预占，不占次数。
  */
-export function createSpeakupPolicy({ getConfig, speakup, now, dataDir, log, lastPrivateAt, isMuted, budget: injectedBudget } = {}) {
+export function createSpeakupPolicy({ getConfig, speakup, now, dataDir, log, lastPrivateAt, isMuted, identity, owner: ownerOpt, ownerChat, defaultPlatform = '', budget: injectedBudget } = {}) {
   const name = 'speakup'
   const clock = clockOf(now)
   const dir = resolveDir(dataDir)
@@ -884,14 +919,27 @@ export function createSpeakupPolicy({ getConfig, speakup, now, dataDir, log, las
   // 最近一次拒绝的 reason / detail（面板显示「为什么现在不发」，见 §8.1）
   let lastReason = null
   let lastDetail = null
-  const ownerQQ = (() => {
-    try {
-      return String(cfgOf().ownerQQ ?? '')
-    } catch {
-      return ''
+  const readOwner = () => String((typeof identity?.owner === 'function' ? identity.owner() : '') || (typeof ownerOpt === 'function' ? ownerOpt() : ownerOpt) || '').trim()
+  const owner = readOwner()
+  const budget = injectedBudget || createSharedBudget({ owner, dataDir, now: clock, log })
+
+  function isOwnerMuted() {
+    if (typeof isMuted !== 'function') return false
+    const id = readOwner()
+    const defPlat = String(defaultPlatform || '').trim()
+    if (identity && typeof identity.accountsOf === 'function' && id) {
+      for (const a of identity.accountsOf(id) || []) {
+        if (!a?.platform || !a?.account) continue
+        if (isMuted(`${a.platform}:private:${a.account}`)) return true
+        if (defPlat && a.platform === defPlat && isMuted(`private:${a.account}`)) return true
+      }
     }
-  })()
-  const budget = injectedBudget || createSharedBudget({ ownerQQ, dataDir, now: clock, log })
+    const extra = typeof ownerChat === 'function' ? ownerChat() : ownerChat
+    for (const c of [].concat(extra || [])) {
+      if (c && isMuted(String(c))) return true
+    }
+    return false
+  }
 
   function schedule(at) {
     const conf = confOf()
@@ -909,7 +957,7 @@ export function createSpeakupPolicy({ getConfig, speakup, now, dataDir, log, las
     if (companionThrows()) return { ok: false, reason: 'error', detail: 'companion-state' }
     const conf = confOf()
     if (!conf.enabled) return { ok: false, reason: 'quiet', detail: 'disabled' }
-    if (typeof isMuted === 'function' && isMuted(`private:${ownerQQ}`)) {
+    if (isOwnerMuted()) {
       return { ok: false, reason: 'quiet', detail: 'muted' }
     }
     if (!inAwakeWindow(t, conf.awakeFrom, conf.awakeTo)) return { ok: false, reason: 'quiet', detail: 'asleep' }
@@ -967,13 +1015,7 @@ export function createSpeakupPolicy({ getConfig, speakup, now, dataDir, log, las
    * 防的是将来把范围放宽到全部私聊时，忘了按接收人隔离而静默串额度。
    */
   function scopeOf(to) {
-    const target = String(to ?? '').trim()
-    if (!target) return { managed: true } // 没给目标：按主人处理（调用方缺省面向主人）
-    if (!target.startsWith('private:')) return { managed: false, reason: 'out-of-scope' }
-    const qq = target.slice('private:'.length)
-    if (ownerQQ && qq === ownerQQ) return { managed: true }
-    // 非主人的私聊（白名单朋友等）：不归本策略源管
-    return { managed: false, reason: 'out-of-scope' }
+    return ownerScopeOf(to, identity, { defaultPlatform, ownerChat })
   }
 
   function reserve({ to, sourceModule, itemId, at } = {}) {
@@ -1039,7 +1081,7 @@ export function createSpeakupPolicy({ getConfig, speakup, now, dataDir, log, las
     const conf = confOf()
     return {
       name,
-      ownerQQ,
+      owner: readOwner() || owner,
       state: stateOf(),
       day: s.day,
       count: s.count,

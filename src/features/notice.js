@@ -22,16 +22,17 @@ export function normalizeWorkspace(path) {
  * @param {number} [o.maxItems] 一次最多合几条（超了立刻处理）
  * @param {object} [o.log]
  */
-export function createNoticeRelay({ getConfig, workspaceOf, compose, log, windowMs = 8000, maxItems = 8, retryMax = 2, retryDelayMs = 10000 } = {}) {
+export function createNoticeRelay({ getConfig, workspaceOf, compose, identity, hasOwner, log, windowMs = 8000, maxItems = 8, retryMax = 2, retryDelayMs = 10000 } = {}) {
   const seen = new Map()
   const buf = new Map()
   let timer = null
   let retry = 0
 
-  /** 这个会话的这一类事要不要上报：先看总开关，再看工作区覆盖。没配主人号就不报（发不出去）。 */
+  /** 这个会话的这一类事要不要上报：先看总开关，再看工作区覆盖。没认出主人就不报（发不出去）。 */
   function enabled(kind, sessionId) {
     const cfg = getConfig?.() || {}
-    if (!cfg.enabled || cfg.dryRun || !cfg.ownerQQ) return false
+    const ownerOk = typeof hasOwner === 'function' ? hasOwner() : Boolean(identity?.owner?.())
+    if (!cfg.enabled || cfg.dryRun || !ownerOk) return false
     const n = cfg.notice || {}
     if (n.enabled === false) return false
     if (n[kind] === false) return false

@@ -7,17 +7,19 @@ import { readFileSync } from 'node:fs'
 import { groupOwnerTools, levelFor, presetFor } from '../src/chat/access.js'
 import { normalize, DEFAULTS } from '../src/core/config.js'
 import { rulesText } from '../src/persona/personas.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
 const read = (rel) => readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8')
 const GROUP = { kind: 'group', chatId: 'group:100200300', groupId: '100200300', userId: '100200300' }
 const OTHER_GROUP = { kind: 'group', chatId: 'group:200300400', groupId: '200300400' }
 const cfgWith = (group) => normalize({ ownerQQ: '10001', allow: { groups: ['100200300', '200300400'] }, group })
+const id10001 = makeTestIdentity('10001', 'qq')
 
 test('groupOwnerTools：默认关，群聊才有效，私聊一律 off', () => {
   assert.equal(groupOwnerTools(normalize({}), GROUP), 'off')
   assert.equal(groupOwnerTools(cfgWith({ ownerTools: 'owner' }), GROUP), 'owner')
   assert.equal(groupOwnerTools(cfgWith({ ownerTools: 'all' }), GROUP), 'off', 'all 模式已移除，写 all 一律按 off')
-  assert.equal(groupOwnerTools(cfgWith({ ownerTools: 'owner' }), { kind: 'private', userId: '10001' }), 'off')
+  assert.equal(groupOwnerTools(cfgWith({ ownerTools: 'owner' }), { kind: 'private', userId: '10001', platform: 'qq' }), 'off')
   assert.equal(groupOwnerTools(cfgWith({ ownerTools: 'owner' }), { kind: 'system', system: 'autotelic' }), 'off')
 })
 
@@ -30,11 +32,11 @@ test('groupOwnerTools：ownerToolsGroups 非空时只对列出的群生效', () 
 })
 
 test('levelFor：开了本机工具的群给 group-full，其余群仍旧 social', () => {
-  assert.equal(levelFor(cfgWith({ ownerTools: 'owner' }), GROUP), 'group-full')
-  assert.equal(levelFor(cfgWith({ ownerTools: 'all' }), GROUP), 'social', 'all 不再抬档')
-  assert.equal(levelFor(normalize({ ownerQQ: '10001' }), GROUP), 'social')
-  assert.equal(levelFor(normalize({ ownerQQ: '10001', ownerLevel: 'full' }), { kind: 'private', userId: '10001' }), 'full')
-  assert.equal(levelFor(normalize({ ownerQQ: '10001', ownerLevel: 'full' }), { kind: 'private', userId: '20002' }), 'social')
+  assert.equal(levelFor(cfgWith({ ownerTools: 'owner' }), GROUP, id10001), 'group-full')
+  assert.equal(levelFor(cfgWith({ ownerTools: 'all' }), GROUP, id10001), 'social', 'all 不再抬档')
+  assert.equal(levelFor(normalize({ ownerQQ: '10001' }), GROUP, id10001), 'social')
+  assert.equal(levelFor(normalize({ ownerQQ: '10001', ownerLevel: 'full' }), { kind: 'private', userId: '10001', platform: 'qq' }, id10001), 'full')
+  assert.equal(levelFor(normalize({ ownerQQ: '10001', ownerLevel: 'full' }), { kind: 'private', userId: '20002', platform: 'qq' }, id10001), 'social')
 })
 
 test('presetFor：group-full 走专用 preset，不能落到 private', () => {
@@ -121,7 +123,7 @@ test('闸门：群里非主人说话时本机工具被收走', async () => {
   const cfg = normalize({ ownerQQ: OWNER, allow: { groups: [G] }, longTasks: false, group: { ownerTools: 'owner' } })
   const fake = createFakeDsh({ brain: () => '好' })
   const log = { info () {}, warn () {}, debug () {}, error () {} }
-  const hub = createHub({ dsh: fake.ctx, getConfig: () => cfg, log, onebot: { call: async () => ({}) }, buildTools: () => [] })
+  const hub = createHub({ dsh: fake.ctx, getConfig: () => cfg, log, identity: id10001, routeOwner: id10001.routeOwner, defaultPlatform: 'qq', onebot: { call: async () => ({}) }, buildTools: () => [] })
   const chat = { kind: 'group', chatId: `group:${G}`, groupId: G, userId: OTHER, nickname: '别人' }
 
   // 真实消息管线：别人的消息进来，装上去的本机工具必须被 restrict 收走

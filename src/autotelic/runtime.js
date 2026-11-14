@@ -17,6 +17,8 @@ const TRANSIENT_RE = /冷却|等太久|还没结束/
 import { gatherMaterials, proposeTasks, mergeModelScores, buildScreenPrompt, parseScreenVerdicts, trivialWhy, screenFingerprint } from './engine.js'
 import { createBook } from './book.js'
 import { inQuietHours } from '../purpose/engine.js'
+import { isOwnerPrivateChat } from '../chat/access.js'
+import { parseChatId } from '../gateway/address.js'
 import {
   reviewDue, buildDailyPage, dreamDue, distillDream, writeReflection, createJournal, dayKey as dayKeyOf,
 } from './reflect.js'
@@ -52,7 +54,8 @@ export function isQuietNow(settings, at = Date.now()) {
  * @param {object} o
  * @param {()=>object} o.settings 模块设置（ext.autotelic + defaults 合并）
  * @param {object} o.hub 插件 hub（chatLogDays / chatLogOf / runSystemTurn）
- * @param {object} o.cfg 插件配置（ownerQQ 等）
+ * @param {object} o.cfg 插件配置
+ * @param {object} [o.identity] 身份服务
  * @param {()=>object[]} [o.memoryOf] 记忆列表（memory 模块的 list('')）
  * @param {string} [o.personaName] 人格名（素材采集的 roleName）
  * @param {string} [o.ledgerFile] ledger.json 路径
@@ -61,7 +64,7 @@ export function isQuietNow(settings, at = Date.now()) {
  * @param {(prompt:string, opts:object)=>Promise<string>} [o.screenTurn] 立项前预审回合；
  *   没配 evalModel 时用**主模型**跑（默认复用 evalTurn 的接线；测试注入 fake）
  */
-export function createRuntime({ settings, cfg = {}, hub = {}, memoryOf = null, personaName = '', ledgerFile = '', log, evalTurn = null, screenTurn = null, now = () => Date.now(), act = null, journal = null, auditNote = null, auditStat = null } = {}) {
+export function createRuntime({ settings, cfg = {}, hub = {}, identity = null, memoryOf = null, personaName = '', ledgerFile = '', log, evalTurn = null, screenTurn = null, now = () => Date.now(), act = null, journal = null, auditNote = null, auditStat = null } = {}) {
   let running = false
   let book = null
   let bookLimits = ''
@@ -93,21 +96,24 @@ export function createRuntime({ settings, cfg = {}, hub = {}, memoryOf = null, p
   /** 素材采集（§3 P1.1：自己写——purpose 的 conversations()/memoryRecords() 没导出）。 */
   function collect() {
     const per = new Map()
+    const ownerId = identity?.owner?.() || ''
     try {
       const days = hub.chatLogDays?.() || []
-      const ownerKey = cfg.ownerQQ ? `private:${String(cfg.ownerQQ).replace(/[^\d]/g, '')}` : ''
       for (const day of (days || []).slice(-2)) {
         for (const e of hub.chatLogOf?.(day) || []) {
           if (!e?.chatId || e.forgottenAt) continue
+          const isOwnPriv = isOwnerPrivateChat(identity, e.chatId)
+          const isGroup = parseChatId(e.chatId)?.kind === 'group'
           // 只看主人私聊和群聊（她的独立会话不进素材，自言自语不该自我强化）
-          if (!ownerKey || (e.chatId !== ownerKey && !String(e.chatId).startsWith('group:'))) continue
+          if (!ownerId || (!isOwnPriv && !isGroup)) continue
           let c = per.get(e.chatId)
-          if (!c) { c = { key: e.chatId, recentMessages: [], activeTopics: [], pendingThoughts: [] }; per.set(e.chatId, c) }
+          if (!c) { c = { key: e.chatId, isOwner: isOwnPriv, recentMessages: [], activeTopics: [], pendingThoughts: [] }; per.set(e.chatId, c) }
+          else if (isOwnPriv) c.isOwner = true
           c.recentMessages.push({
             text: String(e.text || ''),
             time: Number(e.t) || 0,
             isSelf: e.who === 'bot',
-            isOwner: e.chatId === ownerKey && e.who !== 'bot',
+            isOwner: isOwnPriv && e.who !== 'bot',
             sender: e.who === 'bot' ? '你' : String(e.uid || '群友'),
           })
         }
@@ -118,7 +124,7 @@ export function createRuntime({ settings, cfg = {}, hub = {}, memoryOf = null, p
     const memoryRecords = memories
       .filter((m) => m && !m.invalidAt && m.text && !['hearsay', 'guess'].includes(m.status))
       .map((m) => ({ id: m.id, title: '', text: String(m.text), importance: Math.round((Number(m.importance) || 0) * 100), emotional: 0, lastSeenAt: m.lastHit || m.at, createdAt: m.at, pinned: false, anchor: false, isInitial: false }))
-    return gatherMaterials({ conversations: [...per.values()], memoryRecords, roleName: name, ownerQQ: cfg.ownerQQ, now: now() })
+    return gatherMaterials({ conversations: [...per.values()], memoryRecords, roleName: name, owner: ownerId, now: now() })
   }
 
   /**

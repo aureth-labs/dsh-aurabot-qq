@@ -140,12 +140,15 @@ export default {
     // 自检「听语音」（真 QQ）：拿和某人私聊里最近一条语音，走一遍 get_record → 16k → DSH 识别
     api.route('/voice/asr-last', async (req) => {
       const b = await http.body(req)
-      const uid = Number(b.userId || api.config().ownerQQ)
+      const ownerPerson = api.core.identity?.owner?.()
+      const ownerQq = ownerPerson ? api.core.identity?.accountOn?.(ownerPerson, 'qq') : ''
+      const uid = Number(b.userId || ownerQq || 0)
       const gw = api.core.gateway
       const qqInst = gw?.instances?.()?.find((s) => s?.platform === 'qq' && s.enabled)
       if (!gw || !qqInst || qqInst.caps === null) {
         return { ok: false, message: '仅在启用且连接 QQ 网关时支持此自检' }
       }
+      if (!uid) return { ok: false, message: '请先绑定主人 QQ 账号（或指定 userId）' }
       let h
       try {
         h = await gw.native(qqInst.instance, 'get_friend_msg_history', { user_id: uid, count: 30 })

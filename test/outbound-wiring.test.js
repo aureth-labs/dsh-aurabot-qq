@@ -11,8 +11,16 @@ import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHub } from '../src/chat/hub.js'
-import { createOutboundPolicy } from '../src/chat/outbound-policy.js'
+import { createOutboundPolicy as _createOutboundPolicy } from '../src/chat/outbound-policy.js'
 import { scopeCoreForModule } from '../src/core/modules.js'
+import { makeTestIdentity } from './helpers/identity.js'
+
+const _testOwnerIdentity = makeTestIdentity('10001', 'qq')
+const createOutboundPolicy = (opts = {}) => _createOutboundPolicy({
+  identity: _testOwnerIdentity,
+  owner: () => _testOwnerIdentity.owner() || '',
+  ...opts,
+})
 
 // 这个测试会真调 hub.deliver，不隔离数据目录会把假消息（private:10001）写进真实聊天流水。
 process.env.AURABOT_DATA_DIR = mkdtempSync(join(tmpdir(), 'aurabot-outbound-wiring-'))
@@ -36,6 +44,9 @@ function makeHub(t, overrides = {}) {
   const hub = createHub({
     dsh: {},
     getConfig: () => cfg,
+    identity: _testOwnerIdentity,
+    routeOwner: _testOwnerIdentity.routeOwner,
+    defaultPlatform: 'qq',
     log: { info() {}, debug() {}, warn() {}, error() {}, child() { return this } },
     onebot: {
       call: async (action, params) => {

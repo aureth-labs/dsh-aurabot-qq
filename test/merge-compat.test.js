@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { createFakeDsh } from './helpers/fake-dsh.js'
 import { normalize } from '../src/core/config.js'
 import { clearVisionCache, clearReasoningCache } from '../src/core/llm.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
 const root = mkdtempSync(join(tmpdir(), 'aurabot-merge-'))
 process.env.AURABOT_WORKSPACE = join(root, 'workspace')
@@ -65,7 +66,8 @@ function setup(t, { config = {}, brain = async () => '', hooks = {}, buildTools 
     inputModalities: model === 'see' ? ['text', 'image'] : ['text'],
     ...(model === 'reason' ? { reasoning: { efforts: ['low', 'high'], defaultEffort: 'low' } } : {}),
   }
-  const hub = createHub({ dsh: fake.ctx, getConfig: () => cfg,
+  const identity = makeTestIdentity(cfg.ownerQQ || OWNER)
+  const hub = createHub({ dsh: fake.ctx, getConfig: () => cfg, identity, routeOwner: identity.routeOwner, defaultPlatform: 'qq',
     log: Object.fromEntries(['info', 'warn', 'debug', 'error'].map((k) => [k, (...v) => fake.logs.push(v.join(' '))])),
     onebot: { connected: true, async call() { return { message_id: 1, group_name: '测试群' } } },
     hooks, buildTools, availableModels: () => null })
@@ -74,7 +76,7 @@ function setup(t, { config = {}, brain = async () => '', hooks = {}, buildTools 
   const send = (text = '你好', message) => hub.onMessage({ post_type: 'message', message_type: 'private',
     self_id: Number(BOT), user_id: Number(OWNER), message_id: 1, sender: { user_id: Number(OWNER), nickname: '主人' },
     message: message || [{ type: 'text', data: { text } }] })
-  return { fake, hub, send, selections, cfg: () => cfg, set: (patch) => { cfg = normalize({ ...cfg, ...patch }) },
+  return { fake, hub, send, selections, cfg: () => cfg, set: (patch) => { cfg = normalize({ ...cfg, ...patch }); if (patch.ownerQQ !== undefined) identity.setOwner(patch.ownerQQ, 'qq') },
     agent: () => fake.agents.get(hub.sessions()[CHAT]?.sessionId) }
 }
 

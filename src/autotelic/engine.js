@@ -208,11 +208,11 @@ export function screenFingerprint(text) {
 }
 
 /** 素材采集（§3 P1.1：照 purpose 的写法抄，放在 autotelic 里，不依赖未导出的 purpose 内部函数）。 */
-export function gatherMaterials({ conversations = [], memoryRecords = [], now = Date.now(), roleName = '', ownerQQ = '' } = {}) {
+export function gatherMaterials({ conversations = [], memoryRecords = [], now = Date.now(), roleName = '', owner = '' } = {}) {
   const r = collectMaterials({
     now,
     config: DEFAULT_PURPOSE_CONFIG,
-    ownerUin: String(ownerQQ || ''),
+    ownerUin: String(owner || ''),
     roleName: String(roleName || ''),
     conversations,
     biliEntries: [],

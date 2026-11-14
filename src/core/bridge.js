@@ -10,10 +10,12 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { defineTool } from '../tools/tools.js'
 import { selfName } from '../persona/personas.js'
+import { isOwner, isOwnerPrivateChat } from '../chat/access.js'
+import { parseChatId } from '../gateway/address.js'
 
 const RING = 300
 
-export function createBridge({ ctx, getConfig, setConfig, hub, mods, log, version, apiVersion, overview }) {
+export function createBridge({ ctx, getConfig, setConfig, hub, mods, identity, routeOwner, log, version, apiVersion, overview }) {
   const events = [] // 最近发生的事（收到的消息、她发出去的话、模块发的事件），别的程序轮询用
   let seq = 0
   let disposed = false
@@ -28,13 +30,16 @@ export function createBridge({ ctx, getConfig, setConfig, hub, mods, log, versio
   // ---------- 能发给谁 ----------
   function canSend(target) {
     const cfg = getConfig()
-    const [kind, id] = String(target || '').split(':')
-    if (!id || !['private', 'group'].includes(kind)) return '目标要写成 private:QQ号 或 group:群号'
-    if (cfg.bridge.allowTargets === 'owner') return kind === 'private' && id === cfg.ownerQQ ? '' : '设置成了只能发给主人'
-    const ok = kind === 'group' ? cfg.allow.groups : [cfg.ownerQQ, ...cfg.allow.private]
-    return ok.includes(id) ? '' : '不在白名单里，不能发'
+    const parsed = parseChatId(target)
+    if (!parsed) return '目标格式不对（例：private:账号 / 平台:private:账号 或 group:群号）'
+    if (cfg.bridge.allowTargets === 'owner') {
+      return isOwnerPrivateChat(identity, target) ? '' : '设置成了只能发给主人'
+    }
+    if (parsed.kind === 'private' && isOwner(identity, parsed.id, parsed.platform)) return ''
+    const ok = parsed.kind === 'group' ? cfg.allow?.groups : cfg.allow?.private
+    return (ok || []).map(String).includes(parsed.id) ? '' : '不在白名单里，不能发'
   }
-  const ownerTarget = () => `private:${getConfig().ownerQQ}`
+  const ownerTarget = () => (typeof routeOwner === 'function' ? routeOwner() : hub?.ownerChat?.()) || ''
 
   // ---------- 大家共用的几个操作 ----------
   const ops = {
@@ -49,7 +54,8 @@ export function createBridge({ ctx, getConfig, setConfig, hub, mods, log, versio
     },
     /** 让她把一段话发出去（会拆条、可以带 <voice> <sticker:名字>）。target 不填 = 发给主人。 */
     send: async ({ target, text } = {}) => {
-      const t = String(target || ownerTarget())
+      const t = target ? String(target) : ownerTarget()
+      if (!t) return { ok: false, message: '当前联系不上主人' }
       const why = canSend(t)
       if (why) return { ok: false, message: why }
       if (!String(text || '').trim()) return { ok: false, message: '要说点什么' }

@@ -7,6 +7,7 @@ import { createFakeDsh } from './helpers/fake-dsh.js'
 import { normalize } from '../src/core/config.js'
 import { createSpeakUp } from '../src/features/companion.js'
 import { currentTimeLine } from '../src/chat/time-context.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
 const root = mkdtempSync(join(tmpdir(), 'aurabot-time-poke-'))
 process.env.AURABOT_WORKSPACE = join(root, 'workspace')
@@ -44,8 +45,9 @@ function setup(t, { brain = async () => '收到啦', hooks, patch = {}, call } =
     voice: { enabled: false }, stickers: { enabled: false, collect: false, reactChance: 0 },
     model: { vision: 'on' }, ...patch })
   const fake = createFakeDsh({ brain })
+  const identity = makeTestIdentity(cfg.ownerQQ || OWNER)
   const calls = []
-  const hub = createHub({ dsh: fake.ctx, getConfig: () => cfg, hooks,
+  const hub = createHub({ dsh: fake.ctx, getConfig: () => cfg, hooks, identity, routeOwner: identity.routeOwner, defaultPlatform: 'qq',
     log: Object.fromEntries(['info', 'warn', 'error', 'debug'].map(k => [k, (...args) => fake.logs.push(args.join(' '))])),
     onebot: { connected: true, async call(action, params) {
       calls.push({ action, params })
@@ -60,7 +62,7 @@ function setup(t, { brain = async () => '收到啦', hooks, patch = {}, call } =
     else process.env.AURABOT_DATA_DIR = previous
   })
   const sent = () => calls.filter(c => c.action === 'send_private_msg' || c.action === 'send_group_msg')
-  return { hub, fake, cfg, calls, sent }
+  return { hub, fake, cfg, calls, sent, identity }
 }
 
 test('本机时间包含日期、星期、时分和时段，跨日重新生成', () => {
@@ -96,7 +98,7 @@ test('主动找主人、白名单朋友和目的引擎后台轮次都带当前�
     speakUp: { enabled: true, allow: ['10000004'], awakeFrom: 0, awakeTo: 24 },
     ext: { purpose: { enabled: false } },
   } })
-  const speakUp = createSpeakUp({ getConfig: () => s.cfg, hub: s.hub, log: { info() {} } })
+  const speakUp = createSpeakUp({ getConfig: () => s.cfg, hub: s.hub, identity: s.identity, routeOwner: s.identity.routeOwner, log: { info() {} } })
   await speakUp.fire()
   await settle()
   assert.ok(s.fake.turns[0].userText.includes(currentTimeLine()))

@@ -1,4 +1,8 @@
+import { parseChatId } from '../gateway/address.js'
 import { delegatedCommandCatalog, isDelegatedCommandKey } from './delegated-commands.js'
+import { isOwner } from './access.js'
+
+const defaultPlatform = () => parseChatId('private:0')?.platform || ''
 
 const CAPABILITIES = {
   image: { label: '生图', description: '允许通过聊天请求画图，可能消耗生图额度' },
@@ -22,11 +26,11 @@ function permissionLocation(key, kind) {
 }
 
 /** 只更新指定对象、指定权限，保留同时来自 QQ 或设置页的其他改动。 */
-export function changePermissions(cfg, { id, kind = 'private', changes } = {}, commands) {
+export function changePermissions(cfg, { id, kind = 'private', changes } = {}, commands, identity = null) {
   if (!['private', 'group'].includes(kind) || typeof id !== 'string' || !/^\d{5,}$/.test(id)) {
     return { ok: false, message: '请输入完整的 QQ 号或群号' }
   }
-  if (kind === 'private' && String(cfg.ownerQQ) === id) return { ok: false, message: '主人权限请在主人设置中管理' }
+  if (kind === 'private' && isOwner(identity, id, defaultPlatform())) return { ok: false, message: '主人权限请在主人设置中管理' }
   if (!changes || typeof changes !== 'object' || Array.isArray(changes) || !Object.keys(changes).length) {
     return { ok: false, message: '请选择要修改的权限' }
   }
@@ -45,7 +49,7 @@ export function changePermissions(cfg, { id, kind = 'private', changes } = {}, c
 }
 
 /** 批量加入私聊白名单，不改动已有的功能和命令授权。 */
-export function changePrivateWhitelist(cfg, { ids } = {}) {
+export function changePrivateWhitelist(cfg, { ids } = {}, identity = null) {
   if (!Array.isArray(ids) || !ids.length) return { ok: false, message: '请先输入 QQ 号' }
   if (ids.length > 500) return { ok: false, message: '一次最多处理 500 个 QQ 号，请分批粘贴' }
 
@@ -53,8 +57,10 @@ export function changePrivateWhitelist(cfg, { ids } = {}) {
   if (values.some((id) => !/^\d{5,12}$/.test(id))) return { ok: false, message: 'QQ 号格式不对：每个都要是 5～12 位数字' }
 
   const unique = [...new Set(values)]
-  const owner = String(cfg.ownerQQ || '')
-  const requested = unique.filter((id) => id !== owner)
+  const ownerId = typeof identity?.owner === 'function' ? identity.owner() : null
+  const plat = defaultPlatform()
+  const ownerAccount = ownerId && plat && typeof identity?.accountOn === 'function' ? String(identity.accountOn(ownerId, plat) || '') : ''
+  const requested = ownerAccount ? unique.filter((id) => id !== ownerAccount) : unique
   const current = (cfg.allow?.private || []).map(String)
   const nextList = [...new Set([...current, ...requested])]
   const changed = nextList.length - current.length
@@ -65,6 +71,6 @@ export function changePrivateWhitelist(cfg, { ids } = {}) {
     ...(next ? { config: next } : {}),
     changed,
     skipped: unique.length - changed,
-    ownerSkipped: unique.includes(owner) ? 1 : 0,
+    ownerSkipped: ownerAccount && unique.includes(ownerAccount) ? 1 : 0,
   }
 }

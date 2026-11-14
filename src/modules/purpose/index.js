@@ -46,6 +46,8 @@ export default {
       // 素材口：浏览型模块（rss-reader「自主上网」等）的素材按需取用；没装/没开是 null。
       use: (id) => api.use(id),
       personaText: () => { try { return api.core.personas?.current?.() || '' } catch { return '' } },
+      identity: api.core.identity,
+      routeOwner: api.core.routeOwner,
     })
     api.every(60_000, () => purpose.tick(), '目的引擎')
     api.route('/purpose/fire', async () => {

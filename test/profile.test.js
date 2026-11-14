@@ -5,6 +5,7 @@ import profileModule from '../src/modules/profile/index.js'
 import { createQqProfile } from '../src/features/qq-profile.js'
 import { normalize } from '../src/core/config.js'
 import { startMockOneBot } from './helpers/mock-onebot.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
 const OWNER = '10000001'
 const BOT = '20000002'
@@ -13,6 +14,7 @@ const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a
 
 function setup(overrides = {}) {
   let cfg = normalize({ botQQ: BOT, ownerQQ: OWNER, model: { vision: 'on' }, ...overrides.cfg })
+  const identity = makeTestIdentity(cfg.ownerQQ || OWNER, 'qq')
   const calls = [], rules = [], disposers = [], sends = [], downloads = [], asks = [], attachments = []
   let allOwner = true, builder
   const state = { nickname: '大肥鱼', long_nick: '爱吃白米饭' }
@@ -23,6 +25,8 @@ function setup(overrides = {}) {
       return blocks.map(({ mediaType }) => ({ type: 'image', attachment: { attachmentId: 'avatar-att' }, mediaType }))
     } } },
     core: {
+      identity,
+      routeOwner: identity.routeOwner,
       hub: { turnSendersAllOwner: () => allOwner, modelFor: () => overrides.model,
         async sendSegments(chatId, message) {
           sends.push({ chatId, message })
@@ -49,7 +53,7 @@ function setup(overrides = {}) {
   })
   return { calls, state, rules, sends, downloads, asks, attachments,
     tools: (chat = ownerChat) => Object.fromEntries(builder({ chat, sessionId: 's1' }).map((tool) => [tool.name, tool])),
-    set: (patch) => { cfg = normalize({ ...cfg, ...patch }) },
+    set: (patch) => { cfg = normalize({ ...cfg, ...patch }); if (patch.ownerQQ !== undefined) identity.setOwner(patch.ownerQQ, 'qq') },
     mixed: () => { allOwner = false },
     dispose: () => disposers.forEach((fn) => fn()),
   }

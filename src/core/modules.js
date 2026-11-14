@@ -11,11 +11,16 @@
 import { existsSync, readdirSync, statSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { join, dirname, relative, resolve, sep, isAbsolute } from 'node:path'
 import { pathToFileURL, fileURLToPath } from 'node:url'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { dataDir } from './store.js'
 import { registerSecretField } from './config.js'
 import { defineTool } from '../tools/tools.js'
 import { selfName } from '../persona/personas.js'
 import { normalizeChatId, parseChatId } from '../gateway/address.js'
+import { isOwner as checkOwnerIdentity } from '../chat/access.js'
+
+const platformContext = new AsyncLocalStorage()
+const runWithPlatform = (platform, fn) => (platform ? platformContext.run(platform, fn) : fn())
 
 /** 扩展接口版本：v2 起支持多平台模块（platforms / api.caps / api.native / api.platformOf / api.sendParts），向后兼容 v1。 */
 export const API_VERSION = 2
@@ -444,7 +449,7 @@ function brokerDelegable(core, verdict, ask) {
   if (!text.trim()) return null
   const to = String((ask && ask.chatId) || '')
   // 只代发「主动私聊主人」；群聊、朋友私聊均按原路径。
-  // 治理范围由服务自己判（它的 getConfig 里有 ownerQQ），模块层不必依赖 core.getConfig。
+  // 治理范围由出站服务判别（基于 identity.owner()），模块层不必依赖 core.getConfig。
   const governed = typeof svc.isGoverned === 'function' ? svc.isGoverned(to) : false
   if (!governed) return null
   return svc
@@ -464,8 +469,10 @@ async function delegateToHost(core, id, ask, verdict, svc, log) {
     try { svc.release(verdict.reserveId, { reason: 'delegated-to-host' }) } catch {}
   }
   try {
+    const to = String(ask.chatId)
+    const plat = parseChatId(normalizeChatId(to) || to)?.platform || ''
     const r = await svc.submit(
-      { moduleId: id, itemId: ask.itemId || '', to: String(ask.chatId), channel: 'qq', text: String(ask.text ?? ''), at: Date.now() },
+      { moduleId: id, itemId: ask.itemId || '', to, channel: plat, text: String(ask.text ?? ''), at: Date.now() },
       { hostDelegate: true },
     )
     const state = r && typeof r === 'object' ? String(r.state || '') : ''
@@ -907,7 +914,11 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       rule: (fn) => { rec.rules.push(fn); return () => remove(rec.rules, fn) },
       command: (c) => {
         if (!c || !c.name || typeof c.run !== 'function') throw new Error('command 要有 name 和 run')
-        const item = { ...c, module: id }
+        const item = {
+          ...c,
+          run: (arg, msg, ...rest) => runWithPlatform(msg?.platform || platformOf(msg?.chatId), () => c.run(arg, msg, ...rest)),
+          module: id,
+        }
         rec.commands.push(item)
         return () => remove(rec.commands, item)
       },
@@ -956,7 +967,20 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       sendText: writable('sendText', (chatId, text) => governedSend(core, id, { chatId: String(chatId), text: String(text ?? '') }, (extra) => core.hub.sendText(String(chatId), String(text ?? ''), undefined, undefined, undefined, extra), obLog)),
       // 回某一条消息：群里以「引用回复」发出，私聊直接发
       reply: writable('reply', (msg, text) => core.hub.sendText(String(msg.chatId), String(text ?? ''), msg.kind === 'group' ? msg.messageId : undefined)),
-      isOwner: (userId) => String(userId) === String(getConfig().ownerQQ),
+      isOwner: (userId, platform) => {
+        const id = core.identity
+        if (platform !== undefined) return checkOwnerIdentity(id, userId, platform)
+        if (userId && typeof userId === 'object') return checkOwnerIdentity(id, userId)
+        const activePlat = platformContext.getStore() || ''
+        if (activePlat) {
+          const s = String(userId ?? '').trim()
+          if (!s) return false
+          if (checkOwnerIdentity(id, s, activePlat)) return true
+          if (/^p-/.test(s) && id?.lookup?.(activePlat, s) == null && id?.isValid?.(s)) return Boolean(id.isOwner?.(s))
+          return false
+        }
+        return checkOwnerIdentity(id, userId)
+      },
       sendImage: writable('sendImage', (chatId, src) => governedSend(core, id, { chatId: String(chatId) }, (extra) => core.hub.sendImage(String(chatId), src, undefined, undefined, extra), obLog)),
       sendParts: writable('sendParts', (chatId, parts, opts = {}) => {
         const cid = String(chatId || '')
@@ -1343,20 +1367,24 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     if (disposed) return
     if ((event === 'onebot' || event === 'onebot/state') && !qqEnabled()) return
     const p = eventPlatform(event, args)
-    for (const { id, fn } of listeners.get(event) || []) {
-      if (!listenerAllows(id, event, p)) continue
-      try { const r = fn(...args); if (r && typeof r.catch === 'function') r.catch(() => {}) } catch (error) {}
-    }
+    runWithPlatform(p, () => {
+      for (const { id, fn } of listeners.get(event) || []) {
+        if (!listenerAllows(id, event, p)) continue
+        try { const r = fn(...args); if (r && typeof r.catch === 'function') r.catch(() => {}) } catch (error) {}
+      }
+    })
   }
   /** 依次问每个模块，第一个返回真值的接管（收到消息时用）。 */
   async function claim(event, ...args) {
     const callArgs = event === 'message' && args[0] ? [enrichMsg(args[0]), ...args.slice(1)] : args
     const p = eventPlatform(event, callArgs)
-    for (const { id, fn } of listeners.get(event) || []) {
-      if (!listenerAllows(id, event, p)) continue
-      try { if (await fn(...callArgs)) return true } catch (error) {}
-    }
-    return false
+    return runWithPlatform(p, async () => {
+      for (const { id, fn } of listeners.get(event) || []) {
+        if (!listenerAllows(id, event, p)) continue
+        try { if (await fn(...callArgs)) return true } catch (error) {}
+      }
+      return false
+    })
   }
   /** 依次让每个模块改写一个值（发回复前用）：返回 undefined 不改，null 拦下。 */
   async function filter(event, value, ...args) {
@@ -1365,30 +1393,34 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       ? [{ ...args[0], msg: enrichMsg(args[0].msg) }, ...args.slice(1)]
       : args
     const p = eventPlatform(event, callArgs)
-    for (const { id, fn } of listeners.get(event) || []) {
-      if (!listenerAllows(id, event, p)) continue
-      try {
-        const r = await fn(v, ...callArgs)
-        if (r === null) return null
-        if (r !== undefined) v = r
-      } catch (error) {}
-    }
-    return v
+    return runWithPlatform(p, async () => {
+      for (const { id, fn } of listeners.get(event) || []) {
+        if (!listenerAllows(id, event, p)) continue
+        try {
+          const r = await fn(v, ...callArgs)
+          if (r === null) return null
+          if (r !== undefined) v = r
+        } catch (error) {}
+      }
+      return v
+    })
   }
   /** 同步版（人格、规则、模型选择这些地方不能等）：监听函数返回 Promise 的不算。 */
   function filterSync(event, value, ...args) {
     let v = value
     const p = eventPlatform(event, args)
-    for (const { id, fn } of listeners.get(event) || []) {
-      if (!listenerAllows(id, event, p)) continue
-      try {
-        const r = fn(v, ...args)
-        if (r && typeof r.then === 'function') continue
-        if (r === null) return null
-        if (r !== undefined) v = r
-      } catch (error) {}
-    }
-    return v
+    return runWithPlatform(p, () => {
+      for (const { id, fn } of listeners.get(event) || []) {
+        if (!listenerAllows(id, event, p)) continue
+        try {
+          const r = fn(v, ...args)
+          if (r && typeof r.then === 'function') continue
+          if (r === null) return null
+          if (r !== undefined) v = r
+        } catch (error) {}
+      }
+      return v
+    })
   }
 
   // ---------- 汇总给插件其他部分用 ----------
@@ -1396,30 +1428,34 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     const out = []
     const names = new Set()
     const p = where?.chat?.platform || platformOf(where?.chat?.chatId || where?.chatId)
-    for (const rec of live.values()) {
-      if (p && !recMatchesPlatform(rec, p)) continue
-      for (const b of rec.tools) {
-        let r
-        try { r = typeof b === 'function' ? b(where) : b } catch (error) { note(rec.id, '生成工具', error); continue }
-        for (const t of [].concat(r || [])) {
-          if (!t || !t.name) continue
-          if (names.has(t.name)) { log.debug(`工具 ${t.name} 重名，模块「${rec.id}」的没挂`); continue }
-          names.add(t.name)
-          out.push(t)
+    runWithPlatform(p, () => {
+      for (const rec of live.values()) {
+        if (p && !recMatchesPlatform(rec, p)) continue
+        for (const b of rec.tools) {
+          let r
+          try { r = typeof b === 'function' ? b(where) : b } catch (error) { note(rec.id, '生成工具', error); continue }
+          for (const t of [].concat(r || [])) {
+            if (!t || !t.name) continue
+            if (names.has(t.name)) { log.debug(`工具 ${t.name} 重名，模块「${rec.id}」的没挂`); continue }
+            names.add(t.name)
+            out.push(p && typeof t.execute === 'function' ? { ...t, execute: (...a) => platformContext.run(p, () => t.execute(...a)) } : t)
+          }
         }
       }
-    }
+    })
     return out
   }
   function contextFor(args) {
     const parts = []
     const p = args?.chat?.platform || platformOf(args?.chat?.chatId || args?.chatId)
-    for (const rec of live.values()) {
-      if (p && !recMatchesPlatform(rec, p)) continue
-      for (const fn of rec.contexts) {
-        try { const t = fn(args); if (t) parts.push(String(t)) } catch (error) {}
+    runWithPlatform(p, () => {
+      for (const rec of live.values()) {
+        if (p && !recMatchesPlatform(rec, p)) continue
+        for (const fn of rec.contexts) {
+          try { const t = fn(args); if (t) parts.push(String(t)) } catch (error) {}
+        }
       }
-    }
+    })
     return parts.join('\n\n')
   }
   function rules(kind) {

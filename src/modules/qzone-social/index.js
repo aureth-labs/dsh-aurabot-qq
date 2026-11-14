@@ -17,7 +17,7 @@ export default {
       call: (action, params, opts) => (typeof api.native === 'function' ? api.native('qq', action, params, opts) : onebot.call(action, params, opts)),
       get state() { return api.core.onebot?.state },
     }
-    const social = createQzoneSocial({ getConfig: api.config, onebot: qqOnebot, hub, memory: api.lazy('memory'), log: api.log })
+    const social = createQzoneSocial({ getConfig: api.config, onebot: qqOnebot, hub, memory: api.lazy('memory'), log: api.log, identity: api.core.identity })
     api.every(60_000, () => (api.core.onebot?.state && api.core.onebot.state !== 'connected' ? undefined : social.tick()), '空间互动')
     api.route('/qzone/social/run', async () => social.run({ force: true }))
     api.route('/qzone/social/state', async () => ({ ok: true, ...social.state() }))

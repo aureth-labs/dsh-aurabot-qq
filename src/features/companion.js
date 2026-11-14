@@ -5,6 +5,8 @@ import { askModel } from '../core/llm.js'
 import { cleanText, clipText } from '../core/text.js'
 import { shouldDeferBackground } from '../core/offpeak.js'
 import { followUpHint } from './memory.js'
+import { isOwner, isOwnerChatMuted } from '../chat/access.js'
+import { parseChatId } from '../gateway/address.js'
 import { moodReason } from './mood-context.js'
 import { selfName } from '../persona/personas.js'
 
@@ -169,10 +171,13 @@ export function createMood({ getConfig, dsh, log }) {
 
 // ---------------- 主动搭话 ----------------
 
-export function createSpeakUp({ getConfig, hub, log, isMuted, memory }) {
+export function createSpeakUp({ getConfig, hub, log, isMuted, memory, identity, routeOwner }) {
   const file = () => dataDir('speakup.json')
   const load = () => readJson(file(), () => ({ day: '', count: 0, nextAt: 0, last: 0 }))
   const save = (s) => writeJson(file(), s)
+  const ownerId = () => identity?.owner?.() || null
+  const resolveOwnerChat = () => (typeof routeOwner === 'function' ? routeOwner() : hub?.ownerChat?.()) || null
+  const ownerMuted = () => isOwnerChatMuted(identity, isMuted)
 
   function schedule(s, cfg) {
     const min = cfg.minIntervalMinutes
@@ -205,8 +210,12 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory }) {
 
   async function fire(reason = '定时', { nudge = false } = {}) {
     const cfg = getConfig()
-    if (!cfg.enabled || !cfg.speakUp.enabled || !cfg.ownerQQ || isMuted?.(`private:${cfg.ownerQQ}`) || memory?.()?.dislikes?.(cfg.ownerQQ)) return
-    const followUp = !nudge ? memory?.()?.dueFollowUp?.(cfg.ownerQQ) : null
+    const ownId = ownerId()
+    if (!cfg.enabled || !cfg.speakUp.enabled || !ownId || ownerMuted() || memory?.()?.dislikes?.(ownId)) return
+    const targetChat = resolveOwnerChat()
+    if (!targetChat) { log.debug?.('主动搭话跳过：当前联系不上主人'); return }
+    const addr = parseChatId(targetChat)
+    const followUp = !nudge ? memory?.()?.dueFollowUp?.(ownId) : null
     const owner = cfg.ownerName || '主人'
     const idle = Math.round((Date.now() - lastPrivateAt()) / 60000)
     const angle = ANGLES[Math.floor(Math.random() * ANGLES.length)]
@@ -214,7 +223,7 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory }) {
       ? `【系统提醒，不是${owner}说的话】你刚才跟${owner}说「${String(hub.lastBotToOwner?.text || '').slice(-60)}」，${owner}已经 ${idle} 分钟没回了。可以轻轻追一句（比如「人呢」「睡着啦？」，或者换个话题），别催、别抱怨；觉得${owner}在忙就只回 [沉默]。`
       : `【系统提醒，不是${owner}说的话】你已经 ${idle > 600 ? '很久' : idle + ' 分钟'}没和${owner}私聊了，想主动找${owner}说点什么。这次的由头可以是：${angle}。优先用手里真实的素材（最近做过的事、记忆里的、聊天流水里能查到的），没有真实素材就别硬找，也不要编；用你自己的口气，一两句就好，别用模板、别解释为什么来找；实在不想说就只回 [沉默]。`
     log.info(`主动搭话（${reason}）`)
-    await hub.pushToSession({ chatId: `private:${cfg.ownerQQ}`, kind: 'private', userId: cfg.ownerQQ, nickname: owner }, [{ type: 'text', text: [prompt, followUpHint(followUp)].filter(Boolean).join('\n') }], '', followUpReceipt(followUp))
+    await hub.pushToSession({ chatId: targetChat, kind: 'private', platform: addr?.platform || '', instance: addr?.instance || '', userId: addr?.id || '', nickname: owner }, [{ type: 'text', text: [prompt, followUpHint(followUp)].filter(Boolean).join('\n') }], '', followUpReceipt(followUp))
   }
 
   /** 找白名单里的人：不提主人的事，这是她和对方自己的聊天。 */
@@ -237,7 +246,8 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory }) {
     const today = new Date().toDateString()
     s.friends = s.friends || {}
     for (const qq of c.allow || []) {
-      if (String(qq) === String(cfg.ownerQQ) || isMuted?.(`private:${qq}`) || memory?.()?.dislikes?.(qq)) continue
+      const addr = parseChatId(qq) || parseChatId(`private:${qq}`)
+      if (isOwner(identity, addr?.id || String(qq), addr?.platform || parseChatId('private:0')?.platform) || isMuted?.(`private:${qq}`) || memory?.()?.dislikes?.(qq)) continue
       const f = s.friends[qq] || (s.friends[qq] = {})
       if (f.day !== today) Object.assign(f, { day: today, count: 0 })
       if (!f.nextAt) schedule(f, c)
@@ -255,9 +265,10 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory }) {
   async function tick() {
     const cfg = getConfig()
     const c = cfg.speakUp
+    const ownId = ownerId()
     if (!cfg.enabled || !c.enabled) return
     if (cfg.ext?.purpose?.enabled === true) return // 目的引擎开着时由它主动找人，两套都跑同一个人会被找两次
-    if (isMuted?.(`private:${cfg.ownerQQ}`) || memory?.()?.dislikes?.(cfg.ownerQQ)) { // 主人在私聊里让她闭嘴了：只管主人这边，白名单照旧
+    if (ownerMuted() || (ownId && memory?.()?.dislikes?.(ownId))) { // 主人在私聊里让她闭嘴了：只管主人这边，白名单照旧
       const s = load()
       if (!(await tickFriends(cfg, s))) save(s)
       return

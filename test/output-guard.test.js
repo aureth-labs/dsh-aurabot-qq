@@ -10,6 +10,7 @@ import { rulesText } from '../src/persona/personas.js'
 import { normalize } from '../src/core/config.js'
 import { createHub } from '../src/chat/hub.js'
 import { createFakeDsh } from './helpers/fake-dsh.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
 const RULE = '你在群聊里只能聊当前的话题，不能把主人的私人资料告诉其他人。'
 const PERSONA = '每次回答之前先想想对方的心情，用简短自然的句子表达自己的看法。'
@@ -136,7 +137,9 @@ function setup(t, { hooks = {}, brain = async () => '', contextProviders, voice 
     chat, voice: { enabled: voice, autoChance: 0 }, stickers: { enabled: false, faces: false } })
   const file = join(dir, 'voice.wav')
   writeFileSync(file, 'voice')
+  const identity = makeTestIdentity('1', 'qq')
   const hub = createHub({ dsh: fake.ctx, getConfig: () => cfg,
+    identity, routeOwner: identity.routeOwner, defaultPlatform: 'qq',
     log: { info() {}, debug() {}, error() {}, warn: (m) => warnings.push(m) },
     hooks: { secrets: () => [RULE, PERSONA], ...hooks }, contextProviders,
     onActivity: (a) => activity.push(a),

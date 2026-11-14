@@ -13,6 +13,7 @@ import {
   createSharedBudget,
   resetSharedBudgets,
 } from '../src/features/proactive-policy.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
 const MIN = 60_000
 const OWNER = '10000001'
@@ -29,7 +30,6 @@ function freshDir() {
 
 const baseCfg = () => ({
   enabled: true,
-  ownerQQ: OWNER,
   speakUp: {
     enabled: true,
     awakeFrom: 0,
@@ -44,6 +44,7 @@ const baseCfg = () => ({
 
 function purposePolicy({ cfg = baseCfg(), dir = freshDir(), clock, state, engine, budget } = {}) {
   let t = clock ?? NOON
+  const id = makeTestIdentity(OWNER, 'qq', { personId: OWNER })
   const policy = createPurposePolicy({
     getConfig: () => cfg,
     engine,
@@ -51,6 +52,9 @@ function purposePolicy({ cfg = baseCfg(), dir = freshDir(), clock, state, engine
     now: () => t,
     dataDir: dir,
     log: { warn() {}, info() {} },
+    identity: id,
+    owner: OWNER,
+    defaultPlatform: 'qq',
     budget,
   })
   return { policy, cfg, dir, at: () => t, advance: (ms) => { t += ms } }
@@ -58,6 +62,7 @@ function purposePolicy({ cfg = baseCfg(), dir = freshDir(), clock, state, engine
 
 function speakupPolicy({ cfg = baseCfg(), dir = freshDir(), clock, speakup, lastPrivateAt, isMuted, budget } = {}) {
   let t = clock ?? NOON
+  const id = makeTestIdentity(OWNER, 'qq', { personId: OWNER })
   const policy = createSpeakupPolicy({
     getConfig: () => cfg,
     speakup,
@@ -66,6 +71,9 @@ function speakupPolicy({ cfg = baseCfg(), dir = freshDir(), clock, speakup, last
     log: { warn() {}, info() {} },
     lastPrivateAt,
     isMuted,
+    identity: id,
+    owner: OWNER,
+    defaultPlatform: 'qq',
     budget,
   })
   return { policy, cfg, dir, at: () => t, advance: (ms) => { t += ms } }
@@ -295,8 +303,8 @@ test('共享预算: 两个策略源抢最后一个额度，只有一个 ok', () 
 })
 
 test('共享预算: 没给 dataDir 时退化为内存，不碰磁盘、且同 owner 仍唯一', () => {
-  const b1 = createSharedBudget({ ownerQQ: OWNER })
-  const b2 = createSharedBudget({ ownerQQ: OWNER })
+  const b1 = createSharedBudget({ owner: OWNER })
+  const b2 = createSharedBudget({ owner: OWNER })
   assert.equal(b1, b2)
   assert.equal(b1.snapshot().file, '')
   assert.equal(b1.tryAcquire({ reserveId: 'x', source: 'purpose', at: NOON }).ok, true)

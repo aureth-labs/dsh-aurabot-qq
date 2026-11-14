@@ -9,6 +9,7 @@ import { createHub } from '../src/chat/hub.js'
 import memoryModule from '../src/modules/memory/index.js'
 import { readMemoryState, writeMemoryState } from './helpers/memory-state.js'
 import { createFakeDsh } from './helpers/fake-dsh.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
 const OWNER = '10000001', A = '30000001', B = '30000002', BOT = '20000001'
 const log = { info() {}, warn() {}, debug() {}, error() {} }
@@ -54,13 +55,14 @@ function fixture(t, initial = { items: [] }) {
     yield { type: 'text-delta', text: out }
     yield { type: 'finish', reason: { kind: 'completed' } }
   } } }
-  const memory = createMemoryStore({ dsh, getConfig: () => cfg, hub, log })
+  const identity = makeTestIdentity(OWNER, 'qq', { legacyIds: [OWNER, A, B, '30000003', '30000004', '30000005'] })
+  const memory = createMemoryStore({ dsh, getConfig: () => cfg, hub, log, identity })
   t.after(() => {
     if (previous === undefined) delete process.env.AURABOT_DATA_DIR
     else process.env.AURABOT_DATA_DIR = previous
     rmSync(dir, { recursive: true, force: true })
   })
-  return { dir, cfg, hub, rows, calls, friends, model, memory, state: () => readMemoryState(dir), put: (s) => writeMemoryState(dir, s) }
+  return { dir, cfg, hub, identity, rows, calls, friends, model, memory, state: () => readMemoryState(dir), put: (s) => writeMemoryState(dir, s) }
 }
 
 function oldState() {
@@ -202,7 +204,7 @@ test('开启时可同时删除已有记忆，重建 store 后 noMemory 标记仍
   f.memory.setNoMemory(A, true, { deleteExisting: true })
   assert.deepEqual(f.state().profiles[A], { noMemory: true })
   assert.ok(f.state().items.every((m) => m.about !== A))
-  const reloaded = createMemoryStore({ getConfig: () => f.cfg, hub: f.hub, log })
+  const reloaded = createMemoryStore({ getConfig: () => f.cfg, hub: f.hub, log, identity: f.identity })
   assert.equal(reloaded.remembers(A), false)
   assert.equal(reloaded.setNoMemory(A, false).ok, true)
   assert.equal(reloaded.remembers(A), true)
@@ -273,9 +275,9 @@ test('真实 hub 在静默路径也记录 @ 和回复证据，QQ 好友使用同
   const f = fixture(t)
   const fake = createFakeDsh({ brain: async () => '好' })
   f.cfg.stickers.enabled = false
-  const hub = createHub({ dsh: fake.ctx, getConfig: () => f.cfg, log, isMuted: () => true, onebot: { connected: true, call: async (action) => action === 'get_friend_list' ? [{ user_id: Number(B) }] : action === 'get_msg' ? { sender: { user_id: Number(BOT) }, message: [] } : {} } })
+  const hub = createHub({ dsh: fake.ctx, getConfig: () => f.cfg, log, identity: f.identity, routeOwner: f.identity.routeOwner, defaultPlatform: 'qq', isMuted: () => true, onebot: { connected: true, call: async (action) => action === 'get_friend_list' ? [{ user_id: Number(B) }] : action === 'get_msg' ? { sender: { user_id: Number(BOT) }, message: [] } : {} } })
   t.after(() => { hub.dispose(); fake.dispose() })
-  const memory = createMemoryStore({ getConfig: () => f.cfg, hub, log })
+  const memory = createMemoryStore({ getConfig: () => f.cfg, hub, log, identity: f.identity })
   memory.setNoMemory(A, true)
   const event = (uid, segments) => ({ post_type: 'message', message_type: 'group', group_id: 777, self_id: Number(BOT), user_id: Number(uid), message_id: 123, sender: { user_id: Number(uid), nickname: uid }, message: [...segments, { type: 'text', data: { text: '你好，画画吗' } }] })
   await hub.onMessage(event(A, [{ type: 'at', data: { qq: BOT } }]))
@@ -300,7 +302,7 @@ test('面板路由复用人物删除与不再记住接口；前端保留筛选�
   const f = fixture(t, oldState())
   const routes = new Map()
   let toolFactory
-  memoryModule.setup({ core: { hub: f.hub, http: { body: async (req) => req, query: (req) => req } }, dsh: null, config: () => f.cfg, log, context() {}, on() {}, every() {}, tool(fn) { toolFactory = fn }, route: (path, fn) => routes.set(path, fn) })
+  memoryModule.setup({ core: { hub: f.hub, identity: f.identity, routeOwner: f.identity.routeOwner, http: { body: async (req) => req, query: (req) => req } }, dsh: null, config: () => f.cfg, log, context() {}, on() {}, every() {}, tool(fn) { toolFactory = fn }, route: (path, fn) => routes.set(path, fn) })
   const remember = toolFactory({ chat: { kind: 'group', userId: A, chatId: 'group:777' }, sessionId: '' }).find((tool) => tool.name === 'remember')
   assert.equal((await remember.execute({ text: '路过的阿甲喜欢茶' })).ok, false, '模型的记事工具也不能给路过群友建人物记忆')
   assert.equal((await routes.get('/persona/person/no-memory')({ qq: A, enabled: true })).ok, true)

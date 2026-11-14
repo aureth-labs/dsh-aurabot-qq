@@ -13,6 +13,9 @@ import { proposeTasks, buildTodos, buildScreenPrompt, parseScreenVerdicts, trivi
 import { createBook } from '../src/autotelic/book.js'
 import { createRuntime } from '../src/autotelic/runtime.js'
 import { buildActPrompt, parseActMemo } from '../src/autotelic/exec.js'
+import { makeTestIdentity } from './helpers/identity.js'
+
+const screenIdentity = makeTestIdentity('749830684')
 
 // —— 造素材：collectMaterials 的 items 带 needAffinity（keyword 命中才有分），测试里直接给 ——
 
@@ -233,7 +236,8 @@ function mkScreenRuntime(t, { screenReply, prefix = {} } = {}) {
       chatLogDays: () => ['2026-11-05'],
       chatLogOf: () => [{ chatId: 'group:1130575035', who: 'member', uid: '1215734464', text: '我刚安装dsh那天就有', t: msgAt }],
     },
-    cfg: { ownerQQ: '749830684' },
+    cfg: {},
+    identity: screenIdentity,
     memoryOf: () => ({ list: () => [] }),
     ledgerFile,
     auditNote: (e) => notes.push(e),
@@ -290,7 +294,8 @@ test('预审回合失败但本地能判（纯应答）→ 直接否掉，不必�
   const rt = createRuntime({
     settings: () => ({ ...BASE_SETTINGS, allowAct: false, minCuriosity: 0.1 }),
     hub: { chatLogDays: () => ['2026-11-05'], chatLogOf: () => [{ chatId: 'private:749830684', who: 'owner', uid: '749830684', text: '早安呀，今天天气真好呢', t: Date.now() - 60_000 }] },
-    cfg: { ownerQQ: '749830684' },
+    cfg: {},
+    identity: screenIdentity,
     memoryOf: () => ({ list: () => [] }),
     ledgerFile: join(root, 'ledger.json'),
     screenTurn: async () => { throw new Error('模型炸了') },
@@ -308,7 +313,8 @@ test('没配 evalModel（真机现状）也照样走预审：闸不能因为「�
   const rt = createRuntime({
     settings: () => ({ ...BASE_SETTINGS, allowAct: false, minCuriosity: 0.1 }), // evalModel 留空＝真机口径
     hub: { chatLogDays: () => ['2026-11-05'], chatLogOf: () => [{ chatId: 'group:1130575035', who: 'member', uid: '1215734464', text: '我刚安装dsh那天就有', t: Date.now() - 60_000 }] },
-    cfg: { ownerQQ: '749830684' },
+    cfg: {},
+    identity: screenIdentity,
     memoryOf: () => ({ list: () => [] }),
     ledgerFile: join(root, 'ledger.json'),
     screenTurn: async (prompt, opts) => { seen.push(opts); return '[{"i":1,"worth":false,"why":"群友随口一句"}]' },

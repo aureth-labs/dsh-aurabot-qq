@@ -48,15 +48,40 @@ function readTier(cfg) {
   return TIERS.includes(tier) ? tier : DEFAULT_TIER
 }
 
-/** 读主人 QQ，统一成字符串去空格（保存值与快照比较都用它）。 */
-function readOwnerQQ(cfg) {
+/** 读当前主人 PersonId，统一成字符串去空格（用于账本归属对比）。 */
+function readOwner(cfg, identity, ownerOpt) {
+  const fromId = typeof identity?.owner === 'function' ? identity.owner() : ''
+  const fromOpt = typeof ownerOpt === 'function' ? ownerOpt() : ownerOpt
   const c = cfg || {}
-  const raw = (c.outboundPolicy && c.outboundPolicy.ownerQQ) ?? c.ownerQQ
-  if (raw === null || raw === undefined) return ''
+  const fromCfg = c.outboundPolicy && c.outboundPolicy.owner
+  const raw = fromId || fromOpt || fromCfg || ''
   return String(raw).trim()
 }
 
-/** 把 to 规范化：'private:123456' / 'private: 123456 ' 都收敛成 'private:123456'。 */
+/** 解析私聊目标字符串：支持 private:<acc> 与 <plat>[:inst]:private:<acc>。 */
+function parsePrivateTarget(to) {
+  const s = String(to ?? '').trim()
+  if (!s) return null
+  const bare = /^private\s*:\s*(.+)$/i.exec(s)
+  if (bare) {
+    const id = bare[1].trim()
+    return id ? { platform: 'qq', id } : null
+  }
+  const segs = s.split(':')
+  if (segs.length === 3 && segs[1].trim().toLowerCase() === 'private') {
+    const plat = segs[0].trim()
+    const id = segs[2].trim()
+    return plat && id ? { platform: plat, id } : null
+  }
+  if (segs.length >= 4 && segs[2].trim().toLowerCase() === 'private') {
+    const plat = segs[0].trim()
+    const id = segs.slice(3).join(':').trim()
+    return plat && id ? { platform: plat, id } : null
+  }
+  return null
+}
+
+/** 把 to 规范化：'private: 123456 ' 收敛成 'private:123456'。 */
 function normalizeTarget(to) {
   if (to === null || to === undefined) return ''
   const s = String(to).trim()
@@ -95,13 +120,22 @@ function normalizeCause(cause) {
 }
 
 /**
- * 判定一次发送是否「在治理范围内」。
- * 治理范围：to === 'private:' + ownerQQ（规范化后比较）；delegation 与 reply 另有专门规则。
- * 返回 { managed, reason }：managed=false 表示不治理（直接放行且面板不算纳管）。
+ * 判定一次发送是否「在治理范围内」：必须能识别为主人的平台私聊。
+ * 返回 boolean：false 表示不治理（直接放行且面板不算纳管）。
  */
-function isGovernedTarget(to, ownerQQ) {
-  if (!ownerQQ) return false
-  return normalizeTarget(to) === `private:${ownerQQ}`
+function isGovernedTarget(to, identity) {
+  if (!identity) return false
+  const parsed = parsePrivateTarget(to)
+  if (!parsed) return false
+  if (typeof identity.lookup === 'function') {
+    const person = identity.lookup(parsed.platform, parsed.id)
+    if (person) return Boolean(identity.isOwner?.(person))
+  }
+  const owner = typeof identity.owner === 'function' ? identity.owner() : null
+  if (owner && typeof identity.accountOn === 'function') {
+    return identity.accountOn(owner, parsed.platform) === parsed.id
+  }
+  return false
 }
 
 // ── 主工厂 ─────────────────────────────────────────────────────────────────
@@ -110,7 +144,9 @@ function isGovernedTarget(to, ownerQQ) {
  * 创建宿主统一发送服务。
  *
  * @param {object} [opts]
- * @param {() => object} [opts.getConfig] 取全局配置（档位 / ownerQQ / outboundPolicy）
+ * @param {() => object} [opts.getConfig] 取全局配置（档位 / outboundPolicy）
+ * @param {object} [opts.identity]       身份服务
+ * @param {string|(() => string)} [opts.owner] 主人 PersonId（无 identity 时兜底标识）
  * @param {string|null} [opts.dataDir]    账本落盘目录；为空则退化为纯内存（测试用）
  * @param {(msg: string) => void} [opts.log] 日志函数
  * @param {() => number} [opts.now]       取当前时间的函数（测试可注入）
@@ -121,6 +157,8 @@ function isGovernedTarget(to, ownerQQ) {
  */
 export function createOutboundPolicy(opts = {}) {
   const getConfig = opts.getConfig
+  const identity = opts.identity || null
+  const ownerOpt = opts.owner
   const dataDir = opts.dataDir || null
   const log = typeof opts.log === 'function' ? opts.log : () => {}
   const now = typeof opts.now === 'function' ? opts.now : Date.now
@@ -158,8 +196,8 @@ export function createOutboundPolicy(opts = {}) {
     submitted: 0,
     errors: 0,
   }
-  /** 上一次观察到的 ownerQQ（用于惰性比对，变了就作废旧 pending） */
-  let lastOwnerQQ = ''
+  /** 上一次观察到的 owner PersonId（用于惰性比对，变了就作废旧 pending） */
+  let lastOwner = ''
 
   // ── 落盘 ────────────────────────────────────────────────────────────────
 
@@ -263,7 +301,7 @@ export function createOutboundPolicy(opts = {}) {
   }
 
   /**
-   * 作废：模块卸载 / ownerQQ 变更 → 相关 pending 置 dropped。
+   * 作废：模块卸载 / owner 变更 → 相关 pending 置 dropped。
    * predicate 为真且仍 pending 的条目才动。
    */
   function dropPending(predicate, reason) {
@@ -410,9 +448,10 @@ export function createOutboundPolicy(opts = {}) {
       stats.admitted++
       const at = Number.isFinite(ask.at) ? Number(ask.at) : now()
       const cfg = resolveConfig(getConfig)
-      const ownerQQ = ensureOwnerFresh(readOwnerQQ(cfg))
+      const owner = ensureOwnerFresh(readOwner(cfg, identity, ownerOpt))
       const tier = readTier(cfg)
       const to = normalizeTarget(ask.to)
+      const channel = String(ask.channel ?? (parsePrivateTarget(to)?.platform || ''))
       const moduleId = String(ask.moduleId ?? '')
       const itemId = String(ask.itemId ?? '')
       const { kind: causeKind, raw: causeRaw } = normalizeCause(ask.cause)
@@ -431,7 +470,7 @@ export function createOutboundPolicy(opts = {}) {
       }
 
       // 2) 治理范围外（非 owner 私聊）→ allow 不治理
-      if (!isGovernedTarget(to, ownerQQ)) {
+      if (!isGovernedTarget(to, identity)) {
         stats.allowed++
         stats.passThrough++
         return { action: 'allow', reason: 'out-of-scope', cause, managed: false }
@@ -485,19 +524,19 @@ export function createOutboundPolicy(opts = {}) {
       // 7) broker 档 + 调用方允许 defer → 进账本排队
       if (tier === 'broker' && ask.allowDefer) {
         const deliveryId = makeId('dlv', at)
-        const key = idempotentKey(moduleId, itemId, to, 'qq')
+        const key = idempotentKey(moduleId, itemId, to, channel)
         supersede(key)
         putItem({
           deliveryId,
           moduleId,
           itemId,
           to,
-          channel: 'qq',
+          channel,
           state: 'pending',
           at,
           updatedAt: at,
           ttl: LEDGER_TTL_MS,
-          ownerQQ,
+          owner,
           cause,
           key,
           reserveId,
@@ -515,7 +554,7 @@ export function createOutboundPolicy(opts = {}) {
       // 首版 gate 放行不入账（账本只服务 broker 排队与 api.proactive），避免与策略源重复记账。
       // tier 一并带回：模块包装层据此判断这条要不要走「代发决断」（broker 档的模块消息也要引擎过目）。
       const deliveryId = makeId('dlv', at)
-      const key = idempotentKey(moduleId, itemId, to, 'qq')
+      const key = idempotentKey(moduleId, itemId, to, channel)
       reservations.set(reserveId, { policyName: picked.name, key, deliveryId, deferred: false })
       stats.allowed++
       return { action: 'allow', reserveId, deliveryId, cause, managed: true, policy: picked.name, tier }
@@ -666,16 +705,16 @@ export function createOutboundPolicy(opts = {}) {
       const tier = readTier(cfg)
       if (tier !== 'broker') return { deliveryId: null, state: 'unsupported' }
 
-      const ownerQQ = ensureOwnerFresh(readOwnerQQ(cfg))
+      const owner = ensureOwnerFresh(readOwner(cfg, identity, ownerOpt))
       const moduleId = String(input.moduleId ?? '')
       const itemId = String(input.itemId ?? '')
       const to = normalizeTarget(input.to)
-      const channel = String(input.channel ?? 'qq')
+      const channel = String(input.channel ?? (parsePrivateTarget(to)?.platform || ''))
       const text = input.text === null || input.text === undefined ? '' : String(input.text)
       const link = input.link === null || input.link === undefined ? null : String(input.link)
 
       // 治理范围外（非 owner 私聊）：仍然记账但不参与治理
-      const managed = isGovernedTarget(to, ownerQQ)
+      const managed = isGovernedTarget(to, identity)
 
       // 单条文本 8KB 上限：超限直接拒绝落账（不抛错）
       if (textBytes(text) > MAX_TEXT_BYTES) return { deliveryId: null, state: 'too-large' }
@@ -713,7 +752,7 @@ export function createOutboundPolicy(opts = {}) {
         at,
         updatedAt: at,
         ttl: LEDGER_TTL_MS,
-        ownerQQ,
+        owner,
         cause: 'background',
         key,
         managed,
@@ -885,7 +924,7 @@ export function createOutboundPolicy(opts = {}) {
       const cfg = resolveConfig(getConfig)
       const tier = readTier(cfg)
       // 惰性比对主人身份：变了先把旧 pending 作废，面板与判定口径一致
-      ensureOwnerFresh(readOwnerQQ(cfg))
+      ensureOwnerFresh(readOwner(cfg, identity, ownerOpt))
       const picked = pickSource()
       const sourcesOut = {}
       for (const [name, p] of sources.entries()) {
@@ -943,27 +982,27 @@ export function createOutboundPolicy(opts = {}) {
   // ── 供 hub/modules 复用的辅助面（契约 L102/L108 的接线基石） ────────────
 
   /**
-   * ownerQQ 变更时调用：把旧主人的 pending 全部置 dropped。
+   * owner 变更时调用：把旧主人的 pending 全部置 dropped。
    * 返回被作废的条数。
    * （内部每次 admit/submit/status 前都会自动比对一次，见 ensureOwnerFresh）
    */
-  function syncOwnerQQ(ownerQQIn) {
+  function syncOwner(ownerIn) {
     try {
-      const ownerQQ = ownerQQIn === undefined ? readOwnerQQ(resolveConfig(getConfig)) : String(ownerQQIn ?? '')
+      const owner = ownerIn === undefined ? readOwner(resolveConfig(getConfig), identity, ownerOpt) : String(ownerIn ?? '')
       let changed = 0
       for (const it of items.values()) {
         if (it.state !== 'pending') continue
-        if (String(it.ownerQQ ?? '') === ownerQQ) continue
+        if (String(it.owner ?? '') === owner) continue
         setState(it, 'dropped', { dropReason: 'owner-changed' })
-        it.ownerQQ = ownerQQ
+        it.owner = owner
         changed++
       }
-      lastOwnerQQ = ownerQQ
+      lastOwner = owner
       if (changed) saveLedger()
       return changed
     } catch (err) {
       stats.errors++
-      log(`[outbound-policy] syncOwnerQQ 异常已收敛：${err && err.message ? err.message : err}`)
+      log(`[outbound-policy] syncOwner 异常已收敛：${err && err.message ? err.message : err}`)
       return 0
     }
   }
@@ -971,12 +1010,12 @@ export function createOutboundPolicy(opts = {}) {
   /**
    * 每次对外调用前比对一次主人身份：变了就把旧 pending 作废（契约 L96）。
    * 首版没有配置变更事件总线，用「读配置时惰性比对」实现，语义等价且零额外依赖。
-   * @param {string} [ownerQQ] 已读到的主人 QQ（省一次 getConfig）
+   * @param {string} [ownerIn] 已读到的主人 PersonId（省一次读取）
    */
-  function ensureOwnerFresh(ownerQQ) {
-    const qq = ownerQQ === undefined ? readOwnerQQ(resolveConfig(getConfig)) : ownerQQ
-    if (qq !== lastOwnerQQ) syncOwnerQQ(qq)
-    return qq
+  function ensureOwnerFresh(ownerIn) {
+    const cur = ownerIn === undefined ? readOwner(resolveConfig(getConfig), identity, ownerOpt) : ownerIn
+    if (cur !== lastOwner) syncOwner(cur)
+    return cur
   }
 
   /**
@@ -995,18 +1034,17 @@ export function createOutboundPolicy(opts = {}) {
     }
   }
 
-  // 初始化时同步一次主人状态（历史账本可能属于旧 ownerQQ）
-  syncOwnerQQ()
+  // 初始化时同步一次主人状态（历史账本可能属于旧主人）
+  syncOwner()
 
   /**
-   * 目标是否在治理范围内（= owner 私聊）。给模块包装层判断「要不要改走宿主代发」用：
-   * 模块层拿不到配置也没关系，服务的 getConfig 里就有 ownerQQ。
+   * 目标是否在治理范围内（= owner 私聊）。给模块包装层判断「要不要改走宿主代发」用。
    */
   function isGoverned(to) {
     try {
       const cfg = resolveConfig(getConfig)
-      const ownerQQ = ensureOwnerFresh(readOwnerQQ(cfg))
-      return isGovernedTarget(normalizeTarget(to), ownerQQ)
+      ensureOwnerFresh(readOwner(cfg, identity, ownerOpt))
+      return isGovernedTarget(normalizeTarget(to), identity)
     } catch {
       return false
     }
@@ -1031,7 +1069,7 @@ export function createOutboundPolicy(opts = {}) {
     setDeliverer,
     flushPending,
     // 辅助
-    syncOwnerQQ,
+    syncOwner,
     dropModule,
   }
 }

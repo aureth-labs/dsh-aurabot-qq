@@ -7,6 +7,7 @@ import { join } from 'node:path'
 
 let createMemoryStore
 let normalize
+let identity
 const asked = []
 
 // 假模型：按系统提示词判断是哪种请求
@@ -53,8 +54,10 @@ before(async () => {
   process.env.AURABOT_DATA_DIR = mkdtempSync(join(tmpdir(), 'aurabot-mem-'))
   ;({ createMemoryStore } = await import('../src/features/memory.js'))
   ;({ normalize } = await import('../src/core/config.js'))
+  const { makeTestIdentity } = await import('./helpers/identity.js')
+  identity = makeTestIdentity('10000001', 'qq', { legacyIds: ['10000001', '30000003'] })
   cfg = normalize({ model: { provider: 'p', model: 'm' }, ownerQQ: '10000001', ownerName: '主人', allow: { private: ['30000003'] }, memory: { keepChatlogDays: 0, keepChatlogSet: true } })
-  mem = createMemoryStore({ dsh, getConfig: () => cfg, hub, log: { info() {}, warn() {}, debug() {} } })
+  mem = createMemoryStore({ dsh, getConfig: () => cfg, hub, identity, log: { info() {}, warn() {}, debug() {} } })
 })
 
 test('默认一天整理两次；老配置的单个时间自动变成两个', () => {
@@ -329,7 +332,7 @@ test('新的话：流水留着时，会话重置后也能从没提炼的原话�
   const today = logs.get(day(new Date())) || []
   const done = Array.from({ length: 300 }, () => row('group:8', '已经提炼过的'))
   logs.set(day(new Date()), [...done, row('private:10000001', '我下周二要去成都出差'), row('group:7', '成都火锅店关门了'), ...pad])
-  const fresh = createMemoryStore({ dsh, getConfig: () => cfg, hub, log: { info() {}, warn() {}, debug() {} } })
+  const fresh = createMemoryStore({ dsh, getConfig: () => cfg, hub, identity, log: { info() {}, warn() {}, debug() {} } })
   const hint = fresh.recallHint({ kind: 'private', userId: '10000001', chatId: 'private:10000001' }, '成都出差带什么')
   logs.set(day(new Date()), today)
   assert.match(hint, /下周二要去成都出差/)

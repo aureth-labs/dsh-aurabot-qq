@@ -4,6 +4,16 @@ import { defineTool, str, int } from '../../tools/tools.js'
 import { readQqFile } from '../../features/qq-file.js'
 import { parseMessageEvent } from '../../chat/inbound.js'
 
+const ownerQqAccounts = (identity) => {
+  const owner = identity?.owner?.()
+  if (!owner) return []
+  if (typeof identity.accountsOf === 'function') {
+    return identity.accountsOf(owner).filter((a) => a.platform === 'qq').map((a) => a.account)
+  }
+  const acc = identity.accountOn?.(owner, 'qq')
+  return acc ? [acc] : []
+}
+
 /** 真实网关对不在群里的人也回成功、角色写 member，只有 join_time 是空的：没有它就不算成员。 */
 async function isGroupMember(onebot, groupId, userId) {
   try {
@@ -243,7 +253,7 @@ export default {
           const t = String(target || '').trim()
           if (t) {
             const [kind, id] = t.split(':')
-            const okList = kind === 'group' ? cfg.allow.groups : kind === 'private' ? [cfg.ownerQQ, ...cfg.allow.private] : []
+            const okList = kind === 'group' ? cfg.allow.groups : kind === 'private' ? [...ownerQqAccounts(api.core.identity), ...cfg.allow.private] : []
             if (!okList.includes(String(id))) return { ok: false, message: '不在白名单里，不能发' }
             chatId = `${kind}:${id}`
           }
@@ -280,7 +290,7 @@ export default {
           if (chat.kind === 'group' && !hub.turnSendersAllOwner(sessionId)) return { ok: false, message: '只有主人开口时才能往别的聊天发，这一轮不是。' }
           const cfg = api.config()
           const [kind, id] = String(target || '').split(':')
-          const okList = kind === 'group' ? cfg.allow.groups : kind === 'private' ? [cfg.ownerQQ, ...cfg.allow.private] : []
+          const okList = kind === 'group' ? cfg.allow.groups : kind === 'private' ? [...ownerQqAccounts(api.core.identity), ...cfg.allow.private] : []
           if (!okList.map(String).includes(String(id))) return { ok: false, message: '不在白名单里，不能发' }
           if (`${kind}:${id}` === chat.chatId) return { ok: false, message: '这就是当前聊天，直接回话就行，别用这个工具' }
           const r = await hub.deliver(`${kind}:${id}`, String(text || ''))

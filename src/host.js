@@ -35,7 +35,7 @@ import { dataDir, ensureDir } from './core/store.js'
 import { initUsage, usageReport } from './core/usage.js'
 import { createUpdateChecker, changelogSection, hostEnv, updatePlan, repoOf } from './core/update.js'
 import { parseCommand, runCommand, createMutes, commandList } from './chat/commands.js'
-import { isOwner } from './chat/access.js'
+import { ownerPrivateChatIds } from './chat/access.js'
 import { changePermissions, changePrivateWhitelist, privatePermissionCatalog } from './chat/permission-policy.js'
 import { canUseDelegatedCommand, delegatedCommandKey, runPersonalModelCommand } from './chat/delegated-commands.js'
 import { listPersonas, readPersona, savePersona, deletePersona, currentPersonaText, rulesText, seedPersonas } from './persona/personas.js'
@@ -54,6 +54,14 @@ import { setSsrpMode, assertPublicUrl, fetchGuarded } from './core/net.js'
 import { BUILTINS } from './modules/index.js'
 import { createOutboundPolicy } from './chat/outbound-policy.js'
 import { createPurposePolicy, createSpeakupPolicy, createSharedBudget } from './features/proactive-policy.js'
+import { parseChatId } from './gateway/address.js'
+import { createIdentity } from './gateway/identity.js'
+import { createGateway } from './gateway/index.js'
+import { createQqAdapter } from './adapters/qq/index.js'
+import { createFeishuAdapter } from './adapters/feishu/index.js'
+import { createQqbotAdapter } from './adapters/qqbot/index.js'
+import { createBridgeAdapter } from './adapters/bridge/index.js'
+import { ensureUpgradedStorage } from './features/import-qq.js'
 
 export const name = 'aurabot'
 export const inject = ['agents', 'sessions', 'webServer', 'timer', 'workspaceRegistry', 'attachments', 'systemPrompt', 'llm']
@@ -149,6 +157,23 @@ export function apply(ctx) {
     }
   } catch (error) { log.error('恢复备份失败：', error.message) }
   let cfg = loadConfig()
+  // 启动迁移（I4/I3 就地升级点）：有旧记忆文件先成组备份并升级迁移身份表，再补认领旧配置 ownerQQ
+  try {
+    ensureUpgradedStorage({
+      root: dataDir(),
+      log: logger.child('upgrade'),
+      onClaimOwner: (idStore) => {
+        if (cfg.ownerQQ && !idStore.owner()) idStore.claimOwner('qq', cfg.ownerQQ)
+      },
+    })
+  } catch (error) { log.warn('迁移记忆与身份库失败：', error?.message || error) }
+
+  // 启动迁移（I3 唯一合法转换点）：身份库尚无主人而旧配置有 ownerQQ 时认领进身份主线
+  const identity = createIdentity({ dataDir: dataDir('gateway'), log: logger.child('identity') })
+  if (cfg.ownerQQ && !identity.owner()) {
+    try { identity.claimOwner('qq', cfg.ownerQQ) }
+    catch (error) { log.warn('迁移配置主人 QQ 到身份主线失败：', error?.message || error) }
+  }
   if (cfg.ownerQQ && !ownerAuthorizationRevision(cfg)) {
     try { cfg = saveConfig(cfg, cfg) }
     catch { log.warn('初始化主人授权记录失败，本次启动使用会话授权') }
@@ -193,7 +218,7 @@ export function apply(ctx) {
 
   // ---------- 人格与规则：通过提示词变量注入到 Aurabot 的两个 preset ----------
   const variable = (n, fn) => ctx.effect(() => ctx.systemPrompt.variable(n, (...args) => captureSystemPrompt(n, cleanText(fn(...args)))), `aurabot: 变量 ${n}`)
-  const rulesOpts = (kind) => (mods ? { off: mods.builtinOff(), extra: mods.rules(kind) } : {})
+  const rulesOpts = (kind) => ({ ...(mods ? { off: mods.builtinOff(), extra: mods.rules(kind) } : {}), identity })
   // 扩展模块能整段改写人格和规则（同步：提示词变量不能等）
   const rewrite = (event, text, ...args) => { const r = mods ? mods.filterSync(event, text, ...args) : text; return typeof r === 'string' ? r : r === null ? '' : text }
   variable('aurabot_persona', () => rewrite('persona', currentPersonaText(cfg.persona.current)))
@@ -316,17 +341,42 @@ export function apply(ctx) {
   //  ② 现有直连 OneBot 的路径必须保持行为不变——网关存在本身就会让 sendSegments 改走
   //     gateway.send，而 e2e 的既有断言是照直连路径写的。
   let platformGateway = null
-  let identity = null
-  const hasAnyPlatform = () => Object.values((getConfig()?.platforms) || {}).some((p) => p && p.enabled !== false)
+  const defaultPlatform = parseChatId('private:0')?.platform || ''
+  function routeOwner() {
+    const owner = identity.owner()
+    if (!owner) return ''
+    if (platformGateway) {
+      const r = platformGateway.routeTo(owner)
+      if (r?.chatId) return String(r.chatId)
+    }
+    const defAcc = defaultPlatform ? identity.accountOn(owner, defaultPlatform) : ''
+    const hasDefInGateway = Boolean(platformGateway && defaultPlatform && platformGateway.caps?.(`${defaultPlatform}:private:0`))
+    if (defAcc && !hasDefInGateway && onebotState === 'connected') return `private:${defAcc}`
+    return ''
+  }
+  function primaryOwnerChatId() {
+    const routed = routeOwner()
+    if (routed) return routed
+    const owner = identity.owner()
+    if (!owner) return ''
+    const defAcc = defaultPlatform ? identity.accountOn(owner, defaultPlatform) : ''
+    if (defAcc) return `private:${defAcc}`
+    const first = (identity.accountsOf(owner) || []).find((a) => a?.platform && a?.account)
+    return first ? `${first.platform}:private:${first.account}` : ''
+  }
+  const legacyQqActive = () => Boolean(getConfig()?.enabled)
+  const hasAnyPlatform = () => Object.entries((getConfig()?.platforms) || {}).some(
+    ([k, p]) => p && p.enabled !== false && !(k === defaultPlatform && legacyQqActive()),
+  )
   /** 需要网关时才建（面板访问、配置里有平台、或中枢要路由时） */
   function ensureGateway() {
     if (platformGateway) return platformGateway
     try {
-      // I1 的 dataDir 要**目录字符串**（它自己拼 identity.sqlite），G1 的 dataDir 是函数，别混用
-      identity = createIdentity({ dataDir: dataDir('gateway'), log: logger.child('identity') })
+      // I1 的 dataDir 要**目录字符串**（它自己拼 identity.sqlite），G1 的 dataDir 是函数，别混用；宿主直连 QQ 时不抢接 defaultPlatform 实例
       platformGateway = createGateway({
         config: { get platforms() { return getConfig()?.platforms || {} } },
         dataDir: (...p) => dataDir('gateway', ...p),
+        isExternalInstance: (inst) => inst === defaultPlatform && legacyQqActive(),
         http: { route: (path, handler) => {
           const off = route(path, async (req, res) => {
             try { await handler(req, res) } catch (error) { logger.child('gateway').warn(`平台回调 ${path} 出错：`, error?.message || error) }
@@ -494,6 +544,8 @@ export function apply(ctx) {
     // ── G3：把网关交给中枢。出站改走 gateway.send；中枢原有直连路径在 gateway 为空时保留。
     // 惰性：只有配置里真开了平台才把它给 hub（见 ensureGateway），QQ 单平台时行为与改动前完全一致。
     gateway: platformGateway,
+    identity,
+    routeOwner,
     stickers,
     tts,
     buildTools: (where) => mods.buildTools(where),
@@ -527,7 +579,7 @@ export function apply(ctx) {
         return String((await cmd.ext.run(cmd.arg, msg)) ?? '')
       }
       if (cmd.name === 'permissions' && !markSensitive(cmd.name)) return ''
-      return runCommand(cmd, msg, { getConfig, setConfig, mutes, hub, mood: use('mood'), memory: use('memory'), qzone: use('diary'), song: use('song'), listModels, reasoningFor: (provider, model) => modelReasoning(ctx, provider, model, { refresh: true }), defaultModel: () => defaultModel(ctx, { model: {} }), extraCommands: mods.commands() })
+      return runCommand(cmd, msg, { getConfig, setConfig, mutes, hub, identity, mood: use('mood'), memory: use('memory'), qzone: use('diary'), song: use('song'), listModels, reasoningFor: (provider, model) => modelReasoning(ctx, provider, model, { refresh: true }), defaultModel: () => defaultModel(ctx, { model: {} }), extraCommands: mods.commands() })
     },
     isMuted: (chatId) => mutes.muted(chatId),
     moodEffects: () => use('mood')?.effects?.() ?? null,
@@ -553,6 +605,10 @@ export function apply(ctx) {
   // 网关建好之后再接线（惰性创建，见上面 ensureGateway 的说明）
   gatewayReady = (gw) => {
     const offMsg = gw.onMessage((m) => {
+      if (m && m.kind === 'private') {
+        if (dangerGuard?.handleReply(m.chatId, m.sender?.account, m.text)) return
+        if (approvalRelay?.handleReply(m.chatId, m.sender?.account, m.text)) return
+      }
       hub?.onGatewayMessage(m).catch((error) => logger.child('gateway').error('处理平台消息出错：', error?.message || error))
     })
     const offFlushed = gw.onFlushed((message, result) => {
@@ -788,6 +844,8 @@ export function apply(ctx) {
   // 后交给当前活跃策略源做原子预算预占。档位默认 pass（旧行为直发），未启用时完全惰性。
   outbound = createOutboundPolicy({
     getConfig,
+    identity,
+    owner: () => identity.owner() || '',
     // 账本落盘到模块数据目录（源码目录禁写任何数据，见 AGENTS.md §4）
     dataDir: join(dataDir('modules-data'), 'outbound-policy'),
     log: (msg) => logger.child('出站策略').info(msg),
@@ -834,7 +892,7 @@ export function apply(ctx) {
 
   // ---------- 模块 ----------
   const core = {
-    hub, onebot, snowluma, local, groupRoles, mutes, logger, bridge: null,
+    hub, onebot, snowluma, local, groupRoles, mutes, logger, bridge: null, identity, routeOwner,
     get gateway() { return platformGateway },
     root: ROOT,
     // 模块经 api.proactive 访问出站治理面（modules.js 里读它）
@@ -848,7 +906,7 @@ export function apply(ctx) {
     getConfig, setConfig,
   }
   mods = createModules({ ctx, core, getConfig, setConfig, logger, version: VERSION, builtins: BUILTINS })
-  bridge = createBridge({ ctx, getConfig, setConfig, hub, mods, log: logger.child('bridge'), version: VERSION, apiVersion: API_VERSION, overview: () => overview() })
+  bridge = createBridge({ ctx, getConfig, setConfig, hub, mods, identity, routeOwner, log: logger.child('bridge'), version: VERSION, apiVersion: API_VERSION, overview: () => overview() })
   core.bridge = bridge
   core.modules = mods
 
@@ -892,7 +950,9 @@ export function apply(ctx) {
     const cfg = getConfig()
     const dir = join(dataDir('modules-data'), 'outbound-policy')
     const say = (msg) => logger.child('出站策略').info(msg)
-    const budget = createSharedBudget({ ownerQQ: cfg.ownerQQ, dataDir: dir, log: say })
+    const ownerPerson = identity.owner() || ''
+    const ownerChats = () => ownerPrivateChatIds(identity)
+    const budget = createSharedBudget({ owner: ownerPerson, dataDir: dir, log: say })
     try {
       // 目的引擎（默认关）：模块在跑且配置开着才注册。引擎未启用 / 未 ready 时不注册，
       // 服务自己会处理 managed=false 与 deny 语义（设计稿故障语义：不得静默 pass）。
@@ -900,7 +960,7 @@ export function apply(ctx) {
       if (cfg.ext?.purpose?.enabled === true && pu) {
         const policy = createPurposePolicy({
           getConfig, engine: pu, state: () => pu.state?.() || null,
-          dataDir: dir, log: say, budget,
+          dataDir: dir, log: say, identity, owner: ownerPerson, ownerChat: ownerChats, defaultPlatform, budget,
         })
         outbound.registerPolicySource(policy)
         enginePolicies.set('purpose', policy) // 给 deliver(…, { enginePolicy: 'purpose' }) 用
@@ -920,9 +980,9 @@ export function apply(ctx) {
           // 与 companion.js 同口径：私聊「最近一次来往」= max(主人最后说话, 她最后发给主人)。
           // 注意不能把 hub.lastPrivateAt 直接传进来：那个函数按 QQ 号查，策略源调用时不带参数。
           lastPrivateAt: () => Math.max(hub.lastOwnerChatAt || 0, hub.lastBotToOwner?.at || 0),
-          // 策略源传进来的是完整 chatId（'private:QQ'），直接问 mutes 即可
+          // 策略源传进来的是完整 chatId（如 'qq:private:...' / 'private:...'），直接问 mutes 即可
           isMuted: (chatId) => { try { return Boolean(mutes?.muted?.(chatId)) } catch { return false } },
-          dataDir: dir, log: say, budget,
+          dataDir: dir, log: say, identity, owner: ownerPerson, ownerChat: ownerChats, defaultPlatform, budget,
         })
         outbound.registerPolicySource(policy)
         enginePolicies.set('speakup', policy)
@@ -930,8 +990,8 @@ export function apply(ctx) {
         outbound.unregisterPolicySource('speakup')
         enginePolicies.delete('speakup')
       }
-      // 主人换号：旧 pending 一律作废（设计稿「接收人固定」）
-      outbound.syncOwnerQQ?.(cfg.ownerQQ)
+      // 主人换人/换号：旧 pending 一律作废（设计稿「接收人固定」）
+      outbound.syncOwner?.(ownerPerson)
       // 面板存过的 activePolicy 要在重启后重新生效（否则配置写了却只有服务实例的默认值在跑）
       const active = (cfg.ext?.outboundPolicy && cfg.ext.outboundPolicy.activePolicy) || 'auto'
       outbound.setActivePolicy?.(active)
@@ -953,10 +1013,11 @@ export function apply(ctx) {
     // 判断不出来（hub.isOwnedSession 缺失 / 抛错）时 safeOwnedSession 返回 true，走原 deny 逻辑；
     // 只有明确 false（宿主自己的 GUI/CLI 会话）才放行给 DSH 自己的权限系统，别在异常时 fail-open。
     isOwnedSession: safeOwnedSession(typeof hub?.isOwnedSession === 'function' ? (sessionId) => hub.isOwnedSession(sessionId) : null),
-    ownerQQ: () => cfg.ownerQQ,
+    identity,
+    routeOwner,
   })
   core.dangerGuard = dangerGuard
-  approvalRelay = createApprovalRelay({ getConfig, deliver: (chatId, text) => hub.sendText(chatId, text), chatOfSession: (id) => hub.chatOfSession(id), log })
+  approvalRelay = createApprovalRelay({ getConfig, deliver: (chatId, text) => hub.sendText(chatId, text), chatOfSession: (id) => hub.chatOfSession(id), identity, routeOwner, log })
   ctx.effect(() => {
     let off = null
     try { off = ctx.on('approval/request', (request, next) => approvalRelay.onRequest(request, next)) } catch (error) { log.debug('挂审批应答失败：', error.message) }
@@ -1083,8 +1144,13 @@ export function apply(ctx) {
       const prompt = `（这是一条提示信息，通知你的主人：他电脑上有活卡住了，需要他去 DSH 界面处理。现在是 ${clock(Date.now())}。\n下面每一条都是一次单独的审批或选择请求，编号或时间不重复就是不同的事。\n${lines.join('\n')}\n用你自己的性格和语气随口跟他提一句，就当聊天里顺口提一嘴；别念条目、别像发通知。）`
       // 把真正推给会话的内容也记下来：排查「模型为什么说没带编号」时，先看它到底收到了什么
       log.info(`推送提示：${prompt.replace(/\n/g, ' | ').slice(0, 600)}`)
+      const ownerId = identity.owner()
+      const cid = primaryOwnerChatId()
+      if (!ownerId || !cid) return false
+      const addr = parseChatId(cid)
+      const userId = (addr?.platform && identity.accountOn(ownerId, addr.platform)) || addr?.id || String(ownerId)
       await hub.pushToSession(
-        { chatId: `private:${now.ownerQQ}`, kind: 'private', userId: now.ownerQQ, nickname: owner },
+        { chatId: cid, platform: addr?.platform, kind: 'private', userId, nickname: owner },
         [{ type: 'text', text: prompt }],
         ''
       )
@@ -1097,6 +1163,8 @@ export function apply(ctx) {
   }
   noticeRelay = createNoticeRelay({
     getConfig,
+    identity,
+    hasOwner: () => Boolean(identity.owner()),
     workspaceOf: workspaceOfSession,
     compose: noticeText,
     log,
@@ -1948,7 +2016,7 @@ export function apply(ctx) {
   route('/permissions/subject', async (req) => {
     if (req.method !== 'POST' || !/^application\/json(?:\s*;|$)/i.test(String(req.headers?.['content-type'] || ''))) return { ok: false, message: '权限修改需要 POST JSON 请求' }
     const body = await readBody(req)
-    const result = changePermissions(cfg, body || {}, mods.commands())
+    const result = changePermissions(cfg, body || {}, mods.commands(), identity)
     if (!result.ok) return result
     setConfig(result.config)
     return { ok: true }
@@ -1956,7 +2024,7 @@ export function apply(ctx) {
   route('/permissions/private-batch', async (req) => {
     if (req.method !== 'POST' || !/^application\/json(?:\s*;|$)/i.test(String(req.headers?.['content-type'] || ''))) return { ok: false, message: '私聊名单修改需要 POST JSON 请求' }
     const body = await readBody(req)
-    const result = changePrivateWhitelist(cfg, body || {})
+    const result = changePrivateWhitelist(cfg, body || {}, identity)
     if (!result.ok) return result
     if (result.config) setConfig(result.config)
     return {
@@ -2044,7 +2112,12 @@ export function apply(ctx) {
   })
   route('/setup/done', async (req) => {
     const body = await readBody(req)
-    if (!cfg.botQQ || !cfg.ownerQQ || cfg.botQQ === cfg.ownerQQ) return { ok: false, message: '先填好不同的机器人 QQ 和你的 QQ' }
+    const ownerId = identity.owner()
+    if (!ownerId) return { ok: false, message: '先认领主人身份' }
+    const qqOwner = defaultPlatform ? identity.accountOn(ownerId, defaultPlatform) : ''
+    if ((body.existingConnection || !hasAnyPlatform()) && (!cfg.botQQ || !qqOwner || cfg.botQQ === qqOwner)) {
+      return { ok: false, message: '先填好不同的机器人 QQ 和你的 QQ' }
+    }
     if (body.existingConnection && !(cfg.enabled && onebotState === 'connected' && loginOk)) return { ok: false, message: 'QQ 网关还没通过机器人号核对，请先连接并核对后再进入面板' }
     setConfig({ ...cfg, setupDone: true })
     log.info('首次使用向导完成')
@@ -2154,8 +2227,11 @@ export function apply(ctx) {
   route('/test-send', async () => {
     if (!cfg.enabled) return { ok: false, message: '先打开总开关' }
     if (cfg.dryRun) return { ok: false, message: '现在是试运行，先关掉试运行再测' }
-    const r = await hub.sendText(`private:${cfg.ownerQQ}`, '【Aurabot 自测】大肥鱼到此一游～')
-    return r ? { ok: true, message: '发给主人了，去 QQ 看看' } : { ok: false, message: '没发出去（看日志）' }
+    if (!identity.owner()) return { ok: false, message: '还没配置主人身份' }
+    const to = routeOwner() || primaryOwnerChatId()
+    if (!to) return { ok: false, message: '当前联系不上主人' }
+    const r = await hub.sendText(to, '【Aurabot 自测】大肥鱼到此一游～')
+    return r ? { ok: true, message: '发给主人了，查看一下消息吧' } : { ok: false, message: '没发出去（看日志）' }
   })
 
   route('/sessions/reset', async () => {
@@ -2470,10 +2546,19 @@ export function apply(ctx) {
   // （模块直接调 api.onebot(...) 的操作不在此列，是真的会执行的）
   const simChat = (b) => {
     const owner = b.as !== 'other'
-    const userId = owner ? cfg.ownerQQ : '10001'
+    const ownerCid = primaryOwnerChatId()
+    const addr = ownerCid ? parseChatId(ownerCid) : null
+    const userId = owner ? (addr?.id || String(identity.owner() || 'owner')) : '10001'
+    const plat = owner && addr?.platform ? addr.platform : defaultPlatform
     const group = b.kind === 'group'
     const groupId = String(b.groupId || cfg.allow.groups[0] || '10002')
-    return { owner, userId, chat: group ? { chatId: `group:${groupId}`, kind: 'group', groupId, userId } : { chatId: `private:${userId}`, kind: 'private', userId } }
+    return {
+      owner,
+      userId,
+      chat: group
+        ? { chatId: plat && plat !== defaultPlatform ? `${plat}:group:${groupId}` : `group:${groupId}`, ...(plat ? { platform: plat } : {}), kind: 'group', groupId, userId }
+        : { chatId: owner && ownerCid ? ownerCid : `private:${userId}`, ...(plat ? { platform: plat } : {}), kind: 'private', userId },
+    }
   }
   // 没有文字的（语音条、表情、图片）显示发送备注，比如「[语音·edge] 早呀」
   const sentLines = (sent) => sent.map((s) => ({ chatId: s.chatId, note: s.note, text: s.message.some((seg) => seg.type === 'text') ? s.message.map((seg) => (seg.type === 'text' ? seg.data.text : seg.type === 'reply' ? '' : `[${seg.type}]`)).join('') : s.note }))
@@ -2482,7 +2567,7 @@ export function apply(ctx) {
     const { owner, userId, chat } = simChat(b)
     const text = String(b.text || '')
     const steps = []
-    const msg = { ...chat, nickname: owner ? cfg.ownerName || '主人' : '路人', role: '', messageId: 'sim', text, mentioned: Boolean(b.mentioned), replyId: '', images: [], stickers: [], records: [], forwards: [], raw: { simulated: true } }
+    const msg = { ...chat, sender: { person: owner ? identity.owner() : null, isOwner: owner }, nickname: owner ? cfg.ownerName || '主人' : '路人', role: '', messageId: 'sim', text, mentioned: Boolean(b.mentioned), replyId: '', images: [], stickers: [], records: [], forwards: [], raw: { simulated: true } }
     const { sent } = await hub.capture(async () => {
       if (text) {
         const cmd = (owner || chat.kind === 'private') && /^\s*[/／]/.test(text) ? parseCommand(text, mods.commands()) : null

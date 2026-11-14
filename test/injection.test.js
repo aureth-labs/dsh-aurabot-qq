@@ -10,9 +10,11 @@ process.env.AURABOT_DATA_DIR = mkdtempSync(join(tmpdir(), 'aurabot-injection-'))
 const { normalize } = await import('../src/core/config.js')
 const { rulesText } = await import('../src/persona/personas.js')
 const { createMemoryStore } = await import('../src/features/memory.js')
+const { makeTestIdentity } = await import('./helpers/identity.js')
 
 const owner = '10000001'
 const stranger = '30000003'
+const identity = makeTestIdentity(owner, 'qq', { legacyIds: [owner, stranger] })
 
 function cfg () {
   return normalize({
@@ -40,6 +42,7 @@ test('记忆检索：非主人私聊只能想起和当前说话人有关的内�
     dsh: null,
     getConfig: cfg,
     hub: null,
+    identity,
     log: { info () {}, warn () {}, debug () {} },
   })
   store.add({ text: '主人的银行卡密码是 123456', about: owner, aboutName: '主人', importance: 0.9 })
@@ -60,6 +63,7 @@ test('F4：群聊不把无主 diary/事件带进上下文和回忆', () => {
     dsh: null,
     getConfig: cfg,
     hub: null,
+    identity,
     log: { info () {}, warn () {}, debug () {} },
   })
   const canary = 'OWNER_PRIVATE_DIARY_CANARY_H03'
