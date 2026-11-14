@@ -883,6 +883,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       { id: 'asr', label: '语音识别', flag: 'voice.asr' },
       { id: 'stickers', label: '表情包', flag: 'stickers.enabled' },
       { id: 'imagegen', label: '生图', flag: 'imageGen.enabled' },
+      { id: 'video', label: '视频', flagFn: (cfg) => { const v = cfg.video || {}; const p = v.provider || 'local'; return p === 'local' ? Boolean(cfg.local && cfg.local.video) : p === 'minimax' ? Boolean(v.minimax && v.minimax.apiKeySet) : Boolean(v.custom && v.custom.createUrl && v.custom.queryUrl) } },
       { id: 'diary', label: '空间日记', flag: 'diary.enabled' },
       { id: 'speakup', label: '主动搭话', flag: 'speakUp.enabled' },
       { id: 'autotelic', label: '自驱引擎', flag: 'ext.autotelic.enabled' },
@@ -904,7 +905,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       { id: 'logs', label: '日志' },
     ]
     // 内置标签页属于哪个模块：模块都没在跑就不显示这一页
-    const TAB_MODS = { voice: ['voice'], asr: ['voice'], stickers: ['stickers'], imagegen: ['imagegen'], diary: ['diary', 'qzone-social'], speakup: ['speakup', 'purpose'], pet: ['pet'], mood: ['mood', 'memory'], persona: ['memory'], song: ['song'], bili: ['bili'], douyin: ['douyin'], heybox: ['heybox'], autotelic: ['autotelic'] }
+    const TAB_MODS = { voice: ['voice'], asr: ['voice'], stickers: ['stickers'], imagegen: ['imagegen'], video: ['video'], diary: ['diary', 'qzone-social'], speakup: ['speakup', 'purpose'], pet: ['pet'], mood: ['mood', 'memory'], persona: ['memory'], song: ['song'], bili: ['bili'], douyin: ['douyin'], heybox: ['heybox'], autotelic: ['autotelic'] }
     const modOn = (st, id) => (st.modules || []).some((m) => m.id === id && m.running)
 
     // 两层导航：上面一排是分组，下面一排是这组里的页面；每组记住上次看的那页，Alt+K 查找功能
@@ -912,7 +913,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     const NAV_GROUPS = [
       { id: 'home', label: '概览', icon: 'M3 10.5 12 3l9 7.5M5.5 9v11.5h13V9M10 20.5v-6h4v6', tabs: ['overview'] },
       { id: 'self', label: '人设', icon: 'M12 12.5a4.25 4.25 0 1 0 0-8.5 4.25 4.25 0 0 0 0 8.5zM4.5 20.5c.9-3.6 3.9-5.5 7.5-5.5s6.6 1.9 7.5 5.5', tabs: ['character', 'group', 'speakup', 'autotelic', 'mood', 'memory', 'persona'] },
-      { id: 'express', label: '表达', icon: 'M20.5 11.5a8 8 0 0 1-11.7 7.1L4 20l1.4-4.4A8 8 0 1 1 20.5 11.5zM9 13.2s1.1 1.5 3 1.5 3-1.5 3-1.5M9.5 9.6h.01M14.5 9.6h.01', tabs: ['voice', 'asr', 'stickers', 'imagegen', 'song', 'pet'] },
+      { id: 'express', label: '表达', icon: 'M20.5 11.5a8 8 0 0 1-11.7 7.1L4 20l1.4-4.4A8 8 0 1 1 20.5 11.5zM9 13.2s1.1 1.5 3 1.5 3-1.5 3-1.5M9.5 9.6h.01M14.5 9.6h.01', tabs: ['voice', 'asr', 'stickers', 'imagegen', 'video', 'song', 'pet'] },
       { id: 'platform', label: '平台', icon: 'M3.5 6.5h17v11h-17zM10.5 9.8v4.4l3.8-2.2z', tabs: ['diary', 'bili', 'douyin', 'heybox'] },
       { id: 'system', label: '系统', icon: 'M4 7h9M17 7h3M4 12h3M11 12h9M4 17h11M19 17h1M15 5v4M9 10v4M17 15v4', tabs: ['connect', 'model', 'access', 'browser', 'security', 'backup', 'about', 'logs'] },
       { id: 'market', label: '模块', icon: 'M4 9.5 5.5 4h13L20 9.5M4 9.5a2.7 2.7 0 0 0 5.3 0 2.7 2.7 0 0 0 5.4 0 2.7 2.7 0 0 0 5.3 0M5.5 12.5V20h13v-7.5M10 20v-4.5h4V20', tabs: ['market', 'modules', 'local'] },
@@ -926,7 +927,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     const NAV_ALIAS = {
       overview: '首页 状态', connect: 'qq 网关 snowluma onebot 登录 工作区', character: '人设 性格 设定 头像', persona: '人物 画像 小档案 群印象 梗概 时间轴 相处经验 说话方式', access: '主人 白名单 权限 群管 改资料',
       group: '群聊 插话 合并', model: 'ai 大模型 视觉 思考强度', voice: '语音 tts 说话 音色 edge', asr: '语音识别 听语音 转文字 asr 语音转文本', stickers: '表情 小黄脸 gif 商城表情',
-      imagegen: '画图 图片', diary: '空间 说说 日记', speakup: '搭话 主动', autotelic: '自驱 自主 后台 账本 审计 做梦 立项', mood: '心情', memory: '记忆 星图 联想 翻一翻 向量 重排', song: '唱歌 翻唱 rvc 点歌',
+      imagegen: '画图 图片', video: '视频 生视频 拍视频', diary: '空间 说说 日记', speakup: '搭话 主动', autotelic: '自驱 自主 后台 账本 审计 做梦 立项', mood: '心情', memory: '记忆 星图 联想 翻一翻 向量 重排', song: '唱歌 翻唱 rvc 点歌',
       bili: 'b站 bilibili 视频', douyin: '抖音 短视频 私信', pet: '桌宠 宠物 悬浮窗 气泡 electron', local: '本地 接口 sd sovits', browser: '浏览器 侧边 侧边栏 ego 共享 独立窗口', security: '安全 防护 ssrf 内网 图片 下载', modules: '扩展 自己写 模板 安全模式', market: '模块 市场 插件 社区 下载 安装 桌宠 抖音 小黑盒 群管', logs: '日志 报错', about: '关于 关于我们 版本 许可 鸣谢 开源', backup: '备份 恢复 换电脑 迁移 导入 导出',
     }
     const navIcon = (d) => h('svg', { viewBox: '0 0 24 24', 'aria-hidden': true }, h('path', { d }))
@@ -7967,6 +7968,62 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     const SPONSOR_BASE = 'https://ntmd.cn/v1'
     const SPONSOR_SITE = 'https://ntmd.cn'
 
+    // 生视频：本地脚本 / MiniMax / 自定义异步任务；确认、扩写、抽帧是三种接口通用的
+    function Video({ st, draft, setDraft, toast, reload }) {
+      const f = useField(draft, setDraft)
+      const v = draft.video || {}
+      const provider = v.provider || 'local'
+      const localOn = !!(draft.local && draft.local.video)
+      return h('div', { className: 'ab-grid' },
+        h(Card, {
+          title: '生视频',
+          desc: '她可以按描述生成一段视频。选好接口、填好参数，然后在聊天里让她「生成一段视频：…」。生成本身很慢，做好会自动发到聊天。',
+        },
+          h('div', { style: { margin: '4px 0 12px' } }, f.choices('video.provider', [
+            { value: 'local', label: '本地脚本', desc: localOn ? '走本地接口 video.mjs（ComfyUI 等，已开启）' : '走本地接口 video.mjs（ComfyUI 等，还没开启）' },
+            { value: 'minimax', label: 'MiniMax H3', desc: '云端异步任务，按秒计费' },
+            { value: 'custom', label: '自定义接口', desc: '任何「创建任务 → 轮询 → 结果地址」的接口' },
+          ])),
+          provider === 'local' ? h(Row, { label: '本地接口', hint: '去「系统 → 本地接口」把「生视频」打开，并写好 video.mjs 脚本' },
+            h(Btn, { small: true, onClick: () => toast(localOn ? '「生视频」本地接口已开启' : '请先到「系统 → 本地接口」打开「生视频」', localOn ? 'ok' : 'err') }, localOn ? '已开启' : '还没开启')) : null,
+          provider === 'minimax' ? [
+            h(Row, { key: 'k', label: 'API Key', hint: 'MiniMax 开放平台「接口密钥」；只存在本机配置里' }, f.text('video.minimax.apiKey', { size: 'wide', type: 'password', placeholder: v.minimax && v.minimax.apiKeySet ? '已保存（不改就留空）' : 'sk-api-…' })),
+            h(Row, { key: 'm', label: '模型' }, f.select('video.minimax.model', [
+              { value: 'MiniMax-H3', label: 'H3（质量优先，支持 2K）' },
+              { value: 'MiniMax-H3-Highspeed', label: 'H3 Highspeed（快）' },
+              { value: 'MiniMax-H3-Lite', label: 'H3 Lite（便宜）' },
+              { value: 'MiniMax-H3-Max', label: 'H3 Max（极速，5 秒起）' },
+            ], { width: 260 })),
+            h(Row, { key: 'r', label: '分辨率' }, f.select('video.minimax.resolution', [
+              { value: '480P', label: '480P' }, { value: '768P', label: '768P' }, { value: '2K', label: '2K（仅 H3）' },
+            ], { width: 160 })),
+            h(Row, { key: 'd', label: '默认时长', hint: '4~15 秒；H3 Max 5 秒起' }, f.num('video.minimax.duration', { min: 4, max: 15 })),
+            h(Row, { key: 'a', label: '画面比例' }, f.select('video.minimax.ratio', [
+              { value: '16:9', label: '16:9' }, { value: '9:16', label: '9:16' }, { value: '4:3', label: '4:3' },
+              { value: '3:4', label: '3:4' }, { value: '1:1', label: '1:1' }, { value: '21:9', label: '21:9' },
+            ], { width: 140 })),
+            h(Row, { key: 'b', label: '服务地址', hint: '国内用 api.minimax.cn；海外账号改 api.minimax.io' }, f.text('video.minimax.baseUrl', { size: 'wide', placeholder: 'https://api.minimax.cn' })),
+          ] : null,
+          provider === 'custom' ? [
+            h(Row, { key: 'cu', label: '创建地址', hint: '创建任务的地址；可用 {prompt} {seconds} {image} {reqid}' }, f.text('video.custom.createUrl', { size: 'wide', placeholder: 'https://api.example.com/v1/videos' })),
+            h(Row, { key: 'cm', label: '创建方式' }, f.select('video.custom.createMethod', [{ value: 'POST', label: 'POST' }, { value: 'GET', label: 'GET' }], { width: 120 })),
+            h(Row, { key: 'ch', label: '请求头', hint: '一行一个「Key: Value」，例如 Authorization: Bearer xxx' }, f.area('video.custom.headers', { size: 'wide', rows: 2, placeholder: v.custom && v.custom.headersSet ? '已保存（不改就留空）' : 'Authorization: Bearer xxx' })),
+            h(Row, { key: 'cb', label: '请求体', hint: 'POST 时发这个 JSON；可用 {prompt} {seconds} {image} {reqid}' }, f.area('video.custom.body', { size: 'wide', rows: 5, placeholder: '{"prompt":"{prompt}","duration":{seconds}}' })),
+            h(Row, { key: 'ct', label: '任务 ID 路径', hint: '从创建结果里取任务 ID，例如 task_id 或 task.id' }, f.text('video.custom.taskIdPath', { placeholder: 'task_id' })),
+            h(Row, { key: 'cq', label: '轮询地址', hint: '可用 {taskId}' }, f.text('video.custom.queryUrl', { size: 'wide', placeholder: 'https://api.example.com/v1/videos/{taskId}' })),
+            h(Row, { key: 'cs', label: '状态路径' }, f.text('video.custom.statusPath', { placeholder: 'status' })),
+            h(Row, { key: 'cv', label: '成功 / 失败状态值', hint: '成功一个值，失败可逗号分隔多个' },
+              h('div', { className: 'ab-flex' }, f.text('video.custom.successValue', { placeholder: 'succeeded' }), f.text('video.custom.failValue', { placeholder: 'failed,cancelled' }))),
+            h(Row, { key: 'cr', label: '结果地址路径', hint: '视频 URL 在返回 JSON 里的路径' }, f.text('video.custom.urlPath', { size: 'wide', placeholder: 'content.url' })),
+            h(Row, { key: 'cp', label: '轮询间隔（毫秒）' }, f.num('video.custom.pollMs', { min: 1000, max: 60000, step: 1000 })),
+          ] : null,
+          h(Row, { label: '生成前先确认', hint: '先把描述发给对方，回复「确认」才真的生成；按秒计费的接口建议开' }, f.sw('video.confirm')),
+          h(Row, { label: '提示词扩写', hint: '先让模型把一句话场景扩成分镜提示词（镜头/主体/光线/风格）' }, f.sw('video.enhance')),
+          h(Row, { label: '生成后抽帧自检', hint: '抽 4 帧看懂画面，之后聊天里她记得自己做了什么视频' }, f.sw('video.selfView')),
+          h(Row, { label: '最长等多久（分钟）', hint: '三种接口共用这一项' }, f.num('local.videoTimeoutMin', { min: 1, max: 120 })),
+        ),
+      )
+    }
     function ImageGen({ st, draft, setDraft, toast, reload }) {
       const f = useField(draft, setDraft)
       const c = draft.imageGen
@@ -8736,10 +8793,10 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const curTab = tabs.find((t) => t.id === tab) || tabs[0]
       const body = curTab.ext ? ExtPage : {
         overview: Overview, connect: Connect, character: Persona, access: Access, group: Group, model: Model, voice: Voice, asr: Asr,
-        stickers: Stickers, imagegen: ImageGen, diary: Diary, speakup: SpeakUp, autotelic: Autotelic, pet: PetPanel, mood: Mood, memory: MemoryPage, persona: PersonaMemory, song: Song, bili: Bili, douyin: Douyin, heybox: Heybox, local: LocalApi, browser: Browser, security: Security, market: Market, modules: Modules, logs: Logs, about: About, backup: Backup,
+        stickers: Stickers, imagegen: ImageGen, video: Video, diary: Diary, speakup: SpeakUp, autotelic: Autotelic, pet: PetPanel, mood: Mood, memory: MemoryPage, persona: PersonaMemory, song: Song, bili: Bili, douyin: Douyin, heybox: Heybox, local: LocalApi, browser: Browser, security: Security, market: Market, modules: Modules, logs: Logs, about: About, backup: Backup,
       }[curTab.id] || Overview
       // 哪些标签有没保存的改动
-      const TAB_KEYS = { connect: ['snowluma', 'botQQ'], access: ['ownerQQ', 'ownerName', 'ownerLevel', 'approvalNotify', 'approvalViaQQ', 'qqApi', 'longTasks', 'profilePerms', 'subagentBackground'], group: ['group', 'merge', 'titleFilter', 'chat'], model: ['model', 'chatModels'], voice: ['voice'], asr: ['voice'], stickers: ['stickers'], imagegen: ['imageGen'], diary: ['diary', 'qzoneSocial'], speakup: ['speakUp'], autotelic: [], pet: [], mood: ['mood', 'memory'], song: ['song'], bili: ['bili'], douyin: ['douyin'], heybox: ['heybox'], local: ['local'], browser: ['browser'], security: ['security', 'update'] }
+      const TAB_KEYS = { connect: ['snowluma', 'botQQ'], access: ['ownerQQ', 'ownerName', 'ownerLevel', 'approvalNotify', 'approvalViaQQ', 'qqApi', 'longTasks', 'profilePerms', 'subagentBackground'], group: ['group', 'merge', 'titleFilter', 'chat'], model: ['model', 'chatModels'], voice: ['voice'], asr: ['voice'], stickers: ['stickers'], imagegen: ['imageGen'], video: ['video', 'local'], diary: ['diary', 'qzoneSocial'], speakup: ['speakUp'], autotelic: [], pet: [], mood: ['mood', 'memory'], song: ['song'], bili: ['bili'], douyin: ['douyin'], heybox: ['heybox'], local: ['local'], browser: ['browser'], security: ['security', 'update'] }
       const tabDirty = (id) => {
         if (!dirty) return false
         if (id.startsWith('ext:')) { const k = id.slice(4); return JSON.stringify((draft.ext || {})[k]) !== JSON.stringify((cfg.ext || {})[k]) }
@@ -8767,8 +8824,8 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             tabs, cur: curTab, go, dirtyOf: tabDirty, subRef: tabsRef,
             mark: (t) => {
               if (tabDirty(t.id)) return h('i', { className: 'dirty', title: '有没保存的改动' })
-              if (!t.flag) return null
-              const flag = t.flag === 'group' ? cfg.allow.groups.length > 0 : getPath(cfg, t.flag) ?? t.flagDefault
+              if (!t.flag && !t.flagFn) return null
+              const flag = t.flagFn ? t.flagFn(cfg) : t.flag === 'group' ? cfg.allow.groups.length > 0 : getPath(cfg, t.flag) ?? t.flagDefault
               return h('i', { className: cx('ab-dot', flag && 'ok'), title: flag ? '开着' : '关着' })
             },
           }),

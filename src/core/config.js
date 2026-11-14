@@ -96,6 +96,17 @@ export const DEFAULTS = {
     // 实验性订阅接法；登录令牌独立保存在数据目录，不进入配置。
     codex: { model: 'gpt-image-2', quality: 'auto', background: 'auto' },
   },
+  // 生视频：local（本地接口 video.mjs，默认）/ minimax（MiniMax H3 云端）/ custom（自定义异步任务接口）
+  video: {
+    provider: 'local',
+    confirm: true, // 生成前先让主人确认
+    enhance: true, // 先把一句话场景扩写成分镜提示词
+    selfView: true, // 生成后抽 4 帧交给视觉模型，写进她的上下文
+    // MiniMax H3：/v2/video_generation 创建任务 → /v2/query/video_generation/{id} 轮询 → 下载
+    minimax: { apiKey: '', baseUrl: 'https://api.minimax.cn', model: 'MiniMax-H3', resolution: '768P', duration: 5, ratio: '16:9', pollMs: 5000 },
+    // 自定义异步任务：创建 → 轮询 → 下载；占位符 {prompt} {seconds} {image} {reqid} {taskId}
+    custom: { createUrl: '', createMethod: 'POST', headers: '', body: '{"prompt":"{prompt}","duration":{seconds}}', taskIdPath: 'task_id', queryUrl: '', statusPath: 'status', successValue: 'succeeded', failValue: 'failed,cancelled', urlPath: 'content.url', pollMs: 5000 },
+  },
   persona: { current: 'dafeiyu' },
   // 主人私聊里问起群里的事：把最近 24 小时的群聊流水补进这一轮（默认关，开启前先把群加进白名单）
   group: { ...DEFAULT_GROUP_POLICY, overrides: {}, ownerTools: 'off', ownerToolsGroups: [], ownerBrief: { enabled: true, lines: 24, groups: [] } },
@@ -896,6 +907,29 @@ export function normalize(raw) {
   if (!/^\d{3,4}x\d{3,4}$/.test(String(c.imageGen.size))) c.imageGen.size = '1024x1024'
   c.imageGen.galleryShown = Math.min(50, Math.max(1, Math.round(Number(c.imageGen.galleryShown) || 20)))
   c.imageGen.shape = ['her', 'square', 'portrait', 'landscape', 'wide'].includes(c.imageGen.shape) ? c.imageGen.shape : 'her'
+  // 生视频：接口选择 + 三种接口各自的参数
+  if (!isObj(c.video)) c.video = {}
+  if (!['local', 'minimax', 'custom'].includes(c.video.provider)) c.video.provider = 'local'
+  c.video.confirm = bool(c.video.confirm, true)
+  c.video.enhance = bool(c.video.enhance, true)
+  c.video.selfView = bool(c.video.selfView, true)
+  if (!isObj(c.video.minimax)) c.video.minimax = structuredClone(DEFAULTS.video.minimax)
+  if (!isObj(c.video.custom)) c.video.custom = structuredClone(DEFAULTS.video.custom)
+  if (!['MiniMax-H3', 'MiniMax-H3-Highspeed', 'MiniMax-H3-Lite', 'MiniMax-H3-Max'].includes(c.video.minimax.model)) c.video.minimax.model = 'MiniMax-H3'
+  if (!['480P', '768P', '2K'].includes(c.video.minimax.resolution)) c.video.minimax.resolution = '768P'
+  if (c.video.minimax.model !== 'MiniMax-H3' && c.video.minimax.resolution === '2K') c.video.minimax.resolution = '768P'
+  if (!['16:9', '9:16', '4:3', '3:4', '1:1', '21:9', 'adaptive'].includes(c.video.minimax.ratio)) c.video.minimax.ratio = '16:9'
+  c.video.minimax.duration = num(c.video.minimax.duration, 5, 4, 15)
+  c.video.minimax.pollMs = num(c.video.minimax.pollMs, 5000, 1000, 60000)
+  c.video.minimax.apiKey = String(c.video.minimax.apiKey || '').trim()
+  c.video.minimax.baseUrl = String(c.video.minimax.baseUrl || '').trim() || 'https://api.minimax.cn'
+  c.video.custom.createUrl = String(c.video.custom.createUrl || '').trim()
+  c.video.custom.queryUrl = String(c.video.custom.queryUrl || '').trim()
+  c.video.custom.createMethod = String(c.video.custom.createMethod || 'POST').toUpperCase() === 'GET' ? 'GET' : 'POST'
+  c.video.custom.pollMs = num(c.video.custom.pollMs, 5000, 1000, 60000)
+  for (const k of ['taskIdPath', 'statusPath', 'successValue', 'failValue', 'urlPath']) {
+    c.video.custom[k] = String(c.video.custom[k] || '').trim() || DEFAULTS.video.custom[k]
+  }
 
   // provider：custom = 自己填接口（GET/POST + 自定义参数），其它按 OpenAI 兼容
   c.imageGen.provider = ['custom', 'codex'].includes(c.imageGen.provider) ? c.imageGen.provider : 'openai'
@@ -969,7 +1003,7 @@ export function normalize(raw) {
 }
 
 // 面板里不回传原文的字段：路径（几层都行）
-const SECRETS = [['snowluma', 'webuiPassword'], ['snowluma', 'httpToken'], ['snowluma', 'wsToken'], ['imageGen', 'apiKey'], ['voice', 'asrApi', 'apiKey'], ['memory', 'vector', 'apiKey'], ['memory', 'rerank', 'apiKey'], ['song', 'neteaseCookie'], ['bili', 'cookie'], ['bili', 'sessdata'], ['bili', 'biliJct'], ['heybox', 'cookie'], ['bridge', 'token'], ['voice', 'volcano', 'apiKey'], ['voice', 'breeze', 'key'], ['voice', 'breeze', 'password'], ['voice', 'minimax', 'apiKey'], ['backup', 'remote', 'token'], ['backup', 'remote', 'webdav', 'password']]
+const SECRETS = [['snowluma', 'webuiPassword'], ['snowluma', 'httpToken'], ['snowluma', 'wsToken'], ['imageGen', 'apiKey'], ['voice', 'asrApi', 'apiKey'], ['memory', 'vector', 'apiKey'], ['memory', 'rerank', 'apiKey'], ['song', 'neteaseCookie'], ['bili', 'cookie'], ['bili', 'sessdata'], ['bili', 'biliJct'], ['heybox', 'cookie'], ['bridge', 'token'], ['video', 'minimax', 'apiKey'], ['video', 'custom', 'headers'], ['voice', 'volcano', 'apiKey'], ['voice', 'breeze', 'key'], ['voice', 'breeze', 'password'], ['voice', 'minimax', 'apiKey'], ['backup', 'remote', 'token'], ['backup', 'remote', 'webdav', 'password']]
 // 扩展模块设置里的密码类字段（模块加载时登记）：['ext', 模块id, 字段]
 const extraSecrets = new Map()
 export function registerSecretField(path) { extraSecrets.set(path.join('\u0000'), path) }

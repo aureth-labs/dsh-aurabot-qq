@@ -28,7 +28,7 @@ const STORE_EXT = /\.(png|jpe?g|gif|webp|mp3|mp4|m4a|ogg|opus|webm|zip|7z|rar|pt
  */
 const SKIP = ['backups', '.restore', '.restore-sessions', '.restore-pending.json', '.restore-modules.json', 'logs', 'tmp', 'voice-cache', 'archive-cache', 'douyin/edge-profile']
 // 仅配置备份：媒体不进包，但保留体积很小的聊天流水和当前工作区 DSH 会话
-const CONFIG_ONLY_SKIP = ['imagegen', 'stickers', 'bili-shots', 'douyin']
+const CONFIG_ONLY_SKIP = ['imagegen', 'stickers', 'bili-shots', 'douyin', 'video-out']
 // 记忆库在根目录（数据归属人格），其他人格的在 persona-data/<id>/，两处一样对待
 const memoryPrefix = (rel) => rel.match(/^persona-data\/[^/]+\//)?.[0] || ''
 const memoryRel = (rel) => rel.slice(memoryPrefix(rel).length)
