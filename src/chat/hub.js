@@ -2492,12 +2492,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     return event
   }
 
-  /** G3：网关入站（与 onMessage 并列的入口；走同一套后续逻辑） */
+  /** G3/F2：网关入站（与 onMessage 并列的入口；走同一套后续逻辑） */
   async function onGatewayMessage(m) {
     if (disposed || !m) return
-    // 非 QQ 平台暂不进中枢（G3 只做 QQ 的迁移，别的平台等 F2）
-    if (m.platform && m.platform !== 'qq') return
-    // 能力判断：群里收不到非 @ 消息的平台不做群上下文（CONTRACTS §八.3）
     try { gateway?.noteSeen?.(m.sender.person, m.chatId, Number(m.at) || Date.now()) } catch {}
     const event = inboundToOneBotEvent(m)
     return onMessage(event)

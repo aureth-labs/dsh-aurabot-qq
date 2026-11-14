@@ -121,6 +121,26 @@ export function isOwnerChatMuted(identity, isMuted) {
 }
 
 /**
+ * 非 QQ 平台的默认值是关闭：只能通过主人、规范 ChatId 或 PersonId 放行。
+ * 旧 QQ 白名单仍接受裸 QQ 号，行为不变。
+ */
+function allowMatches(list, msg, kind) {
+  const entries = (list || []).map((x) => String(x).trim()).filter(Boolean)
+  if (!entries.length) return false
+  const platform = String(msg.platform || parseChatId(msg.chatId)?.platform || '').trim()
+  const account = String(kind === 'group' ? msg.groupId : msg.userId || '').trim()
+  const chatId = normalizeChatId(msg.chatId) || (platform && account ? normalizeChatId(`${platform}:${kind}:${account}`) : '')
+  if (chatId && entries.some((entry) => normalizeChatId(entry) === chatId)) return true
+  const person = msg.sender?.person || msg.person
+  if (person && entries.includes(String(person))) return true
+  // 裸编号只沿用到默认平台（旧 QQ 形态），避免飞书/官方机器人的
+  // ou_xxx / openid 被当成另一个平台的号码串误放行。
+  const legacyPlatform = parseChatId('private:0')?.platform || ''
+  if ((platform && platform !== legacyPlatform) || !account) return false
+  return entries.includes(account)
+}
+
+/**
  * @param {object} cfg 插件配置
  * @param {{kind:'private'|'group', userId?:string, groupId?:string, platform?:string, chatId?:string, sender?:object}} msg
  * @param {object|null} [ownerRef] identity 服务
@@ -129,13 +149,11 @@ export function isOwnerChatMuted(identity, isMuted) {
 export function checkAllowed(cfg, msg, ownerRef = null) {
   if (msg.kind === 'private') {
     if (isOwner(ownerRef, msg)) return { allowed: true, reason: '主人' }
-    const list = (cfg.allow?.private || []).map(String)
-    return list.includes(String(msg.userId || ''))
+    return allowMatches(cfg.allow?.private, msg, 'private')
       ? { allowed: true, reason: '私聊白名单' }
       : { allowed: false, reason: '不在私聊白名单' }
   }
-  const groups = (cfg.allow?.groups || []).map(String)
-  return groups.includes(String(msg.groupId || ''))
+  return allowMatches(cfg.allow?.groups, msg, 'group')
     ? { allowed: true, reason: '群白名单' }
     : { allowed: false, reason: '不在群白名单' }
 }
