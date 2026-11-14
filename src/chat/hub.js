@@ -513,6 +513,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   let lastOwnerChatId = ''
   const lastPrivateAt = new Map() // 账号 id → 最后一次和这个人私聊的时间（主动搭话白名单用）
   const lastInbound = new Map() // chatId → { id, at }，被动回复平台用它填 inResponseTo
+  const passivePending = new Map() // chatId → 已过回复窗口、等下一句带出的结果
   let lastBotToOwner = { at: 0, text: '' } // 她在主人私聊里最后说的话
 
   function bump(k) {
@@ -1217,6 +1218,13 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
           const conv = segmentsToGatewayParts(message)
           parts = conv.parts
           replyTo = conv.replyTo
+        }
+        if (caps?.proactive === 'none' && !responseTo && !force) {
+          const list = passivePending.get(chatId) || []
+          list.push({ chatId: normSegId, parts, replyTo, note, timeoutMs })
+          passivePending.set(chatId, list.slice(-20))
+          log.info(`发到 ${chatId} 的结果已过回复窗口，先存着等下一句带出`)
+          return { queued: true, passive: true }
         }
         const sent = await gateway.send({
           chatId: normSegId,
@@ -2533,6 +2541,28 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     return true
   }
 
+  /** F2：被动回复平台过了窗口的结果，在下一条入站消息上带出。 */
+  async function flushPassive(chatId, messageId) {
+    const list = passivePending.get(chatId)
+    if (!list || !list.length || !gateway) return
+    passivePending.delete(chatId)
+    for (const item of list) {
+      try {
+        await gateway.send({
+          chatId: item.chatId,
+          parts: item.parts,
+          ...(item.replyTo ? { replyTo: item.replyTo } : {}),
+          kind: 'reply',
+          note: item.note || '',
+          inResponseTo: messageId,
+          timeoutMs: item.timeoutMs,
+        })
+      } catch (error) {
+        log.warn('带出过窗结果失败：', error.message)
+      }
+    }
+  }
+
   /** G3/F2：网关入站（与 onMessage 并列的入口；走同一套后续逻辑） */
   async function onGatewayMessage(m) {
     if (disposed || !m) return
@@ -2563,6 +2593,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (msg.kind === 'group' && gateway?.caps?.(msg.chatId)?.listenAllInGroup === false && !msg.mentionedMe) return
     if (msg.userId === selfId) return
     if (msg.messageId) lastInbound.set(msg.chatId, { id: String(msg.messageId), at: Date.now() })
+    if (passivePending.has(msg.chatId)) await flushPassive(msg.chatId, String(msg.messageId))
     const now = Date.now()
     const wasCleared = () => isBeforeMemoryReset(msg.chatId, msg.userId, now)
     const revisionOf = (c) => `${ownerId() || ''}:${ownerAuthorizationRevision(c)}`
