@@ -2653,8 +2653,10 @@ export function apply(ctx) {
     const owner = b.as !== 'other'
     const ownerCid = primaryOwnerChatId()
     const addr = ownerCid ? parseChatId(ownerCid) : null
-    const userId = owner ? (addr?.id || String(identity.owner() || 'owner')) : '10001'
-    const plat = owner && addr?.platform ? addr.platform : defaultPlatform
+    const requested = String(b.platform || '').trim()
+    const plat = requested || (owner && addr?.platform ? addr.platform : defaultPlatform)
+    const account = owner ? (identity.accountOn(identity.owner(), plat) || addr?.id || String(identity.owner() || 'owner')) : '10001'
+    const userId = account
     const group = b.kind === 'group'
     const groupId = String(b.groupId || cfg.allow.groups[0] || '10002')
     return {
@@ -2662,7 +2664,7 @@ export function apply(ctx) {
       userId,
       chat: group
         ? { chatId: plat && plat !== defaultPlatform ? `${plat}:group:${groupId}` : `group:${groupId}`, ...(plat ? { platform: plat } : {}), kind: 'group', groupId, userId }
-        : { chatId: owner && ownerCid ? ownerCid : `private:${userId}`, ...(plat ? { platform: plat } : {}), kind: 'private', userId },
+        : { chatId: plat ? `${plat}:private:${account}` : `private:${account}`, ...(plat ? { platform: plat } : {}), kind: 'private', userId },
     }
   }
   // 没有文字的（语音条、表情、图片）显示发送备注，比如「[语音·edge] 早呀」

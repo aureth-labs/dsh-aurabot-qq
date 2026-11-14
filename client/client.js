@@ -6869,6 +6869,8 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     function Simulate({ toast }) {
       const [as, setAs] = useState('owner')
       const [kind, setKind] = useState('private')
+      const [platform, setPlatform] = useState('')
+      const [plats, setPlats] = useState([])
       const [text, setText] = useState('')
       const [reply, setReply] = useState('')
       const [out, setOut] = useState(null)
@@ -6876,13 +6878,15 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [tool, setTool] = useState('')
       const [args, setArgs] = useState('{}')
       const [tout, setTout] = useState(null)
-      useEffect(() => { get('/modules/tools?as=' + as + '&kind=' + kind).then((r) => { const l = r.list || []; setTools(l); if (!l.some((t) => t.name === tool)) setTool(l[0] ? l[0].name : '') }) }, [as, kind])
+      useEffect(() => { get('/platforms').then((r) => setPlats((r.instances || []).filter((x) => x.enabled).map((x) => ({ value: x.platform, label: platformLabel(x.platform) })))).catch(() => {}) }, [])
+      const platformArg = platform ? '&platform=' + encodeURIComponent(platform) : ''
+      useEffect(() => { get('/modules/tools?as=' + as + '&kind=' + kind + platformArg).then((r) => { const l = r.list || []; setTools(l); if (!l.some((t) => t.name === tool)) setTool(l[0] ? l[0].name : '') }) }, [as, kind, platform])
       const cur = tools.find((t) => t.name === tool)
-      const run = async () => { const r = await post('/modules/simulate', { as, kind, text, reply }); if (r.ok === false) return toast(r.message, 'err'); setOut(r) }
+      const run = async () => { const r = await post('/modules/simulate', { as, kind, platform, text, reply }); if (r.ok === false) return toast(r.message, 'err'); setOut(r) }
       const call = async () => {
         let a
         try { a = JSON.parse(args || '{}') } catch (e) { return toast('参数要是 JSON，比如 {"city":"北京"}', 'err') }
-        const r = await post('/modules/tool', { as, kind, name: tool, args: a })
+        const r = await post('/modules/tool', { as, kind, platform, name: tool, args: a })
         if (r.ok === false) return toast(r.message, 'err')
         setTout(r)
       }
@@ -6892,6 +6896,10 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h('div', { className: 'ab-flex' },
             h(Seg, { value: as, options: [{ value: 'owner', label: '主人' }, { value: 'other', label: '别人' }], onChange: setAs }),
             h(Seg, { value: kind, options: [{ value: 'private', label: '私聊' }, { value: 'group', label: '群聊' }], onChange: setKind }))),
+        plats.length ? h(Row, { label: '平台', hint: '在哪个平台的聊天里模拟；不选就用主人最近的平台' },
+          h('select', { className: 'ab-select', value: platform, onChange: (e) => setPlatform(e.target.value) },
+            h('option', { value: '' }, '自动'),
+            plats.map((p) => h('option', { key: p.value, value: p.value }, p.label)))) : null,
         h(Row, { label: '发一条消息', hint: '看哪个模块接管、命令回什么（/开头是命令）' },
           h('input', { className: 'ab-input', value: text, placeholder: '比如：早安，或 /weather 北京', onChange: (e) => setText(e.target.value) })),
         h(Row, { label: 'ta的回复', hint: '可选：假设ta这样回，看经过各个模块改写后最后发出去什么（可以用 ||| 分条、<voice>…</voice>）' },
