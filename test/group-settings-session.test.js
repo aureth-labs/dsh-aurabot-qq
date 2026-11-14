@@ -35,6 +35,14 @@ test('主人会话工具修改可持久化、面板能读、旧草稿不能覆�
   assert.deepEqual(app.getConfig().group.overrides, current.group.overrides)
   await app.hub.pushToSession(ownerChat, [{ type: 'text', text: '不是主人尝试修改' }], '10000002')
   assert.deepEqual(app.getConfig().group.overrides, current.group.overrides)
+  const { createMutes } = await import('../src/chat/commands.js')
+  createMutes().set(`group:${G}`, 0)
+  const pausedFile = readFileSync(join(root, 'mutes.json'), 'utf8')
+  const read = (await fake.call('/modules/tool', { as: 'owner', kind: 'private', name: 'qq_group_settings', args: { action: 'get', group_id: G } })).json()
+  assert.equal(read.result.state.reply_paused, true)
+  assert.match(read.result.message, /已暂停聊天/)
+  assert.deepEqual(read.sent, [])
+  assert.equal(readFileSync(join(root, 'mutes.json'), 'utf8'), pausedFile, '查看不改暂停记录')
   for (const q of ['as=other&kind=private', 'as=owner&kind=group']) {
     const list = (await fake.call('/modules/tools?' + q)).json().list
     assert.ok(!list.some(x => x.name === 'qq_group_settings'))

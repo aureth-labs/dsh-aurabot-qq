@@ -83,3 +83,14 @@ test('旧版和模块不带基线的局部保存继续可用', async () => {
   assert.notEqual(r.ok, false)
   assert.equal(app.getConfig().group.overrides[G].engagedEnabled, true)
 })
+
+test('旁听名单混入文字、斜杠或连写多个号码时整次拒绝，不拼成另一个群号', async () => {
+  const before = snapshot()
+  for (const passiveGroups of [['12345/67890'], ['群30000003'], ['12'], ['3000000340000004'], null, { id: G }]) {
+    const r = await save({ memory: { passiveGroups }, dryRun: !before.dryRun })
+    assert.equal(r.code, 'invalid_passive_groups')
+    assert.deepEqual(app.getConfig(), before)
+  }
+  assert.notEqual((await save({ memory: { passiveGroups: '30000003，40000004' } })).ok, false)
+  assert.deepEqual(app.getConfig().memory.passiveGroups, ['30000003', '40000004'])
+})
