@@ -512,6 +512,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   let lastOwnerChatAt = 0
   let lastOwnerChatId = ''
   const lastPrivateAt = new Map() // 账号 id → 最后一次和这个人私聊的时间（主动搭话白名单用）
+  const lastInbound = new Map() // chatId → { id, at }，被动回复平台用它填 inResponseTo
   let lastBotToOwner = { at: 0, text: '' } // 她在主人私聊里最后说的话
 
   function bump(k) {
@@ -1135,8 +1136,12 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   // quiet：这一条是额外的（比如语音后面补发的表情），失败了不算到这一轮头上（deliver 按 failStore 里的条数判断整条有没有发出去）。
   // queueKind / queueTtlMs：网关短暂不可达时，确定没发出去的消息进入本地补发队列。
   async function sendSegments(chatId, message, note, opts = {}) {
-    const { force = false, isCurrent = null, throwOnError = false, timeoutMs, quiet = false, queueKind = 'reply', queueTtlMs, sensitive = false, proactive = false } = opts
-    if (proactive && gateway?.caps?.(chatId)?.proactive === 'none') return null
+    const { force = false, isCurrent = null, throwOnError = false, timeoutMs, quiet = false, queueKind = 'reply', queueTtlMs, sensitive = false, proactive = false, inResponseTo = '' } = opts
+    const caps = gateway?.caps?.(chatId) || null
+    const lastIn = lastInbound.get(chatId)
+    const responseTo = inResponseTo || (!proactive && lastIn
+      && (!caps?.replyWindowMs || Date.now() - lastIn.at < caps.replyWindowMs) ? lastIn.id : '')
+    if (proactive && caps?.proactive === 'none') return null
     if (disposed) return null
     // 出口层第二道保险：模块直接调 scopedHub.sendSegments/sendImage/sendFile/sendFile 时也要过门闸。
     // 只认带 sourceModule（模块发起）或 enginePolicy（引擎路径）的请求；hub 内部发送不带这两个标记，行为不变。
@@ -1221,7 +1226,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
           note: sensitive ? '敏感命令回执' : (note || ''),
           force: Boolean(force),
           sensitive: Boolean(sensitive),
-          inResponseTo: opts.inResponseTo,
+          inResponseTo: responseTo,
           timeoutMs,
         })
         if (sent?.messageId) {
@@ -2557,6 +2562,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     // F2：收不到群里非 @ 消息的平台，只处理被叫到的消息，不建立群缓冲和群记忆。
     if (msg.kind === 'group' && gateway?.caps?.(msg.chatId)?.listenAllInGroup === false && !msg.mentionedMe) return
     if (msg.userId === selfId) return
+    if (msg.messageId) lastInbound.set(msg.chatId, { id: String(msg.messageId), at: Date.now() })
     const now = Date.now()
     const wasCleared = () => isBeforeMemoryReset(msg.chatId, msg.userId, now)
     const revisionOf = (c) => `${ownerId() || ''}:${ownerAuthorizationRevision(c)}`
