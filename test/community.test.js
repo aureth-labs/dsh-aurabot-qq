@@ -85,6 +85,33 @@ before(async () => {
 })
 after(() => rmSync(root, { recursive: true, force: true }))
 
+test('清单 platforms 只做可用性提示，不阻断安装', async () => {
+  const qqOnly = pack('qq-only', '1.0.0')
+  qqOnly.entry.platforms = ['qq']
+  const any = pack('any-platform', '1.0.0')
+  any.entry.platforms = ['*']
+  const { c } = setup([qqOnly, any], { cfg: { platforms: { feishu: { enabled: true } } } })
+  const { list } = await c.list()
+  const qq = list.find((m) => m.id === 'qq-only')
+  const all = list.find((m) => m.id === 'any-platform')
+  assert.deepEqual(qq.platforms, ['qq'])
+  assert.match(qq.platformNote, /需要平台：qq/)
+  assert.equal(all.platformNote, '')
+  // 平台不满足仍允许安装，只由面板提示
+  assert.equal((await c.install('qq-only')).ok, true)
+})
+
+test('没有启用平台时，平台专属模块给出提示，全平台模块不提示', async () => {
+  const qqOnly = pack('qq-only-2', '1.0.0')
+  qqOnly.entry.platforms = ['qq']
+  const any = pack('any-platform-2', '1.0.0')
+  any.entry.platforms = ['*']
+  const { c } = setup([qqOnly, any], { cfg: { platforms: {} } })
+  const { list } = await c.list()
+  assert.match(list.find((m) => m.id === 'qq-only-2').platformNote, /没有启用任何平台/)
+  assert.equal(list.find((m) => m.id === 'any-platform-2').platformNote, '')
+})
+
 test('安装时报进度，装完清空', async () => {
   const p = pack('progress-mod', '1.0.0')
   const seen = []

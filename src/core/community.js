@@ -226,6 +226,32 @@ export function createCommunity({ mods, getConfig, setConfig, log, version, aliv
     }
   }
 
+  /** 当前启用的平台（实例名 qq#2 只算平台 qq）。 */
+  function enabledPlatforms() {
+    const all = getConfig?.()?.platforms || {}
+    return new Set(Object.entries(all)
+      .filter(([, value]) => value && value.enabled === true)
+      .map(([instance]) => String(instance).split('#')[0])
+      .filter(Boolean))
+  }
+
+  /** 清单里的 platforms：不写 = 只支持 QQ；["*"] = 全平台。 */
+  function platformsOf(e) {
+    const raw = e?.platforms
+    if (!Array.isArray(raw) || !raw.length) return ['qq']
+    return raw.includes('*') ? ['*'] : raw.filter((p) => typeof p === 'string' && p)
+  }
+
+  /** 平台不满足只提示，不阻断安装；用户可以先装上，等启用平台后再生效。 */
+  function platformNote(e) {
+    const wants = platformsOf(e)
+    if (wants.includes('*')) return ''
+    const active = enabledPlatforms()
+    if (!active.size) return '当前没有启用任何平台'
+    const missing = wants.filter((platform) => !active.has(platform))
+    return missing.length ? `需要平台：${missing.join('、')}（当前未启用）` : ''
+  }
+
   /** 这一条现在装不了的原因；能装返回空串。 */
   function blocked(index, e) {
     if (Number(e.api) > API_VERSION) return `要扩展接口 v${e.api}，现在的插件只有 v${API_VERSION}，先更新插件`
@@ -244,6 +270,8 @@ export function createCommunity({ mods, getConfig, setConfig, log, version, aliv
       foreign: !src && hasFolder(e.id), // 同名文件夹是用户自己写的
       update: Boolean(src && compareVersions(e.version, src.version) > 0),
       blocked: blocked(index, e),
+      platforms: platformsOf(e),
+      platformNote: platformNote(e),
       moved: e.id in MOVED,
       // 安装量：模块库 Releases 里安装包的下载次数（更新也算），读不到时是 0
       downloads: Number(counts[e.id]) || 0,
@@ -257,7 +285,7 @@ export function createCommunity({ mods, getConfig, setConfig, log, version, aliv
     const entries = (index.modules || []).filter((e) => ID_RE.test(String(e.id))).map((e) => view(index, e, counts))
     // 已安装但索引里没有了（下架）的也列出来，好让用户卸载
     const known = new Set(entries.map((e) => e.id))
-    const delisted = mods.status().filter((m) => !known.has(m.id) && readSource(m.id)).map((m) => ({ id: m.id, name: m.name, description: m.description, version: readSource(m.id).version, installed: readSource(m.id).version, delisted: true, capabilities: [], blocked: '', downloads: Number(counts[m.id]) || 0 }))
+    const delisted = mods.status().filter((m) => !known.has(m.id) && readSource(m.id)).map((m) => ({ id: m.id, name: m.name, description: m.description, version: readSource(m.id).version, installed: readSource(m.id).version, delisted: true, capabilities: [], platforms: [], platformNote: '', blocked: '', downloads: Number(counts[m.id]) || 0 }))
     const revoked = entries.concat(delisted).filter((e) => e.installed && revokedReason(index, e.id, e.installed)).map((e) => ({ id: e.id, version: e.installed, reason: revokedReason(index, e.id, e.installed) }))
     return { list: [...entries, ...delisted], revoked, generatedAt: index.generatedAt || '', downloads: { source: stats.source || '', at: stats.at || 0, failed: Boolean(stats.failed) } }
   }
