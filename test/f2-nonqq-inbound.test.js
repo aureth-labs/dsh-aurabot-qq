@@ -61,3 +61,32 @@ test('非 QQ 平台私聊进入中枢并回到原平台', async (t) => {
   assert.ok(adapter.sent.some((r) => r.payload?.chat?.id === 'ou_owner'))
   assert.equal(identity.accountOn(owner, 'feishu'), 'ou_owner')
 })
+
+test('listenAllInGroup=false 时，群里没被 @ 不回复，@ 了才回复', async (t) => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'f2-group-'))
+  process.env.AURABOT_DATA_DIR = dataDir
+  const identity = createIdentity({ dataDir: join(dataDir, 'gw'), log: noopLog })
+  identity.claimOwner('feishu', 'ou_owner')
+  const cfg = normalize({
+    enabled: true, dryRun: false, setupDone: true, botQQ: '', ownerQQ: '',
+    voice: { enabled: false }, merge: { enabled: false }, stickers: { enabled: false, collect: false },
+    platforms: { feishu: { enabled: true } }, allow: { private: [], groups: ['feishu:group:oc_1'] },
+  })
+  const gateway = createGateway({ config: cfg, dataDir: (...p) => join(dataDir, ...p), identity, log: noopLog })
+  const adapter = makeFakeAdapter({ id: 'feishu' })
+  adapter.setCaps({ listenAllInGroup: false })
+  gateway.register(() => adapter)
+  await gateway.sync()
+  const fake = createFakeDsh({ brain: async ({ text }) => `群回复：${text}` })
+  const hub = createHub({ dsh: fake.ctx, getConfig: () => cfg, log: noopLog, gateway, identity, defaultPlatform: 'qq' })
+  const offEvent = fake.ctx.on('session/event', hub.onSessionEvent)
+  const offMessage = gateway.onMessage((m) => hub.onGatewayMessage(m))
+  t.after(async () => { offMessage(); offEvent(); hub.dispose(); await gateway.stopAll(); fake.dispose() })
+
+  adapter.pushInbound({ chat: { kind: 'group', id: 'oc_1' }, sender: { account: 'ou_guest', name: '路人' }, parts: [{ type: 'text', text: '没 @ 的群聊' }] })
+  await new Promise((r) => setTimeout(r, 250))
+  assert.equal(adapter.sent.length, 0)
+  adapter.pushInbound({ chat: { kind: 'group', id: 'oc_1' }, sender: { account: 'ou_guest', name: '路人' }, mentionedMe: true, parts: [{ type: 'text', text: '@她 你好' }] })
+  await waitFor(() => adapter.sent.some((r) => r.payload?.chat?.id === 'oc_1'))
+  assert.ok(adapter.sent.some((r) => r.payload?.chat?.id === 'oc_1'))
+})

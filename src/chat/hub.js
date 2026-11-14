@@ -2586,6 +2586,10 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const gw = event.__gateway
     msg.platform = gw?.platform || defaultPlatform()
     if (gw?.chatId) msg.chatId = gw.chatId
+    if (gw?.mentionedMe) {
+      msg.mentioned = true
+      msg.mentionedMe = true
+    }
     if (gw?.person || gw?.isOwner !== undefined) {
       msg.sender = { ...(msg.sender || {}), person: gw.person, isOwner: gw.isOwner }
     }
