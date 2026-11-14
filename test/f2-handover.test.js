@@ -7,21 +7,23 @@ import { join } from 'node:path'
 import { createIdentity } from '../src/gateway/identity.js'
 import { createHandover } from '../src/features/handover.js'
 
-test('交接摘要只读同一人的其他平台私聊，且只做一次', async () => {
+test('交接摘要只读同一人的其他平台私聊，且只做一次', async (t) => {
   const dataDir = mkdtempSync(join(tmpdir(), 'f2-handover-'))
+  const prevDataDir = process.env.AURABOT_DATA_DIR
   process.env.AURABOT_DATA_DIR = dataDir
+  t.after(() => { if (prevDataDir === undefined) delete process.env.AURABOT_DATA_DIR; else process.env.AURABOT_DATA_DIR = prevDataDir })
   const identity = createIdentity({ dataDir: join(dataDir, 'gw'), log: { info() {}, warn() {}, debug() {} } })
   const owner = identity.claimOwner('feishu', 'ou_owner')
   identity.link('qq', '10001', owner, 'owner')
   const today = new Date()
   const day = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`
   mkdirSync(join(dataDir, 'chatlog'), { recursive: true })
-  const t = Date.now() - 60_000
+  const ts = Date.now() - 60_000
   writeFileSync(join(dataDir, 'chatlog', `${day}.jsonl`), [
-    { t, chatId: 'feishu:private:ou_owner', who: 'user', text: '飞书里说过喜欢下雨' },
-    { t: t + 1, chatId: 'feishu:group:oc_1', who: 'user', text: '群里说过的秘密' },
-    { t: t + 2, chatId: 'qq:private:20002', who: 'user', text: '别人私聊的内容' },
-    { t: t + 3, chatId: 'qq:private:10001', who: 'bot', text: '旧平台的机器人回复' },
+    { t: ts, chatId: 'feishu:private:ou_owner', who: 'user', text: '飞书里说过喜欢下雨' },
+    { t: ts + 1, chatId: 'feishu:group:oc_1', who: 'user', text: '群里说过的秘密' },
+    { t: ts + 2, chatId: 'qq:private:20002', who: 'user', text: '别人私聊的内容' },
+    { t: ts + 3, chatId: 'qq:private:10001', who: 'bot', text: '旧平台的机器人回复' },
   ].map((x) => JSON.stringify(x)).join('\n') + '\n')
 
   let prompt = ''

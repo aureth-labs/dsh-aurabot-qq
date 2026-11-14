@@ -440,7 +440,7 @@ const allowList = (v) => {
   for (const item of raw) {
     const s = String(item ?? '').trim()
     if (!s) continue
-    if (/^\d{5,}$/.test(s) || /^p-[0-9a-z]+$/.test(s)) { out.push(s); continue }
+    if (/^\d+$/.test(s) || /^p-[0-9a-z]+$/.test(s)) { out.push(s); continue }
     try { const id = normalizeChatId(s); if (id) out.push(id) } catch {}
   }
   return [...new Set(out)]
