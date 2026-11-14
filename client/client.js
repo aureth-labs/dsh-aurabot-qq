@@ -2003,9 +2003,22 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [batchOpen, setBatchOpen] = useState(false)
       const [batchText, setBatchText] = useState('')
       const [knownChats, setKnownChats] = useState([])
+      const [ownerChatIds, setOwnerChatIds] = useState([])
       const [permissionGroupsOpen, setPermissionGroupsOpen] = useState({ 功能: true })
       const { busy, apply, applyMany } = usePermissionSave(toast, reload)
       useEffect(() => { get('/platforms/chats').then((r) => setKnownChats(r.list || [])).catch(() => {}) }, [])
+      useEffect(() => {
+        get('/platforms/people').then((r) => {
+          const ownerPerson = (r.list || []).find((p) => p.owner)
+          const ids = []
+          for (const account of ownerPerson?.accounts || []) {
+            if (!account?.platform || !account?.account) continue
+            ids.push(`${account.platform}:private:${account.account}`)
+            if (account.platform === 'qq') ids.push(`private:${account.account}`)
+          }
+          setOwnerChatIds(ids)
+        }).catch(() => {})
+      }, [])
       const modules = (st.modules || []).map(({ id, running, commands }) => [id, running, commands])
       const catalogVersion = JSON.stringify(modules)
       useEffect(() => {
@@ -2023,8 +2036,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       }
       const cfg = st.config
       const owner = String(cfg.ownerQQ)
+      const isOwnerChat = (value) => Boolean(value) && (String(value) === owner || String(value) === `private:${owner}` || ownerChatIds.includes(String(value)))
       const privateAllow = (cfg.allow.private || []).map(String)
-      const isOpen = (qq) => privateAllow.includes(String(qq))
+      const isOpen = (qq) => isOwnerChat(qq) || privateAllow.includes(String(qq))
       const validPrivate = (v) => /^\d{5,12}$/.test(String(v)) || /^[a-z][a-z0-9-]*:private:/.test(String(v))
       const knownPrivate = knownChats.filter((c) => c.kind === 'private')
       const saved = [cfg.allow.private, ...Object.values(cfg.capabilityAllow || {}), ...Object.values(cfg.commandAllow || {})]
@@ -2036,14 +2050,14 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const id = selected || (!q ? entries[0] : '')
       const open = Boolean(id && isOpen(id))
       const has = (key) => key === 'chat' ? open : (cfg.capabilityAllow?.[key] || cfg.commandAllow?.[key] || []).includes(id)
-      const canOpen = validPrivate(q) && q !== owner && !entries.includes(q)
+      const canOpen = validPrivate(q) && !isOwnerChat(q) && !entries.includes(q)
       const permissions = catalog?.list || []
       const known = new Set(permissions.map(({ key }) => key))
       const inactive = Object.keys(cfg.commandAllow || {}).filter((key) => has(key) && !known.has(key))
       const quickId = quickQQ.trim()
-      const canQuickAdd = validPrivate(quickId) && quickId !== owner && !isOpen(quickId)
+      const canQuickAdd = validPrivate(quickId) && !isOwnerChat(quickId) && !isOpen(quickId)
       const addPrivate = async (qq) => {
-        if (!validPrivate(qq) || String(qq) === owner) return
+        if (!validPrivate(qq) || isOwnerChat(qq)) return
         if (await apply(String(qq), 'private', { chat: true })) { setSelected(String(qq)); setQuickQQ('') }
       }
       const batchTokens = batchText.split(/[\s,，;；、]+/).filter(Boolean)
@@ -2059,7 +2073,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         const publicFeature = (key === 'image' && cfg.imageGen.ownerOnly === false) || (key === 'song' && cfg.song.ownerOnly === false)
         const hint = publicFeature ? `${description}。当前功能对所有白名单会话开放。` : description
         return h(Row, { key, label, hint },
-          h(Switch, { on: has(key), title: label, disabled: busy, onChange: (value) => apply(id, 'private', { [key]: value }) }))
+          h(Switch, { on: has(key), title: label, disabled: busy || isOwnerChat(id), onChange: (value) => apply(id, 'private', { [key]: value }) }))
       }
       return h('div', { className: 'ab-permission-grid' },
         h(Card, { title: '私聊用户', className: 'ab-permission-card', desc: '按昵称选好友，或输入 QQ 号添加。', right: h('div', { className: 'ab-flex', style: { gap: 6, flexWrap: 'wrap' } },
@@ -2088,20 +2102,20 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
               type: 'button', className: cx('ab-permission-person', qq === id && 'on'), 'aria-pressed': qq === id,
               disabled: busy, onClick: () => setSelected(qq),
             }, h('span', null, names.get(qq) || qq, names.get(qq) ? h('small', null, qq) : null),
-            h('small', null, isOpen(qq) ? '允许私聊' : ids.includes(qq) ? '已暂停' : '未授权')),
+            h('small', null, isOwnerChat(qq) ? '主人（自动允许）' : isOpen(qq) ? '允许私聊' : ids.includes(qq) ? '已暂停' : '未授权')),
             !isOpen(qq) ? h(Btn, { small: true, kind: 'ghost', disabled: busy, onClick: () => addPrivate(qq) }, '添加') : null))),
           canOpen ? h(Btn, { small: true, disabled: busy, onClick: () => setSelected(q) }, `查看 ${q} 的权限`) : null,
           !entries.length && !canOpen ? h('p', { className: 'ab-muted ab-small' }, q ? '没有匹配的用户' : '读取好友后可以按昵称添加；也可以在上方直接输入 QQ 号。') : null,
           matching.length > entries.length ? h('p', { className: 'ab-muted ab-small' }, '请继续输入，缩小搜索范围。') : null,
         ),
         !id ? h(Card, null, h(Empty, { text: '选择一位私聊用户来管理授权' }))
-          : h(Card, { title: names.get(id) || id, className: 'ab-permission-card', desc: names.get(id) ? `QQ ${id}` : undefined },
-            h('div', { className: 'ab-permission-options' }, toggle({ key: 'chat', label: '允许私聊', description: '关闭会暂停这个人的其他授权，重新开启即可恢复。' })),
+          : h(Card, { title: names.get(id) || id, className: 'ab-permission-card', desc: isOwnerChat(id) ? '主人账号：自动允许私聊，权限由主人设置控制' : names.get(id) ? `QQ ${id}` : undefined },
+            h('div', { className: 'ab-permission-options' }, toggle({ key: 'chat', label: '允许私聊', description: isOwnerChat(id) ? '主人账号自动允许，不需要加入白名单。' : '关闭会暂停这个人的其他授权，重新开启即可恢复。' })),
             !open ? h('p', { className: 'ab-muted ab-small' }, '这个人目前无法私聊。可以先选好功能，开启私聊后授权生效。') : null,
             catalog?.ok === false ? h('p', { className: 'ab-note err' }, catalog.message || '读取可授权项失败') : null,
             catalog?.ok ? h(Fragment, null,
               h('div', { className: 'ab-flex', style: { margin: '10px 0', flexWrap: 'wrap' } },
-                h(Btn, { small: true, disabled: busy || (open && has('help') && has('reset')), onClick: () => apply(id, 'private', { chat: true, help: true, reset: true }) }, open ? '授予会话自助' : '开放私聊和会话自助'),
+                h(Btn, { small: true, disabled: busy || isOwnerChat(id) || (open && has('help') && has('reset')), onClick: () => apply(id, 'private', { chat: true, help: true, reset: true }) }, open ? '授予会话自助' : '开放私聊和会话自助'),
                 h('span', { className: 'ab-muted ab-small' }, '包含 /help、/reset')),
               ['功能', '命令', '扩展命令'].map((group) => {
                 const items = permissions.filter((item) => item.group === group)
