@@ -6,17 +6,24 @@ import { createStickerStore, stickerPath } from '../../features/stickers.js'
 import { defineTool, int, str } from '../../tools/tools.js'
 import { fetchImage, segmentBytes } from '../../core/net.js'
 import { resolvePainting } from '../../features/paintings.js'
+import { isOwner } from '../../chat/access.js'
 
 export default {
   id: 'stickers',
   name: '表情包',
   version: '1.0.0',
+  api: 2,
+  platforms: ['qq'],
   description: '偷表情、回复时按情绪配表情、她自己改名删图；关掉后不发也不收表情',
   tab: 'stickers',
   files: ['features/stickers.js'],
   setup(api) {
-    const { hub, onebot, http } = api.core
-    const store = createStickerStore({ dsh: api.dsh, getConfig: api.config, onebot, log: api.log })
+    const { hub, onebot, http, identity } = api.core
+    const qqOnebot = {
+      call: (action, params, opts) => (typeof api.native === 'function' ? api.native('qq', action, params, opts) : onebot.call(action, params, opts)),
+      get state() { return api.core.onebot?.state },
+    }
+    const store = createStickerStore({ dsh: api.dsh, getConfig: api.config, onebot: qqOnebot, log: api.log })
 
     api.tool(({ chat, level, sessionId }) => {
       if (chat.kind === 'system') return []
@@ -112,7 +119,7 @@ export default {
           if (!seg) return { ok: false, message: '这张表情已经拿不到了（超过 30 分钟，或者这一轮里没有这张）' }
           let buf
           try {
-            buf = await segmentBytes(seg, onebot, { maxBytes: 5 * 1024 * 1024 })
+            buf = await segmentBytes(seg, qqOnebot, { maxBytes: 5 * 1024 * 1024 })
           } catch (error) {
             return { ok: false, message: '这张表情下载失败了：' + error.message }
           }
@@ -150,9 +157,9 @@ export default {
           } else {
             const media = hub.recentMedia(current)
             // 优先主人自己发的，其次这个聊天里最近的
-            const pick = media.filter((x) => x.userId === String(api.config().ownerQQ)).at(-1) || media.at(-1)
+            const pick = media.filter((x) => isOwner(identity, x.userId, chat.platform || 'qq')).at(-1) || media.at(-1)
             if (!pick) return { ok: false, message: '最近半小时这个聊天里没有人发表情或图片，先把那张发过来' }
-            buf = await segmentBytes(pick.seg, api.core.onebot, { maxBytes: 5 * 1024 * 1024 })
+            buf = await segmentBytes(pick.seg, qqOnebot, { maxBytes: 5 * 1024 * 1024 })
           }
           const r = await store.addFromBuffer(buf, { name: String(name || '').slice(0, 12), tags: Array.isArray(tags) ? tags.slice(0, 3) : [], from: 'tool' })
           if (!r.ok) return { ok: false, message: r.reason || '没存成' }

@@ -10,10 +10,12 @@ import { isSessionBackoff } from '../src/chat/session-backoff.js'
 import { createBili } from '../src/bili/duty.js'
 import { createPurpose } from '../src/purpose/module.js'
 import { createFakeDsh } from './helpers/fake-dsh.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
 const MINUTE = 60_000
 const OWNER = '10000001'
 const BOT = '20000002'
+const testIdentity = makeTestIdentity(OWNER, 'qq', { personId: OWNER })
 const ownerChat = { kind: 'private', chatId: `private:${OWNER}`, userId: OWNER, nickname: '主人' }
 const content = [{ type: 'text', text: '你好' }]
 const settle = async () => { for (let i = 0; i < 20; i++) await new Promise(setImmediate) }
@@ -34,6 +36,8 @@ function setup(t) {
   const logs = { info: [], warn: [], error: [], debug: [] }
   const log = Object.fromEntries(Object.keys(logs).map((level) => [level, (...args) => logs[level].push(args.join(' '))]))
   const hub = createHub({ dsh: fake.ctx, getConfig: () => cfg, log,
+    identity: testIdentity,
+    routeOwner: () => testIdentity.routeOwner(),
     onebot: { async call() { return { message_id: 1 } } },
   })
   fake.ctx.effect(() => fake.ctx.on('session/event', hub.onSessionEvent))
@@ -283,6 +287,8 @@ test('B站挑关键词遇到挂载失败直接跳过；冷却期间 tick/run/che
 test('目的引擎首次挂载失败撤销预占次数，冷却跳过且不记自己的失败或日志', async (t) => {
   const s = setup(t)
   const purpose = createPurpose({ getConfig: () => s.cfg, hub: s.hub, log: s.log,
+    identity: testIdentity,
+    routeOwner: () => testIdentity.routeOwner(),
     personaText: () => '喜欢游戏，想和主人分享有趣的见闻。',
     memory: () => ({ list: () => [{ id: 'm1', text: '主人喜欢玩游戏', importance: 0.8, at: Date.now() }] }),
   })

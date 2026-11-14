@@ -28,7 +28,7 @@ export const FOLLOW_UP_WEIGHT = 4;
 /** 默认值刻意保守：白天每 2.5~5 小时最多一次，一天最多 4 次，23:30~08:30 不打扰。 */
 export const DEFAULT_PURPOSE_CONFIG = Object.freeze({
   enabled: true,
-  // 空 = 用 config.json 的 ownerQQ；一般不需要改。
+  // 空 = 由宿主自动选择主人当前可触达私聊；一般不需要改。
   ownerUin: '',
   gapMinMs: 150 * 60 * 1000,
   gapMaxMs: 300 * 60 * 1000,
@@ -145,10 +145,10 @@ export function nextDayStartAfter(now, config = DEFAULT_PURPOSE_CONFIG) {
   return d.getTime();
 }
 
-export function normalizePurposeConfig(input = {}, { ownerQQ = '' } = {}) {
+export function normalizePurposeConfig(input = {}, { owner = '' } = {}) {
   const src = isPlainObject(input) ? input : {};
-  const fallbackOwner = String(ownerQQ ?? '').replace(/[^\d]/g, '').slice(0, 12);
-  const rawOwner = String(src.ownerUin ?? '').replace(/[^\d]/g, '').slice(0, 12);
+  const fallbackOwner = String(owner ?? '').trim();
+  const rawOwner = String(src.ownerUin ?? '').trim();
   const gapMinMs = clampInt(src.gapMinMs, DEFAULT_PURPOSE_CONFIG.gapMinMs, 5 * MINUTE, 24 * HOUR);
   const gapMaxMs = clampInt(src.gapMaxMs, Math.max(gapMinMs, DEFAULT_PURPOSE_CONFIG.gapMaxMs), gapMinMs, 24 * HOUR);
   return {
@@ -687,8 +687,17 @@ export function collectMaterials({
   }
 
   // ① 和主人的私聊：最重要，也最不容易「隔着群」。
-  const ownerKey = ownerUin ? `private:${String(ownerUin).replace(/[^\d]/g, '')}` : '';
-  const ownerConv = ownerKey ? list.find((c) => c.key === ownerKey) : null;
+  const rawOwner = String(ownerUin || '').trim();
+  const ownerKeys = new Set();
+  if (rawOwner) {
+    if (rawOwner.includes(':')) ownerKeys.add(rawOwner);
+    else {
+      ownerKeys.add(`private:${rawOwner}`);
+      ownerKeys.add(`qq:private:${rawOwner}`);
+    }
+  }
+  const ownerConv = list.find((c) => ownerKeys.has(String(c.key || '')) || c.isOwner === true) || null;
+  const ownerKey = ownerConv ? String(ownerConv.key || '') : (rawOwner.includes(':') ? rawOwner : rawOwner ? `private:${rawOwner}` : '');
   if (ownerConv) {
     const recent = (Array.isArray(ownerConv.recentMessages) ? ownerConv.recentMessages : [])
       .filter((m) => m && messageAt(m) >= windowStart)
@@ -712,7 +721,7 @@ export function collectMaterials({
 
   // ② 群聊：只取最近活跃的 3 个群，重点挑「跟她有关 / 在问事 / 有约定」的几句。
   const groups = list
-    .filter((c) => String(c.key ?? '').startsWith('group:'))
+    .filter((c) => { const k = String(c.key ?? ''); return k.startsWith('group:') || k.includes(':group:') })
     .map((c) => {
       const recent = (Array.isArray(c.recentMessages) ? c.recentMessages : []).filter((m) => m && messageAt(m) >= windowStart);
       const lastAt = recent.length ? messageAt(recent[recent.length - 1]) : 0;
@@ -2365,7 +2374,7 @@ export function buildPurposePrompt({
 } = {}) {
   const lines = [];
   const owner = String(ownerName || '').trim() || '主人';
-  const uin = String(ownerUin || '').replace(/[^\d]/g, '');
+  const uin = String(ownerUin || '').trim();
   const clock = new Date(now);
   const week = ['日', '一', '二', '三', '四', '五', '六'][clock.getDay()];
   lines.push('【主动找主人 · 目的回合】');

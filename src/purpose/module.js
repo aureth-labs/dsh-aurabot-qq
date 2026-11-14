@@ -11,6 +11,8 @@
 
 import { dataDir, readJson, writeJson } from '../core/store.js'
 import { cleanOutboundText } from '../chat/reply.js'
+import { isOwner, isOwnerChatMuted, isOwnerPrivateChat } from '../chat/access.js'
+import { parseChatId } from '../gateway/address.js'
 import { isSessionBackoff } from '../chat/session-backoff.js'
 import { followUpHint } from '../features/memory.js'
 import { selfName, selfNames } from '../persona/personas.js'
@@ -62,7 +64,7 @@ export function purposeConfig(cfg = {}) {
       // 总开关只看本模块自己的设置（ext.purpose.enabled，默认 false）；
       // 与旧的「主动搭话」互不影响——两套同时开会重复打扰，迁移说明里提醒主人别同时开。
       enabled: cfg.enabled !== false && ext.enabled === true,
-      ownerUin: cfg.ownerQQ,
+      ownerUin: '',
       gapMinMs: clampInt(ext.minIntervalMinutes ?? su.minIntervalMinutes, 90, 5, 2880) * MINUTE,
       gapMaxMs: clampInt(ext.maxIntervalMinutes ?? su.maxIntervalMinutes, 240, 5, 2880) * MINUTE,
       initialDelayMinMs: clampInt(ext.initialDelayMinutes, 15, 1, 720) * MINUTE,
@@ -95,11 +97,14 @@ export function cleanReply(raw, options, cfg) {
   return s
 }
 
-export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, memory, personaText, pet: petOf, use }) {
+export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, memory, personaText, pet: petOf, use, identity, routeOwner }) {
   const moodOf = () => { try { return mood?.() || null } catch { return null } }
   const memoryOf = () => { try { return memory?.() || null } catch { return null } }
-  // 下面的 friend 是主动搭话白名单里的 QQ 号，不传就是主人。朋友各有各的状态，素材只看和这个人的私聊、关于这个人的记忆。
-  const chatIdOf = (cfg, friend) => `private:${friend || cfg.ownerQQ}`
+  const ownerId = () => identity?.owner?.() || null
+  const resolveOwnerChat = () => (typeof routeOwner === 'function' ? routeOwner() : hub?.ownerChat?.()) || ''
+  const ownerMuted = () => isOwnerChatMuted(identity, isMuted)
+  // 下面的 friend 是主动搭话白名单里的对象，不传就是主人。朋友各有各的状态，素材只看和这个人的私聊、关于这个人的记忆。
+  const chatIdOf = (cfg, friend) => (friend ? `private:${friend}` : resolveOwnerChat())
   const lastPrivateAt = (cfg, friend) => friend ? (hub?.lastPrivateAt?.(friend) || 0) : Math.max(hub?.lastOwnerChatAt || 0, hub?.lastBotToOwner?.at || 0)
   const stateFile = (friend) => dataDir('purpose', ...(friend ? ['friends', `${friend}.json`] : ['purpose-state.json']))
   const nudgeFile = () => dataDir('purpose', 'nudge.json')
@@ -153,11 +158,12 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
 
   // 聊天流水（hub.chatLogOf）→ 引擎的 conversations 结构：只看主人私聊 + 最近群；朋友只看 TA 自己的私聊
   function conversations(cfg, now = Date.now(), friend = '') {
-    const ownerKey = chatIdOf(cfg, friend)
+    const friendKey = friend ? `private:${friend}` : ''
     const per = new Map()
-    const pick = (chatId) => {
+    const pick = (chatId, isOwnerConv) => {
       let c = per.get(chatId)
-      if (!c) { c = { key: chatId, recentMessages: [], activeTopics: [], pendingThoughts: [] }; per.set(chatId, c) }
+      if (!c) { c = { key: chatId, isOwner: isOwnerConv, recentMessages: [], activeTopics: [], pendingThoughts: [] }; per.set(chatId, c) }
+      else if (isOwnerConv) c.isOwner = true
       return c
     }
     try {
@@ -165,12 +171,14 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
       for (const day of days.slice(-2)) {
         for (const e of hub.chatLogOf?.(day) || []) {
           if (!e?.chatId || e.forgottenAt) continue
-          if (e.chatId !== ownerKey && (friend || !String(e.chatId).startsWith('group:'))) continue
-          pick(e.chatId).recentMessages.push({
+          const isGroup = parseChatId(e.chatId)?.kind === 'group'
+          const isOwnPriv = friend ? e.chatId === friendKey : isOwnerPrivateChat(identity, e.chatId)
+          if (!isOwnPriv && (friend || !isGroup)) continue
+          pick(e.chatId, isOwnPriv && !friend).recentMessages.push({
             text: String(e.text || ''),
             time: Number(e.t) || 0,
             isSelf: e.who === 'bot',
-            isOwner: e.chatId === ownerKey && e.who !== 'bot',
+            isOwner: isOwnPriv && e.who !== 'bot',
             sender: e.who === 'bot' ? selfName(cfg) : String(e.uid || '群友'),
           })
         }
@@ -260,10 +268,11 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
 
   // ①~④ 收素材 → 驱动 → 目标假设 → 候选（不落盘；打分配了模型才有一次额外回合）
   async function prepare(cfg, config, state, now = Date.now(), friend = '') {
-    const followUp = memoryOf()?.dueFollowUp?.(friend || cfg.ownerQQ, now) || null
+    const targetPerson = friend || ownerId() || ''
+    const followUp = targetPerson ? (memoryOf()?.dueFollowUp?.(targetPerson, now) || null) : null
     const materials = collectMaterials({
       now, config,
-      ownerUin: friend || cfg.ownerQQ,
+      ownerUin: chatIdOf(cfg, friend) || targetPerson,
       roleName: selfName(cfg),
       roleAliases: selfNames(cfg),
       conversations: conversations(cfg, now, friend),
@@ -301,8 +310,8 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
   function promptFor(cfg, config, selected, ctx, state, now = Date.now(), friend = '') {
     const name = friend ? friendName(friend) : cfg.ownerName || '主人'
     const prompt = buildPurposePrompt({
-      now, config, mode: 'auto', // 模型直接输出那句话（Aurabot 没有 QQ 发送工具）
-      ownerUin: friend || cfg.ownerQQ,
+      now, config, mode: 'auto', // 模型直接输出那句话（Aurabot 没有发送工具）
+      ownerUin: friend || ownerId() || '',
       ownerName: name,
       contextBlocks: [],
       materials: ctx.materials.items,
@@ -453,9 +462,14 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
           // 主人在 QQ 私聊回复时补进她的上下文（#133 同款桥接；#211 review 后改为按真发出结果记）。
           const deliverOpts = { userText: MOOD_PREFIX }
           if (cred) { deliverOpts.enginePolicy = cred; deliverOpts.enginePolicyName = 'purpose' }
-          const r = await hub.deliver(chatIdOf(cfg, friend), text, deliverOpts)
-          // 真发出去过才算 sent：deliver 返回 {sent, failed}，sent 空 = 一条都没发出去（吞错/拦截/dry-run）
-          outcome = r && typeof r === 'object' && String(r.sent || '').trim() ? 'sent' : 'silent'
+          const to = chatIdOf(cfg, friend)
+          if (!to) {
+            outcome = 'silent'
+          } else {
+            const r = await hub.deliver(to, text, deliverOpts)
+            // 真发出去过才算 sent：deliver 返回 {sent, failed}，sent 空 = 一条都没发出去（吞错/拦截/dry-run）
+            outcome = r && typeof r === 'object' && String(r.sent || '').trim() ? 'sent' : 'silent'
+          }
         } catch (error) {
           outcome = 'delivery-failed'
           log.warn?.('目的：投递失败：', error?.message)
@@ -770,11 +784,13 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
   async function tick() {
     const cfg = getConfig()
     const config = purposeConfig(cfg)
-    if (!config.enabled || !cfg.ownerQQ) return
+    const ownId = ownerId()
+    if (!config.enabled || !ownId) return
     const ownerConfig = applyPersonaOverrides(config, personaOf(cfg))
-    if (!isMuted?.(chatIdOf(cfg)) && !memoryOf()?.dislikes?.(cfg.ownerQQ) && await tickOne(cfg, ownerConfig)) return
+    if (resolveOwnerChat() && !ownerMuted() && !memoryOf()?.dislikes?.(ownId) && await tickOne(cfg, ownerConfig)) return
     for (const qq of cfg.speakUp?.allow || []) {
-      if (String(qq) === String(cfg.ownerQQ) || isMuted?.(chatIdOf(cfg, qq)) || memoryOf()?.dislikes?.(qq)) continue
+      const addr = parseChatId(qq) || parseChatId(`private:${qq}`)
+      if (isOwner(identity, addr?.id || String(qq), addr?.platform || 'qq') || isMuted?.(chatIdOf(cfg, qq)) || memoryOf()?.dislikes?.(qq)) continue
       if (await tickOne(cfg, config, String(qq))) return
     }
   }
@@ -783,10 +799,11 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
   async function fire(reason = '手动') {
     const cfg = getConfig()
     const config = applyPersonaOverrides(purposeConfig(cfg), personaOf(cfg))
+    const ownId = ownerId()
     if (!config.enabled) return { outcome: 'disabled' }
-    if (isMuted?.(chatIdOf(cfg))) return { outcome: 'muted' }
-    if (memoryOf()?.dislikes?.(cfg.ownerQQ)) return { outcome: 'disliked' }
-    if (!cfg.ownerQQ) return { outcome: 'no-owner' }
+    if (!ownId || !resolveOwnerChat()) return { outcome: 'no-owner' }
+    if (ownerMuted()) return { outcome: 'muted' }
+    if (memoryOf()?.dislikes?.(ownId)) return { outcome: 'disliked' }
     const state = loadState(config)
     return runOnce({ reason, config, state, force: true })
   }

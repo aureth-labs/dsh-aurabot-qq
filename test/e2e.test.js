@@ -33,6 +33,8 @@ function fakePng(w, h, salt = 0) {
 async function brain({ preset, text, images, callTool }) {
   // 脚本按聊天内容匹配分支；时间/记忆/心情等上下文提示由独立回归检查，不当作用户新说的话。
   text = text.split('\n').filter(line => !line.startsWith('【当前本机时间】') && !line.startsWith('（你现在')).join('\n')
+  // 后台写空间日记会附带当天聊天片段：优先命中日记分支，避免聊天片段里的测试触发词误匹配聊天工具。
+  if (text.includes('【写空间日记】')) return '今天主人夸我可爱，开心得尾巴甩来甩去。晚饭吃了一大碗白米饭，满足～明天也要元气满满地陪大家聊天呀'
   // 记忆等上下文可能整段挂在用户消息前面：从聊天正文那行截断
   const chatLine = text.match(/【(?:私聊|群聊)[\s\S]*$/)
   if (chatLine) text = chatLine[0]
@@ -61,7 +63,6 @@ async function brain({ preset, text, images, callTool }) {
   if (text.includes('引用测试') && text.includes('【群聊')) { const n = (text.match(/\[(\d+)\][^\n]*引用测试/) || [])[1]; return n ? `<reply:${n}>收到这条啦\n别的我就不挨个回了` : '没看到编号' }
   if (text.includes('第一句') && text.includes('第二句')) return '两句我都看到啦'
   if (text.includes('画一只')) { const r = await callTool('qq_draw_image', { prompt: '一只蓝色小鲸鱼' }); return r && r.ok ? '画好啦' : '画不了' }
-  if (text.includes('【写空间日记】')) return '今天主人夸我可爱，开心得尾巴甩来甩去。晚饭吃了一大碗白米饭，满足～明天也要元气满满地陪大家聊天呀'
   if (text.includes('禁言')) {
     const r = await callTool('qq_group_admin', { action: 'ban', user_id: '999', minutes: 5 })
     return r && r.ok ? '好 禁了' : '你谁啊 我只听主人的'
@@ -1154,27 +1155,28 @@ test('表情包她自己整理：改名、改标签（同步到 QQ 收藏备注�
   const target = (await fake.call('/stickers')).json().items.find((i) => i.name === '测试猫猫')
   assert.ok(target)
   const mods = mock.sent('modify_custom_face').length
+  const latestChatTurn = () => fake.turns.filter((x) => !String(x.userText || x.inputText || '').startsWith('【写空间日记】')).at(-1)
   mock.push(priv(OWNER, text(`表情改名测试 把「${target.name}」改个名`)))
-  await until(() => fake.turns.at(-1)?.userText.includes('表情改名测试') && fake.turns.at(-1).toolCalls.length)
-  assert.match(fake.turns.at(-1).toolCalls[0].result.message, /改好了/)
+  const renameTurn = await until(() => { const t = latestChatTurn(); return t?.userText.includes('表情改名测试') && t.toolCalls.length ? t : null })
+  assert.match(renameTurn.toolCalls[0].result.message, /改好了/)
   const after = (await fake.call('/stickers')).json().items.find((i) => i.md5 === target.md5)
   assert.equal(after.name, '改过的名字')
   assert.deepEqual(after.tags, ['开心'])
   if (target.emojiId) await until(() => mock.sent('modify_custom_face').length > mods)
   mock.push(priv(OWNER, text('表情删除测试')))
-  await until(() => fake.turns.at(-1)?.userText.includes('表情删除测试') && fake.turns.at(-1).toolCalls.length)
-  assert.match(fake.turns.at(-1).toolCalls[0].result.message, /删掉了/)
+  const delTurn = await until(() => { const t = latestChatTurn(); return t?.userText.includes('表情删除测试') && t.toolCalls.length ? t : null })
+  assert.match(delTurn.toolCalls[0].result.message, /删掉了/)
   assert.equal((await fake.call('/stickers')).json().items.some((i) => i.md5 === target.md5), false)
 })
 
 test('翻聊天记录：读当前聊天更早的消息', async () => {
   mock.state.history = [{ time: 1700000000, user_id: 777, sender: { user_id: 777, nickname: '老张' }, message: [{ type: 'text', data: { text: '上周说好去吃火锅' } }] }]
   mock.push(priv(OWNER, text('翻聊天记录看看')))
-  await until(() => fake.turns.at(-1)?.userText.includes('翻聊天记录') && fake.turns.at(-1).toolCalls.length)
-  assert.match(fake.turns.at(-1).toolCalls[0].result.message, /老张：上周说好去吃火锅/)
+  const histTurn = await until(() => { const t = fake.turns.filter((x) => !String(x.userText || x.inputText || '').startsWith('【写空间日记】')).at(-1); return t?.userText.includes('翻聊天记录') && t.toolCalls.length ? t : null })
+  assert.match(histTurn.toolCalls[0].result.message, /老张：上周说好去吃火锅/)
 })
 
-const lastCall = (word) => until(() => { const t = fake.turns.at(-1); return t && String(t.userText || t.inputText || '').includes(word) && t.toolCalls.length ? t.toolCalls[0] : null })
+const lastCall = (word) => until(() => { const t = fake.turns.filter((x) => !String(x.userText || x.inputText || '').startsWith('【写空间日记】')).at(-1); return t && String(t.userText || t.inputText || '').includes(word) && t.toolCalls.length ? t.toolCalls[0] : null })
 
 test('#6 改资料：默认仅主人私聊，昵称 / 签名 / 头像走 SnowLuma 对应动作', async () => {
   mock.push(priv(OWNER, text('改昵称测试')))

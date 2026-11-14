@@ -6,13 +6,22 @@ export default {
   id: 'speakup',
   name: '主动搭话',
   version: '1.0.0',
+  api: 2,
+  platforms: ['*'],
   description: '主人一阵子没理她时，在私聊里主动找主人说话',
   tab: 'speakup',
   files: ['features/companion.js'],
   setup(api) {
     const { hub, mutes } = api.core
-    const speakUp = createSpeakUp({ getConfig: api.config, hub, log: api.log, isMuted: (chatId) => mutes.muted(chatId), memory: () => api.use('memory') })
-    api.every(60_000, () => (api.core.onebot?.state && api.core.onebot.state !== 'connected' ? undefined : speakUp.tick()), '主动搭话')
+    const speakUp = createSpeakUp({ getConfig: api.config, hub, log: api.log, isMuted: (chatId) => mutes.muted(chatId), memory: () => api.use('memory'), identity: api.core.identity, routeOwner: api.core.routeOwner })
+    const gatewayIdle = () => {
+      const insts = api.core.gateway?.instances?.()
+      if (Array.isArray(insts) && insts.some((s) => s?.enabled && s.caps !== null)) {
+        return !insts.some((s) => s?.enabled && s.state === 'connected')
+      }
+      return Boolean(api.core.onebot?.state && api.core.onebot.state !== 'connected')
+    }
+    api.every(60_000, () => (gatewayIdle() ? undefined : speakUp.tick()), '主动搭话')
     api.route('/speakup/fire', async () => {
       if (!api.config().enabled) return { ok: false, message: '先打开总开关' }
       await speakUp.fire('手动')

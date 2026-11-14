@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs'
 import { createBili } from '../../bili/duty.js'
 import { createGroupShare } from '../../bili/group-share.js'
 import { defineTool, str } from '../../tools/tools.js'
-import { permOf, profileToolVisible, profilePermits } from '../../chat/access.js'
+import { permOf, profileToolVisible, profilePermits, isOwnerPrivateChat } from '../../chat/access.js'
 import { avatarSource } from '../profile/index.js'
 import { resolvePainting } from '../../features/paintings.js'
 import { segmentBytes } from '../../core/net.js'
@@ -16,15 +16,17 @@ export default {
   id: 'bili',
   name: 'B站',
   version: '1.1.0',
+  api: 2,
+  platforms: ['*'],
   description: '看别人发的 B 站视频；定时自己刷、评论、回评论；可选发弹幕；抽帧看画面、发截图；按权限改自己的头像 / 签名（bili_watch / bili_comment / bili_danmaku / qq_send_shot / bili_set_avatar / bili_set_sign）',
   tab: 'bili',
   files: ['bili/duty.js', 'bili/group-share.js', 'bili/api.js', 'bili/vision.js', 'bili/shots.js', 'bili/danmaku.js', 'bili/login-pause.js', 'bili/qr-login.js'],
   setup(api) {
-    const { hub } = api.core
+    const { hub, identity, routeOwner } = api.core
     const lastImage = new Map() // chatId → 最近一张图的网址（给 bili_set_avatar 的 last 用）
     // 想发到群里的视频先攒成待批，主人在私聊里回「发 1」才真发
     const groupShare = createGroupShare({
-      getConfig: api.config, hub, log: api.log,
+      getConfig: api.config, hub, identity, routeOwner, log: api.log,
       // 截图库和「补一张」都在 createBili 里：用闭包延迟取，建完之后才真的被调用
       shotPathOf: (name) => bili.shotFileOf(name),
       captureShot: (bvid) => bili.captureShot(bvid),
@@ -38,10 +40,17 @@ export default {
     })
     const danmaku = createDanmaku(api)
     const bili = createBili({
-      getConfig: api.config, hub, memory: api.lazy('memory'), log: api.log, dsh: api.dsh,
+      getConfig: api.config, hub, identity, routeOwner, memory: api.lazy('memory'), log: api.log, dsh: api.dsh,
       afterBrowse: danmaku.afterBrowse, groupShare,
     })
-    api.every(60_000, () => (api.core.onebot?.state && api.core.onebot.state !== 'connected' ? undefined : bili.tick()), '刷B站')
+    const gatewayIdle = () => {
+      const insts = api.core.gateway?.instances?.()
+      if (Array.isArray(insts) && insts.some((s) => s?.enabled && s.caps !== null)) {
+        return !insts.some((s) => s?.enabled && s.state === 'connected')
+      }
+      return Boolean(api.core.onebot?.state && api.core.onebot.state !== 'connected')
+    }
+    api.every(60_000, () => (gatewayIdle() ? undefined : bili.tick()), '刷B站')
 
     // 看视频谁发的链接都能看，评论要主人开口
     api.tool(({ chat, sessionId }) => {
@@ -96,7 +105,7 @@ export default {
       const cfg = api.config()
       if (!cfg.bili.enabled) return []
       const tools = []
-      if (profileToolVisible(cfg, 'biliAvatar', chat)) tools.push(defineTool({
+      if (profileToolVisible(cfg, 'biliAvatar', chat, identity)) tools.push(defineTool({
         name: 'bili_set_avatar',
         description: '换你自己 B 站账号的头像。image 填图片网址；填 last 就用这个聊天里刚才别人发的那张图；填「画作 #1」就用你自己刚画的那张（画完时会告诉你编号）。图超过 2MB 会自动缩小。',
         properties: { image: str('图片网址（http/https）／last（刚才那张图）／画作编号（如 #1）') },
@@ -104,7 +113,7 @@ export default {
         execute: async ({ image }) => {
           const c = api.config()
           if (!c.bili.enabled) return { ok: false, message: 'B 站没打开' }
-          const p = profilePermits(c, 'biliAvatar', chat, hub.turnSendersAllOwner(sessionId))
+          const p = profilePermits(c, 'biliAvatar', chat, hub.turnSendersAllOwner(sessionId), identity)
           if (!p.ok) return p
           const chatId = hub.chatOfSession?.(sessionId) || chat.chatId
           const raw = String(image || '').trim()
@@ -129,7 +138,7 @@ export default {
             const pick = media.filter((x) => !x.sticker).at(-1) || media.at(-1)
             if (pick) {
               try {
-                const buf = await segmentBytes(pick.seg, api.core.onebot, { maxBytes: 10 * 1024 * 1024 })
+                const buf = await segmentBytes(pick.seg, null, { maxBytes: 10 * 1024 * 1024 })
                 if (buf && buf.length) return bili.setAvatar(buf)
               } catch (error) { /* 退回网址 */ }
             }
@@ -143,7 +152,7 @@ export default {
           return bili.setAvatar(src.file)
         },
       }))
-      if (!profileToolVisible(cfg, 'biliSign', chat)) return tools
+      if (!profileToolVisible(cfg, 'biliSign', chat, identity)) return tools
       return [...tools, defineTool({
         name: 'bili_set_sign',
         description: '改你自己 B 站账号的个性签名（最多 70 字）。有人让你改 B 站签名时用。',
@@ -152,7 +161,7 @@ export default {
         execute: async ({ text }) => {
           const c = api.config()
           if (!c.bili.enabled) return { ok: false, message: 'B 站没打开' }
-          const p = profilePermits(c, 'biliSign', chat, hub.turnSendersAllOwner(sessionId))
+          const p = profilePermits(c, 'biliSign', chat, hub.turnSendersAllOwner(sessionId), identity)
           if (!p.ok) return p
           return bili.setSign(text)
         },
@@ -173,7 +182,7 @@ export default {
     api.tool(({ chat, level, sessionId }) => {
       const cfg = api.config()
       if (!cfg.bili.enabled || !cfg.bili.danmakuEnabled || level !== 'full'
-        || chat.kind !== 'private' || String(chat.userId) !== String(cfg.ownerQQ)) return []
+        || !isOwnerPrivateChat(identity, chat)) return []
       return defineTool({
         name: 'bili_danmaku',
         description: '只有主人明确让你发弹幕时才用。link 为视频或番剧链接；seconds 为当前分P内的出现时间（秒），part 为分P或ss链接的选集序号。不要替主人猜时间或内容。',

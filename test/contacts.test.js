@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { makeTestIdentity } from './helpers/identity.js'
 
 const { default: contacts, planWhitelist, cleanId } = await import('../src/modules/contacts/index.js')
 const { normalize } = await import('../src/core/config.js')
@@ -16,6 +17,7 @@ const group = { kind: 'group', userId: OWNER, groupId: '555', chatId: 'group:555
 
 function setup({ cfg = {}, allOwner = true, callImpl } = {}) {
   let config = normalize({ ownerQQ: OWNER, botQQ: BOT, dryRun: false, ...cfg })
+  const identity = makeTestIdentity(config.ownerQQ || OWNER, 'qq')
   const calls = []
   const sent = []
   const listeners = {}
@@ -23,6 +25,8 @@ function setup({ cfg = {}, allOwner = true, callImpl } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'aurabot-contacts-'))
   const api = {
     core: {
+      identity,
+      routeOwner: identity.routeOwner,
       hub: { turnSendersAllOwner: () => allOwner },
       onebot: {
         call: async (action, params) => {

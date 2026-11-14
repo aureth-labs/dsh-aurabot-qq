@@ -14,6 +14,8 @@ export default {
   id: 'purpose',
   name: '目的引擎（实验）',
   version: '1.0.0',
+  api: 2,
+  platforms: ['*'],
   description: '像人一样主动找主人搭话：攒素材 → 记观察 → 立目标假设 → 挑一个候选，到点了才来找你。默认关闭；开启前建议先关掉「主动搭话」总开关，两套别同时开。',
   tab: 'speakup',
   files: ['purpose/engine.js', 'purpose/module.js'],
@@ -44,6 +46,8 @@ export default {
       // 素材口：浏览型模块（rss-reader「自主上网」等）的素材按需取用；没装/没开是 null。
       use: (id) => api.use(id),
       personaText: () => { try { return api.core.personas?.current?.() || '' } catch { return '' } },
+      identity: api.core.identity,
+      routeOwner: api.core.routeOwner,
     })
     api.every(60_000, () => purpose.tick(), '目的引擎')
     api.route('/purpose/fire', async () => {

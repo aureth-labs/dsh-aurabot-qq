@@ -32,10 +32,10 @@ export function pendingInThread(comment, selfId, handled = new Set()) {
 /**
  * 把说说下面的评论（含回复）整理成几行，给她当上下文。
  * @param {object[]} comments get_qzone_msg_detail 的 comments
- * @param {object} o selfId / ownerQQ / ownerName；exclude = 要跳过的一级评论 id；max = 最多几行
+ * @param {object} o selfId / ownerAccount / ownerName；exclude = 要跳过的一级评论 id；max = 最多几行
  */
-export function summarizeComments(comments, { selfId, ownerQQ, ownerName = '主人', exclude = '', max = 8 } = {}) {
-  const who = (u) => (String(u.uin) === String(selfId) ? '你' : `${u.name || u.uin}${String(u.uin) === String(ownerQQ) ? `（你的${ownerName}）` : ''}`)
+export function summarizeComments(comments, { selfId, ownerAccount, ownerName = '主人', exclude = '', max = 8 } = {}) {
+  const who = (u) => (String(u.uin) === String(selfId) ? '你' : `${u.name || u.uin}${ownerAccount && String(u.uin) === String(ownerAccount) ? `（你的${ownerName}）` : ''}`)
   const lines = []
   for (const c of comments || []) {
     if (String(c.comment_id ?? '') === String(exclude)) continue
@@ -50,7 +50,7 @@ export function pickFeeds(feeds, selfId, now = Date.now()) {
   return (feeds || []).filter((f) => f && f.appid === 311 && Number(f.uin) > 0 && String(f.uin) !== String(selfId) && f.key && now / 1000 - Number(f.time || 0) < 86400)
 }
 
-export function createQzoneSocial({ getConfig, onebot, hub, log, memory }) {
+export function createQzoneSocial({ getConfig, onebot, hub, log, memory, identity }) {
   // 空间里看到的东西记进流水（chatId = qzone），每次整理记忆时从里面提炼关于好友的事
   const remember = (who, uin, text) => { try { hub.logChat?.('qzone', who, text, uin) } catch (error) {} }
   const file = () => dataDir('qzone-social.json')
@@ -60,6 +60,10 @@ export function createQzoneSocial({ getConfig, onebot, hub, log, memory }) {
 
   const self = () => String(hub.selfId || getConfig().botQQ)
   const owner = () => getConfig().ownerName || '主人'
+  const ownerAccount = () => {
+    const id = identity?.owner?.()
+    return id ? String(identity.accountOn?.(id, 'qq') || '') : ''
+  }
 
   async function write(prompt) {
     const out = await hub.runSystemTurn('qzone-social', 'QQ · 空间互动', `【空间互动，不是聊天，这一轮不会发到聊天里】\n${prompt}\n\n只输出评论正文本身，一两句、口语、不超过 40 个字，别加引号和前缀；不想评就只回 [沉默]。`, { timeoutMs: 120000 })
@@ -99,10 +103,11 @@ export function createQzoneSocial({ getConfig, onebot, hub, log, memory }) {
         for (const id of t.pending.map((x) => x.id)) handled.add(id) // 这一串新消息只回一次，回不回都不再看
         for (const x of t.pending) remember(x.name, x.uin, `在你的说说「${String(m.content).slice(0, 30)}」下面说：${String(x.content).slice(0, 200)}`)
         const last = t.pending[t.pending.length - 1]
-        const name = (u) => (String(u.uin) === self() ? '你' : u.name + (String(u.uin) === String(getConfig().ownerQQ) ? `（你的${owner()}）` : ''))
+        const ownerAcc = ownerAccount()
+        const name = (u) => (String(u.uin) === self() ? '你' : u.name + (ownerAcc && String(u.uin) === ownerAcc ? `（你的${owner()}）` : ''))
         const thread = t.thread.map((x) => `${name(x)}：${String(x.content).slice(0, 150)}`).join('\n')
         // 同一条说说下别人在聊的，也让她知道（不重复说、能接上大家的话）
-        const others = summarizeComments(d.comments, { selfId: self(), ownerQQ: getConfig().ownerQQ, ownerName: owner(), exclude: c.comment_id, max: 6 })
+        const others = summarizeComments(d.comments, { selfId: self(), ownerAccount: ownerAcc, ownerName: owner(), exclude: c.comment_id, max: 6 })
         const text = await write(`你在 QQ 空间发过一条说说：「${String(m.content).slice(0, 200)}」${m.images?.length ? `（配了 ${m.images.length} 张图）` : ''}\n` +
           (others.length ? `这条说说下面大家的评论：\n${others.join('\n')}\n\n` : '') +
           `你要回的是这一串：\n${thread}\n\n${last.name} 刚刚说了新的话，结合说说内容和上面的评论，用你的口气接着回 TA 一句。`)
@@ -132,7 +137,8 @@ export function createQzoneSocial({ getConfig, onebot, hub, log, memory }) {
       seen.add(f.key)
       const brief = String(f.html || '').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim()
       remember(f.nickname, f.uin, '发了说说：' + brief.slice(0, 300))
-      const isOwner = String(f.uin) === String(getConfig().ownerQQ)
+      const ownerAcc = ownerAccount()
+      const isOwner = Boolean(ownerAcc) && String(f.uin) === ownerAcc
       const chance = isOwner ? Math.max(c.friendChance, c.ownerChance) : c.friendChance
       if (Math.random() >= chance) continue
       let content = ''
@@ -141,7 +147,7 @@ export function createQzoneSocial({ getConfig, onebot, hub, log, memory }) {
       try {
         const d = await onebot.call('get_qzone_msg_detail', { tid: f.key, target_uin: Number(f.uin), num: 10 }, { timeoutMs: 20000 })
         content = String(d?.content || '')
-        existing = summarizeComments(d?.comments, { selfId: self(), ownerQQ: getConfig().ownerQQ, ownerName: owner(), max: 8 })
+        existing = summarizeComments(d?.comments, { selfId: self(), ownerAccount: ownerAcc, ownerName: owner(), max: 8 })
       } catch (error) {
         content = String(f.html || '').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim()
       }

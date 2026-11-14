@@ -6,7 +6,8 @@
 // 为什么放在 tools/pre-execute 这一层：DSH 在工具真正执行前会走这个 waterfall，
 // 这里返回 deny 就不会执行，能拿到「命令原文」，比只靠提示词可靠。
 
-import { isOwner } from '../chat/access.js'
+import { isOwnerPrivateChat, resolveConfirmChat } from '../chat/access.js'
+import { normalizeChatId } from '../gateway/address.js'
 
 const CONFIRM_RE = /^(确认|确认执行|同意|同意执行|允许|允许执行|可以|执行吧|放行|yes|y|ok)$/i
 const CANCEL_RE = /^(取消|取消执行|拒绝|不要|不|不行|别|停|停手|拦下|no|n)$/i
@@ -432,28 +433,31 @@ const clip = (text, n = 300) => (text.length > n ? text.slice(0, n) + '…' : te
  * 危险命令确认器。host 负责把 DSH 的 tools/pre-execute 和 QQ 私聊回复接进来。
  * @param {object} o
  * @param {() => object} o.getConfig 读最新配置（每次工具调用都重新判断开关）
- * @param {(chatId:string, text:string) => Promise<any>} o.deliver 发 QQ 消息（主人私聊）
- * @param {(sessionId:string) => string} o.chatOfSession DSH session → QQ chatId
- * @param {(sessionId:string) => boolean} [o.isOwnedSession] 这个会话是不是 aurabot 自己开的（QQ 聊天映射来的）
- * @param {() => string} o.ownerQQ 主人 QQ 号
+ * @param {(chatId:string, text:string) => Promise<any>} o.deliver 发消息（主人私聊）
+ * @param {(sessionId:string) => string} o.chatOfSession DSH session → chatId
+ * @param {(sessionId:string) => boolean} [o.isOwnedSession] 这个会话是不是 aurabot 自己开的（聊天映射来的）
+ * @param {object} [o.identity] 身份服务
+ * @param {(platform?:string) => string|null} [o.routeOwner] 主人兜底路由
  * @param {number} [o.timeoutMs] 等确认的超时（默认 60 秒）
  * @param {object} [o.log]
  */
-export function createDangerGuard ({ getConfig, deliver, chatOfSession, isOwnedSession, ownerQQ, timeoutMs = 60_000, log } = {}) {
+export function createDangerGuard ({ getConfig, deliver, chatOfSession, isOwnedSession, identity, routeOwner, timeoutMs = 60_000, log } = {}) {
   const pending = new Map() // chatId → { resolve, timer }
   let disposed = false
+  const pendingKey = (chatId) => normalizeChatId(chatId) || String(chatId || '').trim()
 
   function cleanup (chatId, value) {
-    const p = pending.get(chatId)
+    const key = pendingKey(chatId)
+    const p = pending.get(key)
     if (!p) return false
-    pending.delete(chatId)
+    pending.delete(key)
     clearTimeout(p.timer)
     p.resolve(value)
     return true
   }
 
   /**
-   * 工具执行前：命中危险规则就发 QQ 问主人，等回复；确认才放行。
+   * 工具执行前：命中危险规则就发私聊问主人，等回复；确认才放行。
    * next() 返回 allow；返回 deny 时 DSH 会把 reason 给模型。
    */
   async function preExecute (exec, next) {
@@ -461,7 +465,7 @@ export function createDangerGuard ({ getConfig, deliver, chatOfSession, isOwnedS
     // DSH 的智能体团队是全局工具，打开后群聊会话也拿得到；成员有电脑权限，只有主人私聊能用
     if (String(exec?.name || '') === 'spawn_teammate') {
       const chatId = chatOfSession ? String(chatOfSession(exec.agent?.session?.id) || '') : ''
-      if (chatId && chatId !== `private:${ownerQQ ? ownerQQ() : ''}`) {
+      if (chatId && !isOwnerPrivateChat(identity, chatId)) {
         log?.warn?.(`已拦下 spawn_teammate（${chatId}）`)
         return { kind: 'deny', reason: '只有主人私聊才能创建成员。' }
       }
@@ -475,7 +479,7 @@ export function createDangerGuard ({ getConfig, deliver, chatOfSession, isOwnedS
     if (!danger) return next()
     const sessionId = exec.agent && exec.agent.session && exec.agent.session.id
     // 只管 aurabot 自己开的会话。tools/pre-execute 是进程级的，同一个 DSH 进程里主人自己开的
-    // Web GUI / CLI 会话也会走到这里；那些命令不归这个守卫管，不该被 QQ 的安全策略拦下
+    // Web GUI / CLI 会话也会走到这里；那些命令不归这个守卫管，不该被这个安全策略拦下
     // （何况拦下时拿不到 chatId，连确认消息都发不出去，主人没有任何办法放行）。
     // 没传 isOwnedSession 的调用方（老用法 / 单测）保持原行为，照旧往下判断。
     if (typeof isOwnedSession === 'function') {
@@ -484,16 +488,17 @@ export function createDangerGuard ({ getConfig, deliver, chatOfSession, isOwnedS
       try { owned = !!isOwnedSession(sessionId) } catch (error) { owned = null }
       if (owned === false) return next()
     }
-    const chatId = chatOfSession ? String(chatOfSession(sessionId) || '') : ''
-    const owner = String(ownerQQ ? ownerQQ() : '')
-    const ownerChat = owner ? `private:${owner}` : ''
-    // 是我的会话但认不出聊天（比如 QQ 会话刚建立、映射还没落盘）：不敢放也不敢问，仍然拦下
-    if (!chatId || chatId !== ownerChat) {
-      log?.warn?.(`危险命令已拦下（非主人私聊 ${chatId || '未知'}）：${clip(command, 120)}`)
+    const rawChat = chatOfSession ? String(chatOfSession(sessionId) || '') : ''
+    const ownerBefore = typeof identity?.owner === 'function' ? identity.owner() : null
+    const targetChat = rawChat && ownerBefore ? resolveConfirmChat(identity, rawChat, routeOwner) : ''
+    // 是我的会话但认不出聊天（比如会话刚建立、映射还没落盘）或非主人私聊：不敢放也不敢问，仍然拦下
+    if (!targetChat) {
+      log?.warn?.(`危险命令已拦下（非主人私聊 ${rawChat || '未知'}）：${clip(command, 120)}`)
       return { kind: 'deny', reason: `这条命令被安全策略拦下了（${danger.label}）：只有主人私聊里、并且经过主人确认才能执行。` }
     }
-    // 同一个人已经在等确认：别再发第二条，直接拦
-    if (pending.has(chatId)) {
+    const key = pendingKey(targetChat)
+    // 同一个私聊已经在等确认：别再发第二条，直接拦
+    if (pending.has(key)) {
       return { kind: 'deny', reason: `上一条危险命令还在等主人确认（${danger.label}），这条先不执行。` }
     }
     const seconds = Math.max(1, Math.round(timeoutMs / 1000))
@@ -506,10 +511,10 @@ export function createDangerGuard ({ getConfig, deliver, chatOfSession, isOwnedS
     try {
       const asked = new Promise((resolve) => {
         // 注意别 unref：系统就在等这个确认（工具调用被挂住），计时器必须撑着
-        const timer = setTimeout(() => { cleanup(chatId, false); log?.warn?.(`危险命令确认超时，已拦下：${clip(command, 120)}`) }, timeoutMs)
-        pending.set(chatId, { resolve, timer })
+        const timer = setTimeout(() => { cleanup(key, false); log?.warn?.(`危险命令确认超时，已拦下：${clip(command, 120)}`) }, timeoutMs)
+        pending.set(key, { resolve, timer })
       })
-      ;(async () => { try { await deliver(ownerChat, question) } catch (error) { log?.warn?.('危险命令确认消息没发出去：', error.message); cleanup(chatId, false) } })()
+      ;(async () => { try { await deliver(targetChat, question) } catch (error) { log?.warn?.('危险命令确认消息没发出去：', error.message); cleanup(key, false) } })()
       ok = await asked
     } catch (error) {
       log?.warn?.('危险命令确认出错：', error.message)
@@ -518,8 +523,8 @@ export function createDangerGuard ({ getConfig, deliver, chatOfSession, isOwnedS
     if (ok && !disposed) {
       // 等待期间可能已经关闭确认开关或换了主人：旧确认不能继续放行
       const nowCfg = getConfig() || {}
-      const ownerNow = String(ownerQQ ? ownerQQ() : '')
-      if (nowCfg.security?.dangerConfirm !== true || ownerNow !== owner) {
+      const ownerNow = typeof identity?.owner === 'function' ? identity.owner() : null
+      if (nowCfg.security?.dangerConfirm !== true || !ownerBefore || ownerNow !== ownerBefore || !isOwnerPrivateChat(identity, targetChat)) {
         log?.warn?.(`危险命令确认已失效（开关或主人已变），拦下：${clip(command, 120)}`)
         return { kind: 'deny', reason: `危险命令确认已失效（${danger.label}）：确认开关或主人身份在执行前发生了变化，请重新发起。` }
       }
@@ -531,22 +536,22 @@ export function createDangerGuard ({ getConfig, deliver, chatOfSession, isOwnedS
   }
 
   /**
-   * 处理主人 QQ 私聊回复。命中的确认/取消返回 true（这条消息被消费，不再交给她）；
+   * 处理主人私聊回复。命中的确认/取消返回 true（这条消息被消费，不再交给她）；
    * 其它消息返回 false，照常走原来的聊天流程。
    */
   function handleReply (chatId, userId, text) {
-    if (!pending.has(String(chatId || ''))) return false
+    const key = pendingKey(chatId)
+    if (!key || !pending.has(key)) return false
     // 等待期间关闭确认开关：取消旧 pending，不再接受旧确认
     const cfg = getConfig() || {}
     if (!cfg.security || cfg.security.dangerConfirm !== true) {
-      cleanup(String(chatId), false)
+      cleanup(key, false)
       return false
     }
-    const owner = String(ownerQQ ? ownerQQ() : '')
-    if (!isOwner({ ownerQQ: owner }, userId)) return false
+    if (!isOwnerPrivateChat(identity, chatId, userId)) return false
     const t = String(text || '').trim()
-    if (CONFIRM_RE.test(t)) return cleanup(String(chatId), true)
-    if (CANCEL_RE.test(t)) return cleanup(String(chatId), false)
+    if (CONFIRM_RE.test(t)) return cleanup(key, true)
+    if (CANCEL_RE.test(t)) return cleanup(key, false)
     return false
   }
 

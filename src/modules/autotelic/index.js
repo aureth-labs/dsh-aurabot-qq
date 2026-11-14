@@ -22,6 +22,8 @@ export default {
   id: 'autotelic',
   name: '自驱引擎（实验）',
   version: '0.4.1',
+  api: 2,
+  platforms: ['*'],
   description: '给她自己的后台会话与账本：独立 preset、机械审计（哈希链）、好奇判分与立项、L1 分级执行（反思/每日一页/做梦）、Python 与用户模块（P3）、技能库与提案通道（P4）。默认关闭，全关时插件行为与旧版一致。',
   files: ['autotelic/audit.js', 'autotelic/engine.js', 'autotelic/book.js', 'autotelic/runtime.js', 'autotelic/exec.js', 'autotelic/reflect.js', 'autotelic/python.js', 'autotelic/skills.js', 'autotelic/takeover.js'],
   // 独立标签页「自驱引擎」（页面在 client/client.js：TABS/TAB_MODS/NAV_GROUPS/Autotelic 组件）。
@@ -91,6 +93,7 @@ export default {
       settings: () => api.settings(),
       cfg: api.config(),
       hub: api.core.hub,
+      identity: api.core.identity,
       memoryOf: () => { try { return api.use('memory') } catch { return null } },
       personaName: () => '', // 人格名（素材提权重用）；取不到就空着
       ledgerFile: api.dataDir('ledger.json'),

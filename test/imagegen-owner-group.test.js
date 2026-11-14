@@ -7,6 +7,7 @@ import { normalize } from '../src/core/config.js'
 import { createHub } from '../src/chat/hub.js'
 import imagegenModule from '../src/modules/imagegen/index.js'
 import { createFakeDsh } from './helpers/fake-dsh.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
 const OWNER = '10000001', OTHER = '10000002', BOT = '20000002', GROUP = '30000003'
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -46,7 +47,9 @@ function setup(t, { beforeDraw } = {}) {
     await callTool('qq_draw_image', { prompt: '测试图片' })
     return ''
   } })
+  const identity = makeTestIdentity(OWNER, 'qq')
   hub = createHub({ dsh: fake.ctx, getConfig: () => cfg, log,
+    identity, routeOwner: identity.routeOwner, defaultPlatform: 'qq',
     onebot: { connected: true, async call(action) {
       if (action === 'get_group_info') return { group_name: '测试群' }
       if (action === 'get_msg') return { sender: { user_id: Number(BOT) }, message: [{ type: 'text', data: { text: '上一条回复' } }] }
@@ -57,7 +60,7 @@ function setup(t, { beforeDraw } = {}) {
   })
   imagegenModule.setup({ config: () => cfg, log, dsh: fake.ctx, lazy: () => ({}), route() {},
     tool: fn => { buildImage = fn },
-    core: { hub, local: { active: name => name === 'image', call: async () => { draws++; throw new Error('TEST_AUTHORIZED_NO_IMAGE_API') } } },
+    core: { hub, identity, routeOwner: identity.routeOwner, local: { active: name => name === 'image', call: async () => { draws++; throw new Error('TEST_AUTHORIZED_NO_IMAGE_API') } } },
   })
   fake.ctx.effect(() => fake.ctx.on('session/event', hub.onSessionEvent))
   t.after(() => { if (!fake.turns.length) t.diagnostic(fake.logs.join('\n')); hub.dispose(); fake.dispose(); rmSync(dir, { recursive: true, force: true }) })

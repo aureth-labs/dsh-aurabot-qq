@@ -10,6 +10,7 @@ import { normalize } from '../src/core/config.js'
 import { createLocal } from '../src/local/local.js'
 import { savePainting } from '../src/features/paintings.js'
 import imagegenModule from '../src/modules/imagegen/index.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
 const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(64)])
 const OTHER = Buffer.from(PNG)
@@ -177,7 +178,8 @@ test('图库只接受文件名；任意路径、URL、base64 输入、伪图片�
 function mediaHub(t) {
   sandbox(t)
   const cfg = normalize({ botQQ: BOT, ownerQQ: OWNER, enabled: false, dryRun: true, titleFilter: { enabled: false }, stickers: { collect: false }, allow: { private: ['10000002'], groups: ['123'] } })
-  const hub = createHub({ dsh: {}, getConfig: () => cfg, log, onebot: {}, stickers: {} })
+  const identity = makeTestIdentity(OWNER, 'qq')
+  const hub = createHub({ dsh: {}, getConfig: () => cfg, log, identity, routeOwner: identity.routeOwner, defaultPlatform: 'qq', onebot: {}, stickers: {} })
   t.after(() => hub.dispose())
   return hub
 }
@@ -225,7 +227,8 @@ test('quote 复用 hub 引用解析缓存，按聊天隔离，支持私聊并保
     merge: { enabled: true, waitSec: 3600, maxSec: 3600 },
     titleFilter: { enabled: false }, stickers: { collect: false }, allow: { groups: ['123', '456'] },
   })
-  const hub = createHub({ dsh: {}, getConfig: () => cfg, log, stickers: {},
+  const identity = makeTestIdentity(OWNER, 'qq')
+  const hub = createHub({ dsh: {}, getConfig: () => cfg, log, identity, routeOwner: identity.routeOwner, defaultPlatform: 'qq', stickers: {},
     hooks: { groupDecide: () => ({ reply: false }) },
     onebot: { call: async (action) => {
       assert.equal(action, 'get_msg')
@@ -264,9 +267,10 @@ function drawTool(cfg, overrides = {}) {
     canSeeImages: async () => false,
     ...overrides,
   }
+  const identity = makeTestIdentity(OWNER, 'qq')
   imagegenModule.setup({ config: () => cfg, log, dsh: {}, lazy: () => ({ addEvent: (event) => events.push(event) }),
     route() {}, tool: (fn) => { build = fn },
-    core: { hub, local: { active: () => true, call: async (slot, args) => { generated.push({ slot, args }); return OTHER } } },
+    core: { hub, identity, routeOwner: identity.routeOwner, local: { active: () => true, call: async (slot, args) => { generated.push({ slot, args }); return OTHER } } },
   })
   return { tool: build({ chat: privateChat, sessionId: 'img-test' }), generated, sent, events, references }
 }

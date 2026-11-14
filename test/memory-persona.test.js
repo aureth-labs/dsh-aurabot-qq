@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { normalize } from '../src/core/config.js'
 import { createMemoryStore, memoryLine } from '../src/features/memory.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
 const OWNER = '10000001'
 const A = '30000001'
@@ -41,7 +42,8 @@ function setup(t, answer = () => '[]', memory = {}, fetchImpl) {
     yield { type: 'text-delta', text: response || '[]' }
     yield { type: 'finish', reason: { kind: 'completed' } }
   } } }
-  const make = () => createMemoryStore({ dsh, getConfig: () => cfg, hub, log, fetchImpl })
+  const identity = makeTestIdentity(OWNER, 'qq', { legacyIds: [OWNER, A, B, C, '30000004'] })
+  const make = () => createMemoryStore({ dsh, getConfig: () => cfg, hub, log, fetchImpl, identity })
   const state = () => readMemoryState(dir)
   const put = (s) => writeMemoryState(dir, s)
   t.after(() => {
@@ -49,7 +51,7 @@ function setup(t, answer = () => '[]', memory = {}, fetchImpl) {
     else process.env.AURABOT_DATA_DIR = previous
     rmSync(dir, { recursive: true, force: true })
   })
-  return { cfg, calls, logs, hub, make, state, put, speakers: (v) => { speakers = v } }
+  return { cfg, calls, logs, hub, identity, make, state, put, speakers: (v) => { speakers = v } }
 }
 
 const isExtract = (system) => system.includes('整理长期记忆')

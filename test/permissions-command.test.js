@@ -2,12 +2,14 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { parseCommand, runCommand } from '../src/chat/commands.js'
 import { runPermissionsCommand } from '../src/chat/permissions-command.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
-const owner = { kind: 'private', userId: '123456' }
-const guest = { kind: 'private', userId: '10000002' }
+const owner = { kind: 'private', platform: 'qq', userId: '123456' }
+const guest = { kind: 'private', platform: 'qq', userId: '10000002' }
 function setup() {
-  let config = { ownerQQ: owner.userId, allow: { private: [], groups: [] }, capabilityAllow: { image: [], song: [], video: [] }, commandAllow: {} }
-  const deps = { getConfig: () => config, setConfig: (v) => { config = v }, extraCommands: [{ name: 'hello', module: 'probe', delegatable: true }, { name: 'admin', module: 'probe' }] }
+  let config = { allow: { private: [], groups: [] }, capabilityAllow: { image: [], song: [], video: [] }, commandAllow: {} }
+  const identity = makeTestIdentity(owner.userId)
+  const deps = { getConfig: () => config, setConfig: (v) => { config = v }, identity, extraCommands: [{ name: 'hello', module: 'probe', delegatable: true }, { name: 'admin', module: 'probe' }] }
   return { deps, config: () => config, call: (arg, msg = owner) => runPermissionsCommand(arg, msg, deps) }
 }
 

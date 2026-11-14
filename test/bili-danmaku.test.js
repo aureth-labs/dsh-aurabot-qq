@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { createDanmaku, danmakuInput, danmakuPanelRequest } from '../src/modules/bili/danmaku.js'
 import definition from '../src/modules/bili/index.js'
 import { bangumiEpisode } from '../src/bili/danmaku.js'
+import { makeTestIdentity } from './helpers/identity.js'
 const video = 'BV1xx411c7mD'
 const input = { video, text: '这一段好有意思😀', seconds: 8.25, position: 'bottom' }
 
@@ -15,12 +16,13 @@ function fixture() {
   Object.defineProperty(cfg.bili, 'cookie', { get: () => cookie })
   const calls = [], memories = [], disposers = [], prompts = []
   let onPrepare = () => {}, onPost = () => {}, response = { dmid_str: '12345678901234567890' }
+  const identity = makeTestIdentity('10000', 'qq')
   const api = {
     config: () => cfg, settings: () => cfg.bili, dataDir: () => '/unused/danmaku.json',
     lib: () => ({ readJson: () => structuredClone(data), writeJson: (file, next) => { data = structuredClone(next) } }),
     use: (name) => name === 'login-manager' ? { resolve: () => ({ handled: true, ok: !!cookie, cookie }) } : name === 'memory' ? { addEvent: (event) => memories.push(event) } : null,
     onDispose: (fn) => disposers.push(fn), log: { warn() {} },
-    core: { hub: { runSystemTurn: async (...args) => { prompts.push(args); return JSON.stringify({ send: true, text: '这个主题挺有趣', seconds: 0 }) } } },
+    core: { identity, routeOwner: identity.routeOwner, hub: { runSystemTurn: async (...args) => { prompts.push(args); return JSON.stringify({ send: true, text: '这个主题挺有趣', seconds: 0 }) } } },
   }
   const controller = createDanmaku(api, { read: () => structuredClone(data), write: (file, next) => { data = structuredClone(next) }, now: () => time, prepare: async (options) => {
     calls.push({ type: 'prepare', options })
@@ -193,17 +195,18 @@ test('面板请求拒绝GET、跨站、伪造Origin和缺操作头；接受本�
 
 test('内置弹幕工具默认不挂载，只接受主人私聊且执行时复核身份', async () => {
   const f = fixture()
+  const identity = makeTestIdentity('10000', 'qq')
   const builders = []
   definition.setup({ ...f.api, on() {}, every() {}, route() {},
     lazy: () => ({}), tool: (builder) => builders.push(builder),
-    core: { hub: { turnSendersAllOwner: () => false } },
+    core: { identity, routeOwner: identity.routeOwner, hub: { turnSendersAllOwner: () => false } },
   })
-  const context = { level: 'full', chat: { kind: 'private', userId: '10000' }, sessionId: 'test' }
+  const context = { level: 'full', chat: { kind: 'private', userId: '10000', chatId: 'private:10000', platform: 'qq' }, sessionId: 'test' }
   const find = (ctx) => builders.flatMap((build) => build(ctx)).find((tool) => tool?.name === 'bili_danmaku')
   f.settings.danmakuEnabled = false
   assert.equal(find(context), undefined)
   f.settings.danmakuEnabled = true
-  assert.equal(find({ ...context, chat: { kind: 'group', userId: '10000' } }), undefined)
+  assert.equal(find({ ...context, chat: { kind: 'group', userId: '10000', chatId: 'group:1' } }), undefined)
   assert.equal(find({ ...context, level: 'social' }), undefined)
   const tool = find(context)
   assert.ok(tool)

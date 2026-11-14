@@ -6,6 +6,7 @@ import { parseMessageEvent, isStickerSegment, stickerSizeOk, imageSize } from '.
 import { checkAllowed, levelFor, presetFor, isOwner, profileToolVisible, profilePermits } from '../src/chat/access.js'
 import { avatarSource } from '../src/modules/profile/index.js'
 import { redact, registerSecret } from '../src/core/redact.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
 test('parseReply 拆 ||| 成多条', () => {
   const r = parseReply('在呢|||刚睡醒 嗯…|||你呢')
@@ -210,19 +211,20 @@ test('imageSize 读 PNG 宽高', () => {
   assert.deepEqual(imageSize(png), { width: 200, height: 180 })
 })
 
-const cfg = { ownerQQ: '10000001', ownerLevel: 'full', allow: { private: ['10000001'], groups: ['555'] } }
+const cfg = { ownerLevel: 'full', allow: { private: ['10000001'], groups: ['555'] } }
+const idOwner = makeTestIdentity('10000001')
 
 test('白名单', () => {
-  assert.equal(checkAllowed(cfg, { kind: 'private', userId: '10000001' }).allowed, true)
-  assert.equal(checkAllowed(cfg, { kind: 'private', userId: '999' }).allowed, false)
-  assert.equal(checkAllowed(cfg, { kind: 'group', groupId: '555', userId: '1' }).allowed, true)
-  assert.equal(checkAllowed(cfg, { kind: 'group', groupId: '556', userId: '1' }).allowed, false)
+  assert.equal(checkAllowed(cfg, { kind: 'private', platform: 'qq', userId: '10000001' }, idOwner).allowed, true)
+  assert.equal(checkAllowed(cfg, { kind: 'private', platform: 'qq', userId: '999' }, idOwner).allowed, false)
+  assert.equal(checkAllowed(cfg, { kind: 'group', platform: 'qq', groupId: '555', userId: '1' }, idOwner).allowed, true)
+  assert.equal(checkAllowed(cfg, { kind: 'group', platform: 'qq', groupId: '556', userId: '1' }, idOwner).allowed, false)
 })
 
 test('权限档位：主人私聊完整，群聊永远受限', () => {
-  assert.equal(levelFor(cfg, { kind: 'private', userId: '10000001' }), 'full')
-  assert.equal(levelFor({ ...cfg, ownerLevel: 'chat' }, { kind: 'private', userId: '10000001' }), 'chat')
-  assert.equal(levelFor(cfg, { kind: 'group', userId: '10000001' }), 'social')
+  assert.equal(levelFor(cfg, { kind: 'private', platform: 'qq', userId: '10000001' }, idOwner), 'full')
+  assert.equal(levelFor({ ...cfg, ownerLevel: 'chat' }, { kind: 'private', platform: 'qq', userId: '10000001' }, idOwner), 'chat')
+  assert.equal(levelFor(cfg, { kind: 'group', platform: 'qq', userId: '10000001' }, idOwner), 'social')
   assert.equal(presetFor('full'), 'aurabot-private')
   assert.equal(presetFor('full', { longTasks: true }), 'aurabot-private-long')
   assert.equal(presetFor('social', { longTasks: true }), 'aurabot-social')
@@ -230,9 +232,9 @@ test('权限档位：主人私聊完整，群聊永远受限', () => {
 })
 
 test('群管发起人校验：只认主人', () => {
-  assert.equal(isOwner(cfg, '10000001'), true)
-  assert.equal(isOwner(cfg, '12345'), false)
-  assert.equal(isOwner(cfg, ''), false)
+  assert.equal(isOwner(idOwner, '10000001', 'qq'), true)
+  assert.equal(isOwner(idOwner, '12345', 'qq'), false)
+  assert.equal(isOwner(idOwner, '', 'qq'), false)
 })
 
 test('脱敏', () => {
@@ -342,7 +344,7 @@ test('空间互动：说说下的评论整理成上下文', async () => {
     { uin: 1, name: 'A', content: '好看', comment_id: 'c1', replies: [{ uin: 9, name: '大肥鱼', content: '谢谢' }] },
     { uin: 2, name: '小明', content: '在哪拍的', comment_id: 'c2', replies: [] },
   ]
-  assert.deepEqual(summarizeComments(comments, { selfId: '9', ownerQQ: '2', ownerName: '主人' }), ['A：好看', '  └ 你：谢谢', '小明（你的主人）：在哪拍的'])
+  assert.deepEqual(summarizeComments(comments, { selfId: '9', ownerAccount: '2', ownerName: '主人' }), ['A：好看', '  └ 你：谢谢', '小明（你的主人）：在哪拍的'])
   assert.deepEqual(summarizeComments(comments, { selfId: '9', exclude: 'c1' }), ['小明：在哪拍的'])
   assert.equal(summarizeComments(comments, { selfId: '9', max: 1 }).at(-1), '……还有 2 条')
 })
@@ -359,24 +361,25 @@ test('解析：合并转发记下 id，回复里的 <poke> 变成戳一戳', asy
 
 test('#6 改资料权限：默认仅主人私聊；所有人含群；关了都不行；执行时再查', async () => {
   const { normalize } = await import('../src/core/config.js')
-  const d = normalize({ ownerQQ: '1' })
+  const idOne = makeTestIdentity('1')
+  const d = normalize({})
   assert.deepEqual(d.profilePerms, { qqNickname: 'owner', qqSignature: 'owner', qqAvatar: 'owner', biliSign: 'owner', biliAvatar: 'owner', biliComment: 'owner', qqFriendRequest: 'owner', whitelist: 'owner', douyinBrowse: 'owner', douyinLike: 'owner', douyinComment: 'owner', douyinShareOwner: 'owner', douyinDm: 'owner', heyboxBrowse: 'owner', heyboxLike: 'owner', heyboxComment: 'owner', heyboxPost: 'owner' })
   assert.equal(normalize({ profilePerms: { qqAvatar: 'boss', biliSign: 'all' } }).profilePerms.qqAvatar, 'owner', '乱填的回到默认')
-  const ownerPm = { kind: 'private', userId: '1' }
-  const otherPm = { kind: 'private', userId: '2' }
-  const group = { kind: 'group', userId: '1', groupId: '9' }
-  assert.equal(profileToolVisible(d, 'qqNickname', ownerPm), true)
-  assert.equal(profileToolVisible(d, 'qqNickname', otherPm), false)
-  assert.equal(profileToolVisible(d, 'qqNickname', group), false)
-  assert.equal(profilePermits(d, 'qqNickname', ownerPm, true).ok, true)
-  assert.equal(profilePermits(d, 'qqNickname', ownerPm, false).ok, false, '主人私聊里混进了别人的话也不行')
-  const all = normalize({ ownerQQ: '1', profilePerms: { qqNickname: 'all' } })
-  assert.equal(profileToolVisible(all, 'qqNickname', group), true)
-  assert.equal(profilePermits(all, 'qqNickname', otherPm, false).ok, true)
-  assert.equal(profileToolVisible(all, 'qqNickname', { kind: 'system' }), false)
-  const off = normalize({ ownerQQ: '1', profilePerms: { qqNickname: 'off' } })
-  assert.equal(profileToolVisible(off, 'qqNickname', ownerPm), false)
-  assert.equal(profilePermits(off, 'qqNickname', ownerPm, true).ok, false)
+  const ownerPm = { kind: 'private', platform: 'qq', userId: '1' }
+  const otherPm = { kind: 'private', platform: 'qq', userId: '2' }
+  const group = { kind: 'group', platform: 'qq', userId: '1', groupId: '9' }
+  assert.equal(profileToolVisible(d, 'qqNickname', ownerPm, idOne), true)
+  assert.equal(profileToolVisible(d, 'qqNickname', otherPm, idOne), false)
+  assert.equal(profileToolVisible(d, 'qqNickname', group, idOne), false)
+  assert.equal(profilePermits(d, 'qqNickname', ownerPm, true, idOne).ok, true)
+  assert.equal(profilePermits(d, 'qqNickname', ownerPm, false, idOne).ok, false, '主人私聊里混进了别人的话也不行')
+  const all = normalize({ profilePerms: { qqNickname: 'all' } })
+  assert.equal(profileToolVisible(all, 'qqNickname', group, idOne), true)
+  assert.equal(profilePermits(all, 'qqNickname', otherPm, false, idOne).ok, true)
+  assert.equal(profileToolVisible(all, 'qqNickname', { kind: 'system' }, idOne), false)
+  const off = normalize({ profilePerms: { qqNickname: 'off' } })
+  assert.equal(profileToolVisible(off, 'qqNickname', ownerPm, idOne), false)
+  assert.equal(profilePermits(off, 'qqNickname', ownerPm, true, idOne).ok, false)
 })
 
 test('#6 头像来源：显式网址直接给网关；「刚才那张」和「画作」由工具取字节；本地路径不收', () => {

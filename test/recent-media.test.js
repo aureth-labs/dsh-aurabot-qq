@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { createHub } from '../src/chat/hub.js'
 import { normalize } from '../src/core/config.js'
 import stickersModule from '../src/modules/stickers/index.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
 const OWNER = '10000001'
 const BOT = '20000002'
@@ -17,8 +18,9 @@ function setup() {
   process.env.AURABOT_DATA_DIR = mkdtempSync(join(tmpdir(), 'aurabot-media-'))
   const dir = process.env.AURABOT_DATA_DIR
   const cfg = normalize({ botQQ: BOT, ownerQQ: OWNER, enabled: false, dryRun: true, stickers: { collect: false, caption: false }, allow: { private: ['10000002'], groups: ['123'] } })
-  const hub = (logger = log) => createHub({ dsh: {}, getConfig: () => cfg, log: logger, onebot: {}, stickers: {} })
-  return { hub, cfg, dir, file: join(dir, 'recent-media.json') }
+  const identity = makeTestIdentity(OWNER, 'qq')
+  const hub = (logger = log) => createHub({ dsh: {}, getConfig: () => cfg, log: logger, identity, routeOwner: identity.routeOwner, defaultPlatform: 'qq', onebot: {}, stickers: {} })
+  return { hub, cfg, dir, identity, file: join(dir, 'recent-media.json') }
 }
 const send = (hub, seg, user = OWNER, group = '') => hub.onMessage({
   message_type: group ? 'group' : 'private', self_id: Number(BOT), user_id: Number(user),
@@ -154,8 +156,9 @@ test('媒体缓存关闭后旧实例不可取图，迟到消息不再改写暂�
 
 function saveTool(hub, cfg, chat = { kind: 'private', chatId: CHAT, userId: OWNER }) {
   let build
+  const identity = makeTestIdentity(OWNER, 'qq')
   stickersModule.setup({
-    core: { hub, onebot: {}, http: {} }, config: () => cfg, dsh: {}, log,
+    core: { hub, identity, routeOwner: identity.routeOwner, onebot: {}, http: {} }, config: () => cfg, dsh: {}, log,
     tool: (fn) => { build = fn }, route() {}, rule() {},
   })
   return build({ chat, sessionId: 'save-test', level: 'full' }).find((tool) => tool.name === 'qq_save_sticker')

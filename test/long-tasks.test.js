@@ -5,6 +5,7 @@ import { normalize } from '../src/core/config.js'
 import { presetFor } from '../src/chat/access.js'
 import { rulesText } from '../src/persona/personas.js'
 import { createDangerGuard } from '../src/security/danger.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
 test('新安装默认打开长任务模式，老用户存过的不变', () => {
   assert.equal(normalize({}).longTasks, true)
@@ -28,7 +29,7 @@ test('预设里不挂团队工具：DSH 的开关已经全局挂了，重复注�
 
 test('spawn_teammate 只有主人私聊能用', async () => {
   const guard = createDangerGuard({
-    getConfig: () => ({}), ownerQQ: () => '1',
+    getConfig: () => ({}), identity: makeTestIdentity('1'),
     chatOfSession: (id) => ({ own: 'private:1', group: 'group:9', other: 'private:2', sys: 'system:diary' })[id] || '',
   })
   const run = (id, name = 'spawn_teammate') => guard.preExecute({ name, agent: { session: { id } } }, async () => ({ kind: 'allow' }))

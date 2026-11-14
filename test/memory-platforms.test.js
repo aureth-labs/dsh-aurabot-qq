@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { normalize } from '../src/core/config.js'
 import { createHub } from '../src/chat/hub.js'
 import { createMemoryStore } from '../src/features/memory.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
 const OWNER = '10000001'
 const OTHER = '10000002'
@@ -23,8 +24,9 @@ function setup(t) {
     yield { type: 'text-delta', text: system.includes('整理长期记忆') ? '[]' : '{"insights":[],"style":[]}' }
     yield { type: 'finish', reason: { kind: 'completed' } }
   } } }
-  const hub = createHub({ dsh, getConfig: () => cfg, log, onebot: {}, stickers: {}, tts: {} })
-  const memory = createMemoryStore({ dsh, getConfig: () => cfg, hub, log })
+  const identity = makeTestIdentity(OWNER, 'qq', { legacyIds: [OWNER, OTHER] })
+  const hub = createHub({ dsh, getConfig: () => cfg, log, identity, routeOwner: identity.routeOwner, defaultPlatform: 'qq', onebot: {}, stickers: {}, tts: {} })
+  const memory = createMemoryStore({ dsh, getConfig: () => cfg, hub, log, identity })
   t.after(() => {
     hub.dispose()
     if (previous === undefined) delete process.env.AURABOT_DATA_DIR

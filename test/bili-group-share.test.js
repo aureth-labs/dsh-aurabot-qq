@@ -10,6 +10,7 @@ let share
 let store
 let normalize
 let duty
+let makeTestIdentity
 
 before(async () => {
   process.env.AURABOT_DATA_DIR = mkdtempSync(join(tmpdir(), 'aurabot-group-share-'))
@@ -17,6 +18,7 @@ before(async () => {
   store = await import('../src/core/store.js')
   ;({ normalize } = await import('../src/core/config.js'))
   duty = await import('../src/bili/duty.js')
+  ;({ makeTestIdentity } = await import('./helpers/identity.js'))
 })
 
 const file = () => store.dataDir('bili-group-share.json')
@@ -39,8 +41,9 @@ function setup({ over = {}, top = {}, sendResult = { message_id: 1 }, say = '', 
     groupNames: new Map(),
   }
   const log = { info() {}, warn() {}, debug() {} }
+  const identity = makeTestIdentity(OWNER, 'qq')
   const gs = share.createGroupShare({
-    getConfig: () => cfg, hub, log,
+    getConfig: () => cfg, hub, identity, routeOwner: identity.routeOwner, log,
     // 话术和理解都注掉：测试只验流程，不看模型文笔
     think: async (kind) => (kind === 'ask'
       ? (say || '看到这个挺有意思，想发到群里给大家看看，可以吗？')
@@ -305,8 +308,9 @@ test('刷一轮：模型给了 shareGroup 就攒成待批，现场不往群里�
     bili: { enabled: true, cookie: 'SESSDATA=x; bili_jct=y', perRun: 2, groupShare: { enabled: true, groupId: GROUP } },
   })
   const log = { info() {}, warn() {}, debug() {} }
-  const gs = share.createGroupShare({ getConfig: () => cfg, hub, log })
-  const b = duty.createBili({ getConfig: () => cfg, hub, memory, log, api: fakeApi, groupShare: gs })
+  const identity = makeTestIdentity(OWNER, 'qq')
+  const gs = share.createGroupShare({ getConfig: () => cfg, hub, identity, routeOwner: identity.routeOwner, log })
+  const b = duty.createBili({ getConfig: () => cfg, hub, memory, identity, routeOwner: identity.routeOwner, log, api: fakeApi, groupShare: gs })
   const r = await b.run({ force: true })
   assert.equal(r.ok, true, r.message)
   assert.equal(r.awaitingGroup, 1)
@@ -358,8 +362,9 @@ test('群分享关着时提示词里不塞 shareGroup，也不攒', async () => 
     bili: { enabled: true, cookie: 'SESSDATA=x; bili_jct=y', perRun: 1, groupShare: { enabled: false, groupId: GROUP } },
   })
   const log = { info() {}, warn() {}, debug() {} }
-  const gs = share.createGroupShare({ getConfig: () => cfg, hub, log })
-  const b = duty.createBili({ getConfig: () => cfg, hub, memory, log, api: fakeApi, groupShare: gs })
+  const identity = makeTestIdentity(OWNER, 'qq')
+  const gs = share.createGroupShare({ getConfig: () => cfg, hub, identity, routeOwner: identity.routeOwner, log })
+  const b = duty.createBili({ getConfig: () => cfg, hub, memory, identity, routeOwner: identity.routeOwner, log, api: fakeApi, groupShare: gs })
   const r = await b.run({ force: true })
   assert.equal(r.ok, true, r.message)
   assert.equal(r.awaitingGroup, 0)
@@ -616,7 +621,8 @@ test('没注入模型时退回朴素话术（带群名/群号），不至于问�
   const sent = []
   const cfg = normalize({ enabled: true, dryRun: false, ownerQQ: OWNER, bili: { enabled: true, cookie: 'x', groupShare: { enabled: true, groupId: GROUP } } })
   const hub = { sendText: async (chatId, text) => { sent.push({ chatId, text }); return { message_id: 1 } } }
-  const gs = share.createGroupShare({ getConfig: () => cfg, hub, log: { info() {}, warn() {}, debug() {} } })
+  const identity = makeTestIdentity(OWNER, 'qq')
+  const gs = share.createGroupShare({ getConfig: () => cfg, hub, identity, routeOwner: identity.routeOwner, log: { info() {}, warn() {}, debug() {} } })
   await gs.submit([{ bvid: 'BV1aaaaaaa1', title: '米饭大赛', text: '群友快看' }])
   assert.equal(sent.length, 1)
   assert.match(sent[0].text, /米饭大赛/)

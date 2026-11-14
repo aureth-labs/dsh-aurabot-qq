@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { normalize } from '../src/core/config.js'
 import { createHub } from '../src/chat/hub.js'
 import { buildIndex, createMemoryStore, memoryLine, parseMemoryCommand, search, shouldForget, tokenize } from '../src/features/memory.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
 const OWNER = '10000001'
 const A = '30000001'
@@ -34,7 +35,8 @@ function setup(t, answer = () => '[]', patch = {}) {
     yield { type: 'text-delta', text: out || '[]' }
     yield { type: 'finish', reason: { kind: 'completed' } }
   } } }
-  const make = () => createMemoryStore({ dsh, getConfig: () => cfg, hub, log })
+  const identity = makeTestIdentity(OWNER, 'qq', { legacyIds: [OWNER, A, B] })
+  const make = () => createMemoryStore({ dsh, getConfig: () => cfg, hub, log, identity })
   const state = () => readMemoryState(dir)
   const putState = (s) => writeMemoryState(dir, s)
   t.after(() => {
@@ -42,7 +44,7 @@ function setup(t, answer = () => '[]', patch = {}) {
     else process.env.AURABOT_DATA_DIR = old
     rmSync(dir, { recursive: true, force: true })
   })
-  return { cfg, hub, logs, calls, make, state, putState }
+  return { cfg, hub, identity, logs, calls, make, state, putState }
 }
 
 const row = (chatId, uid, text, t = Date.now() - 3600_000) => ({ chatId, uid, who: uid === BOT ? 'bot' : '小明', text, t, interaction: uid === BOT ? [] : [uid] })
@@ -101,9 +103,9 @@ test('hub 收到私聊时执行请求、继续交给消息钩子，忘记标记�
   const s = setup(t, () => '[]', { enabled: true, allow: { private: [A, B], groups: ['777'] }, stickers: { collect: false } })
   let mem
   const seen = []
-  const hub = createHub({ dsh: {}, getConfig: () => s.cfg, log, onebot: {}, onMemoryCommand: (msg, text) => mem.handleCommand(msg, text), hooks: { message: async (msg) => { seen.push(msg.text); return true } } })
+  const hub = createHub({ dsh: {}, getConfig: () => s.cfg, log, identity: s.identity, routeOwner: s.identity.routeOwner, defaultPlatform: 'qq', onebot: {}, onMemoryCommand: (msg, text) => mem.handleCommand(msg, text), hooks: { message: async (msg) => { seen.push(msg.text); return true } } })
   t.after(() => hub.dispose())
-  mem = createMemoryStore({ dsh: {}, getConfig: () => s.cfg, hub, log })
+  mem = createMemoryStore({ dsh: {}, getConfig: () => s.cfg, hub, log, identity: s.identity })
   hub.logChat(`private:${A}`, '小明', '我昨天喝了乌龙茶', A)
   hub.logChat(`private:${B}`, '别人', '我昨天喝了乌龙茶', B)
   for (let i = 0; i < 7; i++) hub.logChat(`private:${A}`, '小明', `闲聊${i}`, A)

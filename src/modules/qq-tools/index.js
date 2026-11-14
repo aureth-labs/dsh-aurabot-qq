@@ -4,6 +4,16 @@ import { defineTool, str, int } from '../../tools/tools.js'
 import { readQqFile } from '../../features/qq-file.js'
 import { parseMessageEvent } from '../../chat/inbound.js'
 
+const ownerQqAccounts = (identity) => {
+  const owner = identity?.owner?.()
+  if (!owner) return []
+  if (typeof identity.accountsOf === 'function') {
+    return identity.accountsOf(owner).filter((a) => a.platform === 'qq').map((a) => a.account)
+  }
+  const acc = identity.accountOn?.(owner, 'qq')
+  return acc ? [acc] : []
+}
+
 /** 真实网关对不在群里的人也回成功、角色写 member，只有 join_time 是空的：没有它就不算成员。 */
 async function isGroupMember(onebot, groupId, userId) {
   try {
@@ -79,9 +89,15 @@ export default {
   id: 'qq-tools',
   name: '基础 QQ 工具',
   version: '1.0.0',
+  api: 2,
+  platforms: ['qq'],
   description: '翻当前聊天的记录（qq_chat_history）；主人私聊里让她主动给白名单里的人和群发消息（qq_send_message）；把本机文件发到 QQ（qq_send_file，图片会直接显示成图）——私聊里随时能发，群里只在她主人开口的那一轮能发',
   setup(api) {
     const { hub, onebot } = api.core
+    const qqOnebot = {
+      call: (action, params, opts) => (typeof api.native === 'function' ? api.native('qq', action, params, opts) : onebot.call(action, params, opts)),
+      get state() { return api.core.onebot?.state },
+    }
     api.tool(({ chat, level, sessionId }) => {
       if (chat.kind === 'system') return []
       const crossRead = api.config().group?.crossRead || 'private'
@@ -102,17 +118,23 @@ export default {
           let elsewhere = false
           if (group) {
             const isOwner = level === 'full' || Boolean(hub.turnSendersAllOwner?.(sessionId))
-            const hit = await resolveGroup(onebot, cfg.allow?.groups || [], group, isOwner)
+            const hit = await resolveGroup(qqOnebot, cfg.allow?.groups || [], group, isOwner)
             if (hit.error) return { ok: false, message: hit.error }
-            const scope = { mode: cfg.group?.crossRead || 'private', hub, onebot, chat, level, sessionId }
+            const scope = { mode: cfg.group?.crossRead || 'private', hub, onebot: qqOnebot, chat, level, sessionId }
             if (hit.id !== String(chat.groupId || '') && !(await canReadGroup(scope, hit.id))) return { ok: false, message: '这个群看不了' }
             groupId = hit.id
             elsewhere = hit.id !== String(chat.groupId || '')
           }
           const page = { count: anchor ? n + 1 : n, ...(anchor ? { message_id: Number(anchor), reverse_order: true } : {}) }
-          const r = groupId
-            ? await onebot.call('get_group_msg_history', { group_id: Number(groupId), ...page }, { timeoutMs: 15000 })
-            : await onebot.call('get_friend_msg_history', { user_id: Number(chat.userId), ...page }, { timeoutMs: 15000 })
+          let r
+          try {
+            r = groupId
+              ? await qqOnebot.call('get_group_msg_history', { group_id: Number(groupId), ...page }, { timeoutMs: 15000 })
+              : await qqOnebot.call('get_friend_msg_history', { user_id: Number(chat.userId), ...page }, { timeoutMs: 15000 })
+          } catch (error) {
+            if (error?.code === 'unsupported-action') return { ok: false, message: '当前 QQ 网关不支持读取聊天记录' }
+            throw error
+          }
           const history = Array.isArray(r) ? r : (r?.messages || [])
           const historyChatId = groupId ? 'group:' + groupId : 'private:' + chat.userId
           const visible = hub.filterHistory?.(historyChatId, history) ?? history
@@ -204,7 +226,12 @@ export default {
           const want = String(name || '').trim()
           const file = want ? list.findLast((f) => f.name === want) || list.findLast((f) => f.name.includes(want)) : list.at(-1)
           if (!file) return { ok: false, message: `没找到「${want}」，最近的文件有：${list.map((f) => f.name).join('、')}` }
-          return readQqFile({ onebot, chat, file })
+          try {
+            return await readQqFile({ onebot: qqOnebot, chat, file })
+          } catch (error) {
+            if (error?.code === 'unsupported-action') return { ok: false, message: '当前 QQ 网关不支持读取聊天文件' }
+            throw error
+          }
         },
       }))
       // 发文件/发图：主人私聊（full）和群聊都挂；群里只有「这一轮说话的人全是主人」才放行（#169）。
@@ -226,7 +253,7 @@ export default {
           const t = String(target || '').trim()
           if (t) {
             const [kind, id] = t.split(':')
-            const okList = kind === 'group' ? cfg.allow.groups : kind === 'private' ? [cfg.ownerQQ, ...cfg.allow.private] : []
+            const okList = kind === 'group' ? cfg.allow.groups : kind === 'private' ? [...ownerQqAccounts(api.core.identity), ...cfg.allow.private] : []
             if (!okList.includes(String(id))) return { ok: false, message: '不在白名单里，不能发' }
             chatId = `${kind}:${id}`
           }
@@ -263,7 +290,7 @@ export default {
           if (chat.kind === 'group' && !hub.turnSendersAllOwner(sessionId)) return { ok: false, message: '只有主人开口时才能往别的聊天发，这一轮不是。' }
           const cfg = api.config()
           const [kind, id] = String(target || '').split(':')
-          const okList = kind === 'group' ? cfg.allow.groups : kind === 'private' ? [cfg.ownerQQ, ...cfg.allow.private] : []
+          const okList = kind === 'group' ? cfg.allow.groups : kind === 'private' ? [...ownerQqAccounts(api.core.identity), ...cfg.allow.private] : []
           if (!okList.map(String).includes(String(id))) return { ok: false, message: '不在白名单里，不能发' }
           if (`${kind}:${id}` === chat.chatId) return { ok: false, message: '这就是当前聊天，直接回话就行，别用这个工具' }
           const r = await hub.deliver(`${kind}:${id}`, String(text || ''))

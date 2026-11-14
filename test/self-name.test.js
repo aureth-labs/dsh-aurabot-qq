@@ -11,8 +11,10 @@ import { createPurpose, cleanReply } from '../src/purpose/module.js'
 import { collectMaterials, needAffinity } from '../src/purpose/engine.js'
 import { createBridge } from '../src/core/bridge.js'
 import { writeMemoryState } from './helpers/memory-state.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
 const OWNER = '10000001', BOT = '20000001'
+const testIdentity = makeTestIdentity(OWNER, 'qq', { personId: OWNER })
 const DAY = 86400_000
 const log = { info() {}, warn() {}, debug() {} }
 const dayKey = (at) => {
@@ -56,7 +58,7 @@ function setup(t, answer) {
     deleteChatLog: (day) => logs.delete(day),
     speakersOf: () => [OWNER],
   }
-  const memory = () => createMemoryStore({ dsh, getConfig: () => cfg, hub, log })
+  const memory = () => createMemoryStore({ dsh, getConfig: () => cfg, hub, log, identity: testIdentity })
   const select = (id, name) => {
     savePersona(id, { name, body: `你是${name}。` })
     cfg.persona.current = id
@@ -220,6 +222,8 @@ test('目的引擎以当前名识别自我素材和身份话题，保留旧称�
   Object.assign(s.cfg.speakUp, { awakeFrom: 0, awakeTo: 24 })
   const prompts = [], sent = []
   const purpose = createPurpose({ getConfig: () => s.cfg, log,
+    identity: testIdentity,
+    routeOwner: () => testIdentity.routeOwner(),
     personaText: () => currentPersonaText(s.cfg.persona.current),
     memory: () => ({ list: () => [{ id: 'm1', text: '主人周末想找人一起玩游戏', importance: 0.8, at: now }] }),
     hub: { ...s.hub, lastOwnerChatAt: 0,

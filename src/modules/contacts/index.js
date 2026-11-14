@@ -6,7 +6,7 @@
 
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { defineTool, str, bool } from '../../tools/tools.js'
-import { profileToolVisible, profilePermits } from '../../chat/access.js'
+import { isOwner, isOwnerPrivateChat, profileToolVisible, profilePermits } from '../../chat/access.js'
 
 const PENDING_MAX = 50
 const ID_RE = /^\d{5,12}$/
@@ -18,7 +18,7 @@ export function cleanId(v) {
 }
 
 /** 白名单增删的纯逻辑：返回 { ok, message, next? }。next = 改完后的这张表（没变化时不给）。 */
-export function planWhitelist(cfg, { action, kind, id }) {
+export function planWhitelist(cfg, { action, kind, id }, identity = null) {
   const act = String(action || '').trim().toLowerCase()
   if (!['add', 'remove'].includes(act)) return { ok: false, message: 'action 只能是 add 或 remove' }
   const k = String(kind || '').trim().toLowerCase()
@@ -27,7 +27,7 @@ export function planWhitelist(cfg, { action, kind, id }) {
   if (!n) return { ok: false, message: '号码不对：要 5~12 位数字的 QQ 号 / 群号' }
   const label = k === 'private' ? 'QQ' : '群'
   const listName = k === 'private' ? '私聊白名单' : '群白名单'
-  if (k === 'private' && n === String(cfg.ownerQQ || '')) {
+  if (k === 'private' && isOwner(identity, n, 'qq')) {
     return act === 'remove'
       ? { ok: false, message: '主人不能被移出私聊白名单' }
       : { ok: true, message: '主人本来就能私聊，不用加白名单' }
@@ -47,9 +47,12 @@ export default {
   id: 'contacts',
   name: '好友申请与白名单',
   version: '1.0.0',
+  api: 2,
+  platforms: ['qq'],
   description: '处理好友申请、加群申请和邀请，改私聊 / 群白名单；权限在「权限」页',
   setup(api) {
-    const { hub, onebot } = api.core
+    const { hub, onebot, identity, routeOwner } = api.core
+    const qqCall = (action, params, opts) => (typeof api.native === 'function' ? api.native('qq', action, params, opts) : onebot.call(action, params, opts))
     const pendingFile = () => api.dataDir('friend-requests.json')
     const groupPendingFile = () => api.dataDir('group-requests.json')
 
@@ -95,9 +98,9 @@ export default {
       list.push(req)
       saveGroupPending(list)
       const cfg = api.config()
-      if (cfg.ownerQQ && (cfg.profilePerms?.qqFriendRequest || 'owner') !== 'off') {
+      if ((cfg.profilePerms?.qqFriendRequest || 'owner') !== 'off' && (routeOwner?.() || hub?.ownerChat?.())) {
         const note = req.comment ? `，验证消息：「${req.comment}」` : ''
-        api.sendText(`private:${cfg.ownerQQ}`, `${groupRequestText(req, cfg.botQQ)}${note}。可以让我列出待处理的加群申请并通过或拒绝。`).catch(() => {})
+        api.sendText(routeOwner?.() || hub?.ownerChat?.(), `${groupRequestText(req, cfg.botQQ)}${note}。可以让我列出待处理的加群申请并通过或拒绝。`).catch(() => {})
       }
     }
 
@@ -115,20 +118,20 @@ export default {
         savePending(list)
       }
       const cfg = api.config()
-      if (isNew && cfg.ownerQQ && (cfg.profilePerms?.qqFriendRequest || 'owner') !== 'off') {
+      if (isNew && (cfg.profilePerms?.qqFriendRequest || 'owner') !== 'off' && (routeOwner?.() || hub?.ownerChat?.())) {
         const note = ev.comment ? `，验证消息：「${String(ev.comment).slice(0, 80)}」` : ''
-        api.sendText(`private:${cfg.ownerQQ}`, `有人想加我好友：QQ ${userId}${note}。要通过就跟我说「通过 ${userId}」，不想加说「拒绝 ${userId}」。`).catch(() => {})
+        api.sendText(routeOwner?.() || hub?.ownerChat?.(), `有人想加我好友：QQ ${userId}${note}。要通过就跟我说「通过 ${userId}」，不想加说「拒绝 ${userId}」。`).catch(() => {})
       }
     })
 
     const guarded = (key, chat, sessionId, run) => async (args) => {
       const cfg = api.config()
-      const p = profilePermits(cfg, key, chat, hub.turnSendersAllOwner(sessionId))
+      const p = profilePermits(cfg, key, chat, hub.turnSendersAllOwner(sessionId), identity)
       if (!p.ok) return p
       return run(args, cfg)
     }
 
-    const groupOwner = (chat) => chat.kind === 'private' && Boolean(api.config().ownerQQ) && String(chat.userId) === String(api.config().ownerQQ)
+    const groupOwner = (chat) => isOwnerPrivateChat(identity, chat)
     const guardedGroup = (chat, sessionId, run) => guarded('qqFriendRequest', chat, sessionId, async (args, cfg) => {
       if (!groupOwner(chat) || !hub.turnSendersAllOwner(sessionId)) return { ok: false, message: '只有主人私聊才能处理加群申请' }
       return run(args, cfg)
@@ -143,7 +146,7 @@ export default {
         return { ok: false, message: `有 ${pending.length} 个待处理的申请：${pending.map((x) => x.userId).join('、')}。说清楚是哪个 QQ 号` }
       }
       let doubt = []
-      try { doubt = (await onebot.call('get_doubt_friends_add_request', { count: 50 }, { timeoutMs: 15000 })) || [] } catch (error) { doubt = [] }
+      try { doubt = (await qqCall('get_doubt_friends_add_request', { count: 50 }, { timeoutMs: 15000 })) || [] } catch (error) { doubt = [] }
       if (!Array.isArray(doubt)) doubt = []
       const d = qq ? doubt.find((x) => String(x.user_id) === qq) : (doubt.length === 1 ? doubt[0] : null)
       if (d && d.uid) return { ok: true, via: 'doubt', flag: String(d.uid), userId: String(d.user_id || qq || '') }
@@ -155,7 +158,7 @@ export default {
       if (chat.kind !== 'private' && chat.kind !== 'group') return []
       const cfg = api.config()
       const tools = []
-      if (profileToolVisible(cfg, 'qqFriendRequest', chat)) tools.push(defineTool({
+      if (profileToolVisible(cfg, 'qqFriendRequest', chat, identity)) tools.push(defineTool({
         name: 'qq_handle_friend_request',
         description: '通过或拒绝别人加你为好友的申请。qq 填申请人的 QQ 号（只有一个待处理申请时可不填）；approve 填 true 通过、false 拒绝。你不能主动加别人为好友。',
         properties: { qq: str('申请人的 QQ 号，可不填'), approve: bool('true 通过，false 拒绝') },
@@ -169,16 +172,17 @@ export default {
           const verb = approve ? '通过' : '拒绝'
           if (c.dryRun) return { ok: true, message: `试运行：本来要${verb} QQ ${req.userId} 的好友申请` }
           try {
-            if (req.via === 'event') await onebot.call('set_friend_add_request', { flag: req.flag, approve }, { timeoutMs: 15000 })
-            else await onebot.call('set_doubt_friends_add_request', { flag: req.flag, approve }, { timeoutMs: 15000 })
+            if (req.via === 'event') await qqCall('set_friend_add_request', { flag: req.flag, approve }, { timeoutMs: 15000 })
+            else await qqCall('set_doubt_friends_add_request', { flag: req.flag, approve }, { timeoutMs: 15000 })
           } catch (error) {
+            if (error?.code === 'unsupported-action') return { ok: false, message: '当前 QQ 网关不支持处理好友申请' }
             return { ok: false, message: `${verb} QQ ${req.userId} 的好友申请没成功：${error.message}` }
           }
           savePending(loadPending().filter((x) => x.flag !== req.flag && x.userId !== req.userId))
           return { ok: true, message: `已${verb} QQ ${req.userId} 的好友申请` }
         }),
       }))
-      if (groupOwner(chat) && profileToolVisible(cfg, 'qqFriendRequest', chat)) {
+      if (groupOwner(chat) && profileToolVisible(cfg, 'qqFriendRequest', chat, identity)) {
         tools.push(defineTool({
           name: 'qq_list_group_requests',
           description: '列出收到过、尚未处理的加群申请和邀请，处理时使用列表中的 flag。',
@@ -205,29 +209,30 @@ export default {
             if (groupInFlight.has(req.flag)) return { ok: false, message: '这条申请正在处理' }
             groupInFlight.add(req.flag)
             try {
-              await onebot.call('set_group_add_request', { flag: req.flag, sub_type: req.subType, approve, ...(reason && !approve ? { reason: String(reason) } : {}) }, { timeoutMs: 15000 })
+              await qqCall('set_group_add_request', { flag: req.flag, sub_type: req.subType, approve, ...(reason && !approve ? { reason: String(reason) } : {}) }, { timeoutMs: 15000 })
               saveGroupPending(loadGroupPending().filter((x) => x.flag !== req.flag))
               return { ok: true, message: `已${verb}「${label}」` }
             } catch (error) {
+              if (error?.code === 'unsupported-action') return { ok: false, message: '当前 QQ 网关不支持处理加群申请' }
               return { ok: false, message: `${verb}「${label}」没成功：${error.message}` }
             } finally { groupInFlight.delete(req.flag) }
           }),
         }))
       }
-      if (profileToolVisible(cfg, 'whitelist', chat)) tools.push(defineTool({
+      if (profileToolVisible(cfg, 'whitelist', chat, identity)) tools.push(defineTool({
         name: 'qq_whitelist',
         description: '改白名单：action 填 add（加进）或 remove（移出），kind 填 private（某个 QQ 号可以私聊你）或 group（某个群你会理），id 填 QQ 号或群号。主人不能被移出。',
         properties: { action: str('add 加进 / remove 移出'), kind: str('private 私聊的人 / group 群'), id: str('QQ 号或群号（数字）') },
         required: ['action', 'kind', 'id'],
         execute: guarded('whitelist', chat, sessionId, async (args, c) => {
-          const plan = planWhitelist(c, args)
+          const plan = planWhitelist(c, args, identity)
           if (!plan.ok || !plan.changed) return plan
           if (c.dryRun) return { ok: true, message: `试运行：本来要${plan.message}` }
           const key = String(args.kind).trim().toLowerCase() === 'private' ? 'private' : 'groups'
           // 用保存那一刻最新的配置再算一遍，免得盖掉面板刚改的
           let result = plan
           api.setConfig((cur) => {
-            result = planWhitelist(cur, args)
+            result = planWhitelist(cur, args, identity)
             if (!result.ok || !result.changed) return cur
             return { ...cur, allow: { ...cur.allow, [key]: result.next } }
           })

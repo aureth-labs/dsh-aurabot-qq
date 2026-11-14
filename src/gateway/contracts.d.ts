@@ -402,5 +402,5 @@ export interface InstanceConfig {
 /**
  * config.json 里新增 platforms。旧字段读入时自动换算，写回时只写新字段：
  *   gateway + snowluma.{httpUrl,wsUrl,httpToken,wsToken,dir,…}  →  platforms.qq.{backend,…}
- *   ownerQQ  →  启动时 identity.claimOwner('qq', ownerQQ)（已有主人则跳过）
+ *   旧配置 QQ 号 → 启动时 identity.claimOwner('qq', rawOwner)（已有主人则跳过）
  */

@@ -13,6 +13,7 @@ mkdirSync(process.env.AURABOT_DATA_DIR, { recursive: true })
 
 const { normalize } = await import('../src/core/config.js')
 const { createMemoryStore } = await import('../src/features/memory.js')
+const { makeTestIdentity } = await import('./helpers/identity.js')
 
 const OWNER = '10000001'
 const GUEST = '10000111'
@@ -32,7 +33,8 @@ function freshStore (tag, memory = {}) {
   process.env.AURABOT_DATA_DIR = dir
   const cfg = normalize({ enabled: true, ownerQQ: OWNER, ownerName: '主人', memory: { enabled: true, recallCount: 20, ...memory } })
   const hub = { chatLogOf: () => [], chatLogDays: () => [], deleteChatLog: () => {}, speakersOf: () => [] }
-  return { dir, cfg, hub, store: createMemoryStore({ dsh: null, getConfig: () => cfg, hub, log }) }
+  const identity = makeTestIdentity(OWNER, 'qq', { legacyIds: [OWNER, GUEST, OTHER] })
+  return { dir, cfg, hub, identity, store: createMemoryStore({ dsh: null, getConfig: () => cfg, hub, identity, log }) }
 }
 
 // ---------- F1：检索层的来源可见性 ----------
@@ -152,7 +154,7 @@ test('F5：mergeGroups 不跨聊天合并（模型混入跨来源 id 会被拒�
   const hub = { chatLogOf: () => [], chatLogDays: () => [], deleteChatLog: () => {}, groupNames: new Map(), speakersOf: () => [] }
   const mode = { crossAttempt: true }
   const dsh = mergeDsh(() => process.env.AURABOT_DATA_DIR, mode)
-  const store = createMemoryStore({ dsh, getConfig: () => cfg, hub, log })
+  const store = createMemoryStore({ dsh, getConfig: () => cfg, hub, log, identity: makeTestIdentity(OWNER, 'qq', { legacyIds: [OWNER, GUEST] }) })
   // 群 555：4 条低权重、同一人；主人私聊：4 条低权重、同一人
   for (let i = 0; i < 4; i++) store.add({ text: `GROUP_MERGE_${i} 小七喜欢篮球`, about: GUEST, aboutName: '群友小七', source: 'auto', chatId: G555_CHAT, importance: 0.4 })
   for (let i = 0; i < 4; i++) store.add({ text: `OWNER_MERGE_${i} 主人私下说小七欠他500块`, about: GUEST, aboutName: '群友小七', source: 'auto', chatId: OWNER_CHAT, importance: 0.4 })

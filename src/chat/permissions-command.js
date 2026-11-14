@@ -1,4 +1,5 @@
-import { isOwner, PROFILE_PERM_KEYS, PROFILE_PERM_LEVELS, permOf } from './access.js'
+import { parseChatId } from '../gateway/address.js'
+import { isOwner, isOwnerPrivateChat, PROFILE_PERM_KEYS, PROFILE_PERM_LEVELS, permOf } from './access.js'
 import { changePermissions, privatePermissionCatalog } from './permission-policy.js'
 
 const HELP = [
@@ -21,9 +22,9 @@ const NAMES = new Map(Object.entries({
 const keyOf = (name) => NAMES.get(name) || name?.replace(/^[/／]/, '')
 const hasId = (list, id) => (list || []).map(String).includes(id)
 
-export function runPermissionsCommand(arg, msg, { getConfig, setConfig, extraCommands = [] }) {
+export function runPermissionsCommand(arg, msg, { getConfig, setConfig, identity, extraCommands = [] }) {
   const cfg = getConfig()
-  if (msg?.kind !== 'private' || !isOwner(cfg, msg.userId)) return '权限管理只能由主人私聊使用。'
+  if (!isOwnerPrivateChat(identity, msg)) return '权限管理只能由主人私聊使用。'
   const catalog = privatePermissionCatalog(extraCommands)
   const labels = new Map(catalog.map(({ key, label }) => [key, label]))
   const labelOf = (key) => labels.get(key) || '/' + key
@@ -42,7 +43,8 @@ export function runPermissionsCommand(arg, msg, { getConfig, setConfig, extraCom
   }
   const subject = parts.length === 1 ? action : /^(用户|user)$/.test(action) && parts.length === 2 ? type : ''
   if (/^\d{5,}$/.test(subject)) {
-    if (String(cfg.ownerQQ) === subject) return `${subject} 是主人账号。`
+    const plat = msg?.platform || parseChatId(msg?.chatId || '')?.platform || parseChatId('private:0')?.platform
+    if (isOwner(identity, subject, plat)) return `${subject} 是主人账号。`
     const allowed = hasId(cfg.allow?.private, subject)
     const grants = [...Object.entries(cfg.capabilityAllow || {}), ...Object.entries(cfg.commandAllow || {})]
       .filter(([, list]) => hasId(list, subject)).map(([key]) => labels.has(key) ? labelOf(key) : `${labelOf(key)}（当前不可用）`)
@@ -72,7 +74,7 @@ export function runPermissionsCommand(arg, msg, { getConfig, setConfig, extraCom
     keys = [kind === 'group' ? 'chat' : keyOf(type)]
   } else return HELP
   const changes = Object.fromEntries(keys.map((key) => [key, add]))
-  const result = changePermissions(cfg, { id, kind, changes }, extraCommands)
+  const result = changePermissions(cfg, { id, kind, changes }, extraCommands, identity)
   if (!result.ok) return result.message
   setConfig(result.config)
   const names = kind === 'group' ? '群白名单' : [...new Set(keys)].map(labelOf).join('、')

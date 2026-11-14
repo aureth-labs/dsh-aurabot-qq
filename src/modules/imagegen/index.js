@@ -17,6 +17,8 @@ export default {
   id: 'imagegen',
   name: '生图',
   version: '1.0.0',
+  api: 2,
+  platforms: ['*'],
   description: '画一张图发到聊天里（qq_draw_image）',
   tab: 'imagegen',
   files: ['features/imagegen.js', 'features/image-shape.js', 'features/paintings.js', 'features/codex-auth.js', 'features/codex-image.js'],
@@ -137,12 +139,16 @@ export default {
         let buf
         try { buf = await gen.generate(String(prompt || ''), { shape, image: reference, size, onRetry: ({ error }) => progress(error, true) }) }
         catch (error) { await progress(error, false); return { ok: false, message: `生图失败：${reason(error)}。已尝试告知对方，请结合情况回应，不要说画好了。` } }
-        const sent = await hub.sendSegments(chat.chatId, [{ type: 'image', data: { file: 'base64://' + buf.toString('base64') } }], `[生图] ${String(prompt).slice(0, 30)}`)
-        // 调试 / 试运行下本来就不真发（sendSegments 只记日志、返回 null）：
-        // 这一轮仍算画好了 —— 存盘、给编号、能看图，只是 QQ 里收不到；不能当失败。
+        const note = `[生图] ${String(prompt).slice(0, 30)}`
+        const sent = typeof api.sendParts === 'function'
+          ? await api.sendParts(chat.chatId, [{ type: 'image', base64: buf.toString('base64') }], { note })
+          : await hub.sendSegments(chat.chatId, [{ type: 'image', data: { file: 'base64://' + buf.toString('base64') } }], note)
+        // 调试 / 试运行下本来就不真发（只记日志、返回 null）：
+        // 这一轮仍算画好了 —— 存盘、给编号、能看图，只是聊天里收不到；不能当失败。
         // 只有 null 才是“试运行/调试拦下”；明确的 false 仍按发送失败处理。
         const simulated = sent === null && Boolean(cfg.debug || cfg.dryRun)
-        if (!sent && !simulated) return { ok: false, message: '画好了，但没有发到 QQ（请检查网关）' }
+        const isQq = !api.platformOf || api.platformOf(chat.chatId) === 'qq'
+        if (!sent && !simulated) return { ok: false, message: isQq ? '画好了，但没有发到 QQ（请检查网关）' : '画好了，但没能发出去（请检查网关）' }
         const saved = savePainting(buf, String(prompt || ''))
         if (saved) api.log.debug(`生图已存盘：${saved}`)
         try { memory.addEvent?.({ text: reference ? `参考了一张图画了：${String(prompt).slice(0, 120)}（提示词不一定等于实际画面）` : `按提示词画了一张图（不一定等于实际画面）：${String(prompt).slice(0, 120)}`, about: chat.kind === 'private' ? chat.userId : '', tags: ['画画'], importance: 0.4 }) }

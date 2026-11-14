@@ -12,6 +12,7 @@ import { QQ_API, paramsOf } from '../src/modules/qq-api/actions.js'
 import qqApi, { refusal, pickParams } from '../src/modules/qq-api/index.js'
 import { createFakeDsh } from './helpers/fake-dsh.js'
 import { startMockOneBot } from './helpers/mock-onebot.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
 const OWNER = '10000001'
 const BOT = '20000002'
@@ -23,12 +24,13 @@ const groupEvent = (patch = {}) => ({ post_type: 'request', request_type: 'group
 
 function setupContacts({ cfg = {}, allOwner = true, callImpl } = {}) {
   let config = normalize({ ownerQQ: OWNER, botQQ: BOT, enabled: true, dryRun: false, ...cfg })
+  const identity = makeTestIdentity(config.ownerQQ || OWNER, 'qq')
   let owner = allOwner
   const dir = mkdtempSync(join(tmpdir(), 'aurabot-sl-contacts-'))
   const sent = [], calls = []
   let listener, builder
   contacts.setup({
-    core: { hub: { turnSendersAllOwner: () => owner }, onebot: { call: async (action, params) => { calls.push({ action, params }); return callImpl?.(action, params) } } },
+    core: { identity, routeOwner: identity.routeOwner, hub: { turnSendersAllOwner: () => owner }, onebot: { call: async (action, params) => { calls.push({ action, params }); return callImpl?.(action, params) } } },
     config: () => config,
     dataDir: (...parts) => join(dir, ...parts),
     log: { warn() {} },
@@ -39,7 +41,7 @@ function setupContacts({ cfg = {}, allOwner = true, callImpl } = {}) {
   return {
     event: (ev) => listener(ev), sent, calls,
     tools: (chat) => Object.fromEntries(builder({ chat, sessionId: 's' }).map((tool) => [tool.name, tool])),
-    set: (patch) => { config = normalize({ ...config, ...patch }) },
+    set: (patch) => { config = normalize({ ...config, ...patch }); if (patch.ownerQQ !== undefined) identity.setOwner(patch.ownerQQ, 'qq') },
     setOwner: (value) => { owner = value },
   }
 }
@@ -163,7 +165,8 @@ test('临时私聊保存来源群，普通好友不带来源群', async (t) => {
   const fake = createFakeDsh({ brain: async () => '' })
   const cfg = normalize({ enabled: true, dryRun: false, ownerQQ: OWNER, botQQ: BOT, allow: { private: [OTHER], groups: [] }, stickers: { collect: false } })
   const calls = []
-  const hub = createHub({ dsh: fake.ctx, getConfig: () => cfg, log: { debug() {}, info() {}, warn() {}, error() {} }, onebot: { call: async (action, params) => { calls.push({ action, params }); return { message_id: 1 } } }, hooks: { message: () => true } })
+  const identity = makeTestIdentity(OWNER, 'qq')
+  const hub = createHub({ dsh: fake.ctx, getConfig: () => cfg, identity, routeOwner: identity.routeOwner, defaultPlatform: 'qq', log: { debug() {}, info() {}, warn() {}, error() {} }, onebot: { call: async (action, params) => { calls.push({ action, params }); return { message_id: 1 } } }, hooks: { message: () => true } })
   t.after(() => { hub.dispose(); fake.dispose() })
   const ev = { post_type: 'message', message_type: 'private', sub_type: 'group', self_id: Number(BOT), user_id: Number(OTHER), sender: { user_id: Number(OTHER), group_id: 44444444 }, message: [{ type: 'text', data: { text: '你好' } }] }
   const parsed = parseMessageEvent(ev, BOT)
@@ -193,9 +196,12 @@ test('临时私聊保存来源群，普通好友不带来源群', async (t) => {
 function setupTools({ chat = otherChat, level = 'social', cfg = {}, hub = {}, callImpl } = {}) {
   const calls = [], sent = []
   const config = { enabled: true, dryRun: false, botQQ: BOT, group: { crossRead: 'private' }, allow: { groups: ['44444444', '55555555'] }, files: { enabled: false }, ...cfg }
+  const identity = makeTestIdentity(OWNER, 'qq')
   let builder
   qqTools.setup({
     core: {
+      identity,
+      routeOwner: identity.routeOwner,
       hub: { turnHasOwner: () => false, turnSenders: () => [OTHER], sendSegments: async (...args) => { sent.push(args); return { message_id: 99 } }, ...hub },
       onebot: { call: async (action, params) => { calls.push({ action, params }); return callImpl?.(action, params) } },
     },
@@ -314,8 +320,9 @@ test('新增 QQ 接口经工具调用时仍检查主人和试运行', async () =
   let build
   const cfg = { enabled: true, dryRun: false, qqApi: { enabled: true } }
   const calls = []
+  const identity = makeTestIdentity(OWNER, 'qq')
   qqApi.setup({
-    core: { hub: { turnSendersAllOwner: () => owner }, onebot: { call: async (action, params) => { calls.push({ action, params }); return null } } },
+    core: { identity, routeOwner: identity.routeOwner, hub: { turnSendersAllOwner: () => owner }, onebot: { call: async (action, params) => { calls.push({ action, params }); return null } } },
     config: () => cfg, tool: (fn) => { build = fn }, rule() {}, log: { info() {} },
   })
   const call = build({ chat: groupChat, level: 'social', sessionId: 's' }).find((tool) => tool.name === 'qq_api_call')

@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { makeTestIdentity } from './helpers/identity.js'
 
 let api
 let duty
@@ -108,7 +109,8 @@ function fakes({ decisions, replyText = '是呀 我也觉得', cfgOver = {}, pos
     add: (m) => facts.push(m.text),
   }
   const cfg = normalize({ enabled: true, dryRun: false, ownerQQ: '10000001', bili: { enabled: true, cookie: 'SESSDATA=x; bili_jct=y', perRun: 2, maxCommentsPerDay: 1, ...cfgOver } })
-  const b = duty.createBili({ getConfig: () => cfg, hub, memory, log: { info() {}, warn() {}, debug() {} }, api: fakeApi })
+  const identity = makeTestIdentity('10000001', 'qq')
+  const b = duty.createBili({ getConfig: () => cfg, hub, memory, identity, routeOwner: identity.routeOwner, log: { info() {}, warn() {}, debug() {} }, api: fakeApi })
   return { b, posted, sent, events, eventRecords, facts }
 }
 

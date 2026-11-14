@@ -12,12 +12,14 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { makeTestIdentity } from './helpers/identity.js'
 
 let createPurpose
 let purposeConfig
 let cleanReply
 let engine
 const OWNER = '10000001'
+const ownerIdentity = makeTestIdentity(OWNER, 'qq', { personId: OWNER })
 const MIN = 60_000
 let dataRoot = ''
 
@@ -66,6 +68,8 @@ function makePurpose(hub, overrides = {}) {
   const p = createPurpose({
     getConfig: () => cfg,
     hub,
+    identity: ownerIdentity,
+    routeOwner: () => ownerIdentity.routeOwner(),
     log: { info() {}, warn() {}, debug() {} },
     isMuted: () => false,
     mood: () => ({ nudge: (d, r) => nudges.push({ d, r }) }),
@@ -405,6 +409,8 @@ test('白名单：朋友单独排程，提示词里没有主人的记忆和群�
   }
   const p = createPurpose({
     getConfig: () => cfg, hub, log: { info() {}, warn() {}, debug() {} },
+    identity: ownerIdentity,
+    routeOwner: () => ownerIdentity.routeOwner(),
     isMuted: (id) => id === `private:${OWNER}`,
     mood: () => null, personaText: () => '',
     memory: () => ({ list: () => memories, profiles: () => [{ qq: FRIEND, name: '阿花' }] }),
@@ -437,6 +443,8 @@ test('白名单：朋友不吃主人人格卡（persona 为空，不生成「我
   }
   const p = createPurpose({
     getConfig: () => cfg, hub, log: { info() {}, warn() {}, debug() {} },
+    identity: ownerIdentity,
+    routeOwner: () => ownerIdentity.routeOwner(),
     isMuted: (id) => id === `private:${OWNER}`,
     // 主人线有完整人格卡：爱玩、黏人；朋友线必须完全不受它影响
     mood: () => null, personaText: () => '她是一条活泼爱玩又黏人的鱼，总想找主人说话',
@@ -467,6 +475,8 @@ test('白名单：没聊过的朋友不找，人设再完整也不凭空开口',
   }
   const p = createPurpose({
     getConfig: () => cfg, hub, log: { info() {}, warn() {}, debug() {} },
+    identity: ownerIdentity,
+    routeOwner: () => ownerIdentity.routeOwner(),
     isMuted: (id) => id === `private:${OWNER}`, mood: () => null,
     personaText: () => '她是一条活泼的鱼，喜欢聊天', memory: () => ({ list: () => [] }),
   })
@@ -924,6 +934,8 @@ test('代发决断：记忆里刚记下同样的内容 ≠ 已经跟主人说过
       ext: { purpose: { enabled: true, initialDelayMinutes: 1, minMaterials: 0 } },
     }),
     hub,
+    identity: ownerIdentity,
+    routeOwner: () => ownerIdentity.routeOwner(),
     log: { info() {}, warn() {}, debug() {} },
     isMuted: () => false, mood: () => null,
     memory: () => ({ list: () => memories, recall: () => memories.map((m) => ({ it: m, score: 0.9 })), personaPerson: () => null }),
@@ -954,6 +966,8 @@ test('代发决断：聊天流水里确实发过类似内容 → 明确提示重
       ext: { purpose: { enabled: true, initialDelayMinutes: 1, minMaterials: 0 } },
     }),
     hub,
+    identity: ownerIdentity,
+    routeOwner: () => ownerIdentity.routeOwner(),
     log: { info() {}, warn() {}, debug() {} },
     isMuted: () => false, mood: () => null, memory: () => ({ list: () => [], recall: () => [] }),
     personaText: () => '',
@@ -983,6 +997,8 @@ test('代发决断：提示词注入人格、心情、相关记忆、人物档�
       ext: { purpose: { enabled: true, initialDelayMinutes: 1, minMaterials: 0 } },
     }),
     hub,
+    identity: ownerIdentity,
+    routeOwner: () => ownerIdentity.routeOwner(),
     log: { info() {}, warn() {}, debug() {} },
     isMuted: () => false,
     // 心情：contextLine 有就用它（真实 mood 模块的形态）

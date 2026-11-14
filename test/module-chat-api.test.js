@@ -7,6 +7,7 @@ import { createFakeDsh } from './helpers/fake-dsh.js'
 import { normalize } from '../src/core/config.js'
 import { createHub } from '../src/chat/hub.js'
 import { buildWav } from '../src/voice/wav.js'
+import { makeTestIdentity } from './helpers/identity.js'
 
 const OWNER = '10001', CHAT = `private:${OWNER}`, GROUP = 'group:555'
 const ownerChat = { chatId: CHAT, kind: 'private', userId: OWNER, groupId: '', nickname: '主人' }
@@ -20,9 +21,11 @@ function setup(t, options = {}) {
     allow: { private: ['10002'], groups: ['555'] }, voice: { enabled: false },
     stickers: { enabled: false }, conversationContext: { enabled: true }, model: { vision: 'on' }, merge: { enabled: false } })
   const fake = createFakeDsh({ brain: async () => '' }), rows = [], calls = [], memory = [], activity = []
+  const identity = makeTestIdentity(OWNER, 'qq')
   let muted = false
   const hub = createHub({ dsh: fake.ctx, getConfig: () => cfg,
     log: { info() {}, warn() {}, debug() {}, error() {} },
+    identity, routeOwner: identity.routeOwner, defaultPlatform: 'qq',
     onebot: { connected: true, async call(action, params) { calls.push({ action, params }); return { message_id: calls.length } } },
     onMemoryCommand: (chat, text) => memory.push({ chat, text }), onActivity: (a) => activity.push(a),
     isMuted: () => muted, hooks: { journal: (row) => rows.push(row), ...options.hooks } })
@@ -32,7 +35,7 @@ function setup(t, options = {}) {
     for (const [key, value] of [['AURABOT_DATA_DIR', before.data], ['AURABOT_WORKSPACE', before.workspace]]) { if (value === undefined) delete process.env[key]; else process.env[key] = value }
     rmSync(dir, { recursive: true, force: true })
   })
-  return { hub, cfg, fake, rows, calls, memory, activity, mute: (value) => { muted = value } }
+  return { hub, cfg, fake, identity, rows, calls, memory, activity, mute: (value) => { muted = value } }
 }
 
 test('流水通知与落盘同源：来源端标记不落盘，监听失败不影响写入，调试不通知', async (t) => {
@@ -113,7 +116,7 @@ test('异步 prompt 准备期间撤销身份，投递前再次鉴权；旧主人
   await s.hub.pushToSession(ownerChat, [{ type: 'text', text: '准备' }], OWNER)
   block = true
   const pending = s.hub.receiveOwnerMessage(CHAT, { text: '异步输入' })
-  await entered.promise; s.cfg.ownerQQ = '10009'; gate.resolve()
+  await entered.promise; s.cfg.ownerQQ = '10009'; s.identity.setOwner('10009', 'qq'); gate.resolve()
   await assert.rejects(pending, { status: 503 })
   assert.ok(!s.fake.turns.some((r) => r.userText.includes('异步输入')))
 })

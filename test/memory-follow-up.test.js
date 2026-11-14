@@ -8,6 +8,7 @@ import { createHub } from '../src/chat/hub.js'
 import { createMemoryStore, parseFollowUpAt, compressionClusters, shouldForget } from '../src/features/memory.js'
 import { createSpeakUp } from '../src/features/companion.js'
 import { createPurpose } from '../src/purpose/module.js'
+import { makeTestIdentity } from './helpers/identity.js'
 import { collectMaterials, minePurposeSeeds, selectPurpose, FOLLOW_UP_WEIGHT } from '../src/purpose/engine.js'
 import { readMemoryState, writeMemoryState } from './helpers/memory-state.js'
 import { createFakeDsh } from './helpers/fake-dsh.js'
@@ -54,9 +55,10 @@ function setup(t, options = {}) {
     async runSystemTurn(id, title, prompt) { generated.push(prompt); return options.reply ?? '公司那件事后来怎么样了？' },
     async deliver(target, text) { delivered.push({ target, text }); return { sent: options.sent === false ? '' : text } },
   }
-  const mem = createMemoryStore({ dsh, getConfig: () => cfg, hub, log })
-  const speak = createSpeakUp({ getConfig: () => cfg, hub, log, memory: () => mem, isMuted: (id) => muted.has(id) })
-  const purpose = createPurpose({ getConfig: () => cfg, hub, log, memory: () => mem, isMuted: (id) => muted.has(id), personaText: () => '' })
+  const identity = makeTestIdentity(OWNER, 'qq', { legacyIds: [OWNER, FRIEND, STRANGER] })
+  const mem = createMemoryStore({ dsh, getConfig: () => cfg, hub, log, identity })
+  const speak = createSpeakUp({ getConfig: () => cfg, hub, log, identity, routeOwner: identity.routeOwner, memory: () => mem, isMuted: (id) => muted.has(id) })
+  const purpose = createPurpose({ getConfig: () => cfg, hub, log, identity, routeOwner: identity.routeOwner, memory: () => mem, isMuted: (id) => muted.has(id), personaText: () => '' })
   const pending = (patch = {}) => {
     const qq = patch.about || OWNER
     return mem.add({ text: '主人公司正在裁员，还在等通知', about: qq, aboutName: qq, speaker: qq, status: 'fact', tier: 3,
@@ -339,12 +341,13 @@ for (const pauseAdmission of [false, true]) test(pauseAdmission
     }
     return admit(content)
   }
-  const hub = createHub({ dsh: fake.ctx, getConfig: () => s.cfg, log,
+  const identity = makeTestIdentity(OWNER, 'qq', { legacyIds: [OWNER, FRIEND, STRANGER] })
+  const hub = createHub({ dsh: fake.ctx, getConfig: () => s.cfg, log, identity, routeOwner: identity.routeOwner, defaultPlatform: 'qq',
     onebot: { async call() { return { message_id: 42 } } },
   })
   fake.ctx.effect(() => fake.ctx.on('session/event', hub.onSessionEvent))
   t.after(() => { firstReply.resolve(); nextReply.resolve(); admissionReady.resolve(); hub.dispose(); fake.dispose() })
-  const speak = createSpeakUp({ getConfig: () => s.cfg, hub, log, memory: () => s.mem })
+  const speak = createSpeakUp({ getConfig: () => s.cfg, hub, log, identity, routeOwner: identity.routeOwner, memory: () => s.mem })
   const previousTurn = hub.pushToSession(chat(OWNER), [{ type: 'text', text: '普通聊天' }], OWNER)
   await firstEntered.promise
   const followTurn = speak.fire()
@@ -369,7 +372,8 @@ test('真实发送回执：沉默、试运行、被拦截和网关失败均不�
   const s = setup(t, { sent: false })
   const id = s.pending()
   let blocked = false, fail = false
-  const hub = createHub({ dsh: {}, getConfig: () => s.cfg, log,
+  const identity = makeTestIdentity(OWNER, 'qq', { legacyIds: [OWNER, FRIEND, STRANGER] })
+  const hub = createHub({ dsh: {}, getConfig: () => s.cfg, log, identity, routeOwner: identity.routeOwner, defaultPlatform: 'qq',
     onebot: { async call() { if (fail) throw new Error('网关失败'); return { message_id: 42 } } },
     hooks: { reply: async (text) => blocked ? null : text },
   })

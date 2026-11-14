@@ -11,14 +11,43 @@
 import { existsSync, readdirSync, statSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { join, dirname, relative, resolve, sep, isAbsolute } from 'node:path'
 import { pathToFileURL, fileURLToPath } from 'node:url'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { dataDir } from './store.js'
 import { registerSecretField } from './config.js'
 import { defineTool } from '../tools/tools.js'
 import { selfName } from '../persona/personas.js'
+import { normalizeChatId, parseChatId } from '../gateway/address.js'
+import { isOwner as checkOwnerIdentity } from '../chat/access.js'
 
-/** 扩展接口版本：只加不改。哪天不得不改已有的东西才升到 2，并在更新说明里写清楚怎么迁移。 */
-export const API_VERSION = 1
+const platformContext = new AsyncLocalStorage()
+const runWithPlatform = (platform, fn) => (platform ? platformContext.run(platform, fn) : fn())
+
+/** 扩展接口版本：v2 起支持多平台模块（platforms / api.caps / api.native / api.platformOf / api.sendParts），向后兼容 v1。 */
+export const API_VERSION = 2
 export const MIN_API_VERSION = 1
+
+const QQ_FALLBACK_CAPS = {
+  image: true,
+  sticker: true,
+  voice: 'native',
+  video: true,
+  file: true,
+  maxFileBytes: 100 * 1024 * 1024,
+  quoteReply: true,
+  mention: true,
+  mentionAll: true,
+  poke: true,
+  typing: false,
+  recall: true,
+  card: false,
+  listenAllInGroup: true,
+  proactive: 'free',
+  replyWindowMs: 0,
+  repliesPerMessage: 0,
+  history: true,
+  memberList: true,
+  forwardExpand: true,
+}
 
 const SRC = fileURLToPath(new URL('../', import.meta.url)) // 插件的 src/
 const BUILTIN_DIR = join(SRC, 'modules')
@@ -99,6 +128,79 @@ export function scanUser() {
   return out
 }
 
+/** 模块声明支持的平台列表：没写（v1 旧模块）默认 ['qq']。 */
+export function modulePlatforms(def) {
+  if (!def || def.platforms == null) return ['qq']
+  if (!Array.isArray(def.platforms)) return ['qq']
+  const out = []
+  for (const p of def.platforms) {
+    if (typeof p !== 'string') continue
+    const s = p.trim()
+    if (s && !out.includes(s)) out.push(s)
+  }
+  return out.length ? out : ['qq']
+}
+
+function segmentsToPartsFallback(segs = []) {
+  if (!Array.isArray(segs)) return []
+  const out = []
+  for (const s of segs) {
+    if (!s || typeof s !== 'object') continue
+    const d = s.data || {}
+    if (s.type === 'text') {
+      if (d.text !== undefined) out.push({ type: 'text', text: String(d.text) })
+    } else if (s.type === 'at') {
+      if (String(d.qq) === 'all') out.push({ type: 'mention', all: true })
+      else if (d.qq != null) out.push({ type: 'mention', userId: String(d.qq) })
+    } else if (s.type === 'face') {
+      if (d.id != null) out.push({ type: 'face', id: String(d.id) })
+    } else if (s.type === 'reply') {
+      if (d.id != null) out.push({ type: 'reply', messageId: String(d.id) })
+    } else if (s.type === 'image' || s.type === 'record' || s.type === 'voice' || s.type === 'video' || s.type === 'file') {
+      const type = s.type === 'record' ? 'voice' : s.type
+      const file = String(d.url || d.file || '')
+      if (!file) continue
+      const part = { type }
+      if (file.startsWith('base64://')) part.base64 = file.slice('base64://'.length)
+      else if (/^https?:\/\//i.test(file)) part.url = file
+      else part.file = file
+      if (d.name) part.name = String(d.name)
+      out.push(part)
+    }
+  }
+  return out
+}
+
+function partsToSegmentsFallback(parts = []) {
+  if (!Array.isArray(parts)) return []
+  const out = []
+  for (const p of parts) {
+    if (!p || typeof p !== 'object') continue
+    if (p.type === 'text') {
+      if (p.text) out.push({ type: 'text', data: { text: String(p.text) } })
+    } else if (p.type === 'mention') {
+      const qq = p.all ? 'all' : String(p.userId || '')
+      if (qq) out.push({ type: 'at', data: { qq } })
+    } else if (p.type === 'face') {
+      if (p.id != null) out.push({ type: 'face', data: { id: String(p.id) } })
+    } else if (p.type === 'reply') {
+      if (p.messageId != null) out.push({ type: 'reply', data: { id: String(p.messageId) } })
+    } else if (p.type === 'image' || p.type === 'voice' || p.type === 'video' || p.type === 'file') {
+      const file = p.url
+        ? String(p.url)
+        : p.file
+          ? (isAbsolute(String(p.file)) ? pathToFileURL(String(p.file)).href : String(p.file))
+          : p.base64
+            ? `base64://${p.base64}`
+            : ''
+      if (!file) continue
+      const segType = p.type === 'voice' ? 'record' : p.type
+      out.push({ type: segType, data: p.type === 'file' && p.name ? { file, name: String(p.name) } : { file } })
+    }
+  }
+  return out
+}
+
 /** 检查模块定义，返回出错原因（没问题返回空串）。 */
 export function checkDef(def, id) {
   if (!def || typeof def !== 'object') return '入口文件要 export default 一个对象（看 API.md）'
@@ -108,6 +210,11 @@ export function checkDef(def, id) {
   const want = Number(def.api ?? 1)
   if (want > API_VERSION) return `这个模块要扩展接口 v${want}，现在的插件只有 v${API_VERSION}，先更新插件`
   if (want < MIN_API_VERSION) return `这个模块是按扩展接口 v${want} 写的，现在最低支持 v${MIN_API_VERSION}，按更新说明改一下`
+  if (def.platforms !== undefined) {
+    if (!Array.isArray(def.platforms) || !def.platforms.length || def.platforms.some((p) => typeof p !== 'string' || !p.trim())) {
+      return '模块 platforms 要是非空字符串数组（例如 [\'qq\'] 或 [\'*\']）'
+    }
+  }
   return ''
 }
 
@@ -342,7 +449,7 @@ function brokerDelegable(core, verdict, ask) {
   if (!text.trim()) return null
   const to = String((ask && ask.chatId) || '')
   // 只代发「主动私聊主人」；群聊、朋友私聊均按原路径。
-  // 治理范围由服务自己判（它的 getConfig 里有 ownerQQ），模块层不必依赖 core.getConfig。
+  // 治理范围由出站服务判别（基于 identity.owner()），模块层不必依赖 core.getConfig。
   const governed = typeof svc.isGoverned === 'function' ? svc.isGoverned(to) : false
   if (!governed) return null
   return svc
@@ -362,8 +469,10 @@ async function delegateToHost(core, id, ask, verdict, svc, log) {
     try { svc.release(verdict.reserveId, { reason: 'delegated-to-host' }) } catch {}
   }
   try {
+    const to = String(ask.chatId)
+    const plat = parseChatId(normalizeChatId(to) || to)?.platform || ''
     const r = await svc.submit(
-      { moduleId: id, itemId: ask.itemId || '', to: String(ask.chatId), channel: 'qq', text: String(ask.text ?? ''), at: Date.now() },
+      { moduleId: id, itemId: ask.itemId || '', to, channel: plat, text: String(ask.text ?? ''), at: Date.now() },
       { hostDelegate: true },
     )
     const state = r && typeof r === 'object' ? String(r.state || '') : ''
@@ -382,7 +491,7 @@ async function delegateToHost(core, id, ask, verdict, svc, log) {
  * scopedHub 上这 6 个函数要过治理（CONTRACT §5）。
  * 其余名字照旧直接转发：hub 的内部入口（stats / sessions / chatOfSession……）与发送无关。
  */
-const GOVERNED_HUB_METHODS = new Set(['sendText', 'sendSegments', 'sendImage', 'sendFile', 'sendVoiceFile', 'deliver'])
+const GOVERNED_HUB_METHODS = new Set(['sendText', 'sendSegments', 'sendParts', 'sendImage', 'sendFile', 'sendVoiceFile', 'deliver'])
 
 /**
  * 按方法名把一次 scopedHub 调用翻译成「治理问题 + 真正执行」。
@@ -391,7 +500,7 @@ const GOVERNED_HUB_METHODS = new Set(['sendText', 'sendSegments', 'sendImage', '
  * 说明：每个分支的 ask 只取发送目标与文本，**身份一律由宿主绑定的 id 决定**，
  * 模块即使在自己参数里塞 moduleId / sourceModule 也覆盖不了（防止冒充别的模块）。
  */
-function governScopedCall(core, id, name, args, log) {
+function governScopedCall(core, id, name, args, log, compat = null) {
   const [chatId, a, b, c] = args
   switch (name) {
     case 'sendText':
@@ -403,10 +512,17 @@ function governScopedCall(core, id, name, args, log) {
       }, log)
     case 'sendSegments':
       // sendSegments(chatId, segments, note, opts)
+      compat?.requireQqSend?.(chatId)
       return governedSend(core, id, { chatId, text: '' }, (extra) => {
         const last = args[3]
         const opts = last && typeof last === 'object' ? { ...last, ...extra } : extra
         return core.hub.sendSegments(chatId, a, b, opts)
+      }, log)
+    case 'sendParts':
+      // sendParts(chatId, parts, opts)
+      return governedSend(core, id, { chatId, text: '' }, (extra) => {
+        const opts = b && typeof b === 'object' ? { ...b, ...extra } : extra
+        return core.hub.sendParts(chatId, a, opts)
       }, log)
     case 'sendImage':
       // sendImage(chatId, src, replyId, userId, opts)
@@ -436,42 +552,92 @@ function governScopedCall(core, id, name, args, log) {
  * 给单个模块的 core：hub 下发「白名单副本」，原始委派入口不下发、也不可经原型链摸回（三审 #177）。
  * - scopedHub：平面对象，只转发 hub 的函数/取值器（跳过原始 runSubagentTurn / subagentFor），
  *   再补一个固定模块 id 的 runSubagentTurn；原型就是 Object.prototype，没有可逃逸的入口。
- * - 6 个发送函数额外过一层出站治理（moduleId 由宿主绑定，模块伪造不了；未注入服务时完全惰性）。
+ * - 发送函数额外过一层出站治理（moduleId 由宿主绑定，模块伪造不了；未注入服务时完全惰性）。
  * - scopedCore：Proxy 转发 core 的其余属性（bridge / modules 后挂的也可见），
  *   但 getPrototypeOf 掐成 null —— Object.getPrototypeOf(api.core).hub 也绕不回去。
  */
-export function scopeCoreForModule(core, id) {
-  if (!core || !core.hub || typeof core.hub.subagentFor !== 'function') return core || {}
+export function scopeCoreForModule(core, id, compat = null) {
+  if (!core) return {}
+  if (!compat && (!core.hub || typeof core.hub.subagentFor !== 'function')) return core
   const obLog = outboundLogOf(core)
-  const scopedHub = {}
-  for (const name of Object.getOwnPropertyNames(core.hub)) {
-    if (name === 'runSubagentTurn' || name === 'subagentFor') continue
-    const d = Object.getOwnPropertyDescriptor(core.hub, name)
-    if (!d) continue
-    if (typeof d.get === 'function') {
-      Object.defineProperty(scopedHub, name, { enumerable: true, configurable: true, get: () => core.hub[name] })
-    } else if (typeof d.value === 'function') {
-      const fn = d.value
-      // 发送类入口走治理：拦下返回 null，放行才真的调 hub（旧真值语义不变）
-      if (GOVERNED_HUB_METHODS.has(name)) {
-        Object.defineProperty(scopedHub, name, {
-          enumerable: true, configurable: true,
-          value: (...args) => governScopedCall(core, id, name, args, obLog),
-        })
+  let scopedHub = core.hub
+  if (core.hub && typeof core.hub === 'object') {
+    const hasSubagent = typeof core.hub.subagentFor === 'function'
+    scopedHub = {}
+    for (const name of Object.getOwnPropertyNames(core.hub)) {
+      if (hasSubagent && (name === 'runSubagentTurn' || name === 'subagentFor')) continue
+      const d = Object.getOwnPropertyDescriptor(core.hub, name)
+      if (!d) continue
+      if (typeof d.get === 'function') {
+        Object.defineProperty(scopedHub, name, { enumerable: true, configurable: true, get: () => core.hub[name] })
+      } else if (typeof d.value === 'function') {
+        const fn = d.value
+        // 发送类入口走治理：拦下返回 null，放行才真的调 hub（旧真值语义不变）
+        if (GOVERNED_HUB_METHODS.has(name)) {
+          Object.defineProperty(scopedHub, name, {
+            enumerable: true, configurable: true,
+            value: (...args) => governScopedCall(core, id, name, args, obLog, compat),
+          })
+        } else {
+          Object.defineProperty(scopedHub, name, { enumerable: true, configurable: true, value: (...args) => fn.apply(core.hub, args) })
+        }
       } else {
-        Object.defineProperty(scopedHub, name, { enumerable: true, configurable: true, value: (...args) => fn.apply(core.hub, args) })
+        Object.defineProperty(scopedHub, name, { enumerable: true, configurable: true, get: () => core.hub[name], set: (v) => { core.hub[name] = v } })
       }
-    } else {
-      Object.defineProperty(scopedHub, name, { enumerable: true, configurable: true, get: () => core.hub[name], set: (v) => { core.hub[name] = v } })
+    }
+    if (hasSubagent) {
+      Object.defineProperty(scopedHub, 'runSubagentTurn', {
+        enumerable: true, configurable: true,
+        value: (name, title, prompt, opts = {}) => core.hub.subagentFor(id)(name, title, prompt, opts),
+      })
     }
   }
-  Object.defineProperty(scopedHub, 'runSubagentTurn', {
-    enumerable: true, configurable: true,
-    value: (name, title, prompt, opts = {}) => core.hub.subagentFor(id)(name, title, prompt, opts),
-  })
+  const scopedOnebot = compat
+    ? new Proxy(core.onebot || {}, {
+      get(t, key, r) {
+        if (key === 'state') return compat.qqState()
+        if (key === 'call') return (action, params, opts) => {
+          compat.requireQqNative('api.core.onebot.call')
+          return compat.callQq(action, params, opts)
+        }
+        const v = Reflect.get(t, key, r)
+        if (typeof v === 'function') {
+          return (...args) => {
+            compat.requireQqNative(`api.core.onebot.${String(key)}`)
+            return v.apply(t, args)
+          }
+        }
+        if (v === undefined && typeof key === 'string') return undefined
+        return v
+      },
+    })
+    : null
+  const scopedSnowluma = compat
+    ? new Proxy(core.snowluma || {}, {
+      get(t, key, r) {
+        const v = Reflect.get(t, key, r)
+        if (typeof v === 'function') {
+          return (...args) => {
+            compat.requireQqNative(`api.core.snowluma.${String(key)}`)
+            return v.apply(t, args)
+          }
+        }
+        if (typeof key === 'string' && v === undefined) {
+          return (..._args) => {
+            compat.requireQqNative(`api.core.snowluma.${key}`)
+            return undefined
+          }
+        }
+        compat.requireQqNative(`api.core.snowluma.${String(key)}`)
+        return v
+      },
+    })
+    : null
   return new Proxy(core, {
     get(target, key, recv) {
       if (key === 'hub') return scopedHub
+      if (key === 'onebot' && scopedOnebot) return scopedOnebot
+      if (key === 'snowluma' && scopedSnowluma) return scopedSnowluma
       // 出站治理服务不下发给模块：模块能拿到原始 svc 就能自己填 moduleId 冒充别人，
       // 也会绕过 api.proactive 的身份绑定。模块只能走 api.proactive（见 makeApi）。
       if (key === 'outbound') return undefined
@@ -492,12 +658,182 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
   // 模块每次（重）启动都递增一次「代际」：hub 用它判断会话里挂的工具是不是旧模块实例的闭包。
   let generation = 0
   let userSeen = new Map() // id → { dir, file, stamp }
+  const userMeta = new Map() // id → { name, description, version, platforms }
+  const skipped = new Map() // id → 跳过原因（例如 '未启用对应平台'）
   let watching = null
+  let wiredGateway = null
+  let offGatewayState = null
   let disposed = false
 
   const modCfg = (id) => getConfig().modules?.[id] || {}
   const isEnabled = (id) => modCfg(id).enabled !== false
   const isUserOn = () => !getConfig().safeMode
+  const platformOf = (chatId) => {
+    if (!chatId) return ''
+    const raw = String(chatId)
+    const norm = normalizeChatId(raw) || raw
+    const p = parseChatId(norm)?.platform
+    if (p) return p
+    const st = core.gateway?.instances?.()?.find?.((s) => s?.instance === raw)
+    return st?.platform || ''
+  }
+  const activePlatforms = () => {
+    const cfg = getConfig()
+    const set = new Set()
+    const plats = cfg?.platforms
+    const hasPlatMap = Boolean(plats && typeof plats === 'object')
+    if (hasPlatMap) {
+      for (const [k, v] of Object.entries(plats)) {
+        if (!v || v.enabled === false) continue
+        const p = String(v.platform || k.split(':')[0] || '').trim()
+        if (p) set.add(p)
+      }
+    }
+    const insts = core.gateway?.instances?.()
+    if (Array.isArray(insts)) {
+      for (const st of insts) {
+        if (!st?.enabled || !st.platform) continue
+        if (hasPlatMap && st.instance in plats && plats[st.instance]?.enabled === false) continue
+        set.add(String(st.platform))
+      }
+    }
+    // 仅核心单测（既没配 platforms 也没注入网关）沿用 QQ 默认
+    if (!hasPlatMap && !core.gateway) set.add('qq')
+    return set
+  }
+  const qqEnabled = () => activePlatforms().has('qq')
+  const allowsQq = (rec) => Boolean(rec?.platforms?.includes('qq'))
+  const platformAllowed = (plats, active = activePlatforms()) => plats.includes('*') || plats.some((p) => active.has(p))
+  const recMatchesPlatform = (rec, platform) => !rec ? false : (!platform || rec.platforms.includes('*') || rec.platforms.includes(platform))
+  const getQqState = () => {
+    if (!qqEnabled()) return 'stopped'
+    const insts = core.gateway?.instances?.()
+    if (Array.isArray(insts)) {
+      const target = insts.find((st) => st?.platform === 'qq' && st.enabled && st.caps !== null)
+      if (target) return target.state || 'stopped'
+    }
+    return core.onebot?.state || 'stopped'
+  }
+  const capsFor = (chatId) => {
+    if (!chatId) return null
+    const raw = String(chatId)
+    const norm = normalizeChatId(raw) || raw
+    const gw = core.gateway
+    if (gw && typeof gw.caps === 'function') {
+      const c = gw.caps(norm)
+      if (c) return c
+    }
+    const addr = parseChatId(norm)
+    if (addr?.platform === 'qq' && qqEnabled() && core.onebot && (!gw || core.onebot.state === 'connected')) {
+      return { ...QQ_FALLBACK_CAPS }
+    }
+    return null
+  }
+  const requireQqCompatFor = (rec, id, label, chatId) => {
+    if (!qqEnabled()) throw new Error(`QQ 平台未启用，${label} 不可用`)
+    if (!allowsQq(rec)) throw new Error(`模块「${id}」未在 platforms 中声明 'qq'，不能使用 ${label}`)
+    if (chatId !== undefined) {
+      const p = platformOf(chatId)
+      if (p !== 'qq') throw new Error(`非 QQ 会话「${chatId}」不支持 ${label}，请改用 api.sendParts`)
+    }
+  }
+  const nativeCall = (rec, id, platform, action, params, opts) => {
+    const p = String(platform || '').trim()
+    if (!p) throw new Error('api.native 需要指定 platform')
+    if (!rec?.platforms?.includes(p)) {
+      throw new Error(`模块「${id}」没有在 platforms 里声明「${p}」，不能调 api.native('${p}', ...)`)
+    }
+    const plats = getConfig()?.platforms
+    const hasPlatMap = Boolean(plats && typeof plats === 'object')
+    const gw = core.gateway
+    if (gw && typeof gw.instances === 'function') {
+      const matches = gw.instances().filter((st) => st?.platform === p && st.enabled && !(hasPlatMap && st.instance in plats && plats[st.instance]?.enabled === false))
+      if (!matches.length) throw new Error(`平台「${p}」未启用`)
+      const target = matches.find((st) => st.caps !== null) || matches[0]
+      if (target.caps !== null) return gw.native(target.instance, action, params, opts)
+      // G3 共存回退：宿主直接连着 core.onebot，而 gw 尚未同步启动 qq adapter
+      if (p === 'qq' && core.onebot?.call && qqEnabled()) return core.onebot.call(action, params, opts)
+      throw new Error(`平台「${p}」尚未就绪，native 不可用`)
+    }
+    if (p === 'qq' && core.onebot?.call) {
+      if (!qqEnabled()) throw new Error('平台「qq」未启用')
+      return core.onebot.call(action, params, opts)
+    }
+    throw new Error(`平台「${p}」未启用或网关未就绪`)
+  }
+  const wireGateway = () => {
+    const gw = core.gateway
+    if (!gw || gw === wiredGateway) return
+    try { offGatewayState?.() } catch {}
+    offGatewayState = typeof gw.onState === 'function'
+      ? gw.onState((status) => {
+        emit('platform/state', status)
+        if (!core.onebot && status?.platform === 'qq' && status?.state) emit('onebot/state', status.state)
+      })
+      : null
+    wiredGateway = gw
+  }
+  const enrichMsg = (rawMsg) => {
+    if (!rawMsg || typeof rawMsg !== 'object') return rawMsg
+    const gwMeta = rawMsg.raw?.__gateway
+    const chatId = rawMsg.chatId ? String(rawMsg.chatId) : ''
+    const norm = chatId ? (normalizeChatId(chatId) || chatId) : ''
+    const addr = norm ? parseChatId(norm) : null
+    const platform = String(rawMsg.platform || gwMeta?.platform || addr?.platform || 'qq')
+    const instance = String(rawMsg.instance || gwMeta?.instance || addr?.instance || platform)
+    const person = rawMsg.person !== undefined ? rawMsg.person : (gwMeta?.person ?? null)
+    let parts = Array.isArray(rawMsg.parts) ? rawMsg.parts : (Array.isArray(gwMeta?.parts) ? gwMeta.parts : null)
+    if (!parts) {
+      if (Array.isArray(rawMsg.raw?.message)) {
+        try {
+          parts = typeof core.gateway?.toParts === 'function'
+            ? core.gateway.toParts(norm || chatId, rawMsg.raw.message)
+            : segmentsToPartsFallback(rawMsg.raw.message)
+        } catch {
+          parts = segmentsToPartsFallback(rawMsg.raw.message)
+        }
+      } else {
+        parts = []
+        if (rawMsg.text) parts.push({ type: 'text', text: String(rawMsg.text) })
+        for (const u of rawMsg.images || []) parts.push({ type: 'image', ...(typeof u === 'string' && /^https?:\/\//i.test(u) ? { url: u } : { file: String(u || '') }) })
+        for (const u of rawMsg.records || []) parts.push({ type: 'voice', ...(typeof u === 'string' && /^https?:\/\//i.test(u) ? { url: u } : { file: String(u || '') }) })
+      }
+    }
+    return { ...rawMsg, platform, instance, parts, person }
+  }
+  const eventPlatform = (event, args) => {
+    if (event === 'onebot' || event === 'onebot/state') return 'qq'
+    if (event === 'platform/state') return args[0]?.platform || ''
+    if (event === 'activity' || event === 'chat/log') {
+      const first = args[0]
+      const cid = typeof first === 'string' ? first : (first?.chatId || '')
+      return first?.platform || (cid ? platformOf(cid) : '')
+    }
+    if (event === 'message') {
+      const m = args[0]
+      return m?.platform || m?.raw?.__gateway?.platform || (m?.chatId ? platformOf(m.chatId) : '')
+    }
+    if (event === 'poke') {
+      const ev = args[0]
+      return ev?.platform || (ev?.chatId ? platformOf(ev.chatId) : 'qq')
+    }
+    if (event === 'reply' || event === 'reply/items' || event === 'send') {
+      return args[0]?.platform || (args[0]?.chatId ? platformOf(args[0].chatId) : '')
+    }
+    if (event === 'group/decide') {
+      const m = args[0]?.msg
+      return m?.platform || m?.raw?.__gateway?.platform || (m?.chatId ? platformOf(m.chatId) : '')
+    }
+    if (event === 'prompt') {
+      const c = args[0]?.chat
+      return c?.platform || (c?.chatId ? platformOf(c.chatId) : '')
+    }
+    if (event === 'model') {
+      const c = args[0]
+      return c?.platform || (c?.chatId ? platformOf(c.chatId) : '')
+    }
+    return ''
+  }
   // 接口挂在哪：内置模块（以及从内置搬到社区库的那几个）沿用原来的根路径，别的模块挂在自己的 /ext/<id>/ 下。
   // 面板里的 call('/x') 要用同一份判断决定基址（见 status().routesAtRoot），两边不能各算各的。
   const routesAtRoot = (id) => builtinDefs.has(id) || STABLE_ROUTES.has(id)
@@ -538,7 +874,12 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     // 模块拿到的 core：hub 换成「宿主按模块身份封装」的白名单副本（三审 #177：原型链斩断，
     // 模块摸不到原始 runSubagentTurn / subagentFor）；core 本体用 Proxy 转发，
     // getPrototypeOf 也掐断，防 getPrototypeOf(api.core).hub 绕回原始入口。
-    const scopedCore = scopeCoreForModule(core, id)
+    const scopedCore = scopeCoreForModule(core, id, {
+      qqState: getQqState,
+      requireQqNative: (label) => requireQqCompatFor(rec, id, label),
+      requireQqSend: (chatId) => requireQqCompatFor(rec, id, 'api.core.hub.sendSegments', chatId),
+      callQq: (action, params, opts) => nativeCall(rec, id, 'qq', action, params, opts),
+    })
     // 出站治理的日志口（模块快捷发送层的判定/结算都往这里记；未注入服务时不会用到）
     const obLog = outboundLogOf(core)
     const api = {
@@ -573,7 +914,11 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       rule: (fn) => { rec.rules.push(fn); return () => remove(rec.rules, fn) },
       command: (c) => {
         if (!c || !c.name || typeof c.run !== 'function') throw new Error('command 要有 name 和 run')
-        const item = { ...c, module: id }
+        const item = {
+          ...c,
+          run: (arg, msg, ...rest) => runWithPlatform(msg?.platform || platformOf(msg?.chatId), () => c.run(arg, msg, ...rest)),
+          module: id,
+        }
         rec.commands.push(item)
         return () => remove(rec.commands, item)
       },
@@ -622,17 +967,69 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       sendText: writable('sendText', (chatId, text) => governedSend(core, id, { chatId: String(chatId), text: String(text ?? '') }, (extra) => core.hub.sendText(String(chatId), String(text ?? ''), undefined, undefined, undefined, extra), obLog)),
       // 回某一条消息：群里以「引用回复」发出，私聊直接发
       reply: writable('reply', (msg, text) => core.hub.sendText(String(msg.chatId), String(text ?? ''), msg.kind === 'group' ? msg.messageId : undefined)),
-      isOwner: (userId) => String(userId) === String(getConfig().ownerQQ),
+      isOwner: (userId, platform) => {
+        const id = core.identity
+        if (platform !== undefined) return checkOwnerIdentity(id, userId, platform)
+        if (userId && typeof userId === 'object') return checkOwnerIdentity(id, userId)
+        const activePlat = platformContext.getStore() || ''
+        if (activePlat) {
+          const s = String(userId ?? '').trim()
+          if (!s) return false
+          if (checkOwnerIdentity(id, s, activePlat)) return true
+          if (/^p-/.test(s) && id?.lookup?.(activePlat, s) == null && id?.isValid?.(s)) return Boolean(id.isOwner?.(s))
+          return false
+        }
+        return checkOwnerIdentity(id, userId)
+      },
       sendImage: writable('sendImage', (chatId, src) => governedSend(core, id, { chatId: String(chatId) }, (extra) => core.hub.sendImage(String(chatId), src, undefined, undefined, extra), obLog)),
-      sendSegments: writable('sendSegments', (chatId, segs, note) => governedSend(core, id, { chatId: String(chatId) }, (extra) => core.hub.sendSegments(String(chatId), segs, note || `[${id}]`, extra), obLog)),
+      sendParts: writable('sendParts', (chatId, parts, opts = {}) => {
+        const cid = String(chatId || '')
+        const norm = normalizeChatId(cid) || cid
+        const arr = Array.isArray(parts) ? parts : []
+        const allText = arr.length > 0 && arr.every((p) => p && (p.type === 'text' || p.type === 'mention' || p.type === 'face'))
+        const textPreview = arr.filter((p) => p?.type === 'text').map((p) => p.text || '').join('')
+        const reviewable = allText && textPreview && !opts?.replyTo && !opts?.replyId && !opts?.inResponseTo && !opts?.force && !opts?.throwOnError
+        return governedSend(core, id, { chatId: norm, ...(reviewable ? { text: textPreview } : {}) }, (extra) => {
+          if (typeof core.hub?.sendParts === 'function') {
+            return core.hub.sendParts(norm, arr, { note: `[${id}]`, ...opts, ...extra })
+          }
+          if (platformOf(norm) === 'qq' && typeof core.hub?.sendSegments === 'function') {
+            return core.hub.sendSegments(norm, partsToSegmentsFallback(arr), opts?.note || `[${id}]`, { ...opts, ...extra })
+          }
+          throw new Error('中枢不支持 sendParts（未注入 hub.sendParts 或非默认平台缺少网关）')
+        }, obLog)
+      }),
+      sendSegments: writable('sendSegments', (chatId, segs, note) => {
+        requireQqCompatFor(rec, id, 'api.sendSegments', chatId)
+        return governedSend(core, id, { chatId: String(chatId) }, (extra) => {
+          if (typeof core.hub?.sendParts === 'function') {
+            const norm = normalizeChatId(String(chatId)) || String(chatId)
+            let parts
+            try {
+              parts = typeof core.gateway?.toParts === 'function' ? core.gateway.toParts(norm, segs) : segmentsToPartsFallback(segs)
+            } catch (err) {
+              if (!/没有实现 toParts/.test(err?.message || '')) throw err
+              parts = segmentsToPartsFallback(segs)
+            }
+            return core.hub.sendParts(norm, parts, { note: note || `[${id}]`, ...extra })
+          }
+          return core.hub.sendSegments(String(chatId), segs, note || `[${id}]`, extra)
+        }, obLog)
+      }),
       // 发任意文件（文档 / 压缩包 / 音频 / 视频……）：本机绝对路径，或网关能取到的网址 / base64://
       sendFile: writable('sendFile', (chatId, file, name) => governedSend(core, id, { chatId: String(chatId) }, () => core.hub.sendFile(String(chatId), file, name), obLog)),
       // 把一个音频文件当语音条发出去（不走念文字）
       sendVoiceFile: writable('sendVoiceFile', (chatId, file, note) => governedSend(core, id, { chatId: String(chatId) }, () => core.hub.sendVoiceFile(String(chatId), file, note || `[${id}] 语音`), obLog)),
+      platformOf: (chatId) => platformOf(chatId),
+      caps: (chatId) => capsFor(chatId),
+      native: writable('native', (platform, action, params, opts) => nativeCall(rec, id, platform, action, params, opts)),
       // module: id —— 这次模型调用的用量记到哪个模块名下（面板「概览」的 token 明细）
       ask: writable('ask', (opts) => core.ask(typeof opts === 'string' ? { text: opts, module: id } : { ...opts, module: id })),
       think: writable('think', (prompt, opts = {}) => core.hub.runSystemTurn(`ext-${id}`, opts.title || def.name || id, String(prompt), opts)),
-      onebot: writable('onebot', (action, params, opts) => core.onebot.call(action, params, opts)),
+      onebot: writable('onebot', (action, params, opts) => {
+        requireQqCompatFor(rec, id, 'api.onebot')
+        return nativeCall(rec, id, 'qq', action, params, opts)
+      }),
       // 出站治理面（主动发言策略，见 docs/OUTBOUND-POLICY-DESIGN.md）。
       // 宿主注入 core.outbound 才有；旧环境/纯测试下 available=false，模块据此降级，
       // 绝不因此抛错。moduleId 由宿主闭包绑定，模块无法伪造他人身份。
@@ -686,7 +1083,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
   async function start(def, source, extra = {}) {
     if (disposed) return null
     const id = def.id
-    const rec = { id, def, source, exports: null, offs: [], tools: [], contexts: [], rules: [], commands: [], dshTools: [], errors: [], startedAt: Date.now(), ...extra }
+    const rec = { id, def, source, platforms: modulePlatforms(def), exports: null, offs: [], tools: [], contexts: [], rules: [], commands: [], dshTools: [], errors: [], startedAt: Date.now(), ...extra }
     // 设置里的密码字段不回传给面板
     for (const f of def.settings || []) if (f && f.type === 'password' && f.key) registerSecretField(['ext', id, f.key])
     // 设置的默认值补进配置（面板表单直接有值可改；已经填过的不动）
@@ -697,6 +1094,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     }
     live.set(id, rec)
     errors.delete(id)
+    skipped.delete(id)
     generation++ // 新实例：会话里的工具要在下一轮重挂（issue #73）
     try {
       const api = makeApi(id, source, rec)
@@ -722,8 +1120,9 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
   function startSync(def) {
     if (disposed) return
     const id = def.id
-    const rec = { id, def, source: 'builtin', exports: null, offs: [], tools: [], contexts: [], rules: [], commands: [], dshTools: [], errors: [], startedAt: Date.now() }
+    const rec = { id, def, source: 'builtin', platforms: modulePlatforms(def), exports: null, offs: [], tools: [], contexts: [], rules: [], commands: [], dshTools: [], errors: [], startedAt: Date.now() }
     live.set(id, rec)
+    skipped.delete(id)
     generation++ // 内置模块（重）启动也换代际：会话里的工具要在下一轮重挂
     if (errors.get(id)?.source !== 'user') errors.delete(id) // 替换版的报错留着给面板看
     try {
@@ -784,21 +1183,31 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     }
     let def
     let stamp = 0
+    let plats = ['qq']
     try {
       ({ def, stamp } = await importUser(u))
       if (disposed || (revisions.get(u.id) || 0) !== revision) return null
       if (!stillWanted()) { resyncRequested = true; return null }
       const why = checkDef(def, u.id)
       if (why) throw new Error(why)
+      plats = modulePlatforms(def)
+      userMeta.set(u.id, { name: def.name || u.id, description: def.description || '', version: def.version || '', platforms: plats })
     } catch (error) {
       if (disposed || (revisions.get(u.id) || 0) !== revision) return null
       if (!stillWanted()) { resyncRequested = true; return null }
+      skipped.delete(u.id)
       errors.set(u.id, { message: String(error.message || error).slice(0, 800), at: Date.now(), source: 'user', fallback: builtinDefs.has(u.id) })
       log.warn(`模块「${u.id}」加载失败：`, error.message)
       userSeen.set(u.id, { ...u, stamp: stampOf(u.dir) })
       return null
     }
     userSeen.set(u.id, { ...u, stamp })
+    if (!platformAllowed(plats, activePlatforms())) {
+      errors.delete(u.id)
+      skipped.set(u.id, '未启用对应平台')
+      return null
+    }
+    skipped.delete(u.id)
     // 替换内置模块：记下替换时内置模块的版本，以后内置的更新了提醒一声
     const b = builtinDefs.get(u.id)
     const extra = { dir: u.dir }
@@ -821,11 +1230,21 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     return builtinDefs.has(id) ? 'builtin' : null
   }
 
-  /** 插件加载时：内置模块同步启动（被替换 / 关掉的跳过），自己写的随后异步加载。 */
+  /** 插件加载时：内置模块同步启动（被替换 / 关掉 / 未启用对应平台的跳过），自己写的随后异步加载。 */
   function boot() {
     if (disposed) return Promise.resolve()
+    wireGateway()
     const users = isUserOn() ? scanUser() : []
-    for (const def of builtins) if (wanted(def.id, users) === 'builtin') startSync(def)
+    const active = activePlatforms()
+    for (const def of builtins) {
+      if (wanted(def.id, users) !== 'builtin') continue
+      if (!platformAllowed(modulePlatforms(def), active)) {
+        skipped.set(def.id, '未启用对应平台')
+        continue
+      }
+      skipped.delete(def.id)
+      startSync(def)
+    }
     return (async () => {
       await loadLib()
       if (disposed) return
@@ -842,26 +1261,46 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
   let syncing = null
   let resyncRequested = false
   async function syncPass() {
+    wireGateway()
     const users = isUserOn() ? scanUser() : []
+    const active = activePlatforms()
     const ids = new Set([...builtinDefs.keys(), ...users.map((u) => u.id), ...live.keys()])
     for (const id of ids) {
       if (disposed || resyncRequested) return
       const want = wanted(id, users)
       const rec = live.get(id)
       const u = users.find((x) => x.id === id)
-      if (!want) { if (rec) stop(id); continue }
+      if (!want) { if (rec) stop(id); skipped.delete(id); continue }
       if (want === 'builtin') {
+        const bdef = builtinDefs.get(id)
+        if (!platformAllowed(modulePlatforms(bdef), active)) {
+          if (rec) stop(id)
+          skipped.set(id, '未启用对应平台')
+          continue
+        }
+        skipped.delete(id)
         if (rec && rec.source === 'builtin') continue
         if (rec) stop(id)
         if (errors.get(id)?.source === 'builtin' && !rec) continue // 内置的启动失败过，别每 3 秒重试
-        startSync(builtinDefs.get(id))
+        startSync(bdef)
         continue
       }
-      // 自己写的：没跑、换了文件、改过 → (重新)加载
+      // 自己写的：没跑、换了文件、改过、或平台开关变了 → (重新)加载或停掉
       const seen = userSeen.get(id)
       const changed = !seen || seen.file !== u.file || seen.stamp !== stampOf(u.dir)
-      if (rec && rec.source === 'user' && !changed) continue
-      if (!changed && (!rec || rec.fallback)) continue // 上次加载失败、文件也没改：等改了再试
+      if (!changed && rec && rec.source === 'user') {
+        if (!platformAllowed(rec.platforms, active)) {
+          stop(id)
+          skipped.set(id, '未启用对应平台')
+        }
+        continue
+      }
+      if (!changed && skipped.get(id) === '未启用对应平台') {
+        const knownPlats = userMeta.get(id)?.platforms || ['qq']
+        if (!platformAllowed(knownPlats, active)) continue
+      } else if (!changed && (!rec || rec.fallback)) {
+        continue // 上次加载失败、文件也没改：等改了再试
+      }
       if (rec) stop(id, { quiet: true })
       if (seen && changed) log.info(`模块「${id}」文件改了，重新加载`)
       const revision = revisions.get(id) || 0
@@ -870,13 +1309,13 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       // import 期间被停止或改了配置时，由下一次检查决定是否启动。
       if ((revisions.get(id) || 0) !== revision || resyncRequested) continue
       // 替换版加载失败：先用回内置的，免得这项功能直接没了
-      if (!ok && builtinDefs.has(id)) {
+      if (!ok && skipped.get(id) !== '未启用对应平台' && builtinDefs.has(id) && platformAllowed(modulePlatforms(builtinDefs.get(id)), activePlatforms())) {
         startSync(builtinDefs.get(id))
         const back = live.get(id)
         if (back) { back.fallback = true; log.warn(`模块「${id}」：你的版本没加载成功，先用内置的`) }
       }
     }
-    for (const id of [...userSeen.keys()]) if (!users.some((u) => u.id === id)) { userSeen.delete(id); if (errors.get(id)?.source === 'user') errors.delete(id) }
+    for (const id of [...userSeen.keys()]) if (!users.some((u) => u.id === id)) { userSeen.delete(id); userMeta.delete(id); skipped.delete(id); if (errors.get(id)?.source === 'user') errors.delete(id) }
   }
 
   function sync() {
@@ -895,6 +1334,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
   async function reload(id) {
     stop(id, { quiet: true })
     errors.delete(id)
+    skipped.delete(id)
     userSeen.delete(id)
     await sync()
     return status().find((m) => m.id === id) || null
@@ -904,77 +1344,118 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     if (disposed) return
     disposed = true
     clearInterval(watching)
+    try { offGatewayState?.() } catch {}
+    offGatewayState = null
+    wiredGateway = null
     for (const id of [...live.keys()].reverse()) stop(id, { quiet: true })
     routes.clear()
     listeners.clear()
+    skipped.clear()
+    userMeta.clear()
     if (globalThis.aurabot?.modules === publicHandle) delete globalThis.aurabot
   }
 
   // ---------- 事件 ----------
+  const listenerAllows = (id, event, platform) => {
+    if (id === '@core') return true
+    const rec = live.get(id)
+    if (!rec) return false
+    if (event === 'onebot' || event === 'onebot/state') return allowsQq(rec)
+    return !platform || recMatchesPlatform(rec, platform)
+  }
   function emit(event, ...args) {
     if (disposed) return
-    for (const { fn } of listeners.get(event) || []) {
-      try { const r = fn(...args); if (r && typeof r.catch === 'function') r.catch(() => {}) } catch (error) {}
-    }
+    if ((event === 'onebot' || event === 'onebot/state') && !qqEnabled()) return
+    const p = eventPlatform(event, args)
+    runWithPlatform(p, () => {
+      for (const { id, fn } of listeners.get(event) || []) {
+        if (!listenerAllows(id, event, p)) continue
+        try { const r = fn(...args); if (r && typeof r.catch === 'function') r.catch(() => {}) } catch (error) {}
+      }
+    })
   }
   /** 依次问每个模块，第一个返回真值的接管（收到消息时用）。 */
   async function claim(event, ...args) {
-    for (const { fn } of listeners.get(event) || []) {
-      try { if (await fn(...args)) return true } catch (error) {}
-    }
-    return false
+    const callArgs = event === 'message' && args[0] ? [enrichMsg(args[0]), ...args.slice(1)] : args
+    const p = eventPlatform(event, callArgs)
+    return runWithPlatform(p, async () => {
+      for (const { id, fn } of listeners.get(event) || []) {
+        if (!listenerAllows(id, event, p)) continue
+        try { if (await fn(...callArgs)) return true } catch (error) {}
+      }
+      return false
+    })
   }
   /** 依次让每个模块改写一个值（发回复前用）：返回 undefined 不改，null 拦下。 */
   async function filter(event, value, ...args) {
     let v = value
-    for (const { fn } of listeners.get(event) || []) {
-      try {
-        const r = await fn(v, ...args)
-        if (r === null) return null
-        if (r !== undefined) v = r
-      } catch (error) {}
-    }
-    return v
+    const callArgs = event === 'group/decide' && args[0]?.msg
+      ? [{ ...args[0], msg: enrichMsg(args[0].msg) }, ...args.slice(1)]
+      : args
+    const p = eventPlatform(event, callArgs)
+    return runWithPlatform(p, async () => {
+      for (const { id, fn } of listeners.get(event) || []) {
+        if (!listenerAllows(id, event, p)) continue
+        try {
+          const r = await fn(v, ...callArgs)
+          if (r === null) return null
+          if (r !== undefined) v = r
+        } catch (error) {}
+      }
+      return v
+    })
   }
   /** 同步版（人格、规则、模型选择这些地方不能等）：监听函数返回 Promise 的不算。 */
   function filterSync(event, value, ...args) {
     let v = value
-    for (const { fn } of listeners.get(event) || []) {
-      try {
-        const r = fn(v, ...args)
-        if (r && typeof r.then === 'function') continue
-        if (r === null) return null
-        if (r !== undefined) v = r
-      } catch (error) {}
-    }
-    return v
+    const p = eventPlatform(event, args)
+    return runWithPlatform(p, () => {
+      for (const { id, fn } of listeners.get(event) || []) {
+        if (!listenerAllows(id, event, p)) continue
+        try {
+          const r = fn(v, ...args)
+          if (r && typeof r.then === 'function') continue
+          if (r === null) return null
+          if (r !== undefined) v = r
+        } catch (error) {}
+      }
+      return v
+    })
   }
 
   // ---------- 汇总给插件其他部分用 ----------
   function buildTools(where) {
     const out = []
     const names = new Set()
-    for (const rec of live.values()) {
-      for (const b of rec.tools) {
-        let r
-        try { r = typeof b === 'function' ? b(where) : b } catch (error) { note(rec.id, '生成工具', error); continue }
-        for (const t of [].concat(r || [])) {
-          if (!t || !t.name) continue
-          if (names.has(t.name)) { log.debug(`工具 ${t.name} 重名，模块「${rec.id}」的没挂`); continue }
-          names.add(t.name)
-          out.push(t)
+    const p = where?.chat?.platform || platformOf(where?.chat?.chatId || where?.chatId)
+    runWithPlatform(p, () => {
+      for (const rec of live.values()) {
+        if (p && !recMatchesPlatform(rec, p)) continue
+        for (const b of rec.tools) {
+          let r
+          try { r = typeof b === 'function' ? b(where) : b } catch (error) { note(rec.id, '生成工具', error); continue }
+          for (const t of [].concat(r || [])) {
+            if (!t || !t.name) continue
+            if (names.has(t.name)) { log.debug(`工具 ${t.name} 重名，模块「${rec.id}」的没挂`); continue }
+            names.add(t.name)
+            out.push(p && typeof t.execute === 'function' ? { ...t, execute: (...a) => platformContext.run(p, () => t.execute(...a)) } : t)
+          }
         }
       }
-    }
+    })
     return out
   }
   function contextFor(args) {
     const parts = []
-    for (const rec of live.values()) {
-      for (const fn of rec.contexts) {
-        try { const t = fn(args); if (t) parts.push(String(t)) } catch (error) {}
+    const p = args?.chat?.platform || platformOf(args?.chat?.chatId || args?.chatId)
+    runWithPlatform(p, () => {
+      for (const rec of live.values()) {
+        if (p && !recMatchesPlatform(rec, p)) continue
+        for (const fn of rec.contexts) {
+          try { const t = fn(args); if (t) parts.push(String(t)) } catch (error) {}
+        }
       }
-    }
+    })
     return parts.join('\n\n')
   }
   function rules(kind) {
@@ -1026,7 +1507,8 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       const b = builtinDefs.get(id)
       const u = users.find((x) => x.id === id)
       const rec = live.get(id)
-      const def = rec?.def || b || {}
+      const um = userMeta.get(id)
+      const def = rec?.def || b || um || {}
       const m = modCfg(id)
       const err = errors.get(id)
       return {
@@ -1034,6 +1516,8 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
         name: def.name || id,
         description: def.description || '',
         version: def.version || '',
+        platforms: rec?.platforms || um?.platforms || modulePlatforms(b || def),
+        skipReason: skipped.get(id) || '',
         builtin: Boolean(b),
         builtinVersion: b?.version || '',
         hasUser: Boolean(u),

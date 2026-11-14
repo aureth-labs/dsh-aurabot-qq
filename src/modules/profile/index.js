@@ -44,11 +44,17 @@ export default {
   id: 'profile',
   name: '改资料',
   version: '1.2.0',
+  api: 2,
+  platforms: ['qq'],
   description: '主人私聊时查看自己的 QQ 资料与头像图片（qq_get_profile）、发送当前头像（qq_send_avatar）；按权限修改 QQ 资料',
   files: ['features/qq-profile.js'],
   setup(api, { fetchAvatar, ask } = {}) {
     const { hub, onebot } = api.core
-    const reader = createQqProfile({ getConfig: api.config, onebot, dsh: api.dsh, log: api.log, fetchAvatar, ask })
+    const qqOnebot = {
+      call: (action, params, opts) => (typeof api.native === 'function' ? api.native('qq', action, params, opts) : onebot.call(action, params, opts)),
+      get state() { return api.core.onebot?.state },
+    }
+    const reader = createQqProfile({ getConfig: api.config, onebot: qqOnebot, dsh: api.dsh, log: api.log, fetchAvatar, ask })
     api.onDispose(reader.dispose)
     api.rule((kind) => kind === 'private' ? '主人谈到你自己的 QQ 昵称、个性签名或头像时，可以主动用 qq_get_profile 查看当前资料，不必等主人明确说“查询”。例如“你现在叫什么”“签名是什么”“喜欢这个头像吗”。问头像画面时传 view_avatar=true，依据本次头像附件和描述回答；查不到就如实说明，不凭旧聊天记录猜。主人明确说“把现在头像发出来”“发你的头像给我”时，用 qq_send_avatar 直接发送，不必先识图；只有工具报告 sent=true 才能说发出去了，成功后不要再用链接或 Markdown 重复发图。查询不会发送图片或修改资料；普通无关聊天无需查询。' : '')
 
@@ -65,9 +71,10 @@ export default {
         writeFileSync(tmp, small)
         for (const file of [`base64://${small.toString('base64')}`, tmp]) {
           try {
-            await onebot.call('set_qq_avatar', { file }, { timeoutMs: 30000 })
+            await qqOnebot.call('set_qq_avatar', { file }, { timeoutMs: 30000 })
             return { ok: true, message: okMessage }
           } catch (error) {
+            if (error?.code === 'unsupported-action') return { ok: false, message: '当前 QQ 网关不支持更换头像' }
             lastError = error
           }
         }
@@ -82,7 +89,7 @@ export default {
     // 统一套路：dryRun 只说不做；执行前再按最新配置查一遍权限
     const guarded = (key, chat, sessionId, run) => async (args) => {
       const cfg = api.config()
-      const p = profilePermits(cfg, key, chat, hub.turnSendersAllOwner(sessionId))
+      const p = profilePermits(cfg, key, chat, hub.turnSendersAllOwner(sessionId), api.core.identity)
       if (!p.ok) return p
       return run(args, cfg)
     }
@@ -91,9 +98,9 @@ export default {
       if (chat.kind !== 'private' && chat.kind !== 'group') return []
       const cfg = api.config()
       const tools = []
-      const allowed = () => chat.kind === 'private' && isOwner(api.config(), chat.userId) && hub.turnSendersAllOwner(sessionId)
+      const allowed = () => chat.kind === 'private' && isOwner(api.core.identity, chat) && hub.turnSendersAllOwner(sessionId)
       // 查询权限独立于修改权限，始终只给主人私聊，读取对象固定为机器人自己。
-      if (chat.kind === 'private' && isOwner(cfg, chat.userId)) tools.push(defineTool({
+      if (chat.kind === 'private' && isOwner(api.core.identity, chat)) tools.push(defineTool({
         name: 'qq_get_profile',
         description: '查看你自己的当前 QQ 昵称、个性签名和头像地址。主人私聊谈到资料时可主动查询；需要看头像长什么样、评价头像时传 view_avatar=true，返回实际头像图片附件及辅助描述。只读，不发送图片或修改资料；主人要你发头像时用 qq_send_avatar。',
         properties: { view_avatar: { type: 'boolean', description: '是否实际查看头像画面；讨论头像外观时填 true，默认 false' } },
@@ -105,7 +112,7 @@ export default {
           return result
         },
       }))
-      if (chat.kind === 'private' && isOwner(cfg, chat.userId)) tools.push(defineTool({
+      if (chat.kind === 'private' && isOwner(api.core.identity, chat)) tools.push(defineTool({
         name: 'qq_send_avatar',
         description: '主人明确要求“把现在头像发出来”“发你的头像给我”时，发送你自己的当前 QQ 头像图片到本次主人私聊。无需先识图，不接受地址、QQ 号或发送目标。发送成功后不要再重复发图。',
         execute: async () => {
@@ -131,7 +138,7 @@ export default {
           }
         },
       }))
-      if (profileToolVisible(cfg, 'qqNickname', chat)) tools.push(defineTool({
+      if (profileToolVisible(cfg, 'qqNickname', chat, api.core.identity)) tools.push(defineTool({
         name: 'qq_set_nickname',
         description: `改你自己的 QQ 昵称（最多 ${NICK_MAX} 字）。有人让你改名时用。`,
         properties: { name: str('新昵称') },
@@ -141,11 +148,16 @@ export default {
           if (!nick) return { ok: false, message: '昵称不能是空的' }
           if ([...nick].length > NICK_MAX) return { ok: false, message: `昵称最多 ${NICK_MAX} 个字` }
           if (c.dryRun) return { ok: true, message: `试运行：本来要把 QQ 昵称改成：${nick}` }
-          await onebot.call('set_qq_profile', { nickname: nick }, { timeoutMs: 15000 })
+          try {
+            await qqOnebot.call('set_qq_profile', { nickname: nick }, { timeoutMs: 15000 })
+          } catch (error) {
+            if (error?.code === 'unsupported-action') return { ok: false, message: '当前 QQ 网关不支持修改昵称' }
+            throw error
+          }
           return { ok: true, message: `QQ 昵称改好了：${nick}` }
         }),
       }))
-      if (profileToolVisible(cfg, 'qqSignature', chat)) tools.push(defineTool({
+      if (profileToolVisible(cfg, 'qqSignature', chat, api.core.identity)) tools.push(defineTool({
         name: 'qq_set_signature',
         description: `改你自己的 QQ 个性签名（最多 ${SIGN_MAX} 字）。有人让你改签名时用。`,
         properties: { text: str('新签名') },
@@ -155,11 +167,16 @@ export default {
           if (!sign) return { ok: false, message: '签名不能是空的' }
           if ([...sign].length > SIGN_MAX) return { ok: false, message: `签名最多 ${SIGN_MAX} 个字` }
           if (c.dryRun) return { ok: true, message: `试运行：本来要把 QQ 签名改成：${sign}` }
-          await onebot.call('set_self_longnick', { longNick: sign }, { timeoutMs: 15000 })
+          try {
+            await qqOnebot.call('set_self_longnick', { longNick: sign }, { timeoutMs: 15000 })
+          } catch (error) {
+            if (error?.code === 'unsupported-action') return { ok: false, message: '当前 QQ 网关不支持修改个性签名' }
+            throw error
+          }
           return { ok: true, message: `QQ 签名改好了：${sign}` }
         }),
       }))
-      if (profileToolVisible(cfg, 'qqAvatar', chat)) tools.push(defineTool({
+      if (profileToolVisible(cfg, 'qqAvatar', chat, api.core.identity)) tools.push(defineTool({
         name: 'qq_set_avatar',
         description: '换你自己的 QQ 头像。image 填图片网址；主人刚发来一张图、说「用我刚才发的 / 刚才那张」换头像时，填 last（不是画作编号）；填「画作 #1」才是用你自己画的那张（画完时会告诉你编号）。图太大会自动缩小。',
         properties: { image: str('图片网址（http/https）／last（刚才那张图）／画作编号（如 #1）') },
@@ -175,7 +192,7 @@ export default {
             if (!pick) return { ok: false, message: '最近半小时这个聊天里没人发过图片，先把图发过来' }
             let buf
             try {
-              buf = await segmentBytes(pick.seg, onebot, { maxBytes: 10 * 1024 * 1024 })
+              buf = await segmentBytes(pick.seg, qqOnebot, { maxBytes: 10 * 1024 * 1024 })
             } catch (error) {
               return { ok: false, message: '这张图我拿不到：' + error.message }
             }
@@ -186,7 +203,12 @@ export default {
             const src = avatarSource(raw)
             if (!src.ok) return src
             if (c.dryRun) return { ok: true, message: `试运行：本来要把 QQ 头像换成：${src.file}` }
-            await onebot.call('set_qq_avatar', { file: src.file }, { timeoutMs: 30000 })
+            try {
+              await qqOnebot.call('set_qq_avatar', { file: src.file }, { timeoutMs: 30000 })
+            } catch (error) {
+              if (error?.code === 'unsupported-action') return { ok: false, message: '当前 QQ 网关不支持更换头像' }
+              throw error
+            }
             return { ok: true, message: 'QQ 头像换好了' }
           }
           // ③ 自己画的图：只认「画作」「画作 #1」「#1」或完整文件名；绝对路径一律不认

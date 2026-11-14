@@ -1156,3 +1156,27 @@ export function mergeFromPanel(current, incoming) {
   if (incoming?.allow) next.allow = { ...current.allow, ...incoming.allow }
   return normalize(next)
 }
+
+const LEGACY_NEUTRAL_KEYS = [
+  'ownerQQ', 'ownerName', 'ownerLevel',
+  'persona', 'personas', 'model', 'chatModels', 'chatEfforts', 'memory',
+  'merge', 'forward', 'cost', 'diary', 'group', 'titleFilter', 'allow',
+  'capabilityAllow', 'commandAllow', 'longTasks', 'subagentBackground',
+  'local', 'stickers', 'mood', 'purpose', 'autotelic', 'schedule',
+]
+
+/** 判断旧版（QQ 版）配置是否仍在启用，供跨版导入跳过 sessions.json 等热冲突项。 */
+export function isLegacyQQEnabled(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false
+  return raw.enabled === true || raw.platforms?.qq?.enabled === true
+}
+
+/** 提取旧配置中与平台/网关/鉴权无关的可迁移字段；排除网关、SnowLuma 密码/令牌及凭据。 */
+export function pickPlatformNeutralConfig(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
+  const out = {}
+  for (const key of LEGACY_NEUTRAL_KEYS) {
+    if (Object.hasOwn(raw, key) && raw[key] !== undefined) out[key] = structuredClone(raw[key])
+  }
+  return out
+}

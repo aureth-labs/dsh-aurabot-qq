@@ -15,11 +15,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 let createPurpose
+let makeTestIdentity
 const OWNER = '10000001'
 
 before(async () => {
   process.env.AURABOT_DATA_DIR = mkdtempSync(join(tmpdir(), 'aurabot-carrier-'))
   ;({ createPurpose } = await import('../src/purpose/module.js'))
+  ;({ makeTestIdentity } = await import('./helpers/identity.js'))
 })
 
 beforeEach(() => {
@@ -64,10 +66,13 @@ function runPurpose(hub, pet, extPurpose = {}, extOverrides = {}) {
     speakUp: { enabled: true, awakeFrom: 0, awakeTo: 24, idleMinutes: 30, maxPerDay: 10 },
     ext: { purpose: { enabled: true, minMaterials: 0, ...extPurpose }, pet: { ...extOverrides } },
   }
+  const identity = makeTestIdentity(OWNER, 'qq')
   const p = createPurpose({
     getConfig: () => cfg,
     setConfig: (patch) => { Object.assign(cfg, patch) },
     hub,
+    identity,
+    routeOwner: identity.routeOwner,
     log: { info() {}, warn() {}, debug() {} },
     isMuted: () => false,
     mood: () => null,

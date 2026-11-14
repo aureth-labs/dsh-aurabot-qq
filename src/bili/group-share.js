@@ -7,6 +7,7 @@
 //   understand —— 主人回「那就发吧，多发几个群也行」这种自然话，交给模型听懂
 // 规则快判（发 1 / 不发）仍然保留：秒回，也让模型挂掉时还有路可走。
 
+import { isOwnerPrivateChat } from '../chat/access.js'
 import { dataDir, readJson, writeJson } from '../core/store.js'
 import { reallySent } from '../chat/hub.js'
 
@@ -64,7 +65,7 @@ export function parsePlan(raw) {
   return { action, items, groups }
 }
 
-export function createGroupShare({ getConfig, hub, log = console, think: thinkInjected = null, groupNameOf, shotPathOf, captureShot } = {}) {
+export function createGroupShare({ getConfig, hub, identity = null, routeOwner = null, log = console, think: thinkInjected = null, groupNameOf, shotPathOf, captureShot } = {}) {
   // 默认借她自己的后台会话写话/读话：人设、语气都现成，不用另外拼 prompt 风格
   const think = thinkInjected || (async (kind, prompt) => {
     if (!hub?.runSystemTurn) return ''
@@ -91,7 +92,7 @@ export function createGroupShare({ getConfig, hub, log = console, think: thinkIn
     chain = chain.then(task).catch((error) => log.warn('处理群分享出错：', error.message))
     return chain
   }
-  const ownerChat = () => `private:${getConfig().ownerQQ}`
+  const ownerChat = () => (typeof routeOwner === 'function' ? routeOwner() : hub?.ownerChat?.()) || ''
 
   /** 默认群 + 额外授权群；没配额外群就只认 groupId。 */
   function allowedGroups() {
@@ -140,14 +141,19 @@ export function createGroupShare({ getConfig, hub, log = console, think: thinkIn
   async function ask(s) {
     const list = pendingOf(s)
     if (!list.length) return true
+    const to = ownerChat()
+    if (!to) {
+      log.warn('当前联系不上主人，群分享审批先作废')
+      return false
+    }
     const groups = allowedGroups().slice(0, 1)
     const speech = await askSpeech(list, groups)
     // 编号 → 条目 id 的快照：之后有过期或已处理，编号也不会错位到别的条目。
     // 必须在这里落盘：submit 是先 save 再 ask 的，不存的话主人回复时就只剩「当前顺序」。
-    s.lastAsked = { at: Date.now(), ids: list.map((x) => x.id) }
+    s.lastAsked = { at: Date.now(), ids: list.map((x) => x.id), chatId: to }
     save(s)
     try {
-      const r = await hub.sendText(ownerChat(), speech, undefined, undefined, undefined, { proactive: true, proactiveCause: 'bili-groupshare-ask' })
+      const r = await hub.sendText(to, speech, undefined, undefined, undefined, { proactive: true, proactiveCause: 'bili-groupshare-ask' })
       const shown = reallySent(r)
       if (!shown) log.warn('群分享的审批消息没发出去，这批先作废')
       return shown
@@ -167,7 +173,7 @@ export function createGroupShare({ getConfig, hub, log = console, think: thinkIn
     if (!c.enabled || !String(c.groupId || '').trim()) return { ok: false, why: '群分享没开（没配群号）' }
     if (!g.enabled) return { ok: false, why: '总开关关着' }
     if (g.dryRun) return { ok: false, why: '试运行，不攒待批' }
-    if (!g.ownerQQ) return { ok: false, why: '没配主人的 QQ' }
+    if (!ownerChat()) return { ok: false, why: '当前联系不上主人' }
     const s = load()
     if (s.sentToday >= Number(c.dailyLimit)) return { ok: false, why: `今天已经发够 ${c.dailyLimit} 条了` }
     const have = pendingOf(s)
@@ -242,7 +248,7 @@ export function createGroupShare({ getConfig, hub, log = console, think: thinkIn
     return said
   }
 
-  async function decide(ids, action, groups) {
+  async function decide(ids, action, groups, replyTo = '') {
     // 每次进链都重新读文件：排队期间上一条命令可能已经处理过同一批
     const s = load()
     const touched = []
@@ -306,7 +312,10 @@ export function createGroupShare({ getConfig, hub, log = console, think: thinkIn
       if (left) tail.push(`还有 ${left} 条没发，今天 ${limit} 条的额度用完了`)
       if (failed) tail.push(`${failed} 条没确认发出去`)
       const text = spoken ? [spoken, ...tail.map((x) => `（${x}）`)].join('\n') : lines.join('；')
-      try { await hub.sendText(ownerChat(), text, undefined, undefined, undefined, { proactive: true, proactiveCause: 'bili-groupshare-receipt' }) } catch (error) { log.warn('群分享回执没发出去：', error.message) }
+      const receiptTo = replyTo || s.lastAsked?.chatId || ownerChat()
+      if (receiptTo) {
+        try { await hub.sendText(receiptTo, text, undefined, undefined, undefined, { proactive: true, proactiveCause: 'bili-groupshare-receipt' }) } catch (error) { log.warn('群分享回执没发出去：', error.message) }
+      }
     }
     return { sent, dropped, failed, left }
   }
@@ -339,8 +348,7 @@ export function createGroupShare({ getConfig, hub, log = console, think: thinkIn
 
   /** 主人的私聊回复。认出来就返回 true（不再交给她），认不出返回 false。 */
   async function handleReply(chatId, userId, text) {
-    const g = getConfig()
-    if (!g.ownerQQ || chatId !== ownerChat() || String(userId) !== String(g.ownerQQ)) return false
+    if (!isOwnerPrivateChat(identity, chatId, userId)) return false
     const s = load()
     if (expireIn(s)) save(s) // 网关断线时 tick 可能很久没跑，回话前先清一次，别把过期的发出去
     const askedIds = Array.isArray(s.lastAsked?.ids) ? s.lastAsked.ids : null
@@ -363,21 +371,21 @@ export function createGroupShare({ getConfig, hub, log = console, think: thinkIn
     const d = parseDecision(text)
     if (d) {
       if (d.all) {
-        enqueue(() => decide(list.map((x) => x.id), d.action))
+        enqueue(() => decide(list.map((x) => x.id), d.action, undefined, chatId))
         return true
       }
       if (d.index === 0) {
         // 裸「发」只发一条：发多了像刷屏，主人明确说「都发」才全发
-        enqueue(() => decide([list[0].id], d.action))
+        enqueue(() => decide([list[0].id], d.action, undefined, chatId))
         return true
       }
       const id = byNumber(d.index)
       const one = list.find((x) => x.id === id)
       if (!one) {
-        Promise.resolve().then(() => hub.sendText(ownerChat(), `第 ${d.index} 条已经不在了（过期或已经处理过），现在有 ${list.length} 条。`, undefined, undefined, undefined, { proactive: true, proactiveCause: 'bili-groupshare-receipt' })).catch(() => {})
+        Promise.resolve().then(() => hub.sendText(chatId, `第 ${d.index} 条已经不在了（过期或已经处理过），现在有 ${list.length} 条。`, undefined, undefined, undefined, { proactive: true, proactiveCause: 'bili-groupshare-receipt' })).catch(() => {})
         return true
       }
-      enqueue(() => decide([one.id], d.action))
+      enqueue(() => decide([one.id], d.action, undefined, chatId))
       return true
     }
 
@@ -387,7 +395,7 @@ export function createGroupShare({ getConfig, hub, log = console, think: thinkIn
     // 模型没点名就发第一条：默认一次只挑一条，别刷屏
     const ids = (plan.items.length ? plan.items.map(byNumber) : [list[0].id]).filter((id) => list.some((x) => x.id === id))
     if (!ids.length) return false
-    enqueue(() => decide(ids, plan.action, plan.groups))
+    enqueue(() => decide(ids, plan.action, plan.groups, chatId))
     return true
   }
 

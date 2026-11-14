@@ -74,7 +74,8 @@ export default {
   id: 'weather',              // 必填：小写字母开头，小写字母 / 数字 / -，2~40 个字；和文件夹名一样
   name: '查天气',             // 面板上显示的名字
   version: '0.1.0',           // 你自己的版本号，随便写
-  api: 1,                     // 按哪一版扩展接口写的（现在是 {{API}}）
+  api: 2,                     // 按哪一版扩展接口写的（现在是 {{API}}；v1 仍兼容）
+  platforms: ['*'],           // 可选：支持的平台，如 ['*']（平台无关）或 ['qq', 'feishu']；不写默认 ['qq']
   description: '一句话说明',
   defaults: { city: '北京' }, // 设置的默认值
   settings: [                 // 面板自动生成设置表单（见「面板」）
@@ -118,10 +119,16 @@ export default {
 | `api.sendImage(chatId, 图片路径或网址)` | 发图 |
 | `api.sendFile(chatId, 文件路径或网址, 文件名?)` | 把文件（文档、压缩包、音频、视频……）当文件发过去。要先在面板「聊天」页打开「发文件」；本机文件给**绝对路径**，而且只能在 QQ 工作区或主人在面板里加的目录里；单个文件有大小上限（默认 50 MB）。网关在别的机器 / 容器里看不到本机路径时，小文件会自动改用 base64 再试一次 |
 | `api.sendVoiceFile(chatId, 音频文件, 日志备注?)` | 把本机一个音频文件当语音条发出去（不走「念文字」） |
-| `api.sendSegments(chatId, [OneBot 消息段], 日志备注)` | 发任意 OneBot 消息段 |
-| `api.onebot(action, params)` | 直接调 OneBot（SnowLuma）的任意 API，比如 `api.onebot('get_group_member_list', { group_id: 123 })` |
+| `api.sendParts(chatId, parts, opts?)` | **推荐**：发跨平台标准化 `Part[]` 消息段（`text`、`image`、`voice`、`video`、`file`、`mention`、`reply`……），自动走网关降级与出站策略 |
+| `api.platformOf(chatId)` | 从 `chatId` 解析所属平台（如 `'qq'`、`'feishu'`），无法识别返回 `''` |
+| `api.caps(chatId)` | 查询该聊天所在平台实例的当前能力表（`Caps`），未就绪返回 `null` |
+| `api.native(platform, action, params?, opts?)` | 调用指定平台的原生动作；**必须在模块 `platforms` 里显式声明该平台**（`['*']` 不放行） |
+| `api.sendSegments(chatId, [OneBot 消息段], 日志备注)` | *(已弃用，仅 QQ 兼容)* 发 OneBot 消息段；未开启 QQ、模块未声明 `'qq'` 或传入非 QQ `chatId` 会直接报错，请改用 `api.sendParts` |
+| `api.onebot(action, params)` | *(已弃用，仅 QQ 兼容)* 调 OneBot API；未开启 QQ 或模块未声明 `'qq'` 会直接报错，请改用 `api.native('qq', ...)` |
 
-`chatId` 的格式：`private:QQ号`、`group:群号`（她后台自己想事情用的会话是 `system:名字`，工具生成函数里可能见到，发不了消息）。
+`chatId` 的格式：`private:QQ号`、`group:群号` 或 `<实例>:<private|group>:<账号/群>`（如 `feishu:group:oc_xxx`；她后台自己想事情用的会话是 `system:名字`，工具生成函数里可能见到，发不了消息）。
+
+> **多平台过滤规则**：插件按模块声明的 `platforms`（缺省 `['qq']`）自动把不匹配的模块跳过（状态说明「未启用对应平台」），也只往匹配该平台聊天的模块派发 `message` / `poke` / `reply` / `reply/items` / `send` / `group/decide` / `prompt` / `model`、`api.tool` 和 `api.context`。
 
 判断是不是主人：`api.isOwner(msg.userId)`。
 
@@ -230,8 +237,9 @@ api.on('reply/items', (items) => [...items, { kind: 'text', value: '—— 大�
 |---|---|---|
 | `chat/log` | `{ t, chatId, who, text, uid?, via?, interaction?, forgottenAt?, originId? }` | 1.3.0 起，每条流水成功落盘后的只读快照，包括经 `deliver` 记账的回复 / 模块发送及已确认身份的外部输入。文字沿用原流水的脱敏和 500 字上限；`originId` 只在通知中存在。调试模式不写流水，也不产生通知。监听失败不影响消息与落盘，不是发送前的拦截器 |
 | `activity` | `{ kind: 'in' \| 'out', chatId, userId, nickname, text, reply, direct, owner }` | 收到的消息 / 她发出去的话（只看不拦） |
-| `onebot` | 原始 OneBot 事件 | **所有**事件：消息、加群、退群、撤回、好友申请、戳一戳……（只看不拦；不管白名单） |
-| `onebot/state` | `'connected'` 等 | QQ 网关连上 / 断开 |
+| `onebot` | 原始 OneBot 事件 | **仅限声明 `'qq'` 的模块且 QQ 已启用**：消息、加群、退群、撤回、好友申请、戳一戳……（只看不拦；不管白名单） |
+| `onebot/state` | `'connected'` 等 | **仅限声明 `'qq'` 的模块且 QQ 已启用**：QQ 网关连上 / 断开 |
+| `platform/state` | `InstanceStatus` (`{ instance, platform, state, enabled, self, caps }`) | 任意平台实例状态变化（按模块 `platforms` 过滤派发） |
 | `config` | `新配置, 旧配置` | 配置改了 |
 | `module/start` / `module/stop` | 模块 id | 有模块启动 / 停下 |
 | `song/sung` | `{ title, chatId }` | 翻唱模块唱完一首 |
@@ -245,11 +253,13 @@ api.on('reply/items', (items) => [...items, { kind: 'text', value: '—— 大�
 ```js
 {
   kind: 'private' | 'group',
-  chatId: 'private:123' | 'group:456',
-  userId: '123', groupId: '456', nickname: '昵称（群名片优先）', role: 'owner' | 'admin' | 'member' | '' /* 在群里的身份 */
+  chatId: 'qq:private:123' | 'feishu:group:oc_456',
+  platform: 'qq' | 'feishu', instance: 'qq',
+  userId: '123', groupId: '456', nickname: '昵称（群名片优先）', role: 'owner' | 'admin' | 'member' | '' /* 在群里的身份 */,
   text: '纯文字内容', messageId: '…', mentioned: true /* @了她 */, replyId: '…' /* 引用的消息 */,
+  parts: [/* 标准化 Part[] 消息段 */], person: 'p_xxx' /* 已核对身份，未核对时为 null */,
   images: [...], stickers: [...], records: [...] /* 语音 */, forwards: [...] /* 合并转发 */,
-  raw: { /* 原始 OneBot 事件 */ },
+  raw: { /* 原始平台事件 */ },
 }
 ```
 
@@ -424,7 +434,7 @@ return function Panel({ settings, save, toast }) {
 ## 升级会不会坏
 
 - **你的文件**：`modules/` 里的东西插件升级不碰
-- **`api.*` 和内置模块导出表**：同一个扩展接口版本（现在是 v{{API}}）里**只加不改**。哪天不得不改，接口版本升到 2，更新说明里写清楚怎么迁移；插件会拒绝加载版本对不上的模块，并在面板上告诉你原因，不会默默出错
+- **`api.*` 和内置模块导出表**：v1 扩展接口（只支持 QQ）**只加不改**；v2 起新增了多平台字段与方法（`platforms`、`api.sendParts`、`api.caps`、`api.native`、`api.platformOf`、`platform/state`），同时向后兼容 v1 模块（缺省视为 `platforms: ['qq']`）。插件会拒绝加载高于当前支持版本的模块并在面板里说明原因。
 - **`api.core`、`api.lib`、`api.dsh`**：插件内部和 DSH 的东西，全开放但可能随版本变。用了它们的模块，升级后留意面板「已安装」页的报错
 - **复制出来改的内置模块**：是你的分叉。内置的版本更新了，面板会提示「内置版本更新了」，你可以对照着把新改动合进去，或者删掉文件夹用回内置的
 
