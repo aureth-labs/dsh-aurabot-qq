@@ -2492,6 +2492,41 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     return event
   }
 
+  /** F2：/bind-code 必须在主人/白名单检查之前处理，否则新平台账号还没绑定就被当成陌生人。 */
+  async function handleBindCodeCommand(msg) {
+    if (!identity) return false
+    const m = /^\s*[/／]\s*bind-code(?:\s+([\s\S]*))?$/i.exec(String(msg.text || ''))
+    if (!m) return false
+    const code = String(m[1] || '').trim()
+    if (msg.kind === 'group') {
+      // 群里泄露的口令当场作废：给当前主人重签一个（旧口令会被 issueCode 清掉），
+      // 只私聊告诉主人，不在群里重复口令。
+      const owner = identity.owner?.()
+      if (owner) {
+        try { identity.issueCode(owner) } catch (error) { log.warn('作废群里的绑定口令失败：', error.message) }
+        const ownerChat = resolveOwnerChat()
+        if (ownerChat) sendText(ownerChat, '有人在群里发了绑定口令，口令已作废；要绑定请在私聊里重新发 /bind。', undefined, [], undefined, { force: true }).catch(() => {})
+      }
+      await sendText(msg.chatId, '绑定口令只能在私聊里用，刚才的口令已经作废。', undefined, [], undefined, { force: true }).catch(() => {})
+      return true
+    }
+    if (msg.kind !== 'private') return false
+    if (!/^\d{6}$/.test(code)) {
+      await sendText(msg.chatId, '用法：/bind-code 六位口令', undefined, [], undefined, { force: true }).catch(() => {})
+      return true
+    }
+    let person = null
+    try { person = identity.redeemCode(msg.platform || defaultPlatform(), msg.userId, code) } catch (error) {
+      log.warn('兑换绑定口令失败：', error.message)
+    }
+    await sendText(
+      msg.chatId,
+      person ? '绑定好了，这个账号现在也是主人。' : '口令不对、过期或已经用过了。',
+      undefined, [], undefined, { force: true },
+    ).catch(() => {})
+    return true
+  }
+
   /** G3/F2：网关入站（与 onMessage 并列的入口；走同一套后续逻辑） */
   async function onGatewayMessage(m) {
     if (disposed || !m) return
@@ -2533,6 +2568,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       while (buf.length > 40) buf.shift()
       groupBuf.set(msg.groupId, buf)
     }
+
+    if (await handleBindCodeCommand(msg)) return
 
     const allowed = checkAllowed(cfg, msg, ownerRef())
     if (msg.kind === 'private' && (allowed.allowed || event.sub_type === 'friend')) {

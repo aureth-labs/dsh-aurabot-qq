@@ -46,6 +46,8 @@ const COMMANDS = {
   help: '看这份命令列表',
   permissions: '主人私聊管理权限：/权限 查看用法',
   silent: '在这里闭嘴（可带分钟数，如 /silent 30；不带就一直到 /active）',
+  bind: '在已确认的私聊里取一次性绑定口令，用来把新平台账号绑到同一个人',
+  'bind-code': '在另一个平台的私聊里用 /bind-code 口令 完成绑定',
   active: '解除闭嘴；在群里还会接着参与话题一会儿',
   quiet: '这个群里只在被叫到时说话，不插话',
   chatty: '这个群里话多一点，更爱插话',
@@ -120,6 +122,16 @@ export async function runCommand(cmd, msg, deps) {
       return runPermissionsCommand(cmd.arg, msg, deps)
     case 'help':
       return helpText(deps.extraCommands || [])
+    case 'bind': {
+      if (!deps.identity) return '身份库还没准备好'
+      if (msg.kind !== 'private') return '绑定口令只能在私聊里取'
+      const owner = deps.identity.owner?.()
+      if (!owner) return '还没有主人，先在面板里认主'
+      const code = deps.identity.issueCode(owner)
+      return `绑定口令：${code}\n10 分钟内在新平台私聊发 /bind-code ${code}，只能用一次。`
+    }
+    case 'bind-code':
+      return '在私聊里发 /bind-code 六位口令'
     case 'silent': {
       const min = Math.max(0, Math.min(7 * 24 * 60, Number.parseInt(cmd.arg, 10) || 0))
       mutes.set(msg.chatId, min)
