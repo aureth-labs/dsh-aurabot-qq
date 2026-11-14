@@ -831,10 +831,11 @@ export function createFeishuAdapter(options = {}) {
       const timer = setTimeout(() => controller.abort(), timeoutMs)
       try {
         const res = await fetch(url, { method, headers, body, signal: controller.signal })
-        const text = await res.text()
+        const bytes = Buffer.from(await res.arrayBuffer())
+        const text = bytes.toString('utf8')
         let json = null
         try { json = text ? JSON.parse(text) : null } catch { json = { raw: text } }
-        return { status: res.status, json }
+        return { status: res.status, json, bytes }
       } finally {
         clearTimeout(timer)
       }
