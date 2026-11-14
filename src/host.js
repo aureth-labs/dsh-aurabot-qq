@@ -63,6 +63,8 @@ import { createQqbotAdapter } from './adapters/qqbot/index.js'
 import { createBridgeAdapter } from './adapters/bridge/index.js'
 import { ensureUpgradedStorage } from './features/import-qq.js'
 import { createHandover } from './features/handover.js'
+import { mergePerson } from './features/merge-person.js'
+import { importFromQQ } from './features/import-qq.js'
 
 export const name = 'aurabot'
 export const inject = ['agents', 'sessions', 'webServer', 'timer', 'workspaceRegistry', 'attachments', 'systemPrompt', 'llm']
@@ -2565,6 +2567,61 @@ export function apply(ctx) {
     if (identity.owner()) return { ok: false, message: '已经有主人了' }
     const person = identity.claimOwner(status.platform, status.self.account)
     return { ...platformView(), ok: true, person, message: '已把这个平台的账号认成主人' }
+  })
+
+  route('/platforms/people', async () => {
+    const mem = use('memory')
+    let ids = []
+    try { ids = mem?.enumeratePeople?.() || [] } catch (error) { log.debug('枚举人物失败：', error.message) }
+    const idsSet = new Set([...(identity.owner() ? [identity.owner()] : []), ...ids])
+    const profiles = new Map((mem?.profiles?.() || []).map((p) => [String(p.qq), p]))
+    const list = [...idsSet].map((person) => {
+      const profile = profiles.get(String(person)) || null
+      return {
+        person,
+        name: profile?.name || profile?.alias || '',
+        accounts: identity.accountsOf(person) || [],
+        owner: identity.isOwner(person),
+        fixed: platformGateway?.fixedPlatform?.(person) || '',
+      }
+    }).sort((a, b) => Number(b.owner) - Number(a.owner) || String(a.person).localeCompare(String(b.person)))
+    return { ok: true, list, owner: identity.owner(), platforms: [...new Set(list.flatMap((x) => x.accounts.map((a) => a.platform)))].sort() }
+  })
+  route('/platforms/people/merge', async (req) => {
+    const b = await readBody(req)
+    const from = String(b.from || '').trim()
+    const into = String(b.into || '').trim()
+    if (!from || !into || from === into) return { ok: false, message: '要选两个不同的人' }
+    try {
+      const r = await mergePerson({ from, into, dryRun: b.dryRun !== false, memory: use('memory'), identity, log })
+      return { ...r, ok: r?.ok !== false, from, into, dryRun: b.dryRun !== false }
+    } catch (error) { return { ok: false, message: error.message } }
+  })
+  route('/platforms/people/unlink', async (req) => {
+    const b = await readBody(req)
+    const platform = String(b.platform || '').trim()
+    const account = String(b.account || '').trim()
+    if (!platform || !account) return { ok: false, message: '缺少平台或账号' }
+    try { identity.unlink(platform, account); return { ...(await platformView()), ok: true, message: '已解绑这个账号' } } catch (error) { return { ok: false, message: error.message } }
+  })
+  route('/platforms/people/fixed', async (req) => {
+    const b = await readBody(req)
+    const person = String(b.person || '').trim()
+    if (!person || !platformGateway?.setFixed) return { ok: false, message: '平台网关还没启动' }
+    platformGateway.setFixed(person, String(b.platform || '').trim())
+    return { ok: true, message: b.platform ? '已固定平台' : '已取消固定平台' }
+  })
+  route('/platforms/import/preview', async (req) => {
+    const b = await readBody(req)
+    const source = String(b.source || '').trim()
+    if (!source) return { ok: false, message: '先选 QQ 版数据目录' }
+    try { return { ...(await importFromQQ({ source, dryRun: true, log })), ok: true } } catch (error) { return { ok: false, message: error.message } }
+  })
+  route('/platforms/import', async (req) => {
+    const b = await readBody(req)
+    const source = String(b.source || '').trim()
+    if (!source) return { ok: false, message: '先选 QQ 版数据目录' }
+    try { return { ...(await importFromQQ({ source, dryRun: false, log })), ok: true } } catch (error) { return { ok: false, message: error.message } }
   })
 
   route('/modules/reload', async (req) => {

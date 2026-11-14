@@ -1444,6 +1444,60 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           reload()
         } finally { setBusy('') }
       }
+      const [peopleData, setPeopleData] = useState(null)
+      const [mergeFrom, setMergeFrom] = useState('')
+      const [mergeInto, setMergeInto] = useState('')
+      const [mergeMsg, setMergeMsg] = useState(null)
+      const [importPath, setImportPath] = useState('')
+      const [importPreview, setImportPreview] = useState(null)
+      const [importMsg, setImportMsg] = useState('')
+      const [importBusy, setImportBusy] = useState(false)
+      const loadPeople = () => get('/platforms/people').then(setPeopleData).catch(() => {})
+      useEffect(() => { loadPeople() }, [])
+      const people = (peopleData && peopleData.list) || []
+      const personName = (id) => {
+        const p = people.find((x) => x.person === id)
+        return p && p.name ? p.name : id
+      }
+      const merge = async (dryRun) => {
+        if (!mergeFrom || !mergeInto || mergeFrom === mergeInto) return toast('选两个不同的人', 'err')
+        const r = await post('/platforms/people/merge', { from: mergeFrom, into: mergeInto, dryRun })
+        setMergeMsg(r)
+        if (!dryRun) {
+          toast(r.message || (r.ok ? '合并好了' : '没成功'), r.ok ? 'ok' : 'err')
+          if (r.ok) { setMergeFrom(''); setMergeInto(''); loadPeople(); reload() }
+        }
+      }
+      const unlink = async (account) => {
+        if (!window.confirm('解绑 ' + account.platform + ' / ' + account.account + '？')) return
+        const r = await post('/platforms/people/unlink', { platform: account.platform, account: account.account })
+        toast(r.message || (r.ok ? '已解绑' : '没成功'), r.ok ? 'ok' : 'err')
+        if (r.ok) { loadPeople(); load(); reload() }
+      }
+      const fix = async (person, platform) => {
+        const r = await post('/platforms/people/fixed', { person, platform })
+        toast(r.message || (r.ok ? '已更新' : '没成功'), r.ok ? 'ok' : 'err')
+        if (r.ok) loadPeople()
+      }
+      const previewImport = async () => {
+        if (!importPath.trim()) return toast('先填 QQ 版数据目录', 'err')
+        setImportBusy(true)
+        try {
+          const r = await post('/platforms/import/preview', { source: importPath.trim() })
+          setImportPreview(r)
+          setImportMsg(r.message || (r.ok ? '预检通过，确认后才会写入' : '预检没通过'))
+        } finally { setImportBusy(false) }
+      }
+      const doImport = async () => {
+        if (!window.confirm('确认把预检通过的数据导入当前实例？导入前会自动备份。')) return
+        setImportBusy(true)
+        try {
+          const r = await post('/platforms/import', { source: importPath.trim() })
+          setImportMsg(r.message || (r.ok ? '导入完成' : '导入没完成'))
+          toast(r.message || (r.ok ? '导入完成' : '导入没完成'), r.ok ? 'ok' : 'err')
+          if (r.ok) { loadPeople(); reload() }
+        } finally { setImportBusy(false) }
+      }
       return h('div', { className: 'ab-grid' },
         h(Card, { title: '平台', desc: '这里列出所有已注册的平台实例。开关即时生效；填错凭证时看卡片上的状态和原因，密钥不会回显。' },
           !owner ? h('div', { className: 'ab-note warn', style: { marginBottom: 10 } }, '还没有主人。先连上一个平台，用那个账号给她发一句话，再点下面的「确认这是我」。') : null,
@@ -1466,6 +1520,38 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h('div', { className: 'ab-flex', style: { marginTop: 8 } }, inst.platform === 'qq' && go ? h(Btn, { small: true, onClick: () => go('connect') }, '打开 QQ 详细设置') : null),
           !owner && inst.self ? h('div', { style: { marginTop: 8 } }, h(Btn, { small: true, kind: 'primary', disabled: busy === inst.instance, onClick: () => claim(inst) }, '确认这是我')) : null,
         )) : h(Card, { title: '还没有平台' }, h(Empty, { icon: '📡', text: '在「QQ 网关」里先接上一个平台；接好后这里会出现卡片。' })),
+        h(Card, { title: '人', desc: '每个人可以挂多个平台账号。合并前先预览；解绑只解除这个平台账号，不删记忆。' },
+          people.length ? people.map((p) => h('div', { key: p.person, style: { padding: '8px 0', borderBottom: '1px solid var(--ab-line)' } },
+            h('div', { className: 'ab-flex', style: { flexWrap: 'wrap', gap: 6, alignItems: 'center' } },
+              h('b', null, p.name || '(未命名)'),
+              h('span', { className: 'ab-small ab-muted' }, p.person),
+              p.owner ? h('span', { className: 'ab-badge' }, '主人') : null,
+              h('span', { className: 'ab-small ab-muted' }, '固定平台：'),
+              h('select', { className: 'ab-select', value: p.fixed || '', onChange: (e) => fix(p.person, e.target.value) },
+                h('option', { value: '' }, '跟随最近'),
+                [...new Set(people.flatMap((x) => x.accounts.map((a) => a.platform)))].sort().map((pl) => h('option', { key: pl, value: pl }, platformLabel(pl))))),
+            h('div', { className: 'ab-flex', style: { flexWrap: 'wrap', gap: 6, marginTop: 6 } },
+              (p.accounts || []).length ? p.accounts.map((a) => h('span', { key: a.platform + ':' + a.account, className: 'ab-badge mine' },
+                platformLabel(a.platform) + '：' + a.account,
+                h('button', { type: 'button', title: '解绑', style: { marginLeft: 6, border: 0, background: 'none', cursor: 'pointer' }, onClick: () => unlink(a) }, '×'))) :
+                h('span', { className: 'ab-small ab-muted' }, '还没有账号')),
+          )) : h('div', { className: 'ab-small ab-muted' }, '记忆里还没有人物。'),
+          h('div', { className: 'ab-muted ab-small', style: { marginTop: 10 } }, '合并两个人（先预览，再确认）：'),
+          h('div', { className: 'ab-flex', style: { flexWrap: 'wrap', gap: 6, marginTop: 6 } },
+            h('select', { className: 'ab-select', value: mergeFrom, onChange: (e) => setMergeFrom(e.target.value) },
+              h('option', { value: '' }, '从谁'), people.map((p) => h('option', { key: p.person, value: p.person }, p.name || p.person))),
+            h('select', { className: 'ab-select', value: mergeInto, onChange: (e) => setMergeInto(e.target.value) },
+              h('option', { value: '' }, '并到谁'), people.map((p) => h('option', { key: p.person, value: p.person }, p.name || p.person))),
+            h(Btn, { small: true, onClick: () => merge(true) }, '预览合并'),
+            h(Btn, { small: true, kind: 'primary', disabled: !mergeMsg || mergeMsg.dryRun !== true, onClick: () => merge(false) }, '确认合并')),
+          mergeMsg ? h('pre', { className: 'ab-code', style: { whiteSpace: 'pre-wrap', marginTop: 8 } }, JSON.stringify(mergeMsg, null, 2)) : null),
+        h(Card, { title: '从 QQ 版导入', desc: '只读预检 → 确认 → 导入。导入前会先把记忆和身份库成组备份；不覆盖现有主人的数据。' },
+          h('div', { className: 'ab-flex', style: { gap: 6, flexWrap: 'wrap' } },
+            h('input', { className: 'ab-input', style: { minWidth: 260, flex: 1 }, placeholder: 'QQ 版数据目录，例如 D:\\Aurabot\\data', value: importPath, onChange: (e) => setImportPath(e.target.value) }),
+            h(Btn, { small: true, disabled: importBusy, onClick: previewImport }, '预检'),
+            h(Btn, { small: true, kind: 'primary', disabled: importBusy || !importPreview || importPreview.ok === false, onClick: doImport }, '确认导入')),
+          importMsg ? h('div', { className: 'ab-note', style: { marginTop: 8 } }, importMsg) : null,
+          importPreview ? h('pre', { className: 'ab-code', style: { whiteSpace: 'pre-wrap', maxHeight: 260, overflow: 'auto', marginTop: 8 } }, JSON.stringify(importPreview, null, 2)) : null),
       )
     }
 
