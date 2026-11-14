@@ -14,6 +14,7 @@ import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
 import net from 'node:net'
+import { isDeepStrictEqual } from 'node:util'
 import { loadConfig, saveConfig, publicConfig, mergeFromPanel, ownerAuthorizationRevision } from './core/config.js'
 import { createLogger } from './core/logger.js'
 import { encodeResponse } from './core/http-compress.js'
@@ -1249,6 +1250,14 @@ export function apply(ctx) {
 
   route('/save', async (req) => {
     const body = await readBody(req)
+    // 面板草稿可能早于 QQ 的 /quiet /chatty；拒绝覆盖期间改过的群设置。
+    // 只检查新版面板显式附带的基线，旧版和模块的局部保存维持原约定。
+    const expected = body?._groupSettingsBase
+    if (body) delete body._groupSettingsBase
+    if (expected && (
+      (Object.hasOwn(expected, 'group') && !isDeepStrictEqual(expected.group, cfg.group)) ||
+      (Object.hasOwn(expected, 'passiveGroups') && !isDeepStrictEqual(expected.passiveGroups, cfg.memory.passiveGroups))
+    )) return { ok: false, code: 'group_settings_conflict', message: '群聊或旁听设置已在别处修改，本次没有保存。请记下要保留的改动，再点「读取最新设置」放弃草稿。' }
     const before = cfg
     // 控制台密码不能只改配置（SnowLuma 那边还是旧的）：拿出来单独去 SnowLuma 改
     const newPw = typeof body?.snowluma?.webuiPassword === 'string' ? body.snowluma.webuiPassword : ''

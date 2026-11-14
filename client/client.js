@@ -8673,6 +8673,8 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [wizardOpen, setWizardOpen] = useState(false)
       const toastTimer = useRef(null)
       const dirtyRef = useRef(false)
+      const draftBaseRef = useRef(null)
+      const [saveConflict, setSaveConflict] = useState('')
       const saveRef = useRef(null)
       const pluginStartRef = useRef(0)
       // kind：ok / err / 不填 = 普通
@@ -8690,7 +8692,10 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         setErr('')
         setSt(r)
         setDraft((current) => {
-          if (!dirtyRef.current || !current) return clone(r.config)
+          if (!dirtyRef.current || !current) {
+            draftBaseRef.current = clone(r.config)
+            return clone(r.config)
+          }
           return { ...current, allow: r.config.allow, commandAllow: r.config.commandAllow, capabilityAllow: r.config.capabilityAllow }
         })
         return r
@@ -8737,10 +8742,29 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const dirty = useMemo(() => !!(st && draft) && JSON.stringify(draft) !== JSON.stringify(st.config), [st, draft])
       dirtyRef.current = dirty
       const setD = (d) => setDraft(d)
+      const discardDraft = () => { draftBaseRef.current = clone(st.config); dirtyRef.current = false; setSaveConflict(''); setDraft(clone(st.config)) }
       const save = async (override) => {
-        const { allow, commandAllow, capabilityAllow, ...body } = override || draft
+        const { allow, commandAllow, capabilityAllow, ...body } = clone(override || draft)
+        // 未编辑的群设置不回写；编辑过的带上草稿基线，避免悄悄撤销 QQ 命令。
+        const baseline = draftBaseRef.current || st.config
+        const expected = {}
+        if (JSON.stringify(body.group) === JSON.stringify(baseline.group)) delete body.group
+        else expected.group = baseline.group
+        if (JSON.stringify(body.memory?.passiveGroups) === JSON.stringify(baseline.memory?.passiveGroups)) {
+          if (body.memory) delete body.memory.passiveGroups
+        } else expected.passiveGroups = baseline.memory?.passiveGroups
+        if (Object.keys(expected).length) body._groupSettingsBase = expected
         const r = await post('/save', body)
-        if (r.ok === false) { toast(r.message || '保存失败', 'err'); return false }
+        if (r.ok === false) {
+          if (r.code === 'group_settings_conflict') {
+            setSaveConflict(r.message)
+            // 保留草稿供查看，同时让「撤销」能取到最新值。轮询不能替换草稿基线。
+            await reload()
+          }
+          toast(r.message || '保存失败', 'err'); return false
+        }
+        setSaveConflict('')
+        draftBaseRef.current = clone(r.config)
         dirtyRef.current = false
         setSt(r)
         setDraft(clone(r.config))
@@ -8853,12 +8877,13 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             },
           }),
           showWizard ? null : h(SnowLumaCompatBanner, { st, go }),
+          saveConflict ? h('div', { className: 'ab-note err', role: 'alert' }, saveConflict, h(Btn, { small: true, onClick: discardDraft }, '读取最新设置')) : null,
           showWizard ? null : h(TabBoundary, { key: curTab.id, onHome: () => go('overview') }, h(body, { ...props, mod: curTab.ext })),
           // dsh-image 已经嵌进「生图」页的「接口格式」里了，这里再渲染一次就是同一张卡出现两遍。
           showWizard || curTab.ext ? null : mods.filter((m) => hasUi(m) && tabOf(m) === curTab.id && !(curTab.id === 'imagegen' && m.id === 'dsh-image')).map((m) => h('div', { key: 'embed-' + m.id, style: { marginTop: 14 } }, h(ExtPage, { ...props, mod: m.id, embedded: true }))),
           dirty && !showWizard ? h('div', { className: 'ab-savebar' }, h('span', { className: 'msg' }, '有改动还没保存'),
             h('span', { className: 'ab-muted ab-small' }, h('span', { className: 'ab-kbd' }, 'Ctrl'), ' + ', h('span', { className: 'ab-kbd' }, 'S')),
-            h(Btn, { kind: 'ghost', onClick: () => setDraft(clone(st.config)) }, '撤销'),
+            h(Btn, { kind: 'ghost', onClick: discardDraft }, '撤销'),
             h(Btn, { kind: 'primary', onClick: () => save() }, '保存设置')) : null,
         ),
         toastMsg ? h('div', { className: cx('ab-toast', toastMsg.kind), role: 'status' }, toastMsg.text) : null,
