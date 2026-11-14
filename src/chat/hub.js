@@ -2530,7 +2530,10 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       return true
     }
     let person = null
-    try { person = identity.redeemCode(msg.platform || defaultPlatform(), msg.userId, code) } catch (error) {
+    try {
+      const redeem = identity.redeemCodeBinding || identity.redeemCode
+      person = redeem.call(identity, msg.platform || defaultPlatform(), msg.userId, code)
+    } catch (error) {
       log.warn('兑换绑定口令失败：', error.message)
     }
     await sendText(

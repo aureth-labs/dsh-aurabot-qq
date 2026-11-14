@@ -165,6 +165,27 @@ test('口令：账号已属于别人时兑换失败，表未被改', (t) => {
   assert.equal(identity.redeemCode('telegram', 'tg_new', code), p)
 })
 
+test('绑定兑换：接管只含一个 auto 账号的临时人', (t) => {
+  const { identity } = makeIdentity(t)
+  const p = identity.resolve('qq', '10001')
+  const q = identity.resolve('feishu', 'ou_auto')
+  const code = identity.issueCode(p)
+  assert.equal(identity.redeemCode('feishu', 'ou_auto', code), null)
+  assert.equal(identity.redeemCodeBinding('feishu', 'ou_auto', code), p)
+  assert.equal(identity.lookup('feishu', 'ou_auto'), p)
+  assert.equal(identity.accountsOf(q).length, 0)
+})
+
+test('绑定兑换：已经有主动绑定的人不接管', (t) => {
+  const { identity } = makeIdentity(t)
+  const p = identity.resolve('qq', '10001')
+  const q = identity.resolve('feishu', 'ou_linked')
+  identity.link('telegram', 'tg_linked', q, 'owner')
+  const code = identity.issueCode(p)
+  assert.equal(identity.redeemCodeBinding('feishu', 'ou_linked', code), null)
+  assert.equal(identity.lookup('feishu', 'ou_linked'), q)
+})
+
 test('口令：存 meta 重启不丢；同一人旧口令被新签发作废', (t) => {
   const { identity, dir } = makeIdentity(t)
   const p = identity.resolve('qq', '10001')

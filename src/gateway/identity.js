@@ -185,6 +185,34 @@ export function createIdentity({ dataDir, now = () => Date.now(), log = console 
     return entry.person
   })
 
+  /**
+   * F2 绑定专用：新平台账号在第一次发消息时通常已经被 resolve() 自动建了临时人。
+   * 普通 redeemCode 遇到这种账号会拒绝；绑定时允许把「只有这一个 auto 账号」的临时人
+   * 并入签发口令的人，其他已有绑定/历史的人仍然拒绝。
+   */
+  const redeemCodeBinding = (platform, account, code) => store.transact((db) => {
+    const key = `code:${code}`
+    const entry = typeof code === 'string' ? metaGet(db, key) : null
+    if (!entry) { voidFailing(db); return null }
+    const cleanup = () => metaDelete(db, key)
+    if (now() > entry.expiresAt) { cleanup(); return null }
+    if (entry.fails >= CODE_MAX_FAILS) { cleanup(); return null }
+    const existing = rowOf(db, platform, account)
+    if (!existing) {
+      insertAccount(db, { platform, account, personId: entry.person, linkedBy: 'code' })
+      cleanup()
+      return entry.person
+    }
+    if (existing.person_id === entry.person) { cleanup(); return entry.person }
+    const rows = db.prepare('SELECT * FROM identities WHERE person_id = ?').all(existing.person_id)
+    // 只接管一个平台的单个临时账号；已经有过主动 link/code/import 的人不合并。
+    if (rows.length !== 1 || rows[0].linked_by !== 'auto') return null
+    const clash = db.prepare('SELECT 1 FROM identities WHERE person_id = ? AND platform = ? LIMIT 1').get(entry.person, platform)
+    if (clash) return null
+    db.prepare('UPDATE identities SET person_id = ? WHERE person_id = ?').run(entry.person, existing.person_id)
+    cleanup()
+    return entry.person
+  })
   // 兑换失败时给所有待兑换口令记失败；达到次数上限的当场作废。
   function voidFailing(db) {
     for (const row of db.prepare("SELECT key, json FROM meta WHERE key LIKE 'code:%'").all()) {
@@ -228,7 +256,7 @@ export function createIdentity({ dataDir, now = () => Date.now(), log = console 
     resolve, lookup, accountsOf, accountOn, isValid,
     owner: () => store.transact(ownerOf),
     isOwner: (person) => store.transact(ownerOf) === person,
-    claimOwner, link, unlink, issueCode, redeemCode,
+    claimOwner, link, unlink, issueCode, redeemCode, redeemCodeBinding,
     importLegacyQQ, repoint,
   }
 }
