@@ -1,5 +1,6 @@
 // OneBot v11 客户端：HTTP 调接口，WS（Universal）收事件，断线自动重连。
 // 只依赖 Node 自带的 fetch / WebSocket。
+import { confirmMessage, reserveMessage } from '../chat/send-budget.js'
 
 const RECONNECT_MIN = 2000
 const RECONNECT_MAX = 30000
@@ -96,6 +97,7 @@ export function createOneBotClient({ endpoint, onEvent, onState, log, retryDelay
   }
 
   async function call(action, params = {}, { timeoutMs = 30000, retries = retryDelays.length } = {}) {
+    const reservation = reserveMessage(action, params)
     if (explicitlyStopped) throw new OneBotError(action, { message: 'QQ 网关客户端已停止' })
     const ep0 = endpoint()
     // 压根没配网关：立即失败，别让调用方白等重试（查群名之类的会立刻回退）
@@ -108,7 +110,9 @@ export function createOneBotClient({ endpoint, onEvent, onState, log, retryDelay
     for (let i = 0; i <= retries; i++) {
       if (generation !== stopGeneration) throw stoppedError()
       try {
-        return await callOnce(action, params, timeoutMs, generation)
+        const result = await callOnce(action, params, timeoutMs, generation)
+        confirmMessage(reservation, params)
+        return result
       } catch (error) {
         lastError = error
         if (generation !== stopGeneration) throw stoppedError()

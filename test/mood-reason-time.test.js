@@ -23,18 +23,21 @@ function setup(t, patch = {}, dsh) {
   return { mood: createMood({ getConfig: () => cfg, dsh }), cfg, file: join(dir, 'mood.json') }
 }
 
-test('心情理由记录发生时间，重启后按分钟/小时展示，三小时后隐藏', (t) => {
+test('心情理由保留本机时间信息；重启后仍不把聊天原话注入提示', (t) => {
   const { mood, cfg, file } = setup(t)
   mood.nudge(30, '主人调侃她存图')
   const state = JSON.parse(readFileSync(file, 'utf8'))
   assert.equal(state.reasonAt, now)
   assert.equal(state.reasonAt, state.at)
-  assert.match(mood.contextLine(), /1 分钟前因为主人调侃她存图/)
+  assert.match(moodReason(mood.state(), mood.current(), 60), /1 分钟前因为主人调侃她存图/)
+  assert.doesNotMatch(mood.contextLine(), /因为|调侃|存图/)
   t.mock.timers.setTime(now + 25 * 60_000)
   const restored = createMood({ getConfig: () => cfg })
-  assert.match(restored.contextLine(), /25 分钟前因为主人调侃她存图/)
+  assert.match(moodReason(restored.state(), restored.current(), 60), /25 分钟前因为主人调侃她存图/)
+  assert.doesNotMatch(restored.contextLine(), /因为|旧事|调侃|主人夸/)
   t.mock.timers.setTime(now + 2 * HOUR)
-  assert.match(restored.contextLine(), /2 小时前因为主人调侃她存图/)
+  assert.match(moodReason(restored.state(), restored.current(), 60), /2 小时前因为主人调侃她存图/)
+  assert.doesNotMatch(restored.contextLine(), /因为|旧事|调侃|主人夸/)
   t.mock.timers.setTime(now + 3 * HOUR)
   assert.match(restored.contextLine(), /开心/)
   assert.doesNotMatch(restored.contextLine(), /因为|调侃|存图/)
@@ -51,7 +54,8 @@ test('模型判断未达到阈值，不把旧理由刷新为现在发生', async
   t.mock.timers.setTime(now + HOUR)
   await mood.judge({ userText: '嗯', reply: '嗯嗯' })
   assert.equal(mood.state().reasonAt, now)
-  assert.match(mood.contextLine(), /1 小时前因为被调侃了/)
+  assert.match(moodReason(mood.state(), mood.current(), 60), /1 小时前因为被调侃了/)
+  assert.doesNotMatch(mood.contextLine(), /因为|旧事|调侃|主人夸/)
   answer = { delta: 10, reason: '没把握的推测', confidence: 0.2 }
   t.mock.timers.setTime(now + 3 * HOUR)
   await mood.judge({ userText: '哦', reply: '好' })
@@ -59,13 +63,15 @@ test('模型判断未达到阈值，不把旧理由刷新为现在发生', async
   answer = { delta: 5, reason: '主人夸她', confidence: 0.9 }
   await mood.judge({ userText: '真棒', reply: '嘿嘿' })
   assert.equal(mood.state().reasonAt, now + 3 * HOUR)
-  assert.match(mood.contextLine(), /1 分钟前因为主人夸她/)
+  assert.match(moodReason(mood.state(), mood.current(), 60), /1 分钟前因为主人夸她/)
+  assert.doesNotMatch(mood.contextLine(), /因为|旧事|调侃|主人夸/)
 })
 
 test('旧 mood.json 使用原 at，缺失或无效时间不把旧理由当作新事件', (t) => {
   const { mood, file } = setup(t)
   writeFileSync(file, JSON.stringify({ value: 95, at: now - HOUR, reason: '旧事', history: [] }))
-  assert.match(mood.contextLine(), /1 小时前因为旧事/)
+  assert.match(moodReason(mood.state(), mood.current(), 60), /1 小时前因为旧事/)
+  assert.doesNotMatch(mood.contextLine(), /因为|旧事|调侃|主人夸/)
   writeFileSync(file, JSON.stringify({ value: 95, at: now - 4 * HOUR, reason: '旧事', history: [] }))
   assert.doesNotMatch(mood.contextLine(), /旧事|因为/)
   for (const reasonAt of [0, 'bad', now + 1]) {
@@ -87,7 +93,7 @@ test('心情衰减回基线、平常状态、关闭模块时都不注入理由�
   assert.equal(mood.contextLine(), '')
 })
 
-test('普通聊天和主动搭话共用有时效的心情提示，只放本轮消息，不注册上下文快照', (t) => {
+test('普通聊天和主动搭话只注入心情语气，不带其他聊天的原话或名字', (t) => {
   const { cfg } = setup(t)
   const handlers = new Map()
   const mood = moodModule.setup({ config: () => cfg, log: {}, dsh: null,
@@ -100,7 +106,8 @@ test('普通聊天和主动搭话共用有时效的心情提示，只放本轮�
   for (const prompt of ['你好', '【系统提醒，不是主人说的话】想主动找主人说点什么']) {
     const content = [{ type: 'text', text: prompt }]
     const result = handlers.get('prompt')(content, { chat: { kind: 'private' } })
-    assert.match(result.at(-1).text, /1 小时前因为被主人夸了/)
+    assert.match(result.at(-1).text, /开心/)
+    assert.doesNotMatch(result.at(-1).text, /因为|主人夸/)
     assert.equal(content.length, 1)
     t.mock.timers.setTime(now + 3 * HOUR)
     assert.doesNotMatch(handlers.get('prompt')(content, { chat: { kind: 'private' } }).at(-1).text, /因为|被主人夸了/)

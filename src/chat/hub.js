@@ -1,3 +1,4 @@
+import { compactReplyItems, createSendBudget, currentSendBudget, remainingMessages, singleMediaDelivered, withSendBudget } from './send-budget.js'
 // 消息中枢：QQ 会话 ↔ DSH 会话。
 //   收：OneBot 事件 → 白名单 / 群聊策略 → 拼好文案（带发言人、群上下文、图片、语音转写）→ 喂进对应 DSH 会话
 //   发：DSH 会话一轮结束 → 取最终正文 → 拆条 / 语音 / 表情 → 发回原来的 QQ 会话
@@ -1052,6 +1053,12 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
               },
             }
           }
+          const execute = reg.execute
+          reg = { ...reg, execute(args, exec) {
+            const st = turnState.get(sid)
+            const budget = st ? (st.sendBudget ??= createSendBudget()) : createSendBudget()
+            return withSendBudget(budget, () => execute(args, exec))
+          } }
           // 注册表里如果残留同名工具（旧 agent 作用域/旧版泄漏），先把我们记着的旧 disposer 清掉再注册
           const dkey = sid + '|' + tool.name
           const stale = toolDisposers.get(dkey)
@@ -1070,6 +1077,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         order: 905,
         text: () => {
           const parts = []
+          if (chat.kind !== 'system') parts.push(`当前 QQ 会话是 ${chat.chatId}；机器人自己的 QQ 是 ${getConfig().botQQ || '未配置'}。直接回复会自动发到当前会话，语音也一样。只有对方本轮明确要求转告或发送到其他聊天时，才调用跨聊天发送工具；历史、记忆里出现的群号不是这次的发送目标。`)
           // 正文标记：代码注入，不改人格文件。模型必须用 ⟦REPLY⟧ 包住要发的话。
           try {
             if (getConfig().chat?.replyMarker?.enabled === true) parts.push(markerInstruction())
@@ -1440,7 +1448,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     }
     const seg = stickers.segmentFor(item)
     if (!seg) return false
-    await sendSegments(chatId, [...quote(replyId), ...mention(userId), seg], `[表情] ${item.name || item.md5.slice(0, 8)}`)
+    const sent = await sendSegments(chatId, [...quote(replyId), ...mention(userId), seg], `[表情] ${item.name || item.md5.slice(0, 8)}`)
+    if (!sent) return false
     stickers.markUsed?.(item.md5)
     bump('stickers')
     return true
@@ -1542,7 +1551,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const active = currentPromptSources()
     const current = active || outputSources.get(chatId)
     const sources = current && { ...current, system: new Map(current.system), memory: [...current.memory] }
-    return outputScope.run({ chatId, sources, sent: 0, blocked: false, allowPromptEcho: false }, () => deliverWithEnginePolicy(chatId, text, opts))
+    const budget = opts.sendBudget || currentSendBudget() || createSendBudget()
+    return withSendBudget(budget, () => outputScope.run({ chatId, sources, sent: 0, blocked: false, allowPromptEcho: false }, () => deliverWithEnginePolicy(chatId, text, opts)))
   }
 
   /**
@@ -1588,6 +1598,10 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   async function deliverTurn(chatId, text, opts = {}) {
     if (disposed) return
     const cfg = getConfig()
+    if (singleMediaDelivered(chatId, opts.userText)) {
+      log.info(`${chatId}：请求的单条媒体已发送，不重复补发`)
+      return { silent: true }
+    }
     text = cleanOutboundText(text, cleaningFor(chatId))
     if (text.trim() && hooks?.reply) {
       try {
@@ -1630,8 +1644,6 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       if (all.length <= cfg.voice.autoMaxChars && Math.random() < cfg.voice.autoChance * mood().voice) items = [{ kind: 'voice', value: all }]
     }
     const inGroup = chatId.startsWith('group:')
-    // 群里别刷屏：一段最多 3 条
-    if (inGroup && items.length > 3) items = items.slice(0, 3)
     // 按概率补一张表情（群里已经有两条以上就不补了）
     if (!interim && cfg.stickers.enabled && !items.some((i) => i.kind === 'sticker') && !(inGroup && items.length >= 2) && Math.random() < cfg.stickers.autoChance * mood().sticker) {
       const pick = stickers.pickForReply(texts.map((t) => t.value).join(' '))
@@ -1646,6 +1658,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         log.warn('扩展模块改写回复出错：', error.message)
       }
     }
+    items = compactReplyItems(items, remainingMessages(chatId))
     // 钩子改写后仍走同一个清洗，保留每条的语音/引用元数据。
     items = cleanOutboundSegments(items.map((item) => ({
       type: ['text', 'voice'].includes(item.kind) ? 'text' : item.kind,
@@ -1737,6 +1750,10 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   function onPersonaSessionEvent(key, chatId, event) {
     const st = turnState.get(key) || { lastTurn: -1, text: '', senders: new Set() }
     turnState.set(key, st)
+    if (event.type === 'turn/start') {
+      st.sendBudget = createSendBudget()
+      return
+    }
     if (event.type === 'user/message') {
       // 主人在 DSH 会话窗口里直接打字（不是从 QQ 转进来的，#58）：只有主人能操作 DSH，
       // 这一轮按「主人说的」算；不然重开会话后在面板里让她改资料会报没权限。
@@ -1797,8 +1814,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
           // 不在这里记账：deliver 会在真发出去之后自己 logChat，一条都没发成功就不记。
           // 这里再记一次会让每个中间段在聊天流水里出现两遍，发送失败时还会把没发出去的话算成说过。
           log.debug(`${chatId}：分条发出上一段（${prev.length} 字）`)
+          const sendBudget = st.sendBudget
           const onDelivered = st.onDelivered
-          chainSend(chatId, () => deliver(chatId, prev, { own: true, interim: true, onDelivered }), '分条发送出错：')
+          chainSend(chatId, () => deliver(chatId, prev, { own: true, interim: true, onDelivered, sendBudget }), '分条发送出错：')
         }
       }
       return
@@ -1875,6 +1893,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       const sys = st.system
       const wantVoice = Boolean(st.wantVoice)
       const autoReply = st.autoReply
+      const sendBudget = st.sendBudget
       const onDelivered = st.onDelivered
       st.onDelivered = st.pendingOnDelivered || null
       st.pendingOnDelivered = null
@@ -1906,7 +1925,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       // 发完再放开：发送期间来的消息也攒到下一段。
       // 没有中间段在发的时候就走原来的路径（同步开始、release 跟着这一条走），时序和以前一模一样；
       // 只有前面真有中间段没发完时才排队，保证最后一段一定是最后一条（#214 review）。
-      const sendLast = () => deliver(chatId, text, { wantVoice, autoReply, userText: st.lastText || '', own: true, onDelivered, fromThinking })
+      const sendLast = () => deliver(chatId, text, { wantVoice, autoReply, userText: st.lastText || '', own: true, onDelivered, fromThinking, sendBudget })
         .catch((error) => log.warn('发送出错：', error.message))
         .finally(() => release(chatId, turnToken))
       const pending = sendChain.get(chatId)
@@ -3100,6 +3119,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const steer = opts.steer && running.has(chat.chatId) && typeof agent.steer === 'function'
     // 不能用 busy：flush 在这一批开始前就会置上它。
     const queuedNextTurn = !steer && running.has(chat.chatId)
+    if (!queuedNextTurn && !steer) st.sendBudget = createSendBudget()
     if (queuedNextTurn) {
       st.pendingArchiveNamespace = archiveNamespace; st.pendingArchiveContextAt = archiveContextAt
     } else if (!steer || !st.archiveNamespace) {

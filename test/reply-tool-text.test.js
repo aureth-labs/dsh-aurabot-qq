@@ -34,6 +34,6 @@ test('她可以不搭理人：写进规则，整段 [沉默] 不发任何东西�
   const rules = rulesText('social', normalize({ ownerName: '哥哥' }))
   assert.match(rules, /你可以不搭理人/)
   assert.match(rules, /被 @ 了也一样/)
-  assert.match(rules, /哥哥对你说的话不能这样/)
+  assert.match(rules, /不能用沉默逃避哥哥尚未完成的请求/)
   assert.equal(parseReply('[沉默]').silent, true)
 })
