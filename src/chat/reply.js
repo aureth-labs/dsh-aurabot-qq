@@ -355,6 +355,14 @@ export function cleanOutboundSegments(message, options) {
   return result.some((seg) => seg.type === 'text' ? seg.data.text.trim() : !['reply', 'at'].includes(seg.type)) ? result : []
 }
 
+/** 完整语音块中的分条标记作为停顿，不能先拆断标签；代码示例和嵌套标签不改写。 */
+function joinVoiceBubbles(text) {
+  return text.replace(/```[\s\S]*?```|`[^`\n]+`|<voice>([\s\S]*?)<\/voice>/g, (block, speech) => {
+    if (speech === undefined || /<\/?voice\b/i.test(speech)) return block
+    return `<voice>${speech.replace(/\|{3,}/g, '\n')}</voice>`
+  })
+}
+
 /** 解析一轮回复；在拆气泡/语音前清洗，避免协议里的竖线被误作气泡分隔符。 */
 export function parseReply(text, options) {
   // 模型偶尔把换行写成 HTML `<br>`：当真正的换行处理；代码示例里的字面量保留。
@@ -370,7 +378,7 @@ export function parseReply(text, options) {
       replyTo = ''
     }
   }
-  for (const bubble of raw.split('|||')) {
+  for (const bubble of joinVoiceBubbles(raw).split('|||')) {
     const part = bubble.trim()
     if (!part) continue
     // 依次切出 reply / voice / sticker / markdown 图片，其余是文字
