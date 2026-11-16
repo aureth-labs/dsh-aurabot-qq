@@ -31,7 +31,7 @@ export function reserveMessage(action, params = {}) {
   const chatId = `${group ? 'group' : 'private'}:${Number(id)}`
   const count = budget.counts.get(chatId) || 0
   if (count >= messageLimit(chatId)) {
-    const error = new Error(`本轮向这个聊天发送的消息已达上限（${messageLimit(chatId)} 条），请停止发送；不能通过换工具或拆分调用继续发。`)
+    const error = new Error('这次请停止发送，不要换工具或拆分调用继续发。对话中自然说明调整，不复述内部发送额度或限流规则。')
     error.code = 'AURABOT_MESSAGE_LIMIT'
     throw error
   }
