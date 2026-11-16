@@ -51,7 +51,7 @@ export function confirmMessage(reservation, params) {
 /** A single requested image/voice already sent by a tool needs no final
  * acknowledgement or second copy. Multi-item requests keep their normal path.
  */
-export function singleMediaDelivered(chatId, userText) {
+function singleRequestedMedia(userText) {
   const text = String(userText || '')
   if (!/(?:不要|不用|别)(?:再)?(?:发|配|加|补)?(?:文字版|文字|文本)|只(?:要|发)(?:图片|表情包|语音)/.test(text)) return false
   const quantities = text.match(/[零〇一二两三四五六七八九十百千万\d]+(?:张|个|条)/g) || []
@@ -59,8 +59,25 @@ export function singleMediaDelivered(chatId, userText) {
   const image = /(?<![零〇一二两三四五六七八九十百千万\d])(?:一|1)(?:张|个)(?:[^。！？\n]{0,12})(?:图片|表情包)/.test(text)
   const voice = /(?<![零〇一二两三四五六七八九十百千万\d])(?:一|1)条语音/.test(text)
   if (image === voice) return false
-  const types = scope.getStore()?.delivered.get(chatId)
-  return Boolean(types?.has(image ? 'image' : 'record'))
+  return image ? 'image' : 'record'
+}
+
+export function singleMediaDelivered(chatId, userText) {
+  const requested = singleRequestedMedia(userText)
+  return Boolean(requested && scope.getStore()?.delivered.get(chatId)?.has(requested))
+}
+
+/** Explicit reply formats also apply to automatically added decorations. Keep
+ * a textual failure report when the requested media could not be produced.
+ */
+export function respectReplyMedia(items, userText) {
+  const text = String(userText || '')
+  if (/(?:不要|不用|别)(?:再|额外)?(?:发|加|配|带)?(?:图片|表情包)/.test(text)) {
+    items = items.filter(it => it.kind !== 'sticker' && it.kind !== 'image')
+  }
+  const requested = singleRequestedMedia(text)
+  const media = items.filter(it => requested === 'image' ? ['image', 'sticker'].includes(it.kind) : requested === 'record' && it.kind === 'voice')
+  return media.length ? compactReplyItems(media, 1) : items
 }
 
 /** Keep complete prose in the last available bubble. Excess decorative media

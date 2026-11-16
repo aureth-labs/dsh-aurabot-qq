@@ -185,3 +185,16 @@ test('runtime context identifies the current recipient separately from the bot a
   assert.match(context, /直接回复会自动发到当前会话/)
   assert.match(context, /历史、记忆里出现的群号不是这次的发送目标/)
 })
+
+test('explicit no-image and one-voice formats override decorative module output without suppressing normal chat', async t => {
+  const s = setup(t, { hooks: { items: items => [...items, { kind: 'sticker', value: '笑' }] } })
+  await s.hub.deliver('group:2', '收到<face:呲牙>', { simulate: true, userText: '回一句收到，后面加一个QQ自带的呲牙小黄脸，不要图片表情包。' })
+  assert.equal(s.sends().length, 1)
+  assert.ok(s.sends()[0].params.message.some(it => it.type === 'face'))
+  await s.hub.deliver('private:1', '<voice>晚安</voice>|||已经发了', { simulate: true, userText: '用一条语音说晚安，不要再发文字版。' })
+  assert.equal(s.sends().length, 2)
+  assert.ok(s.sends()[1].params.message.some(it => it.type === 'record'))
+  await s.hub.deliver('group:2', '聊两句', { simulate: true, userText: '今天很开心' })
+  assert.equal(s.sends().length, 4)
+  assert.ok(s.sends()[3].params.message.some(it => it.type === 'image'))
+})

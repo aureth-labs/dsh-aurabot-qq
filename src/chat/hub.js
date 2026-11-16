@@ -1,4 +1,4 @@
-import { compactReplyItems, createSendBudget, currentSendBudget, remainingMessages, singleMediaDelivered, withSendBudget } from './send-budget.js'
+import { compactReplyItems, createSendBudget, currentSendBudget, remainingMessages, respectReplyMedia, singleMediaDelivered, withSendBudget } from './send-budget.js'
 // 消息中枢：QQ 会话 ↔ DSH 会话。
 //   收：OneBot 事件 → 白名单 / 群聊策略 → 拼好文案（带发言人、群上下文、图片、语音转写）→ 喂进对应 DSH 会话
 //   发：DSH 会话一轮结束 → 取最终正文 → 拆条 / 语音 / 表情 → 发回原来的 QQ 会话
@@ -1658,7 +1658,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         log.warn('扩展模块改写回复出错：', error.message)
       }
     }
-    items = compactReplyItems(items, remainingMessages(chatId))
+    items = compactReplyItems(respectReplyMedia(items, opts.userText), remainingMessages(chatId))
     // 钩子改写后仍走同一个清洗，保留每条的语音/引用元数据。
     items = cleanOutboundSegments(items.map((item) => ({
       type: ['text', 'voice'].includes(item.kind) ? 'text' : item.kind,
