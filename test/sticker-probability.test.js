@@ -228,3 +228,40 @@ test('纯表情豁免不绕过总开关、试运行和群消息条数限制', as
   await s.hub.deliver('group:2', body + '|||<sticker:开心>|||<sticker:开心>', { simulate: true })
   assert.equal(images(s).length, 3)
 })
+
+
+test('自动补图开关默认兼容旧配置，保存不改变表情节流与收藏设置', () => {
+  const before = normalize({ stickers: { autoChance: 0.03, limitTagged: true, collect: true } })
+  assert.equal(before.stickers.autoAppend, true)
+  const after = mergeFromPanel(before, { stickers: { autoAppend: false } })
+  assert.deepEqual(after, { ...before, stickers: { ...before.stickers, autoAppend: false } })
+  assert.equal(normalize({ stickers: { autoAppend: false } }).stickers.autoAppend, false)
+})
+
+for (const chat of ['private:1', 'group:2']) test(`${chat}：关闭自动补图后，100% 抽中也不替纯文字配图`, async t => {
+  const s = setup(t, { stickers: { autoAppend: false, limitTagged: true, autoChance: 1 } }, { roll: 0 })
+  await s.hub.deliver(chat, '说明已经完整，不需要配图')
+  assert.equal(images(s).length, 0)
+  assert.equal(s.picks(), 0)
+  assert.equal(s.draws(), 0)
+  assert.match(words(s), /说明已经完整/)
+})
+
+test('关闭自动补图不拦明确选出的标签；标签仍按既有概率开关处理', async t => {
+  const s = setup(t, { stickers: { autoAppend: false, limitTagged: true, autoChance: 1 } }, { roll: 0.5 })
+  await s.hub.deliver('private:1', '<sticker:开心>')
+  assert.equal(images(s).length, 1)
+  s.cfg.stickers.autoChance = 0
+  await s.hub.deliver('private:1', '文字<sticker:开心>')
+  assert.equal(images(s).length, 1)
+  s.cfg.stickers.limitTagged = false
+  await s.hub.deliver('private:1', '<sticker:开心>')
+  assert.equal(images(s).length, 2)
+  assert.equal(s.picks(), 0)
+})
+
+test('关闭自动补图不影响明确索要时的 sendSticker 单独发送', async t => {
+  const s = setup(t, { stickers: { autoAppend: false, limitTagged: true, autoChance: 0 } })
+  assert.ok(await s.hub.sendSticker('private:1', '开心'))
+  assert.equal(images(s).length, 1)
+})

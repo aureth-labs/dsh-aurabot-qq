@@ -171,6 +171,7 @@ export const DEFAULTS = {
   stickers: {
     enabled: true,
     faces: true, // 回复里能夹 QQ 自带的小黄脸（<face:名字>）
+    autoAppend: true, // 纯文字回复是否按概率自动补图；默认保留原行为
     autoChance: 0.35, // 自动配表情的概率；limitTagged 开启时也限制回复自带的表情
     limitTagged: false, // 升级保持原行为；开启后按 autoChance 限制回复中的表情，不再叠加心情倍率
     keywordExemption: false, // 实验性：正文命中配图关键词时保留已有表情，只在 limitTagged 开启时生效
@@ -651,6 +652,7 @@ export function normalize(raw) {
   for (const k of ['baseUrl', 'model', 'apiKey', 'language']) asrApi[k] = String(asrApi[k] ?? '').trim()
   asrApi.baseUrl = asrApi.baseUrl.replace(/\/+$/, '')
   asrApi.prefer = ['qq', 'cloud'].includes(asrApi.prefer) ? asrApi.prefer : 'qq'
+  c.stickers.autoAppend = bool(c.stickers.autoAppend, true)
   c.stickers.autoChance = num(c.stickers.autoChance, 0.35, 0, 1)
   c.stickers.limitTagged = bool(c.stickers.limitTagged, false)
   c.stickers.keywordExemption = bool(c.stickers.keywordExemption, false)

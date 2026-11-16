@@ -3177,6 +3177,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         ]
       return h('div', { className: 'ab-grid' },
         h(Card, { title: '表情包', right: f.sw('stickers.enabled'), desc: '聊天时从表情库配图；关闭后不发表情包。' },
+          h(Row, { label: '自动补一张表情包', hint: '纯文字回复也按概率配图。关闭后只发送明确选出的表情，不影响主动索要表情；回复标签仍受下方概率开关控制。' }, f.sw('stickers.autoAppend', { title: '自动补一张表情包' })),
           h(Row, { label: draft.stickers.limitTagged ? '回复配表情的概率' : '自动配表情的概率', hint: draft.stickers.limitTagged ? (draft.stickers.keywordExemption ? '有正文且未命中关键词时按此概率；纯表情或命中关键词时保留。' : '每段回复按此概率决定是否配表情；0% 不配，100% 不限。') : '只控制自动补图，会随心情变化；模型自己选的表情仍会发送。' }, f.percent('stickers.autoChance')),
           h(Row, { label: '回复里的表情也受概率限制', hint: draft.stickers.keywordExemption && draft.stickers.limitTagged ? '纯表情直接保留；带文字的回复按下方关键词判断，可能误放或漏判。' : '会删掉没抽中的表情，但不改正文，可能“说要发图却没发”。更在意聊天连贯时请关闭；表情制作不受影响。' }, f.sw('stickers.limitTagged', { title: '回复里的表情也受概率限制' })),
           draft.stickers.limitTagged ? h(Row, { label: '纯表情或提到图片时保留（实验性）', hint: '只发表情，或正文命中“图、表情、一张、看看”等词时保留；其余按概率。关键词匹配可能误判。' }, f.sw('stickers.keywordExemption', { title: '纯表情或提到图片时保留（实验性）' })) : null,
