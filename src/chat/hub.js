@@ -1,3 +1,4 @@
+import { archiveSessions } from './session-reset.js'
 import { ignoredGroupMember } from './member-filter.js'
 import { preserveReplyStickers } from './sticker-policy.js'
 // 消息中枢：QQ 会话 ↔ DSH 会话。
@@ -1064,6 +1065,33 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     }
   }
 
+  /** DSH schedules / sidebar turns bypass agentFor(): restore only durable QQ bindings. */
+  function restoreAgent(agent) {
+    if (disposed || !agent) return false
+    const key = sessionKey(agent.session?.id ?? agent.id)
+    const reg = dsh.workspaceRegistry || dsh.get('workspaceRegistry')
+    if ((reg?.archivedSessionIds || []).some((id) => sessionKey(id) === key)) return false
+    const found = findSession(key)
+    if (!found) return false
+    const { chatId } = found
+    const target = /^(private|group):(\d+)$/.exec(chatId)
+    if (!target) return false
+    const chat = { chatId, kind: target[1], userId: target[1] === 'private' ? target[2] : '', groupId: target[1] === 'group' ? target[2] : '', nickname: '' }
+    const restore = () => {
+      const cfg = getConfig()
+      if (!checkAllowed(cfg, chat).allowed) return false
+      const level = levelFor(cfg, chat)
+      sessionToChat.set(key, chatId)
+      mount(agent, chat, level)
+      return true
+    }
+    return personaScope.run(found.persona, restore)
+  }
+
+  function restoreLiveSessions() {
+    for (const agent of dsh.agents.list?.() || []) restoreAgent(agent)
+  }
+
   function unmount(rec) {
     mounts.delete(rec)
     for (const [k, g] of groupGates) {
@@ -1859,6 +1887,11 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
 
   // DSH 的回调，不在收消息那条异步链上：按这个会话所属的人格固定，回复和流水才记到对的人格
   function onSessionEvent(session, event) {
+    if (event?.type === 'turn/start') {
+      const sid = String(session?.id || '')
+      const agent = dsh.agents.get(sid) || dsh.agents.get('session-' + sessionKey(sid)) || dsh.agents.get(sessionKey(sid))
+      if (agent) restoreAgent(agent)
+    }
     const key = sessionKey(session && session.id)
     // 回合结束时内存映射可能已空（刚重启），退回持久化的映射，别把这一轮丢了（#159）。
     // 中间段也一样要兜底：重启后第一段正文可能早于 turn/end 到达，拿不到 chatId 就整段丢了。
@@ -3579,7 +3612,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     for (const { id } of personaDataRoots(getConfig())) {
       try {
         for (const [chatId, entry] of Object.entries(map(id).chats || {})) {
-          if (!entry?.sessionId || sessionKey(entry.sessionId) !== key) continue
+          if (![entry?.sessionId, ...Object.values(entry?.sessions || {})].some((sid) => sid && sessionKey(sid) === key)) continue
           sessionPersona.set(key, id)
           return { chatId, persona: id }
         }
@@ -3610,8 +3643,59 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     return mounted.has(sessionKey(sessionId))
   }
 
-  /** 只让一个聊天重新开始：归档它的会话，下一条消息开新会话。 */
-  function resetChat(chatId, { memoryResetAt: cutoff = 0 } = {}) {
+  // Serialize reset requests. Keep the map until archive succeeds, including schedule refusals.
+  let resetting = Promise.resolve()
+  const queueReset = (fn) => {
+    const work = resetting.then(() => { assertActive(); return fn() })
+    resetting = work.catch(() => {})
+    return work
+  }
+
+  function forgetArchived({ sessionId, chatId, persona }) {
+    if (chatId) {
+      const m = map(persona)
+      const e = m.chats[chatId]
+      if (e) {
+        const matches = (id) => id && sessionKey(id) === sessionKey(sessionId)
+        const sessions = Object.fromEntries(Object.entries(e.sessions || {}).filter(([, id]) => !matches(id)))
+        const currentRemoved = matches(e.sessionId)
+        if (currentRemoved && !Object.keys(sessions).length) delete m.chats[chatId]
+        else m.chats[chatId] = { ...e, sessions, ...(currentRemoved ? { sessionId: Object.values(sessions)[0], mode: Object.keys(sessions)[0] } : {}) }
+      }
+      saveMap(m, persona)
+    }
+    const key = sessionKey(sessionId)
+    sessionToChat.delete(key)
+    turnState.delete(key)
+    const rec = mounted.get(key)
+    if (rec) unmount(rec)
+    mounted.delete(key)
+    clearSlowNotices(key)
+    stopTyping(key)
+    historySeeded.delete(key)
+    if (chatId) outputSources.delete(chatId)
+  }
+
+  function resetEntries(entries) {
+    return archiveSessions({ registry: dsh.workspaceRegistry || dsh.get('workspaceRegistry'), entries,
+      forget: forgetArchived, assertActive, log })
+  }
+
+  /** Await completion; false means no binding, rejection means the binding was retained. */
+  function resetChat(chatId) {
+    const persona = pnow()
+    return queueReset(async () => {
+      const e = map(persona).chats[chatId]
+      if (!e) return false
+      const entries = [...new Set([e.sessionId, ...Object.values(e.sessions || {})].filter(Boolean))].map((sessionId) => ({ sessionId, chatId, persona }))
+      await resetEntries(entries)
+      log.info(`${chatId} 重新开始`)
+      return true
+    })
+  }
+
+  // 清理记忆的隐私截止线与普通重开不同：保留原来的同步清理契约。
+  function resetPersonHistory(chatId, { memoryResetAt: cutoff = 0 } = {}) {
     const reg = dsh.workspaceRegistry || dsh.get('workspaceRegistry')
     const m = map()
     const entry = m.chats[chatId]
@@ -3654,7 +3738,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       return { ok: false, message: '该私聊正在回复，请等这轮结束后再清理' }
     }
     const cutoff = Date.now()
-    resetChat(chatId, { memoryResetAt: cutoff })
+    resetPersonHistory(chatId, { memoryResetAt: cutoff })
     clearTimeout(pending.get(chatId)?.timer)
     pending.delete(chatId)
     busy.delete(chatId)
@@ -3671,44 +3755,24 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     return { ok: true }
   }
 
-  /** 重新开始：把现有的 QQ 会话都归档（侧栏里还能找回），下一条消息起开新会话。 */
+
+  /** Await and count actual unique archives; partial failure retains failed bindings. */
   function resetSessions() {
-    const reg = dsh.workspaceRegistry || dsh.get('workspaceRegistry')
-    let n = 0
-    // 所有人格的会话表都清空：留着不是当前人格的映射，切回去时会把刚归档的旧会话解归档接着用
-    for (const { id } of personaDataRoots(getConfig())) n += resetMap(reg, id)
-    // 专用工作区里其他零散的会话（比如手动点「新会话」留下的空白会话）也一起归档
-    try {
+    return queueReset(async () => {
+      const reg = dsh.workspaceRegistry || dsh.get('workspaceRegistry')
+      const entries = []
+      for (const persona of personaDataRoots(getConfig()).map((p) => p.id)) {
+        for (const [chatId, e] of Object.entries(map(persona).chats || {})) {
+          for (const sessionId of [...new Set([e.sessionId, ...Object.values(e.sessions || {})].filter(Boolean))]) entries.push({ sessionId, chatId, persona })
+        }
+      }
       const norm = (p) => String(p || '').replace(/[\\/]+$/, '').toLowerCase()
       const ws = (reg?.list?.() || []).find((w) => norm(w.path) === norm(workspaceDirOf(getConfig())))
-      for (const sid of ws?.sessionIds || []) {
-        if ((reg.archivedSessionIds || []).includes(sid)) continue
-        Promise.resolve(reg.archiveSession(sid)).catch(() => {})
-        n++
-      }
-    } catch (error) {}
-    log.info(`重新开始：归档了 ${n} 个 QQ 会话`)
-    return n
-  }
-
-  function resetMap(reg, pid) {
-    const m = map(pid)
-    let n = 0
-    for (const [chatId, e] of Object.entries(m.chats)) {
-      try {
-        // 可能返回 Promise：必须接住 rejection，未处理的 rejection 会让 DSH 宿主退出
-        Promise.resolve(reg?.archiveSession?.(e.sessionId)).catch((error) => log.debug('归档会话失败：', error.message))
-      } catch (error) {
-        log.debug('归档会话失败：', error.message)
-      }
-      sessionToChat.delete(sessionKey(e.sessionId))
-      turnState.delete(sessionKey(e.sessionId))
-      outputSources.delete(chatId)
-      delete m.chats[chatId]
-      n++
-    }
-    if (n) saveMap(m, pid)
-    return n
+      for (const sessionId of ws?.sessionIds || []) entries.push({ sessionId })
+      const r = await resetEntries(entries)
+      log.info(`重新开始：归档了 ${r.archived} 个 QQ 会话`)
+      return r.archived
+    })
   }
 
   /** 模拟测试：fn 里发出去的消息都记下来不真发，返回 { result, sent }。 */
@@ -3940,6 +4004,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     turnHasOwner,
     turnSenders,
     resetChat,
+    restoreAgent,
+    restoreLiveSessions,
     resetPersonChat,
     memoryResetAt,
     filterHistory,

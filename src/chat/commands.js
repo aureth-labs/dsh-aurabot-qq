@@ -236,8 +236,14 @@ export async function runCommand(cmd, msg, deps) {
       return '这次记忆保存未确认，请先在记忆面板查看；详细原因请主人查看本机日志。'
     }
     case 'reset':
-      hub.resetChat(msg.chatId)
-      return '好，我们重新开始'
+      try {
+        return await hub.resetChat(msg.chatId)
+          ? '好，我们重新开始；下一条普通消息会新建会话，长期记忆保留。'
+          : '当前没有已绑定的 QQ 会话；下一条普通消息会新建会话，长期记忆保留。'
+      } catch (error) {
+        deps.log?.warn?.('重开会话失败：', error.message)
+        return error?.code === 'AURABOT_RESET_PARTIAL' ? error.message : '这次没能重开，会话未确认归档；请查看本机日志。'
+      }
     case 'on':
       setConfig({ ...cfg, enabled: true })
       return cfg.dryRun ? '总开关打开了（现在是试运行，我说的话只进日志）' : '我上线啦'

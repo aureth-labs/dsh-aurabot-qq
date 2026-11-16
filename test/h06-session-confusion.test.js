@@ -76,7 +76,7 @@ test('H06-a：resetChat 归档旧会话后，旧一轮的回复不得投递到 Q
   const oldSid = sidOf(`private:${GUEST}`)
   assert.ok(oldSid, '旧会话应已创建')
   // 归档旧会话：映射删除、turnState 删除
-  assert.equal(api.hub.resetChat(`private:${GUEST}`), true, 'resetChat 应成功')
+  assert.equal(await api.hub.resetChat(`private:${GUEST}`), true, 'resetChat 应成功')
   // 放开旧一轮：它结束时 chatId 反查不到，必须静默丢弃
   globalThis.__h06.hangRelease()
   await until(() => fake.turns.some((t) => t.sessionId === oldSid), 5000)

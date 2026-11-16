@@ -168,7 +168,7 @@ QQ 主人命令的参数或回执涉及隐私时，可用 `api.command({ name: '
 
 | | |
 |---|---|
-| `hub` | 聊天中枢：`deliver(chatId, text)` `sendText` `sendVoice(chatId, 文字)` `sendVoiceFile(chatId, 音频文件)` `sendImage` `sendSticker(chatId, 名字)` `sendSegments` `runSystemTurn(名字, 标题, 提示词)` `pushToSession(...)` `resetChat(chatId)` `groupName(群号)` `turnHasOwner(sessionId)`（只表示本轮有人是主人，别拿它做权限门，用下面的 `turnSendersAllOwner`） `turnSendersAllOwner(sessionId)` `referenceImage(chat, 'last' 或 'quote')`（取当前聊天最近收到 / 引用的图，返回 Buffer，沿用短期缓存） `chatOfSession(sessionId)` `stats()` `sessions()` `chatLogOf(日期)` `recentMessagesOf(chatId, limit)`（原话档案开启后，当前人物同一聊天的近期消息，默认 32、最多 256 条） `lastChatAt` `lastOwnerChatAt` …… |
+| `hub` | 聊天中枢：`deliver(chatId, text)` `sendText` `sendVoice(chatId, 文字)` `sendVoiceFile(chatId, 音频文件)` `sendImage` `sendSticker(chatId, 名字)` `sendSegments` `runSystemTurn(名字, 标题, 提示词)` `pushToSession(...)` `await resetChat(chatId)`（归档成功返回 true，无绑定返回 false；归档失败会拒绝且保留绑定） `groupName(群号)` `turnHasOwner(sessionId)`（只表示本轮有人是主人，别拿它做权限门，用下面的 `turnSendersAllOwner`） `turnSendersAllOwner(sessionId)` `referenceImage(chat, 'last' 或 'quote')`（取当前聊天最近收到 / 引用的图，返回 Buffer，沿用短期缓存） `chatOfSession(sessionId)` `stats()` `sessions()` `chatLogOf(日期)` `recentMessagesOf(chatId, limit)`（原话档案开启后，当前人物同一聊天的近期消息，默认 32、最多 256 条） `lastChatAt` `lastOwnerChatAt` …… |
 | `media` | 通用媒体读取与转换辅助：`mimeOf(bytes)`、`avatar()`、`sticker(md5)`、`ffmpegPath()`、`parseWav(bytes)`、`toMono16k(bytes)`，详见下文（1.3.0 起） |
 | `onebot` | QQ 网关：`call(action, params, { timeoutMs })`、`state` |
 | `snowluma` | SnowLuma 管理：`running()` `start()` `stop()` `detect()` …… |

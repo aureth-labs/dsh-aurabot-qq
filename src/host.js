@@ -1103,6 +1103,15 @@ export function apply(ctx) {
   }
 
 
+  // agent/created is awaited by DSH before a schedule can start its first turn.
+  // Existing agents also need restoration after plugin reload; pre-step is too late for tools.resolve.
+  ctx.effect(() => ctx.on('agent/created', async ({ agent }) => {
+    if (!/^(private|group):/.test(hub.chatOfSession(agent?.session?.id ?? agent?.id))) return
+    await booted
+    if (!unloaded) hub.restoreAgent(agent)
+  }))
+  booted.then(() => { if (!unloaded) hub.restoreLiveSessions() }).catch((error) => log.warn('恢复 QQ 会话工具失败：', error.message))
+
   // ---------- 盯会话：一轮结束就发回 QQ ----------
   ctx.effect(() => {
     const off = ctx.on('session/event', (session, event) => {
@@ -2136,8 +2145,13 @@ export function apply(ctx) {
   })
 
   route('/sessions/reset', async () => {
-    const n = hub.resetSessions()
-    return { ok: true, message: n ? `归档了 ${n} 个会话，下一条消息起她会重新开始` : '本来就没有会话' }
+    try {
+      const n = await hub.resetSessions()
+      return { ok: true, message: n ? `已归档 ${n} 个会话，下一条普通消息起重新开始；长期记忆保留` : '没有需要归档的会话；下一条普通消息会新建会话' }
+    } catch (error) {
+      log.warn('重开 QQ 会话未完成：', error.message)
+      return { ok: false, message: error?.code === 'AURABOT_RESET_PARTIAL' ? error.message : '这次没能重开；请查看本机日志', ...(error.result ? { result: error.result } : {}) }
+    }
   })
 
   // 人格：新增写操作显式限制 POST，避免 GET 绕过 CSRF 方法检查。
