@@ -1641,7 +1641,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const texts = items.filter((i) => i.kind === 'text')
     if (!interim && cfg.voice.enabled && items.length === texts.length && texts.length > 0) {
       const all = texts.map((t) => t.value).join('，')
-      if (all.length <= cfg.voice.autoMaxChars && Math.random() < cfg.voice.autoChance * mood().voice) items = [{ kind: 'voice', value: all }]
+      // 自动语音不能吞掉真正的 @ 提醒或 QQ 小黄脸；明确要语音的路径在上面处理。
+      if (!hasMention(all) && !/<face:/i.test(all) && all.length <= cfg.voice.autoMaxChars && Math.random() < cfg.voice.autoChance * mood().voice) items = [{ kind: 'voice', value: all }]
     }
     const inGroup = chatId.startsWith('group:')
     // 按概率补一张表情（群里已经有两条以上就不补了）

@@ -25,12 +25,12 @@ export default {
         // 表情包关着就不挂「发表情」（整理表情库的工具照样留着）
         ...(api.config().stickers.enabled ? [defineTool({
           name: 'qq_send_sticker',
-          description: '在当前 QQ 聊天里发一张表情包。name 写表情的名字或情绪（如「委屈」「开心」「早晚安」），会在表情库里模糊匹配。一般直接在回复里写 <sticker:名字> 就行，这个工具用于回复之外单独补发。',
+          description: '在当前 QQ 聊天里发一张表情包。name 写表情的名字或情绪（如「委屈」「开心」「早晚安」），会在表情库里模糊匹配。一般直接在回复里写 <sticker:名字> 就行，这个工具用于回复之外单独发送。先选好再发，成功后不要为了重新挑选而重复发送；按对方要求的数量停止。',
           properties: { name: str('表情名字或情绪关键词') },
           required: ['name'],
           execute: async ({ name }) => {
             const ok = await hub.sendSticker(current, String(name || ''))
-            return ok ? { ok: true, message: '发了' } : { ok: false, message: '表情库里没找到合适的' }
+            return ok ? { ok: true, message: '已向当前聊天成功发送 1 张表情包；对方只要 1 张时，任务已完成，不再补发。' } : { ok: false, message: '未确认发送成功：可能没有匹配的表情，或发送被拦截、网关失败；先检查原因，不要反复调用。' }
           },
         })] : []),
         defineTool({

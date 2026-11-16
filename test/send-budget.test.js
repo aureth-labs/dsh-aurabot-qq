@@ -198,3 +198,17 @@ test('explicit no-image and one-voice formats override decorative module output 
   assert.equal(s.sends().length, 4)
   assert.ok(s.sends()[3].params.message.some(it => it.type === 'image'))
 })
+
+test('automatic voice conversion preserves real mentions and QQ faces', async t => {
+  const s = setup(t)
+  s.cfg.voice.autoChance = 1
+  s.cfg.voice.autoMaxChars = 200
+  await s.hub.deliver('group:2', '<at:12345> 别忘了保存文件', { simulate: true })
+  await s.hub.deliver('group:2', '收到<face:呲牙>', { simulate: true })
+  assert.equal(s.sends().length, 2)
+  assert.ok(s.sends()[0].params.message.some(it => it.type === 'at' && it.data.qq === '12345'))
+  assert.ok(s.sends()[1].params.message.some(it => it.type === 'face'))
+  assert.ok(s.sends().every(c => !c.params.message.some(it => it.type === 'record')))
+  await s.hub.deliver('private:1', '晚安', { simulate: true })
+  assert.ok(s.sends()[2].params.message.some(it => it.type === 'record'), 'ordinary short replies still support automatic voice')
+})
