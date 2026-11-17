@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createFakeDsh } from './helpers/fake-dsh.js'
-import { createRuntime } from '../src/autotelic/runtime.js'
+import { createBook } from '../src/autotelic/book.js'
 import { createJournal } from '../src/autotelic/reflect.js'
 
 const OWNER = '10000001'
@@ -30,7 +30,7 @@ before(async () => {
   fake = createFakeDsh({ brain: async () => '嗯' })
   const host = await import('../src/host.js')
   api = host.apply(fake.ctx)
-  await fake.call('/persona/save', { id: 'xiaoxing', name: '小星', tags: [], body: '你是小星。' })
+  await fake.call('/persona/save', { id: 'shoko', name: '翔子', tags: [], body: '你是牧之原翔子。' })
 })
 
 after(() => {
@@ -42,7 +42,7 @@ const use = async (id) => {
   const r = await fake.call('/persona/use', { id })
   assert.equal(r.json().ok, true, r.raw())
 }
-const xiaoxingDir = (...parts) => join(dataDir, 'persona-data', 'xiaoxing', ...parts)
+const shokoDir = (...parts) => join(dataDir, 'persona-data', 'shoko', ...parts)
 // 「心里想要」附在本轮消息末尾（和心情一样），不进系统提示词，免得它一变整段缓存失效
 const turn = async () => {
   const content = await api.modules.filter('prompt', [{ type: 'text', text: '【私聊】主人：在吗' }], { chat: { kind: 'private', userId: OWNER, chatId: `private:${OWNER}` }, sessionId: 's' })
@@ -53,15 +53,15 @@ const drives = (dir, need) => {
   writeFileSync(join(dir, 'purpose', 'purpose-state.json'), JSON.stringify({ drives: { [need]: 0.9 } }))
 }
 
-test('心情跟着人格走：大肥鱼开心的原因不带到小星身上，切回来还在', async () => {
+test('心情跟着人格走：大肥鱼开心的原因不带到翔子身上，切回来还在', async () => {
   assert.equal(api.getConfig().persona.dataOwner, 'dafeiyu')
   api.mood.nudge(20, '主人夸她可爱')
   assert.match(api.mood.state().reason, /主人夸她可爱/)
   assert.ok(existsSync(join(dataDir, 'mood.json')), '根目录人格的心情还在老位置')
-  await use('xiaoxing')
+  await use('shoko')
   assert.doesNotMatch(api.mood.state().reason || '', /主人夸她可爱/)
   api.mood.nudge(-10, '下雨了')
-  assert.ok(existsSync(xiaoxingDir('mood.json')))
+  assert.ok(existsSync(shokoDir('mood.json')))
   await use('dafeiyu')
   assert.match(api.mood.state().reason, /主人夸她可爱/)
 })
@@ -70,9 +70,9 @@ test('目的引擎的状态跟着人格走：「心里想要什么」只注入�
   await use('dafeiyu')
   drives(dataDir, 'connect')
   assert.match(await turn(), /你最近心里比较想要：陪/)
-  await use('xiaoxing')
-  assert.doesNotMatch(await turn(), /你最近心里比较想要/, '小星还没有自己的目的状态')
-  drives(xiaoxingDir(), 'share')
+  await use('shoko')
+  assert.doesNotMatch(await turn(), /你最近心里比较想要/, '翔子还没有自己的目的状态')
+  drives(shokoDir(), 'share')
   assert.match(await turn(), /你最近心里比较想要：分享/)
   await use('dafeiyu')
   assert.match(await turn(), /你最近心里比较想要：陪/)
@@ -91,19 +91,18 @@ test('「心里想要」附在本轮消息末尾，不进系统提示词；后�
 test('autotelic 账本按当时的文件取：换了人格就换一本，切回来接着记', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'aurabot-ledger-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
-  let file = join(dir, 'a', 'ledger.json')
-  const rt = createRuntime({
-    settings: () => ({ maxTasksActive: 3, maxSteps: 8, budgetActionsPerHour: 12 }),
-    hub: {},
-    ledgerFile: () => file,
-  })
-  rt.book().heartbeat('大肥鱼的一拍')
-  file = join(dir, 'b', 'ledger.json')
-  assert.equal(rt.book().meta().ticks.length, 0, '小星的账本是空的')
-  rt.book().heartbeat('小星的一拍')
-  file = join(dir, 'a', 'ledger.json')
-  assert.deepEqual(rt.book().meta().ticks.map((x) => x.outcome), ['大肥鱼的一拍'])
-  assert.deepEqual(JSON.parse(readFileSync(join(dir, 'b', 'ledger.json'), 'utf8')).ticks.map((x) => x.outcome), ['小星的一拍'])
+  // v5：模块壳按 own() 的目录惰性建账本（getBook），人格一换目录一换就换一本——这里按同样口径验 book 本体
+  const mkBook = (file) => createBook({ file, now: () => Date.now() })
+  const fileA = join(dir, 'a', 'ledger.json')
+  const bA = mkBook(fileA)
+  bA.heartbeat('大肥鱼的一拍')
+  const fileB = join(dir, 'b', 'ledger.json')
+  const bB = mkBook(fileB)
+  assert.equal(bB.meta().ticks.length, 0, '翔子的账本是空的')
+  bB.heartbeat('翔子的一拍')
+  const bA2 = mkBook(fileA)
+  assert.deepEqual(bA2.meta().ticks.map((x) => x.outcome), ['大肥鱼的一拍'])
+  assert.deepEqual(JSON.parse(readFileSync(fileB, 'utf8')).ticks.map((x) => x.outcome), ['翔子的一拍'])
 })
 
 test('autotelic 日志按当时的目录写', (t) => {

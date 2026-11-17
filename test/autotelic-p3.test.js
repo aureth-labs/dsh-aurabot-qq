@@ -194,7 +194,7 @@ test('autotelic_run_python：能力关了就拒；探测不到 Python 也优雅�
 test('autotelic_propose_say（场景 11）：安静时段先攒着不 submit；平时交治理；unsupported/dropped 都优雅', async (t) => {
   // 安静时段：攒着，submit 不被调
   let submits = 0
-  const quiet = mkApi(t, { settings: { quietFrom: '00:00', quietTo: '23:59' }, submit: async () => { submits++; return { state: 'pending' } } })
+  const quiet = mkApi(t, { settings: { awakeFrom: 2, awakeTo: 3 }, submit: async () => { submits++; return { state: 'pending' } } }) // v5：醒着窗口 2~3 点 → 此刻必在安静时段
   const rq = await quiet.call('autotelic_propose_say', { text: '今天学会了裁切' })
   assert.equal(rq.ok, true)
   assert.match(rq.message, /攒着/)
