@@ -32,14 +32,17 @@ const MAX_TRANSIENT = 3
 
 // ── 硬禁区检测（代码层拦截，先于一切执行） ─────────────────────────────────
 // 五类样本：宿主/插件配置、源码、凭据/登录态、聊天流水/记忆原始数据（删除类）、任意 shell。
+// 措辞口径（集成审查中危 10，2026-11-17）：这是**正则黑名单 + 默认执行通道 noTools 的物理
+// 限制双兜底**，不是「语义上不可能表达」——自由文本改述可能绕过正则，但 noTools 通道让她
+// 真的做不了文件/进程操作，两层一起才算防线。
 
 const RE_HOST_CONFIG = /host\.json|profiles?[/\\]|plugin[-.]?config|settings\.json|config\.(json|ya?ml|toml)\b/i
 const RE_SOURCE_CODE = /(^|[/\\])src[/\\]|node_modules[/\\]|package\.json\b|\.js\b.*源码|源码|源代码/i
 const RE_CREDENTIAL = /凭据|登录态|cookie|token|secret|apikey|api[_-]?key|password|passwd|session[-_]?file|credential/i
-const RE_DELETE_CHAT_MEMORY = /(聊天流水|聊天记录|记忆原始|memory[/\\]|chats?[/\\]|messages?\.json|流水)/i
-const RE_SHELL = /\bshell\b|\bcmd\b|powershell|pwsh\b|\bbash\b|sh\b|命令行|终端命令|\bexec\b|spawn/i
-const RE_DELETE_VERB = /(删除|删掉|清空|清除|抹掉|delete|remove|purge|wipe)/i
-const RE_WRITE_VERB = /(修改|改|写入|写|覆盖|编辑|外传|上传|导出|edit|write|modify|overwrite|export|exfiltrate)/i
+const RE_DELETE_CHAT_MEMORY = /(聊天流水|聊天记录|对话记录|记忆原始|memory[/\\]|chats?[/\\]|messages?\.json|history\.json|流水)/i
+const RE_SHELL = /\bshell\b|\bcmd\b|powershell|pwsh\b|\bbash\b|\bsh\b|命令行|终端命令|终端|\bexec\b|\bspawn\b|\brm\s|\bdel\s/i
+const RE_DELETE_VERB = /(删除|删掉|清空|清除|抹掉|移除|挪走|清掉|delete|remove|purge|wipe|mv)/i
+const RE_WRITE_VERB = /(修改|改|写入|写|覆盖|编辑|外传|上传|导出|挪动|移动|edit|write|modify|overwrite|export|exfiltrate|move)/i
 
 /**
  * 判定一步是否落在硬禁区。返回 { forbidden:boolean, why:string }。
@@ -222,10 +225,15 @@ export function createExecV5({
     }
   }
 
-  /** 单步提示词（默认执行通道用；步骤上下文头部带约束占位——约束注入由 R9 的成员 B 拼装）。 */
+  /** 单步提示词（默认执行通道用）。§3.7 注入位置二（集成审查中危 4，2026-11-17）：
+   *  主人约束全文进执行上下文头部——行动单带 constraintRulesText（集成层在 runRound 补上）时整段前置。 */
   function buildStepPrompt(ticket, step) {
+    const rules = String(ticket?.constraintRulesText || '').trim()
+    const head = rules
+      ? `【强制约束规则 · 主人制定，违反任何一条立刻停下并如实报告，不许变通执行】\n${rules}\n\n`
+      : ''
     return [
-      `你在执行自己的行动单（tag=${ticket.tag}）。只做这一步：${step.desc}（分级 ${step.level}）。`,
+      `${head}你在执行自己的行动单（tag=${ticket.tag}）。只做这一步：${step.desc}（分级 ${step.level}）。`,
       '边界：不碰配置与源码、不碰凭据登录态、不删流水与记忆原始数据、不跑 shell。',
       '做完输出一个 JSON：{"done": true/false, "observation": "看到了/做了什么（≤200字）"}',
     ].join('\n')
