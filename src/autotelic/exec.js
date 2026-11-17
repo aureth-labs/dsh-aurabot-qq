@@ -278,6 +278,15 @@ export function createExecV5({
     return execute(item.ticket, { plan: item.plan }, item.touchIndexes)
   }
 
+  /** 确认队列里的一单取消（面板「取消」按钮，2026-11-17）：不执行任何一步，直接 aborted 收场。 */
+  function cancel(ticketId) {
+    const item = pendingConfirms.get(String(ticketId))
+    if (!item) return { status: 'unknown', why: '没有这张待确认的行动单' }
+    pendingConfirms.delete(String(ticketId))
+    auditNote?.({ kind: 'autotelic/ticket-cancel', tool: 'exec-v5', args: { ticket: String(ticketId), tag: item.ticket.tag }, outcome: '主人取消，行动单作废' })
+    return settle(item.ticket, { status: 'aborted', why: '主人在确认队列里取消', plan: item.plan })
+  }
+
   /** 待确认清单（面板用）；顺带做过期清扫：超窗自动取消 → aborted。 */
   function pendingList() {
     const out = []
@@ -341,7 +350,7 @@ export function createExecV5({
   }
 
   return {
-    run, confirm, pendingList,
+    run, confirm, cancel, pendingList,
     /** 测试/面板用：某 tag 最近一次主动发言时刻。 */
     lastSpokeOf: (tag) => spokeAt(tag),
   }

@@ -750,6 +750,11 @@ export default {
       if (body?.list) return { ok: true, pending: exec.pendingList() }
       const ticketId = String(body?.ticketId || '')
       if (!ticketId) return { ok: false, message: '缺 ticketId', pending: exec.pendingList() }
+      // 取消：不执行任何一步，行动单作废（面板「取消」按钮）
+      if (body?.action === 'cancel') {
+        const rc = exec.cancel(ticketId)
+        return { ok: rc.status === 'aborted', message: `行动单 ${ticketId}：${rc.status}${rc.why ? '（' + rc.why + '）' : ''}`, ...rc, pending: exec.pendingList() }
+      }
       // 主人点了确认 = 真实投递 → 这时才开回应观察窗（集成审查中危 8：排队中不折靡冷度）
       const pendingItem = exec.pendingList().find((p) => p.ticketId === ticketId)
       const r = await exec.confirm(ticketId)
