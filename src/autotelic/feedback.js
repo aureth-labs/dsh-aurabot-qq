@@ -146,10 +146,12 @@ export function createFeedback({ file = '', decisionsFile = '', settings = () =>
 
   // ── 无回应负反馈 ─────────────────────────────────────────────────────────
 
-  /** touch-owner 行动投递：开观察窗（responseWindowHours，默认 48h）。 */
-  function recordDelivery({ id, tag, at = now() } = {}) {
+  /** touch-owner 行动投递：开观察窗（responseWindowHours，默认 48h）。
+   *  text：立项意图原文（集成审查中危 8，2026-11-17）——回应判档按它做关键词匹配，
+   *  「窗口内主人说的话头对得上这次行动」才算回应，否则 ignored 信号被无关聊天稀释。 */
+  function recordDelivery({ id, tag, text = '', at = now() } = {}) {
     if (!id || !tag) return { ok: false }
-    state.windows = [...state.windows, { id: String(id), tag: String(tag), at }]
+    state.windows = [...state.windows, { id: String(id), tag: String(tag), text: String(text || '').slice(0, 160), at }]
     save()
     return { ok: true }
   }

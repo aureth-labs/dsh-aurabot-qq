@@ -174,7 +174,9 @@ export default {
       if (ctx) return ctx
       const feedback = createFeedback({
         file: own('feedback.json'),
-        decisionsFile: own('decisions.jsonl'),
+        // 中危 9（集成审查）：feedback 的事件流水另立文件，不再 append 进 decisions.jsonl——
+        // 那条链由 plan.js 的哈希链独占，旁路写入会被 verifyDecisionLog 判成断链。
+        decisionsFile: own('feedback-events.jsonl'),
         settings,
         log,
       })
@@ -329,11 +331,15 @@ export default {
         selfState,
         skillIndex,
         ticketBudget: { maxSteps: 4, timeoutMs: Number(s.scriptTimeoutMs) || 120000 },
+        // D15：前缀段走 prefix.js 的缓存拼装（同一输入永远同一输出，version hash 没变就不重拼）
+        systemPrefix: prefixText,
       })
-      void prefixText // 前缀版本只作缓存判断；decideRound 内部用同一输入自行拼装
       const dead = res.outcome !== 'tickets'
       const breaker = c.feedback.recordRound({ dead })
       if (dead) return { outcome: res.outcome, deadReasons: res.deadReasons, dropped: res.dropped, breaker }
+
+      // 5.5) park 挂起项：进下轮观察（挂起的念头不蒸发）+ 90 天复活检查（集成审查中危 6）
+      for (const p of res.parked || []) recordParked(p)
 
       // 6) 集成层前置否决（constraint.check 机械核对，排最前，§3.3 判据 0）+ 反馈权重过滤 → 执行
       const reviewer = makeReviewer()
@@ -350,13 +356,54 @@ export default {
           results.push({ ticket: tk.id, status: 'skipped', why: '该方向被抑制/park 中' })
           continue
         }
-        if (tk.ownerSide) c.feedback.recordDelivery({ id: tk.id, tag: tk.tag }) // 开回应观察窗（§3.6）
+        // §3.7 注入位置二：约束全文进行动单，exec 会在每个执行回合头部前置
+        tk.constraintRulesText = constraintRulesText
+        // 必修①（D9 链路）：立项时把「她会不会这件事」锚到既有技能——resolveMethod 命中
+        // 就写 skillId（exec 终态落账时会调 skills.recordOutcome(skillId, …)）；
+        // 未命中（探索模式）不硬凑，行动结束后按对象形态 { tag, status } 记账（skills 已支持）。
+        const method = c.skillsStore.resolveMethod(tk.tag, { kind: tk.tag, text: `${tk.intent} ${tk.reason}` })
+        if (method?.doc?.meta?.id) tk.skillId = method.doc.meta.id
+        // recordDelivery 挪到真实投递之后（集成审查中危 8 后半）：确认排队中不开观察窗，
+        // 免得没发出去的行动到点被记 ignored 折磨冷度。
         const outcome = await exec.run(tk, { plan: { reviewRound: reviewer } })
+        if (tk.ownerSide && outcome.status !== 'queued') c.feedback.recordDelivery({ id: tk.id, tag: tk.tag, text: tk.intent })
+        // 未锚到技能的行动单：熟练度链路也要全通——按对象形态记账（aborted 内部不计分）；
+        // 库里还没有该方向条目时（探索模式），把真实终态立为候选记忆（下一轮就能被 resolveMethod 命中）
+        if (!tk.skillId && (outcome.status === 'done' || outcome.status === 'failed')) {
+          try {
+            const rec = c.skillsStore.recordOutcome({ tag: tk.tag, status: outcome.status, ownerResponse: outcome.ownerResponse || '' })
+            if (!rec.ok && String(rec.why || '').includes('落不到任何条目')) {
+              c.skillsStore.ingestReflection({ topic: tk.tag, text: `行动「${tk.intent}」真实复用终态 ${outcome.status}（立为候选经验）`, finalStatus: outcome.status })
+            }
+          } catch (e) { log.debug?.('自驱v5：终态记账失败：', e?.message) }
+        }
         results.push({ ticket: tk.id, status: outcome.status, why: outcome.why || '' })
         if (outcome.status === 'aborted' || outcome.status === 'rejected') c.feedback.recordStop()
       }
       return { outcome: 'tickets', tickets: res.tickets.map((t) => ({ id: t.id, intent: t.intent, tag: t.tag })), results, breaker }
     }
+
+    // ---------- park 挂起表：挂起的念头进下轮观察 + 90 天复活检查（集成审查中危 6） ----------
+    function recordParked(p) {
+      const file = own('parked.json')
+      const list = readJsonSafe(file, [])
+      const at = Date.now()
+      const entry = { title: String(p.title || '').slice(0, 120), tag: String(p.tag || ''), evidence: Array.isArray(p.evidence) ? p.evidence : [], gateWhy: String(p.gateWhy || '').slice(0, 160), parkedAt: at }
+      // 复活检查：挂满 90 天的念头——摘掉，写一条高显著度观察让下一轮重新惦记它
+      const revive = []
+      const keep = []
+      for (const e of [...list, entry]) {
+        if (at - (e.parkedAt || 0) >= 90 * 24 * 3600_000) revive.push(e)
+        else keep.push(e)
+      }
+      writeJsonSafe(file, keep.slice(-50))
+      const tagOf = (t) => (isValidParkTag(t) ? t : '未完成')
+      for (const e of revive) {
+        observe.append({ source: 'note', tag: tagOf(e.tag), text: `这个念头挂了 90 天，重新想想：${e.title}`, salience: 0.9 })
+      }
+      observe.append({ source: 'note', tag: tagOf(entry.tag), text: `有个念头被自己挂起了（等换个时机或主人松口）：${entry.title}`, salience: 0.8 })
+    }
+    function isValidParkTag(tag) { try { return resolveTags((...p) => api.dataDir(...p)).includes(tag) } catch { return false } }
 
     /** 面板 constraintRules 文本框 → constraints.txt 落盘（watcher 的真相来源）。 */
     async function syncConstraints() {
@@ -374,6 +421,11 @@ export default {
     const schedule = createSchedule({ settings, file: () => own('schedule.json'), run: runRound, hooks: { onError: (e) => log.debug?.('自驱v5：回味出错：', e?.message) } })
 
     // ---------- 主人回应记账（通道层规则，不耗模型调用，§3.6） ----------
+    /** 从一段文本里抽 ≥2 字关键词段（判「主人的话是否在回应这次行动」用）。 */
+    const keywordsOf = (text) => String(text || '')
+      .split(/[，。！？、；：,.!?;:\s（）()"「」''—…]+/)
+      .map((s) => s.trim())
+      .filter((s) => [...s].length >= 2)
     function scanOwnerReplies() {
       const c = ctxOf()
       const windows = c.feedback.snapshot().windows
@@ -388,10 +440,42 @@ export default {
       for (const w of windows) {
         const replies = entries.filter((e) => e?.chatId === `private:${ownerId}` && e.who !== 'bot' && (Number(e.t) || 0) >= w.at)
         if (!replies.length) continue
-        const last = replies[replies.length - 1]
+        // 中危 8（集成审查）：判档收紧——只有「话头对得上这次行动」的私聊才算回应，
+        // 主人在窗口里聊别的事不记 replied（否则 ignored 信号被稀释）。
+        const kws = keywordsOf(w.text || '')
+        const related = replies.filter((e) => {
+          const t = String(e.text || '')
+          return kws.some((k) => t.includes(k))
+        })
+        if (!related.length) continue // 窗口继续开着：真无关就等它到点记 ignored
+        const last = related[related.length - 1]
         const text = String(last.text || '').trim()
         const perfunctory = text.length < 6 || /^(嗯+|哦+|好+|行+|噢+|哈+|6+|666+)[。！~\s]*$/i.test(text)
         c.feedback.recordResponse(w.id, perfunctory ? 'perfunctory' : 'replied')
+      }
+    }
+
+    /** 恢复条件一（mention）自动检测（集成审查中危 7）：主人主动提及相关话题 → park 解封。 */
+    function scanParkMentions() {
+      const c = ctxOf()
+      const park = c.feedback.snapshot().park || {}
+      const tags = Object.keys(park)
+      if (!tags.length) return
+      const ownerId = String(api.core?.identity?.owner?.() || '')
+      if (!ownerId) return
+      let entries = []
+      try {
+        const days = hub.chatLogDays?.() || []
+        for (const day of days.slice(-2)) entries = entries.concat(hub.chatLogOf?.(day) || [])
+      } catch { return }
+      const ownerMsgs = entries.filter((e) => e?.chatId === `private:${ownerId}` && e.who !== 'bot')
+      for (const tag of tags) {
+        const sinceAt = park[tag]?.at || 0
+        const hit = ownerMsgs.find((e) => (Number(e.t) || 0) >= sinceAt && String(e.text || '').includes(tag))
+        if (hit) {
+          c.feedback.resume(tag, 'mention')
+          note({ kind: 'autotelic/resume-mention', args: { tag }, outcome: `主人主动提及相关话题，${tag} 解封` })
+        }
       }
     }
 
@@ -412,7 +496,8 @@ export default {
       try {
         const c = ctxOf()
         c.feedback.tick() // 回应窗到期记 ignored、冷度半衰
-        scanOwnerReplies() // 主人回话了 → replied/perfunctory 记账
+        scanOwnerReplies() // 主人回话了（且话头对得上）→ replied/perfunctory 记账
+        scanParkMentions() // 主人主动提及相关话题 → park 解封（恢复条件一）
         chatCollector.collect() // 聊天流水 → 观察
         emotionBridge.collect() // 情绪波动 → 观察（情绪也是经历）
         getBook().heartbeat('等待下一拍')
@@ -599,14 +684,6 @@ export default {
     })
 
     // ---------- 面板路由 ----------
-    api.route('/autotelic/skills', async () => {
-      const c = ctx?.skillsStore ? ctx : null
-      return {
-        ok: true,
-        list: oldSkills.list(),
-        v5: c ? { index: c.skillsStore.index(), stale: c.skillsStore.suggestStale(), snapshots: c.skillsStore.listSnapshots().slice(0, 20) } : null,
-      }
-    })
     api.route('/autotelic/proposals', async () => {
       let list = []
       try { list = readdirSync(own('proposals')).filter((f) => f.endsWith('.md')).sort().reverse().slice(0, 20) } catch {}
@@ -673,8 +750,33 @@ export default {
       if (body?.list) return { ok: true, pending: exec.pendingList() }
       const ticketId = String(body?.ticketId || '')
       if (!ticketId) return { ok: false, message: '缺 ticketId', pending: exec.pendingList() }
+      // 主人点了确认 = 真实投递 → 这时才开回应观察窗（集成审查中危 8：排队中不折靡冷度）
+      const pendingItem = exec.pendingList().find((p) => p.ticketId === ticketId)
       const r = await exec.confirm(ticketId)
+      if (pendingItem?.tag && r.status !== 'queued' && r.status !== 'aborted') {
+        c.feedback.recordDelivery({ id: ticketId, tag: pendingItem.tag, text: pendingItem.intent })
+      }
       return { ok: r.status === 'done' || r.status === 'failed', message: `行动单 ${ticketId}：${r.status}${r.why ? '（' + r.why + '）' : ''}`, ...r }
+    })
+    // 技能库面板口（GET 清单 + POST 回滚/归档——裁决一的安全兜底要能「按」不能只「看」，集成审查中危 5）。
+    api.route('/autotelic/skills', async (req) => {
+      const c = ctx?.skillsStore ? ctx : null
+      if (req && req.method === 'POST' && c) {
+        const body = await api.core.http.body(req).catch(() => ({}))
+        if (body?.action === 'rollback' && body.stamp) {
+          const r = c.skillsStore.rollback(String(body.stamp))
+          note({ kind: 'autotelic/skill-rollback', args: { stamp: body.stamp, restored: r.restored || 0 }, outcome: r.ok ? '主人一键回滚技能库快照' : (r.why || '回滚失败') })
+          return { ok: r.ok, message: r.ok ? `回滚了快照 ${body.stamp}（${r.restored} 个文件）` : (r.why || '回滚失败') }
+        }
+        if (body?.action === 'archive' && body.id) return { ok: true, ...c.skillsStore.archive(String(body.id)) }
+        if (body?.action === 'revise' && body.id) return { ok: true, ...c.skillsStore.revise(String(body.id), { content: body.content, title: body.title }) }
+        return { ok: false, message: '不认识的操作' }
+      }
+      return {
+        ok: true,
+        list: oldSkills.list(),
+        v5: c ? { index: c.skillsStore.index(), stale: c.skillsStore.suggestStale(), snapshots: c.skillsStore.listSnapshots().slice(0, 20) } : null,
+      }
     })
     // 反馈回路面板：快照 / 恢复 / 检视完成。
     api.route('/autotelic/feedback', async (req) => {
