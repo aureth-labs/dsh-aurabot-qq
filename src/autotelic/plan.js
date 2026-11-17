@@ -233,6 +233,36 @@ export function shuffle(arr, rng = Math.random) {
 }
 
 /**
+ * ②把关输入预算（§9.3 gateMaxInputTokens，集成审查必修③）：候选多、出处引用长时先裁——
+ * 降级顺序：先从队尾丢候选（把关宁可少评，未评到的 parseGateVerdicts 按 reject 保守兜底）
+ * → 再截出处条目；判据清单与前置否决条款**永不裁**（裁了它整个系统回到 v3）。
+ * @returns {{text:string, dropped:number}}
+ */
+export function trimGateInput({ text, maxInputTokens = DEFAULT_BUDGETS.gateMaxInputTokens } = {}) {
+  let t = String(text ?? '')
+  const m = t.match(/\[[\s\S]*\]/) // 候选块（buildGatePrompt 里唯一的 JSON 数组段）
+  if (!m) return { text: t, dropped: 0 }
+  let candidates = []
+  try { candidates = JSON.parse(m[0]) } catch { return { text: t, dropped: 0 } }
+  let dropped = 0
+  const sized = () => estimateTokens(t)
+  while (sized() > maxInputTokens && candidates.length > 1) {
+    candidates.pop() // 洗牌后的随机位次，从队尾丢无位置偏置
+    dropped++
+    t = t.replace(m[0], JSON.stringify(candidates))
+  }
+  if (sized() > maxInputTokens) {
+    const shortened = candidates.map((c) => {
+      const ev = Array.isArray(c?.evidence) ? c.evidence : []
+      if (ev.length > 1) return { ...c, evidence: [ev[0], ev[ev.length - 1]] } // 保留首尾两条出处
+      return c
+    })
+    t = t.replace(m[0], JSON.stringify(shortened))
+  }
+  return { text: t, dropped }
+}
+
+/**
  * ②把关 prompt（§3.7 注入位置一：约束条款在最前部；§3.2：隐藏生成侧 reason，只留候选+出处+判据）。
  * @param {object[]} candidates parseIntents 的候选（隐藏生成侧理由后随机排列）
  * @param {string} constraintRulesText 约束全文（前置否决条款）
@@ -300,6 +330,10 @@ export function parseGateVerdicts(raw, count) {
  */
 export function buildTicket({ candidate, index = 0, budget = {}, id = '', now = () => Date.now() } = {}) {
   const want = candidate.want || candidate.reason
+  // 步骤带 level（集成审查必修②，2026-11-17）：发言类（owner tag）标 touch-owner 走硬闸；
+  // 其余标 write-data——办一轮几乎总要写记忆/技能/草稿，exec 对 write-data 先快照再动手；
+  // 纯只读的甄别交给把关判据 2（「能用读一遍解决的不立项」），不在模板层猜。
+  const level = OWNER_TAGS.has(candidate.tag) ? 'touch-owner' : 'write-data'
   return {
     id: id || `tk-${now()}-${index + 1}`,
     intent: candidate.title,
@@ -309,6 +343,7 @@ export function buildTicket({ candidate, index = 0, budget = {}, id = '', now = 
     visionNote: candidate.visionNote || '',
     steps: [{
       desc: `围绕「${candidate.title}」办一轮：${want}。用既有能力办，别引入新外部能力。`,
+      level,
       status: 'pending',
     }],
     budget: { maxSteps: Number(budget.maxSteps) || 4, timeoutMs: Number(budget.timeoutMs) || 120_000 },
@@ -419,14 +454,17 @@ export function createPlanner({ decisionFile = '', hub = {}, settings = () => ({
      * @param {string} [o.skillIndex] 技能索引（id | 标题 | 标签）
      * @param {string} [o.backgroundHistory] 背景历史（预算紧张时第一个被裁）
      * @param {object} [o.ticketBudget] 行动单预算 {maxSteps, timeoutMs}
-     * @returns {{outcome:'tickets'|'all-dead'|'error', candidates, deadReasons, verdicts, tickets, dropped}}
+     * @param {string} [o.systemPrefix] 外部稳定前缀段（D15：集成层用 prefix.js 缓存拼好传入，
+     *   变更才重拼；不传则退回 buildSystemPrefix 现拼——两条路径不并存）
+     * @returns {{outcome:'tickets'|'all-dead'|'error', candidates, deadReasons, verdicts, whys, tickets, dropped}}
      */
-    async decideRound({ round = 0, persona = {}, constraintRulesText = '', observations = [], selfState = '', skillIndex = '', backgroundHistory = '', ticketBudget = {} } = {}) {
-      const out = { outcome: 'all-dead', candidates: [], deadReasons: [], verdicts: [], tickets: [], dropped: [] }
+    async decideRound({ round = 0, persona = {}, constraintRulesText = '', observations = [], selfState = '', skillIndex = '', backgroundHistory = '', ticketBudget = {}, systemPrefix = '' } = {}) {
+      const out = { outcome: 'all-dead', candidates: [], deadReasons: [], verdicts: [], whys: [], tickets: [], dropped: [] }
       const logLine = createDecisionLog({ file: decisionFile, now })
       try {
         // —— ① 意图生成 ——
-        const prefix = buildSystemPrefix({ personaSummary: persona.summary, instinctExtra: persona.instinctExtra, constraintRulesText })
+        const prefix = String(systemPrefix || '').trim()
+          || buildSystemPrefix({ personaSummary: persona.summary, instinctExtra: persona.instinctExtra, constraintRulesText })
         const assembled = assembleIntentInput({
           prefix, selfState, skillIndex, observations, backgroundHistory,
           maxInputTokens: budgetOf('intentMaxInputTokens', DEFAULT_BUDGETS.intentMaxInputTokens),
@@ -450,18 +488,37 @@ export function createPlanner({ decisionFile = '', hub = {}, settings = () => ({
           return out
         }
         // —— ② 自我把关 ——
-        const gateInput = buildGatePrompt({ candidates: shuffle(parsed.candidates, rng), constraintRulesText, observations })
-        const gateRaw = await doGate(gateInput, { timeoutMs: 60000, noTools: true, key: 'gate', maxOutputTokens: budgetOf('gateMaxOutputTokens', DEFAULT_BUDGETS.gateMaxOutputTokens) })
+        const gateRaw0 = buildGatePrompt({ candidates: shuffle(parsed.candidates, rng), constraintRulesText, observations })
+        const gateTrim = trimGateInput({ text: gateRaw0, maxInputTokens: budgetOf('gateMaxInputTokens', DEFAULT_BUDGETS.gateMaxInputTokens) })
+        const gateRaw = await doGate(gateTrim.text, { timeoutMs: 60000, noTools: true, key: 'gate', maxOutputTokens: budgetOf('gateMaxOutputTokens', DEFAULT_BUDGETS.gateMaxOutputTokens) })
         const gate = parseGateVerdicts(gateRaw, parsed.candidates.length)
         out.verdicts = gate.verdicts
+        out.whys = gate.whys
+        out.gateDropped = gateTrim.dropped
+        // rework =「改写后通过」（集成审查中危 6，2026-11-17）：把关的 why 即改写指引，附进行动单；
+        // park 挂起项由集成层接走（进下轮观察 + 90 天复活检查），这里只如实带出。
         const passed = []
-        parsed.candidates.forEach((c, i) => { if (gate.verdicts[i] === 'pass') passed.push(c) })
+        const parked = []
+        parsed.candidates.forEach((c, i) => {
+          const v = gate.verdicts[i]
+          if (v === 'pass') passed.push({ ...c, gateWhy: gate.whys[i] || '' })
+          else if (v === 'rework') passed.push({ ...c, gateWhy: gate.whys[i] || '', reworked: true })
+          else if (v === 'park') parked.push({ ...c, gateWhy: gate.whys[i] || '' })
+        })
+        out.parked = parked
         out.tickets = passed.map((c, i) => buildTicket({ candidate: c, index: i, budget: ticketBudget, now }))
+        out.tickets.forEach((t, i) => {
+          const src = passed[i]
+          if (src.reworked) { t.reworked = true; t.reason = `${t.reason}（把关改写提示：${src.gateWhy}）`.slice(0, 300) }
+          t.gateWhy = src.gateWhy || ''
+        })
         out.outcome = out.tickets.length ? 'tickets' : 'all-dead'
         await logLine.append('gate', round, {
           verdicts: gate.verdicts.map((v, i) => ({ i: i + 1, verdict: v, why: gate.whys[i] })),
           gateOutcome: gate.outcome,
+          gateInputDropped: gateTrim.dropped,
           tickets: out.tickets.map((t) => ({ id: t.id, intent: t.intent, tag: t.tag, ownerSide: t.ownerSide })),
+          parked: parked.map((c) => ({ title: c.title, tag: c.tag })),
         })
         log?.info?.(`自驱 v5：第 ${round} 轮 ${passed.length}/${parsed.candidates.length} 通过把关${out.tickets.length ? `，立项 ${out.tickets.map((t) => t.id).join('、')}` : '（全灭）'}`)
         return out
