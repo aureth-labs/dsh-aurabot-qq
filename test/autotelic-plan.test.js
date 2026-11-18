@@ -250,6 +250,49 @@ test('决策日志：append 链式哈希；篡改一行即断链被校验器抓�
   assert.ok(v.brokenAt && v.brokenAt.line === 1)
 })
 
+test('决策日志：并发实例同时 append 同一文件，链不断（2026-11-18 真机断链回归）', async (t) => {
+  const file = await tmpDecisionFile(t)
+  // 复现真机形状：两个独立 createDecisionLog 实例（= 两个并行复盘各自 new 一个）同时落账
+  const a = createDecisionLog({ file, now: () => 1234 })
+  const b = createDecisionLog({ file, now: () => 1234 })
+  await Promise.all([
+    a.append('review', 'round-tk-1', { ticketId: 'tk-1' }),
+    b.append('review', 'round-tk-2', { ticketId: 'tk-2' }),
+    a.append('review', 'round-tk-3', { ticketId: 'tk-3' }),
+    b.append('review', 'round-tk-4', { ticketId: 'tk-4' }),
+  ])
+  const v = await verifyDecisionLog(file)
+  assert.equal(v.ok, true, `并发落账后整条链必须可校验（brokenAt=${JSON.stringify(v.brokenAt)}）`)
+  assert.equal(v.total, 4)
+})
+
+test('决策日志：prevHash 断点 = 新链段起点，不判死；段内篡改仍被抓（2026-11-18 口径放宽）', async (t) => {
+  const file = await tmpDecisionFile(t)
+  const log = createDecisionLog({ file, now: () => 1234 })
+  await log.append('intent', 1, { a: 1 })
+  await log.append('gate', 1, { b: 2 })
+  // 手工造一个断点行：prevHash 是个外来值（模拟旧数据/旁路写入），自带合法的段内 hash
+  const raw = await readFile(file, 'utf8')
+  const lines0 = raw.trim().split('\n')
+  const foreignPrev = 'f'.repeat(64)
+  const segBody = JSON.stringify({ ts: 1234, phase: 'review', round: 9, payload: { c: 3 } })
+  const { createHash } = await import('node:crypto')
+  const segHash = createHash('sha256').update(foreignPrev + segBody).digest('hex')
+  const segLine = JSON.stringify({ ts: 1234, phase: 'review', round: 9, payload: { c: 3 }, prevHash: foreignPrev, hash: segHash })
+  await import('node:fs/promises').then((fs) => fs.writeFile(file, [...lines0, segLine].join('\n') + '\n', 'utf8'))
+  const v = await verifyDecisionLog(file)
+  assert.equal(v.ok, true, '断点不再判死：ok 保持 true')
+  assert.equal(v.total, 3)
+  assert.equal(v.breaks.length, 1, '断点要记进 breaks 供面板提示')
+  assert.equal(v.breaks[0].line, 3)
+  // 段内篡改仍被抓：改断点行（第 3 行）的 payload
+  const raw2 = await readFile(file, 'utf8')
+  await import('node:fs/promises').then((fs) => fs.writeFile(file, raw2.replace('"c":3', '"c":999'), 'utf8'))
+  const v2 = await verifyDecisionLog(file)
+  assert.equal(v2.ok, false, '段内改内容必须被抓（防篡改价值保留在段内）')
+  assert.equal(v2.brokenAt.line, 3)
+})
+
 // —— ③ 复盘契约（lead 2026-11-17 定稿） ——
 
 const TICKET_RESULT = {
