@@ -1766,8 +1766,12 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       }
       const capsText = (caps) => {
         if (!caps) return '未连接，能力未知'
-        const labels = { image: '图片', sticker: '表情', video: '视频', file: '文件', voice: '语音', quoteReply: '引用', mention: '@', poke: '戳一戳', card: '卡片', history: '历史', memberList: '成员', forwardExpand: '合并转发' }
-        return Object.entries(labels).filter(([k]) => caps[k] && caps[k] !== 'none' && caps[k] !== 0).map(([k]) => labels[k]).join(' · ') || '基础文字'
+        const labels = { image: '图片', sticker: '表情', video: '视频', file: '文件', voice: '语音', quoteReply: '引用', mention: '@', poke: '戳一戳', card: '卡片', history: '历史', memberList: '成员列表', forwardExpand: '合并转发' }
+        const base = Object.entries(labels).filter(([k]) => caps[k] && caps[k] !== 'none' && caps[k] !== 0).map(([k]) => labels[k]).join(' · ') || '基础文字'
+        if (caps.memberList && caps.features?.['chat.member.read'] === false) {
+          return base + '（成员列表可用；跨群身份校验不可用，非主人跨群默认拒绝）'
+        }
+        return base
       }
       const claim = async (candidate) => {
         setBusy('claim')
@@ -3178,9 +3182,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             h('input', { className: 'ab-input', placeholder: '输入 QQ 官方群 group_openid', value: openid, onChange: (e) => setOpenid(e.target.value) })),
           h(Row, { label: '展示别名 / 数字群号（可选）', hint: '仅用于面板显示及关联白名单里的旧数字群号，不参与官方 API 调用。' },
             h('input', { className: 'ab-input', placeholder: '例如 1136292994（可选）', value: alias, onChange: (e) => setAlias(e.target.value) })),
-          h(Row, { label: '群名称（可选）' },
+          h(Row, { label: '群名称（可选，推荐填写）' },
             h('div', { className: 'ab-flex' },
-              h('input', { className: 'ab-input', placeholder: '留空时若已连接且有权限会自动获取', value: groupName, onChange: (e) => setGroupName(e.target.value) }),
+              h('input', { className: 'ab-input', placeholder: '推荐填写以便权限页显示；留空时有 info 权限会自动读取', value: groupName, onChange: (e) => setGroupName(e.target.value) }),
               h(Btn, { kind: 'primary', disabled: saving || !openid.trim(), onClick: bindGroup }, saving ? '保存中…' : '保存绑定'))),
           bindings.length ? bindings.map((b) => h(Row, {
             key: b.chatId,

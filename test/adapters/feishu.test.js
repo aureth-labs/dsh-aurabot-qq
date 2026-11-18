@@ -4,7 +4,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createCipheriv, createHash } from 'node:crypto'
-import { mkdtempSync, existsSync } from 'node:fs'
+import { mkdtempSync, existsSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { runAdapterContract, makeCtx } from '../contract/adapter-kit.js'
@@ -25,6 +25,11 @@ import {
   MAX_IMAGE_BYTES,
 } from '../../src/adapters/feishu/index.js'
 import { mergeCapsWithFeatures } from '../../src/gateway/features.js'
+import { createGateway } from '../../src/gateway/index.js'
+import { createHub } from '../../src/chat/hub.js'
+import { normalize } from '../../src/core/config.js'
+import { makeIdentity } from '../gateway/helpers.js'
+import { createFakeDsh } from '../helpers/fake-dsh.js'
 
 const APP_ID = 'cli_test'
 const APP_SECRET = 'secret'
@@ -1406,4 +1411,179 @@ test('飞书扩展能力：merge_forward 展开（fetch(forward)）与群成员�
   )
 
   await adapter.stop()
+})
+
+test('feishu 审查加固：P2-4 多层嵌套 merge_forward（inline 树与多跳 HTTP 拉取）+ P2-3 面板能力说明', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'aurabot-feishu-p24-'))
+  const prevDir = process.env.AURABOT_DATA_DIR
+  process.env.AURABOT_DATA_DIR = root
+
+  const silentLog = { debug() {}, info() {}, warn() {}, error() {}, child() { return this } }
+  let inlineHttpCount = 0
+  const hopHttpCalls = []
+
+  const fakeClient = {
+    async request(req) {
+      if (req.url.includes('/tenant_access_token/')) return { status: 200, json: { code: 0, tenant_access_token: 't-nest', expire: 7200 } }
+      if (req.url.includes('/open-apis/bot/v3/info')) return { status: 200, json: { code: 0, bot: { open_id: 'ou_bot_nest', app_name: '飞书测试' } } }
+
+      // 场景 1：单次响应通过 upper_message_id 带出多层内联 merge_forward
+      if (req.url.includes('/open-apis/im/v1/messages/om_nest_inline')) {
+        inlineHttpCount++
+        return {
+          status: 200,
+          json: {
+            code: 0,
+            data: {
+              items: [
+                {
+                  message_id: 'om_nest_inline',
+                  create_time: '1700000000000',
+                  msg_type: 'merge_forward',
+                  body: { content: '合并转发消息' },
+                  sender: { id: 'ou_outer', id_type: 'open_id', sender_type: 'user' },
+                },
+                {
+                  message_id: 'om_inline_txt_1',
+                  upper_message_id: 'om_nest_inline',
+                  create_time: '1700000001000',
+                  msg_type: 'text',
+                  body: { content: JSON.stringify({ text: '第1层外层消息' }) },
+                  sender: { id: 'ou_u1', id_type: 'open_id', sender_type: 'user' },
+                },
+                {
+                  message_id: 'om_nest_inner',
+                  upper_message_id: 'om_nest_inline',
+                  create_time: '1700000002000',
+                  msg_type: 'merge_forward',
+                  body: { content: '合并转发消息' },
+                  sender: { id: 'ou_u2', id_type: 'open_id', sender_type: 'user' },
+                },
+                {
+                  message_id: 'om_inline_txt_2',
+                  upper_message_id: 'om_nest_inner',
+                  create_time: '1700000003000',
+                  msg_type: 'text',
+                  body: { content: JSON.stringify({ text: '第2层内联嵌套' }) },
+                  sender: { id: 'ou_u2', id_type: 'open_id', sender_type: 'user' },
+                },
+                {
+                  message_id: 'om_nest_deep',
+                  upper_message_id: 'om_nest_inner',
+                  create_time: '1700000004000',
+                  msg_type: 'merge_forward',
+                  body: { content: '合并转发消息' },
+                  sender: { id: 'ou_u3', id_type: 'open_id', sender_type: 'user' },
+                },
+                {
+                  message_id: 'om_inline_txt_3',
+                  upper_message_id: 'om_nest_deep',
+                  create_time: '1700000005000',
+                  msg_type: 'text',
+                  body: { content: JSON.stringify({ text: '第3层深处消息' }) },
+                  sender: { id: 'ou_u3', id_type: 'open_id', sender_type: 'user' },
+                },
+              ],
+            },
+          },
+        }
+      }
+
+      // 场景 2：多跳分次 HTTP 拉取 om_hop_1 -> om_hop_2 -> ... -> om_hop_7（验证 MAX_FORWARD_DEPTH = 5）
+      const hopMatch = req.url.match(/\/open-apis\/im\/v1\/messages\/(om_hop_(\d+))/)
+      if (hopMatch) {
+        const msgId = hopMatch[1]
+        const level = Number(hopMatch[2])
+        hopHttpCalls.push(msgId)
+        const items = [
+          {
+            message_id: msgId,
+            create_time: String(1700001000000 + level * 1000),
+            msg_type: 'merge_forward',
+            body: { content: '合并转发消息' },
+            sender: { id: 'ou_h0', id_type: 'open_id', sender_type: 'user' },
+          },
+          {
+            message_id: `${msgId}_txt`,
+            upper_message_id: msgId,
+            create_time: String(1700001000100 + level * 1000),
+            msg_type: 'text',
+            body: { content: JSON.stringify({ text: `多跳层级-${level}` }) },
+            sender: { id: `ou_h${level}`, id_type: 'open_id', sender_type: 'user' },
+          },
+        ]
+        if (level < 7) {
+          items.push({
+            message_id: `om_hop_${level + 1}`,
+            upper_message_id: msgId,
+            create_time: String(1700001000200 + level * 1000),
+            msg_type: 'merge_forward',
+            body: { content: '合并转发消息' },
+            sender: { id: `ou_h${level}`, id_type: 'open_id', sender_type: 'user' },
+          })
+        }
+        return { status: 200, json: { code: 0, data: { items } } }
+      }
+
+      return { status: 200, json: { code: 0, data: {} } }
+    },
+  }
+
+  let adapterRef = null
+  const gw = createGateway({
+    config: {
+      platforms: {
+        feishu: { enabled: true, transport: 'webhook', encryptKey: '', verificationToken: VERIFY_TOKEN, appId: APP_ID, appSecret: APP_SECRET },
+      },
+    },
+    dataDir: (...p) => join(root, 'gw', ...p),
+    http: { route: () => () => {} },
+    identity: makeIdentity(),
+    log: silentLog,
+    replyHoldMs: 10,
+  })
+  gw.register(() => (adapterRef = createFeishuAdapter({ client: fakeClient })))
+  await gw.sync()
+
+  const cfg = normalize({
+    enabled: true,
+    dryRun: false,
+    allow: { groups: ['feishu:group:oc_nest'] },
+    platforms: { feishu: { enabled: true, transport: 'webhook', appId: APP_ID, appSecret: APP_SECRET } },
+  })
+  const dsh = createFakeDsh({ brain: async () => 'ok' })
+  const hub = createHub({ dsh: dsh.ctx, getConfig: () => cfg, log: silentLog, gateway: gw, isMuted: () => false })
+  t.after(async () => {
+    hub.dispose()
+    await gw.stopAll()
+    if (prevDir === undefined) delete process.env.AURABOT_DATA_DIR
+    else process.env.AURABOT_DATA_DIR = prevDir
+  })
+
+  // 1) adapter.fetch 直接保留内联 child merge_forward 引用并缓存子转发消息
+  const outerInline = await adapterRef.fetch({ kind: 'forward', id: 'om_nest_inline' })
+  assert.equal(inlineHttpCount, 1)
+  assert.ok(Array.isArray(outerInline?.messages) && outerInline.messages.some((m) => m.parts.some((p) => p.type === 'forward' && p.id === 'om_nest_inner')), '外层应保留 nested merge_forward 的 forward part')
+  const innerCached = await adapterRef.fetch({ kind: 'forward', id: 'om_nest_inner' })
+  assert.equal(inlineHttpCount, 1, '内联 upper_message_id 子转发应命中 inlineForwardCache 不重复打 HTTP')
+  assert.ok(Array.isArray(innerCached?.messages) && innerCached.messages.some((m) => m.parts.some((p) => p.type === 'text' && p.text.includes('第2层内联嵌套'))))
+
+  // 2) hub.expandForwards 完整递归展开 inline 3 层嵌套（只打 1 次 outer HTTP，子嵌套全部命中缓存）
+  inlineHttpCount = 0
+  const expandedInline = await hub.expandForwards({ chatId: 'feishu:group:oc_nest', forwards: ['om_nest_inline'], images: [], stickers: [] }, '[合并转发]')
+  assert.match(expandedInline, /第1层外层消息/)
+  assert.match(expandedInline, /第2层内联嵌套/)
+  assert.match(expandedInline, /第3层深处消息/)
+  assert.equal(inlineHttpCount, 1)
+
+  // 3) hub.expandForwards 多跳 HTTP 拉取受 MAX_FORWARD_DEPTH = 5 约束且深层不无限展开
+  const expandedHops = await hub.expandForwards({ chatId: 'feishu:group:oc_nest', forwards: ['om_hop_1'], images: [], stickers: [] }, '[合并转发]')
+  assert.match(expandedHops, /多跳层级-1/)
+  assert.match(expandedHops, /多跳层级-5/)
+  assert.ok(!expandedHops.includes('多跳层级-7'), '超过 MAX_FORWARD_DEPTH=5 的层级应停止继续递归展开')
+  assert.ok(!hopHttpCalls.includes('om_hop_7'))
+
+  // P2-3: 面板对 memberList=true 但 chat.member.read=false 的明确提示文案
+  const clientSrc = readFileSync(new URL('../../client/client.js', import.meta.url), 'utf8')
+  assert.ok(clientSrc.includes('成员列表可用；跨群身份校验不可用，非主人跨群默认拒绝'))
 })

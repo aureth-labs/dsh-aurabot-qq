@@ -1009,9 +1009,22 @@ test('WebSocket Resume：READY 记下 session_id 与 seq，op=7/断线重连发 
   ws2.onmessage({ data: JSON.stringify({ op: 0, s: 45, t: 'C2C_MESSAGE_CREATE', d: C2C_EVENT }) })
   assert.equal(ctx.emitted.length, 1)
 
-  // 收到 op=9 Invalid Session → 清掉旧 session_id/seq 并回退 op=2 Identify
-  ws2.onmessage({ data: JSON.stringify({ op: 9, d: false }) })
+  // 收到 op=9 Invalid Session (d=true) → 保留 session_id/seq 并重试 op=6 Resume
+  ws2.onmessage({ data: JSON.stringify({ op: 9, d: true }) })
   ws2.onclose?.()
+  await new Promise((resolve) => setTimeout(resolve, 1150))
+  const ws2b = FakeWebSocket.instances.at(-1)
+  ws2b.onmessage({ data: JSON.stringify({ op: 10, d: { heartbeat_interval: 60000 } }) })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  const resumeAfterOp9True = ws2b.sent.find((x) => x.op === 6)
+  assert.ok(resumeAfterOp9True, 'op=9 (d=true) 后应保留会话并重试 op=6 Resume')
+  assert.equal(resumeAfterOp9True.d?.session_id, 'sess-xyz-1')
+  assert.equal(resumeAfterOp9True.d?.seq, 45)
+  assert.equal(ws2b.sent.some((x) => x.op === 2), false)
+
+  // 收到 op=9 Invalid Session (d=false) → 清掉旧 session_id/seq 并回退 op=2 Identify
+  ws2b.onmessage({ data: JSON.stringify({ op: 9, d: false }) })
+  ws2b.onclose?.()
   await new Promise((resolve) => setTimeout(resolve, 1150))
   const ws3 = FakeWebSocket.instances.at(-1)
   ws3.onmessage({ data: JSON.stringify({ op: 10, d: { heartbeat_interval: 60000 } }) })

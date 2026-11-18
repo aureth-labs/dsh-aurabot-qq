@@ -833,6 +833,7 @@ export function createFeishuAdapter(options = {}) {
   const sentFrames = [] // 测试断言应答/心跳帧用
   const p2pChatIds = new Map() // open_id → p2p chat_id (oc_xxx)，供 GET /im/v1/messages 查私聊历史
   const P2P_CHATS_MAX = 2000
+  const inlineForwardCache = new Map() // nested merge_forward id → sub-items（当接口一次返回多层子消息时复用）
 
   function p2pCachePath() {
     try {
@@ -1558,6 +1559,7 @@ export function createFeishuAdapter(options = {}) {
       for (const off of offs.splice(0)) { try { off() } catch {} }
       closeWebsocket()
       tokenCache = { token: '', expiresAt: 0 }
+      inlineForwardCache.clear()
       ctx?.state('stopped')
     },
 
@@ -1729,15 +1731,34 @@ export function createFeishuAdapter(options = {}) {
       if (request?.kind === 'forward') {
         const messageId = String(request.id || '').trim()
         if (!messageId) throw sendError('not-sent', 'bad-fetch-request', instance, '飞书展开合并转发需要 id（message_id）')
-        const url = `${baseUrl()}${PATH_SEND_MESSAGE}/${encodeURIComponent(messageId)}`
-        const r = await requestAuthedGet(url, '飞书展开合并转发失败')
-        const rawItems = Array.isArray(r?.json?.data?.items) ? r.json.data.items : []
+        let rawItems = inlineForwardCache.get(messageId)
+        if (rawItems) {
+          inlineForwardCache.delete(messageId)
+        } else {
+          const url = `${baseUrl()}${PATH_SEND_MESSAGE}/${encodeURIComponent(messageId)}`
+          const r = await requestAuthedGet(url, '飞书展开合并转发失败')
+          rawItems = Array.isArray(r?.json?.data?.items) ? r.json.data.items : []
+        }
         if (!rawItems.length) {
           throw sendError('not-sent', 'message-not-found', instance, `飞书未返回合并转发内容（${messageId}）`)
         }
-        // 官方 GET /im/v1/messages/:id 返回包装消息及带 upper_message_id === id 的子消息列表
-        const subItems = rawItems.filter((it) => it && (it.upper_message_id === messageId || (String(it.message_id || '') !== messageId && it.msg_type !== 'merge_forward')))
-        const list = subItems.length ? subItems : rawItems.filter((it) => it && String(it.message_id || '') !== messageId)
+        const nonSelf = rawItems.filter((it) => it && String(it.message_id || '') !== messageId)
+        const hasUpperIds = nonSelf.some((it) => it.upper_message_id)
+        const directChildren = hasUpperIds ? nonSelf.filter((it) => it.upper_message_id === messageId) : []
+        const list = directChildren.length ? directChildren : nonSelf
+        if (hasUpperIds && directChildren.length && nonSelf.length > directChildren.length) {
+          // 若响应一次性内联了多层嵌套子消息，缓存每条子合并转发对应的后代列表，供 readFetchedForward 逐层递归至 MAX_FORWARD_DEPTH
+          for (const child of directChildren) {
+            if (child?.msg_type !== 'merge_forward' || !child?.message_id) continue
+            const cid = String(child.message_id)
+            const nested = nonSelf.filter((it) => it !== child)
+            const hasNested = nested.some((it) => it.upper_message_id === cid)
+            if (hasNested) {
+              if (inlineForwardCache.size >= 100) inlineForwardCache.delete(inlineForwardCache.keys().next().value)
+              inlineForwardCache.set(cid, nested)
+            }
+          }
+        }
         const messages = list.map((it, idx) => toFetched(it, `fwd-${idx}`))
         if (messages.length >= 2) {
           const firstAt = Number(messages[0]?.at) || 0

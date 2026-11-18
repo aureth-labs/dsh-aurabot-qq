@@ -678,10 +678,12 @@ export function createQqbotAdapter(options = {}) {
           shouldResume = Boolean(sessionId)
           try { ws.close() } catch (error) {}
         } else if (op === 9) {
-          if (payload?.d !== true || shouldResume) {
+          if (payload?.d !== true) {
             sessionId = ''
             seq = 0
             shouldResume = false
+          } else {
+            shouldResume = Boolean(sessionId)
           }
           try { ws.close() } catch (error) {}
         }

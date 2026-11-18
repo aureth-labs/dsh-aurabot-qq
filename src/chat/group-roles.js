@@ -147,6 +147,18 @@ export function createGroupRoles({ onebot = null, gateway = null, getGateway = n
     return true
   }
 
+  function touchBindingName(chatIdOrOpenid, name) {
+    const key = String(chatIdOrOpenid || '').trim()
+    const clean = String(name || '').trim()
+    if (!key || !clean) return false
+    const map = loadBindings()
+    let target = map[key] || Object.values(map).find((v) => v.openid === key || v.alias === key)
+    if (!target || target.name === clean) return false
+    target.name = clean
+    persistBindings()
+    return true
+  }
+
   function invalidateCache(groupKey) {
     const needle = String(groupKey || '').trim()
     if (!needle) return
@@ -192,8 +204,10 @@ export function createGroupRoles({ onebot = null, gateway = null, getGateway = n
     const allBindings = loadBindings()
     const norm = raw ? normalizeChatId(raw) : null
     const parsed = raw.includes(':') && norm ? parseChatId(norm) : null
+    const isDefaultInstance = parsed ? (!parsed.instance || parsed.instance === defPlat) : true
 
-    if (parsed && parsed.platform !== defPlat) {
+    // 非默认实例（含 qq#2）及非默认平台（qqbot / feishu 等）严禁落回默认 OneBot
+    if (parsed && (!isDefaultInstance || parsed.platform !== defPlat)) {
       const chatId = `${parsed.instance}:group:${parsed.id}`
       const b = allBindings[chatId]
       const active = isInstanceActive(parsed.instance)
@@ -211,11 +225,23 @@ export function createGroupRoles({ onebot = null, gateway = null, getGateway = n
         }
       }
       const ga = gw?.groupAdmin?.(parsed.instance) || null
-      let reason = ''
-      if (!ga) {
-        const instRow = gw?.instances?.().find((x) => x.instance === parsed.instance)
-        reason = !gw || !instRow || instRow.state !== 'connected' ? 'QQ 官方机器人未连接' : '当前平台不支持群管理能力'
+      const instRow = gw?.instances?.().find((x) => x.instance === parsed.instance)
+      if (!ga && (parsed.platform === defPlat || (instRow && instRow.state === 'connected'))) {
+        return {
+          backend: 'none',
+          platform: parsed.platform,
+          instance: parsed.instance,
+          openid: parsed.id,
+          chatId,
+          alias: b?.alias || '',
+          name: b?.name || '',
+          cacheKey: `none:${chatId}`,
+          reason: parsed.platform === defPlat
+            ? `平台实例 ${parsed.instance} 暂不支持群管理（不会回落默认 QQ）`
+            : '当前平台不支持群管理能力',
+        }
       }
+      const reason = ga ? '' : 'QQ 官方机器人未连接'
       return {
         backend: 'gateway-admin',
         platform: parsed.platform,
@@ -230,7 +256,7 @@ export function createGroupRoles({ onebot = null, gateway = null, getGateway = n
       }
     }
 
-    if (parsed && parsed.platform === defPlat) {
+    if (parsed && parsed.platform === defPlat && isDefaultInstance) {
       return {
         backend: 'onebot',
         platform: defPlat,
@@ -241,7 +267,7 @@ export function createGroupRoles({ onebot = null, gateway = null, getGateway = n
       }
     }
 
-    // 裸群号或 group_openid：先查处于激活状态的绑定表，未绑定且无直连 OneBot 通道时明确提示先去绑定
+    // 裸群号或 group_openid：先查处于激活状态的绑定表，未绑定且无可用默认 QQ 通道时明确提示先去绑定
     const boundMatch = Object.values(allBindings).find((b) => isInstanceActive(b.instance) && (b.alias === raw || b.openid === raw))
     if (boundMatch) {
       const ga = gw?.groupAdmin?.(boundMatch.instance) || null
@@ -264,12 +290,22 @@ export function createGroupRoles({ onebot = null, gateway = null, getGateway = n
     const plats = cfg?.platforms
     const hasPlatMap = Boolean(plats && typeof plats === 'object')
     const defPlatCfg = hasPlatMap ? plats[defPlat] : null
-    const gwDefEnabled = Boolean(gw && typeof gw.instances === 'function' && gw.instances().some((x) => x.enabled && x.platform === defPlat))
-    const isOnebotActive = defPlatCfg && typeof defPlatCfg === 'object'
-      ? (defPlatCfg.enabled !== false)
-      : Boolean(gwDefEnabled || cfg.enabled === true || (cfg.enabled === undefined && (!plats || Object.keys(plats).length === 0)))
+    const gwDefInst = gw && typeof gw.instances === 'function' ? gw.instances().find((x) => x.instance === defPlat) : null
+    const hasOtherPlatCfg = Boolean(hasPlatMap && Object.entries(plats).some(([k, v]) => k !== defPlat && v && v.enabled !== false))
+    const hasOtherActiveGw = activeAdminInstances().length > 0
+      || Boolean(gw && typeof gw.instances === 'function' && gw.instances().some((x) => x.enabled && x.platform !== defPlat))
+    const defPlatEnabledInCfg = defPlatCfg && typeof defPlatCfg === 'object'
+      ? defPlatCfg.enabled !== false
+      : (gwDefInst
+          ? Boolean(gwDefInst.enabled)
+          : Boolean(!hasOtherActiveGw && !hasOtherPlatCfg && (cfg.enabled === true || (cfg.enabled === undefined && (!plats || Object.keys(plats).length === 0)))))
+    const onebotReady = !hasOtherActiveGw || (
+      (onebot?.state === undefined || onebot.state === 'connected')
+      && (!gwDefInst || (gwDefInst.enabled && gwDefInst.state === 'connected'))
+    )
+    const isOnebotActive = Boolean(onebot && defPlatEnabledInCfg && onebotReady)
 
-    if (onebot && isOnebotActive) {
+    if (isOnebotActive) {
       const obKey = defPlat ? `${defPlat}:group:${raw}` : raw
       return {
         backend: 'onebot',
@@ -281,28 +317,15 @@ export function createGroupRoles({ onebot = null, gateway = null, getGateway = n
       }
     }
 
-    const hasGwAdminCap = activeAdminInstances().length > 0
-      || Object.keys(allBindings).length > 0
-      || Boolean(gw && typeof gw.instances === 'function' && gw.instances().some((x) => x.enabled && x.platform !== defPlat))
-    if (hasGwAdminCap || !isOnebotActive) {
-      return {
-        backend: 'none',
-        unbound: true,
-        platform: '',
-        instance: '',
-        gid: raw,
-        cacheKey: `unbound:${raw}`,
-        reason: hasGwAdminCap ? '先去绑定群' : 'QQ 未启用且未绑定官方群',
-      }
-    }
-
+    const hasGwAdminCap = hasOtherActiveGw || hasOtherPlatCfg || Object.keys(allBindings).length > 0
     return {
-      backend: 'onebot',
-      platform: defPlat,
-      instance: defPlat,
+      backend: 'none',
+      unbound: true,
+      platform: '',
+      instance: '',
       gid: raw,
-      chatId: `${defPlat}:group:${raw}`,
-      cacheKey: `ob:${defPlat}:${raw}`,
+      cacheKey: `unbound:${raw}`,
+      reason: hasGwAdminCap ? '先去绑定群' : 'QQ 未启用且未绑定官方群',
     }
   }
 
@@ -487,6 +510,7 @@ export function createGroupRoles({ onebot = null, gateway = null, getGateway = n
     bindings: listBindings,
     saveBinding,
     removeBinding,
+    touchBindingName,
     candidates,
     activeAdminInstances,
   }

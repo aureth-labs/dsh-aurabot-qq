@@ -68,10 +68,10 @@
 3. **`ClientConfig` 里除 `PingInterval` 外的字段**（如 `ReconnectInterval`、`ReconnectNonce`）
    存在但语义未核实，本端只用了 `PingInterval`（默认 120 秒），重连用自家指数退避。
 4. **群身份 `sender.role` 拿不到真实值。** 接收消息事件里**没有**群主/管理员字段，本端群聊一律报
-   `'member'`、私聊报 `''`。已接群成员列表接口（`caps.memberList=true` / `fetch({ kind: 'members' })`），但该接口仅返回 `open_id` 与昵称而不返回群管理角色，因此 `features['chat.member.read']` 仍诚实保持 `false`。
+   `'member'`、私聊报 `''`。已接群成员列表接口（`caps.memberList=true` / `fetch({ kind: 'members' })`），但该接口仅返回 `open_id` 与昵称而不返回群管理角色，因此 `features['chat.member.read']` 仍诚实保持 `false`——即飞书成员列表可用，但跨群身份校验仍不可用，非主人跨群默认拒绝。
 5. **发送者昵称拿不到。** 接收消息事件里没有发送者姓名（只有 `mentions[].name`），本端 `sender.name`
    一律空串，不编造。
-6. **`merge_forward` 已支持展开。** 入站收到带 `message_id` 的 `merge_forward` 时发出 `forward` Part，由 `fetch({ kind: 'forward' })` 调 `GET /open-apis/im/v1/messages/:message_id` 取回子消息并按时间升序归一化为 `FetchedForwardResult`（`caps.forwardExpand=true`）。
+6. **`merge_forward` 已支持多层递归展开。** 入站收到带 `message_id` 的 `merge_forward` 时发出 `forward` Part，由 `fetch({ kind: 'forward' })` 调 `GET /open-apis/im/v1/messages/:message_id` 取回子消息（含嵌套 `merge_forward`，由中枢递归展开至 `MAX_FORWARD_DEPTH=5`）并按时间升序归一化为 `FetchedForwardResult`（`caps.forwardExpand=true`）。
 7. **撤回（recall）没实现。** 官方有 `DELETE /open-apis/im/v1/messages/:message_id`，本次没做，
    所以 `caps.recall=false`。`history` 默认仍为 `false`（权限开通后可在配置中启用）。
 8. **长连接在多副本部署下会「只有一个副本收到消息」**（官方原文：集群模式，不广播）。

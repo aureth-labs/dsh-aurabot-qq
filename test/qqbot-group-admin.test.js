@@ -108,6 +108,13 @@ test('groupRoles：qqbot 绑定、11253/offline 原因、同群号跨平台不�
   assert.equal(qqExplicitInfo.role, 'member')
   assert.equal(onebotCalls.length, 1, '显式 qq:group 必须走 OneBot 而不串台')
 
+  // P1: 非默认 QQ 实例（如 qq#2:group:<id>）绝不静默回落到默认 legacy onebot
+  const qq2Spec = roles.resolveBackend('qq#2:group:1136292994')
+  assert.equal(qq2Spec.backend, 'none')
+  const qq2Info = await roles.inspect('qq#2:group:1136292994', { fresh: true })
+  assert.equal(qq2Info.backend, 'none')
+  assert.equal(onebotCalls.length, 1, 'qq#2:group 不得串台调用默认 OneBot')
+
   // 4) 缓存命中 + fresh 强制刷新 + 11253 权限拒绝时不得拿旧缓存 owner/admin 伪装可用
   const beforeCached = botCalls.length
   const cachedHit = await roles.inspect('qqbot:group:OPENID_LIVE')
@@ -132,6 +139,56 @@ test('groupRoles：qqbot 绑定、11253/offline 原因、同群号跨平台不�
   const afterDisable = await rolesReloaded.inspect('1136292994', { fresh: true })
   assert.equal(afterDisable.backend, 'none')
   assert.equal(onebotCalls.length, 1, '停用 qqbot 后不误用残留绑定，也不误打未启用的 OneBot')
+
+  // P2-5: touchBindingName 持久化群名并在重启重载后保留
+  assert.equal(rolesReloaded.touchBindingName('qqbot:group:OPENID_LIVE', '官方测试群名'), true)
+  const rolesPersisted = createGroupRoles({ onebot: fakeOnebot, getGateway: () => gw, getConfig: () => cfg, dataDir: dataFn, log: silent })
+  assert.equal(rolesPersisted.bindings()[0].name, '官方测试群名')
+
+  // P2-2: 纯 QQBot（未配 qq 节点且 qqbot 激活）或 qqbot 激活但 OneBot 未连接时，纯数字群返回“先去绑定群”
+  const dirQqOnly = mkdtempSync(join(tmpdir(), 'aurabot-roles-p22-'))
+  let mustNotCallOnebot = 0
+  const stoppedOb = {
+    state: 'stopped',
+    async call() {
+      mustNotCallOnebot++
+      throw new Error('stopped onebot must not be called')
+    },
+  }
+  const activeQqbotGw = {
+    instances: () => [{ instance: 'qqbot', platform: 'qqbot', enabled: true, state: 'connected' }],
+    groupAdmin: (inst) => (inst === 'qqbot' ? {} : null),
+  }
+  const cfgQqOnly = { enabled: true, platforms: { qqbot: { enabled: true } } }
+  const rolesQqOnly = createGroupRoles({
+    onebot: stoppedOb,
+    getGateway: () => activeQqbotGw,
+    getConfig: () => cfgQqOnly,
+    dataDir: (...p) => join(dirQqOnly, ...p),
+    log: silent,
+  })
+  const unboundSpec = rolesQqOnly.resolveBackend('123456')
+  assert.equal(unboundSpec.backend, 'none')
+  assert.equal(unboundSpec.unbound, true)
+  assert.equal(unboundSpec.reason, '先去绑定群')
+  const unboundInspect = await rolesQqOnly.inspect('123456', { fresh: true })
+  assert.equal(unboundInspect.backend, 'none')
+  assert.equal(unboundInspect.reason, '先去绑定群')
+
+  // 混合配了 qq 与 qqbot 但 OneBot 未连接时，裸数字群也不回退 stopped/connecting onebot
+  const cfgMixed = { enabled: true, platforms: { qq: { enabled: true }, qqbot: { enabled: true } } }
+  const rolesMixed = createGroupRoles({
+    onebot: { ...stoppedOb, state: 'connecting' },
+    getGateway: () => activeQqbotGw,
+    getConfig: () => cfgMixed,
+    dataDir: (...p) => join(dirQqOnly, ...p),
+    log: silent,
+  })
+  const mixedSpec = rolesMixed.resolveBackend('123456')
+  assert.equal(mixedSpec.backend, 'none')
+  assert.equal(mixedSpec.unbound, true)
+  assert.equal(mixedSpec.reason, '先去绑定群')
+  assert.equal(mustNotCallOnebot, 0)
 })
 
 test('group-admin：qqbot ban/unban/kick、禁止纯数字 QQ、实时重查角色、拒绝公告/头衔与 OneBot 兼容', async (t) => {
@@ -380,4 +437,131 @@ test('宿主机 HTTP 全链路：纯 QQBot 安装 group-admin 后正确挂载 ST
   assert.equal(unbindHttp.ok, true)
   const afterUnbind = (await fake.call('/groups/roles')).json()
   assert.equal(afterUnbind.list.find((x) => x.groupId === '99887766')?.reason, '先去绑定群')
+})
+
+test('group-admin 审查加固：P1 拒绝 qq#2 串台退回 onebot；P2-5 /groups/roles 自动回填并持久化群名', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aurabot-ga-p1p25-'))
+  const { default: groupAdminMod } = await import('../src/modules/group-admin/index.js')
+  const { normalize } = await import('../src/core/config.js')
+  const cfg = normalize({
+    enabled: true,
+    dryRun: false,
+    ownerQQ: '10000001',
+    allow: { private: ['10000001'], groups: ['900100'] },
+    platforms: { qqbot: { enabled: true }, 'qq#2': { enabled: true } },
+  })
+  cfg.platforms = { qqbot: { enabled: true }, 'qq#2': { enabled: true } }
+
+  let obCalls = 0
+  const ob = {
+    state: 'connected',
+    async call(action, params) {
+      obCalls++
+      return { action, params }
+    },
+  }
+  let getGroupInfoCalls = 0
+  const qqbotGa = {
+    supportedActions: { ban: true, unban: true, kick: true },
+    async getBotState(openid) { return { role: 'admin', groupOpenid: openid, memberOpenid: 'bot_1' } },
+    async getGroupInfo(openid) {
+      getGroupInfoCalls++
+      return { groupOpenid: openid, name: '自动回填官方群名', memberCount: 42 }
+    },
+  }
+  const gw = {
+    instances: () => [
+      { instance: 'qqbot', platform: 'qqbot', enabled: true, state: 'connected' },
+      { instance: 'qq#2', platform: 'qq', enabled: true, state: 'connected' },
+    ],
+    groupAdmin: (inst) => (inst === 'qqbot' ? qqbotGa : null),
+  }
+
+  const roles = createGroupRoles({
+    onebot: ob,
+    getGateway: () => gw,
+    getConfig: () => cfg,
+    dataDir: (...p) => join(dir, ...p),
+    log: silent,
+  })
+  roles.saveBinding({ instance: 'qqbot', openid: 'OPENID_BACKFILL', alias: '900100', name: '' })
+
+  const routes = new Map()
+  const toolBuilders = []
+  const mockApi = {
+    id: 'group-admin',
+    log: silent,
+    config: () => cfg,
+    defineTool: (spec) => spec,
+    tool: (fn) => { toolBuilders.push(fn); return () => {} },
+    context: () => () => {},
+    rule: () => () => {},
+    command: () => () => {},
+    on: () => () => {},
+    emit() {},
+    onDispose: () => () => {},
+    use: () => null,
+    lazy: () => ({}),
+    has: () => false,
+    platformOf: () => '',
+    caps: () => null,
+    features: () => ({}),
+    can: () => false,
+    route: (path, handler) => { routes.set(path, handler); return () => {} },
+    core: {
+      groupRoles: roles,
+      onebot: ob,
+      gateway: gw,
+      hub: {
+        chats: () => [],
+        sessions: () => [{ chatId: 'qqbot:group:OPENID_BACKFILL', title: '' }],
+        groupName: () => '',
+        turnSendersAllOwner: () => true,
+      },
+      http: {
+        body: async (req) => req?.body || {},
+        query: (req) => req?.query || {},
+        send() {},
+      },
+      getConfig: () => cfg,
+    },
+  }
+
+  const prevGlobal = globalThis.aurabot
+  globalThis.aurabot = undefined
+  t.after(() => {
+    if (prevGlobal === undefined) delete globalThis.aurabot
+    else globalThis.aurabot = prevGlobal
+  })
+
+  groupAdminMod.setup(mockApi)
+  assert.ok(routes.has('/groups/roles'))
+  assert.ok(toolBuilders.length >= 1)
+
+  // P1: 非默认 qq#2 实例在 group-admin 工具层也禁止回落 legacy onebot
+  const BuiltTools = toolBuilders.flatMap((b) => {
+    const res = typeof b === 'function' ? b({ chat: { kind: 'private', chatId: 'qq:private:10000001' }, level: 'full', sessionId: 's1' }) : b
+    return Array.isArray(res) ? res : (res ? [res] : [])
+  })
+  const adminTool = BuiltTools.find((x) => x?.name === 'qq_group_admin')
+  assert.ok(adminTool, '应注册 qq_group_admin 工具')
+  const qq2Exec = await adminTool.execute({ action: 'ban', group_id: 'qq#2:group:777', user_id: '12345' })
+  assert.equal(qq2Exec.ok, false)
+  assert.equal(obCalls, 0, 'qq#2 执行群管时绝不能回退打到默认 OneBot')
+
+  // P2-5: 无名称绑定的 QQ 官方群查询 /groups/roles 时自动通过 getGroupInfo 回填并持久化
+  const rolesResp = await routes.get('/groups/roles')({ query: { fresh: '1' } })
+  assert.equal(rolesResp.ok, true)
+  const row = rolesResp.list.find((x) => x.groupOpenid === 'OPENID_BACKFILL')
+  assert.ok(row, '/groups/roles 应返回已绑定群')
+  assert.equal(row.name, '自动回填官方群名')
+  assert.ok(getGroupInfoCalls >= 1)
+  const rolesReload = createGroupRoles({
+    onebot: ob,
+    getGateway: () => gw,
+    getConfig: () => cfg,
+    dataDir: (...p) => join(dir, ...p),
+    log: silent,
+  })
+  assert.equal(rolesReload.bindings()[0].name, '自动回填官方群名', '回填的群名应持久化到 qqbot-groups.json')
 })

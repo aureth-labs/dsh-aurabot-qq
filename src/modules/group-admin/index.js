@@ -164,6 +164,9 @@ export default {
           if (spec?.backend === 'none') {
             return { ok: false, message: spec.reason || '这个群还没有可用的群管通道，请先在权限页绑定或启用对应平台' }
           }
+          if (!spec && parsedAddr && parsedAddr.instance && parsedAddr.instance !== 'qq') {
+            return { ok: false, message: `平台实例 ${parsedAddr.instance} 暂不支持群管理（不会回落默认 QQ）` }
+          }
 
           // ── 分支 B：传统 QQ OneBot ──
           const gid = Number(spec?.gid || parsedAddr?.id || rawGroup)
@@ -227,10 +230,13 @@ export default {
         const info = await inspectRole(gid, { fresh: true })
         const role = info.role || ''
         let name = info.name || spec?.name || ''
-        if (!name && spec?.backend === 'gateway-admin' && spec.groupAdmin?.getGroupInfo) {
+        if ((!name || name === spec?.openid || name === String(gid)) && spec?.backend === 'gateway-admin' && spec.groupAdmin?.getGroupInfo) {
           try {
             const gInfo = await spec.groupAdmin.getGroupInfo(spec.openid)
-            if (gInfo?.name) name = gInfo.name
+            if (gInfo?.name) {
+              name = gInfo.name
+              if (spec.chatId) groupRoles?.touchBindingName?.(spec.chatId, gInfo.name)
+            }
           } catch {}
         }
         if (!name) name = await hub.groupName(String(gid)).catch(() => String(gid))
