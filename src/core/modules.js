@@ -1573,6 +1573,13 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     })
   }
 
+  const TOOL_ALIASES = Object.freeze({
+    qq_chat_history: 'chat_history',
+    qq_search_chatlog: 'search_chatlog',
+    qq_send_file: 'send_file',
+    qq_send_message: 'send_message',
+  })
+
   // ---------- 汇总给插件其他部分用 ----------
   function buildTools(where) {
     const out = []
@@ -1599,6 +1606,16 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       }
     })
     return out
+  }
+  /** 解析会话可用工具：先精确匹配权威工具名，未命中时再按旧 qq_* 工具别名回落兼容执行路由。 */
+  function resolveTool(where, name) {
+    const wanted = String(name || '').trim()
+    if (!wanted) return undefined
+    const tools = buildTools(where)
+    const exact = tools.find((t) => t.name === wanted)
+    if (exact) return exact
+    const alias = TOOL_ALIASES[wanted]
+    return alias ? tools.find((t) => t.name === alias) : undefined
   }
   function contextFor(args) {
     const parts = []
@@ -1883,7 +1900,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     boot, sync, reload, stop, dispose, status, create, fork, promptFor, panelSource,
     use: exportsOf, has: (id) => live.has(id), running: (id) => live.get(id)?.source || null, generation: () => generation,
     capabilitiesOf,
-    emit, claim, filter, filterSync, buildTools,
+    emit, claim, filter, filterSync, buildTools, resolveTool,
     // 插件核心自己听事件（不属于任何模块，不会被撤掉）
     listen: (event, fn) => { const item = { id: '@core', fn }; listeners.set(event, [...(listeners.get(event) || []), item]); return () => listeners.set(event, (listeners.get(event) || []).filter((x) => x !== item)) }, contextFor, rules, commands, dshTools, builtinOff, activePlatforms: () => [...activePlatforms()], handle,
     hasRoute: (path) => routes.has(path),

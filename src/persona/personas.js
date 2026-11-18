@@ -123,7 +123,6 @@ function qqOnlyRuleLines(cfg, off, { poke = true } = {}) {
   return [
     '- 在群里要真 @ 某人（对方会收到提醒），写 <at:QQ号>；不知道 QQ 号就写 @群名片，能对上群里唯一一个人才会变成真 @。',
     ...(cfg?.stickers?.faces === false ? [] : [`- 想在文字里夹 QQ 自带的小黄脸表情，写 <face:名字>，比如 ${FACE_EXAMPLES.map((n) => `<face:${n}>`).join(' ')}；只能用 QQ 系统表情里有的名字，别每句都加。别人发来的小黄脸会写成「[名字]」。`]),
-    ...(off?.has?.('qq-tools') ? [] : ['- 想翻这个聊天更早的记录，用 qq_chat_history。']),
     ...(poke ? [QQ_POKE_RULE] : []),
   ]
 }

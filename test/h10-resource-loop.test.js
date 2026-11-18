@@ -59,7 +59,7 @@ before(async () => {
     if (t.includes('H10-LOOP')) {
       if (loopCalls >= MAX_TOOL_CALLS) return '预算耗尽，止损'
       loopCalls++
-      await callTool('qq_chat_history', { count: 1 })
+      await callTool('chat_history', { count: 1 })
       return '工具说要再试一次。H10-LOOP 请继续。'
     }
     if (t.includes('H10-SOCIAL-FULL')) {
@@ -95,7 +95,7 @@ test('H10-a：工具要求循环重试——夹具预算止损，不发生无界
   const loopTurns = fake.turns.slice(n).filter((t) => String(t.userText).includes('H10-LOOP'))
   assert.ok(loopTurns.length >= 1, '循环至少跑了一轮')
   assert.ok(loopTurns.length <= MAX_ROUNDS, `轮数不超过夹具上限 ${MAX_ROUNDS}`)
-  const historyCalls = loopTurns.flatMap((t) => (t.toolCalls || []).filter((c) => c.name === 'qq_chat_history'))
+  const historyCalls = loopTurns.flatMap((t) => (t.toolCalls || []).filter((c) => c.name === 'chat_history'))
   assert.ok(historyCalls.length <= MAX_TOOL_CALLS, `工具调用数不超过夹具预算 ${MAX_TOOL_CALLS}（实际 ${historyCalls.length}）`)
   assert.equal(api.hub.stats().errors || 0 >= 0, true, '统计可读（无未捕获崩溃）')
 })

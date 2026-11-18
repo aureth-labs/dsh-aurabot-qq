@@ -543,3 +543,88 @@ test('Step 1A P1-1 & 复审5.3：fetch(media) 仅放行媒体子目录+合法媒
 
   await adapter.stop()
 })
+
+test('Phase 3A：QQ fetch(history) 统一输出按时间升序的 FetchedHistoryPage（群/私聊/before游标/hasMore）', async () => {
+  const h = makeHarness()
+  const adapter = h.makeAdapter()
+  const ctx = makeCtx(adapter)
+  await adapter.start(ctx)
+
+  const calls = []
+  const origCall = adapter.__fakeClient.call
+  adapter.__fakeClient.call = async (action, params, opts) => {
+    calls.push({ action, params })
+    if (action === 'get_group_msg_history') {
+      if (!params.message_id) {
+        // 故意倒序（新 → 旧）返回 3 条（请求 count=2 会多要到 3 条用来判定 hasMore）
+        return {
+          status: 'ok', retcode: 0,
+          data: {
+            messages: [
+              { message_id: 103, time: 1700000300, sender: { user_id: 10000, nickname: '假机器人' }, message: [{ type: 'text', data: { text: '第三条' } }] },
+              { message_id: 102, time: 1700000200, sender: { user_id: 20001, card: '群友A' }, message: [{ type: 'text', data: { text: '第二条' } }] },
+              { message_id: 101, time: 1700000100, sender: { user_id: 20002, nickname: '群友B' }, message: [{ type: 'text', data: { text: '第一条' } }] },
+            ],
+          },
+        }
+      }
+      // 带 before='102' 时可能把锚点 102 本身也带回来，且只有 1 条更早消息
+      return {
+        status: 'ok', retcode: 0,
+        data: {
+          messages: [
+            { message_id: 101, time: 1700000100, sender: { user_id: 20002, nickname: '群友B' }, message: [{ type: 'text', data: { text: '第一条' } }] },
+            { message_id: 102, time: 1700000200, sender: { user_id: 20001, card: '群友A' }, message: [{ type: 'text', data: { text: '第二条' } }] },
+          ],
+        },
+      }
+    }
+    if (action === 'get_friend_msg_history') {
+      return {
+        status: 'ok', retcode: 0,
+        data: {
+          messages: [
+            { message_id: 201, time: 1700000400, sender: { user_id: 30001, nickname: '好友C' }, message: [{ type: 'text', data: { text: '私聊历史' } }] },
+          ],
+        },
+      }
+    }
+    return origCall(action, params, opts)
+  }
+
+  const histCalls = () => calls.filter((c) => c.action === 'get_group_msg_history' || c.action === 'get_friend_msg_history')
+
+  const page1 = await adapter.fetch({ kind: 'history', chat: { kind: 'group', id: '999' }, count: 2 })
+  assert.equal(histCalls()[0].action, 'get_group_msg_history')
+  assert.equal(histCalls()[0].params.group_id, 999)
+  assert.equal(histCalls()[0].params.count, 3)
+  assert.equal(page1.hasMore, true)
+  assert.equal(page1.before, '102')
+  assert.deepEqual(page1.messages.map((m) => m.messageId), ['102', '103'])
+  assert.equal(page1.messages[0].sender?.account, '20001')
+  assert.equal(page1.messages[0].sender?.name, '群友A')
+  assert.equal(page1.messages[0].sender?.isBot, false)
+  assert.equal(page1.messages[1].sender?.isBot, true)
+  assert.equal('raw' in page1.messages[0], false)
+
+  const page2 = await adapter.fetch({ kind: 'history', chat: { kind: 'group', id: '999' }, count: 2, before: page1.before })
+  assert.equal(histCalls()[1].params.message_id, 102)
+  assert.equal(histCalls()[1].params.reverse_order, true)
+  assert.equal(histCalls()[1].params.count, 4)
+  assert.equal(page2.hasMore, false)
+  assert.deepEqual(page2.messages.map((m) => m.messageId), ['101'])
+  assert.equal(page2.before, '101')
+
+  const dmPage = await adapter.fetch({ kind: 'history', chat: { kind: 'private', id: '30001' }, count: 5 })
+  assert.equal(histCalls()[2].action, 'get_friend_msg_history')
+  assert.equal(histCalls()[2].params.user_id, 30001)
+  assert.equal(dmPage.hasMore, false)
+  assert.equal(dmPage.messages[0]?.parts?.[0]?.text, '私聊历史')
+
+  await assert.rejects(
+    () => adapter.fetch({ kind: 'history', chat: { kind: 'group', id: 'not-a-number' } }),
+    (e) => e.certainty === 'not-sent' && e.code === 'bad-fetch-request',
+  )
+
+  await adapter.stop()
+})

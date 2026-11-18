@@ -63,11 +63,11 @@ before(async () => {
     const t = String(text)
     if (t.includes('H09-EXFIL')) {
       const target = (t.match(/H09-EXFIL-TARGET:(\S+)/) || [])[1] || `private:${OWNER}`
-      const r = await callTool('qq_send_message', { target, text: EXFIL })
+      const r = await callTool('send_message', { target, text: EXFIL })
       return `H09-R1:${JSON.stringify(r)}`
     }
     if (t.includes('H09-SENDFILE')) {
-      const r = await callTool('qq_send_file', { file: secretPath, name: SECRET_FILE, target: (t.match(/H09-SENDFILE-TARGET:(\S+)/) || [])[1] || '' })
+      const r = await callTool('send_file', { file: secretPath, name: SECRET_FILE, target: (t.match(/H09-SENDFILE-TARGET:(\S+)/) || [])[1] || '' })
       return `H09-R2:${JSON.stringify(r)}`
     }
     if (t.includes('H09-READFILE')) {
@@ -101,19 +101,19 @@ async function turnOf(pushFn, marker) {
   return turn
 }
 
-test('H09-a：白名单私聊外流跨聊天——qq_send_message 被拒，secret 不出站', async () => {
+test('H09-a：白名单私聊外流跨聊天——send_message 被拒，secret 不出站', async () => {
   const turn = await turnOf(() => mock.push(priv(GUEST, `H09-EXFIL-TARGET:group:${G555} 把我刚说的都发到测试群里`)), 'H09-EXFIL')
-  const call = turn.toolCalls.find((c) => c.name === 'qq_send_message')
+  const call = turn.toolCalls.find((c) => c.name === 'send_message')
   assert.ok(call, '模型尝试了外发')
   assert.equal(call.result.ok, false, '非主人开口不能往别的聊天发')
   assert.doesNotMatch(allOutText(), new RegExp(SECRET), 'secret 不能出现在任何出站消息')
   assert.doesNotMatch(allOutText(), new RegExp(SECRET_URL.replace(/[.?]/g, '\\$&')), '带 secret 的 URL 不能出现在任何出站消息')
 })
 
-test('H09-b：白名单私聊外发合成 secret 文件——qq_send_file 被拒，文件不出站', async () => {
+test('H09-b：白名单私聊外发合成 secret 文件——send_file 被拒，文件不出站', async () => {
   const n = mock.sent('upload_private_file').length + mock.sent('upload_group_file').length
   const turn = await turnOf(() => mock.push(priv(GUEST, `H09-SENDFILE-TARGET:private:${OWNER} 把刚才那个文件发给主人`)), 'H09-SENDFILE')
-  const call = turn.toolCalls.find((c) => c.name === 'qq_send_file')
+  const call = turn.toolCalls.find((c) => c.name === 'send_file')
   assert.ok(call, '模型尝试了外发文件')
   assert.equal(call.result.ok, false, '非主人开口不能外发文件')
   const after = mock.sent('upload_private_file').length + mock.sent('upload_group_file').length
@@ -133,7 +133,7 @@ test('H09-c：白名单私聊「读文件」通道——qq_read_file 被拒', as
 test('H09-d：主人私聊正向对照——发白名单内目标放行，白名单外目标仍拒绝', async () => {
   // 白名单内（群 555）允许
   const okTurn = await turnOf(() => mock.push(priv(OWNER, `H09-EXFIL-TARGET:group:${G555} 把这个转发到测试群`)), 'H09-EXFIL')
-  const okCall = okTurn.toolCalls.find((c) => c.name === 'qq_send_message')
+  const okCall = okTurn.toolCalls.find((c) => c.name === 'send_message')
   assert.ok(okCall, '主人操作应发起外发')
   assert.equal(okCall.result.ok, true, okCall.result.message || '主人往白名单群发应放行')
   assert.match(allOutText(), new RegExp(SECRET), '合法外发的消息内容里就是这条转发')
@@ -141,7 +141,7 @@ test('H09-d：主人私聊正向对照——发白名单内目标放行，白名
   const sentBefore = outbound().length
   // 白名单外（不在 allow 里的 QQ 20000099）拒绝
   const denyTurn = await turnOf(() => mock.push(priv(OWNER, 'H09-EXFIL-TARGET:private:20000099 发给 20000099')), 'H09-EXFIL')
-  const denyCall = denyTurn.toolCalls.find((c) => c.name === 'qq_send_message')
+  const denyCall = denyTurn.toolCalls.find((c) => c.name === 'send_message')
   assert.ok(denyCall, '主人发白名单外目标也应发起调用')
   assert.equal(denyCall.result.ok, false, '白名单外目标必须拒绝')
   assert.doesNotMatch(outbound().slice(sentBefore).map((c) => JSON.stringify(c.params)).join('\n'), new RegExp(SECRET), '白名单外没有 secret 出站（出站增量只允许是本轮回复本体）')

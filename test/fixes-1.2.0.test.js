@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import qqTools from '../src/modules/qq-tools/index.js'
+import chatTools from '../src/modules/chat-tools/index.js'
 import { createMemoryStore } from '../src/features/memory.js'
 import { matchSticker, pickForReply } from '../src/features/stickers.js'
 import { createImageGen } from '../src/features/imagegen.js'
@@ -25,7 +25,7 @@ function searchBuilder() {
     ]],
   ])
   const builders = []
-  qqTools.setup({
+  chatTools.setup({
     core: { hub: { chatLogDays: () => [...logs.keys()], chatLogOf: (day) => logs.get(day) || [] }, onebot: {} },
     config: () => ({ files: { enabled: false } }),
     tool: (builder) => builders.push(builder),
@@ -35,7 +35,7 @@ function searchBuilder() {
 }
 
 function searchTool(builder, chat, level) {
-  const tool = builder({ chat, level }).find((t) => t.name === 'qq_search_chatlog')
+  const tool = builder({ chat, level }).find((t) => t.name === 'search_chatlog')
   assert.ok(tool, '应该注册聊天流水搜索工具')
   return tool
 }
@@ -314,12 +314,12 @@ function historyTool({ mode, level = 'chat', chat = { kind: 'group', groupId: '1
       return { messages: [{ time: 1, user_id: 7, sender: { nickname: '群友' }, message: [{ type: 'text', data: { text: '你好' } }] }] }
     },
   }
-  qqTools.setup({
+  chatTools.setup({
     core: { hub: { turnHasOwner: () => owner, turnSendersAllOwner: () => allOwner, turnSenders: () => senders }, onebot },
     config: () => ({ botQQ: '1', files: { enabled: false }, allow: { groups: ['100', '200', '300'] }, group: { crossRead: mode } }),
     tool: (builder) => builders.push(builder),
   })
-  const tool = builders[0]({ chat, level, sessionId: 's' }).find((x) => x.name === 'qq_chat_history')
+  const tool = builders[0]({ chat, level, sessionId: 's' }).find((x) => x.name === 'chat_history')
   return { tool, calls }
 }
 const privateChat = { kind: 'private', userId: '7', chatId: 'private:7' }

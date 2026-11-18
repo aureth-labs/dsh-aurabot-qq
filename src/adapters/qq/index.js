@@ -625,6 +625,33 @@ export function createQqAdapter(options = {}) {
     }
   }
 
+  /** 把 OneBot 历史消息数组规整成按时间升序 [旧 → 新] 的 FetchedHistoryPage。 */
+  function normalizeHistoryPage(rawList, { count, anchor }) {
+    const mapped = (Array.isArray(rawList) ? rawList : [])
+      .map((m, idx) => toFetchedMessage(m, `hist-${idx}`))
+    // OneBot 网关偶见倒序返回（新 → 旧），统一转为 [旧 → 新]
+    if (mapped.length >= 2) {
+      const firstAt = Number(mapped[0]?.at) || 0
+      const lastAt = Number(mapped[mapped.length - 1]?.at) || 0
+      if (firstAt > 0 && lastAt > 0 && firstAt > lastAt) mapped.reverse()
+    }
+    let filtered = mapped
+    if (anchor) {
+      const anchorIdx = mapped.findIndex((m) => String(m.messageId) === anchor)
+      filtered = anchorIdx >= 0
+        ? mapped.slice(0, anchorIdx)
+        : mapped.filter((m) => String(m.messageId) !== anchor)
+    }
+    const hasMore = filtered.length > count
+    const messages = filtered.slice(-count)
+    const before = messages.length > 0 && messages[0].messageId ? String(messages[0].messageId) : undefined
+    return {
+      messages,
+      hasMore,
+      ...(before ? { before } : {}),
+    }
+  }
+
   async function fetch(request = {}) {
     if (!running || !client || !connected) throw makeSendError('not-sent', 'offline', instance, 'QQ 网关未连接')
     const chat = request.chat || {}
@@ -665,11 +692,20 @@ export function createQqAdapter(options = {}) {
           return { messages: nodes.map((n, idx) => toFetchedMessage(n, `fwd-${idx}`)) }
         }
         case 'history': {
+          if (!/^\d+$/.test(id)) throw makeSendError('not-sent', 'bad-fetch-request', instance, 'QQ fetch(history) 需要数字群号或 QQ 号')
           const count = Math.max(1, Math.min(100, Number(request.count) || 20))
+          const anchor = request.before !== undefined && request.before !== null ? String(request.before).trim() : ''
+          const anchorParam = anchor && /^-?\d+$/.test(anchor) && Number.isSafeInteger(Number(anchor)) ? Number(anchor) : anchor
+          // 多要 1~2 条，用来判定 before 游标之前是否还有更早消息（hasMore）及剔除锚点本身
+          const fetchCount = anchor ? count + 2 : count + 1
           const action = kind === 'group' ? 'get_group_msg_history' : 'get_friend_msg_history'
-          const params = kind === 'group' ? { group_id: Number(id), count } : { user_id: Number(id), count }
+          const base = kind === 'group' ? { group_id: Number(id) } : { user_id: Number(id) }
+          const params = anchor
+            ? { ...base, count: fetchCount, message_id: anchorParam, reverse_order: true }
+            : { ...base, count: fetchCount }
           const r = await call(action, params, { timeoutMs: 20000 })
-          return Array.isArray(r?.messages) ? r.messages : []
+          const rawList = Array.isArray(r?.messages) ? r.messages : (Array.isArray(r) ? r : [])
+          return normalizeHistoryPage(rawList, { count, anchor })
         }
         case 'member': {
           if (kind !== 'group') throw makeSendError('not-sent', 'no-member', instance, '私聊没有成员信息')

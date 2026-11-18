@@ -205,7 +205,7 @@ test('PR-2G 场景2：QQ + Feishu 双平台共存下，全局 preset / Feishu �
   await until(() => fake.turns.length >= 1)
   const fsTurn = fake.turns[0]
   assert.doesNotMatch(fsTurn.ctxText, QQ_LEAK_RE, `飞书回合 ctxText 不得含 QQ 内容：\n${fsTurn.ctxText}`)
-  assert.doesNotMatch(fsTurn.ctxText, /发 QQ 空间说说|当前是 QQ 会话|qq_import_qq_stickers/)
+  assert.doesNotMatch(fsTurn.ctxText, /chat_history|发 QQ 空间说说|当前是 QQ 会话|qq_import_qq_stickers/)
 
   // 4) QQ 主人私聊入站回合：ctxText 应完整拿到 profile / diary / qq-api / qqSessionRulesText
   await app.hub.onMessage({
@@ -231,7 +231,8 @@ test('PR-2G 场景2：QQ + Feishu 双平台共存下，全局 preset / Feishu �
   assert.doesNotMatch(qqGroupCtx, /qq_get_profile|发 QQ 空间说说/, 'QQ 群不应拿到仅主人私聊上下文')
   assert.match(qqTurn.ctxText, /<at:QQ号>/, 'QQ 会话应通过 session context 拿到 QQ 语法提示')
   assert.match(qqTurn.ctxText, /<face:/, 'QQ 会话应通过 session context 拿到小黄脸提示')
-  assert.match(qqTurn.ctxText, /qq_chat_history/, 'QQ 会话应拿到 qq_chat_history 提示')
+  assert.match(qqTurn.ctxText, /chat_history/, 'QQ 会话应按能力拿到 chat_history 提示')
+  assert.doesNotMatch(qqTurn.ctxText, /qq_chat_history/, '会话提示应使用跨平台权威名 chat_history')
   assert.match(qqTurn.ctxText, /<poke>/, 'QQ 会话应拿到戳一戳提示')
 
   // 5) 双平台命令过滤
@@ -273,7 +274,7 @@ test('PR-2G 场景3：纯 qq#2（无默认 qq）与 qq+qq#2 双实例共存时�
   for (const varName of ['aurabot_rules_private', 'aurabot_rules_social', 'aurabot_rules_group_owner']) {
     const text = pureQq2.fake.variables.get(varName)()
     assert.doesNotMatch(text, /<poke>|想戳回去/, `纯 qq#2 下 ${varName} 不得写 <poke>`)
-    assert.match(text, /<face:|<at:QQ号>|qq_chat_history/, '纯 qq#2 仍保留通用 QQ 规则')
+    assert.match(text, /<face:|<at:QQ号>/, '纯 qq#2 仍保留通用 QQ 规则')
   }
   qq2Adapter.pushInbound({
     chat: { id: '10000001', kind: 'private', name: '阿白' },
@@ -285,6 +286,7 @@ test('PR-2G 场景3：纯 qq#2（无默认 qq）与 qq+qq#2 双实例共存时�
   })
   await until(() => pureQq2.fake.turns.length >= 1)
   assert.doesNotMatch(pureQq2.fake.turns[0].ctxText, /<poke>|会变成 QQ 的戳一戳/)
+  assert.match(pureQq2.fake.turns[0].ctxText, /chat_history/, '开启 history 的 qq#2 会话通过 chat-tools 上下文拿到 chat_history 提示')
 
   // 3B) qq + qq#2 双实例共存：共享全局 preset 无 <poke>；默认 qq 会话拿 <poke>，qq#2 不拿
   const dualQq = await bootHost(t, {

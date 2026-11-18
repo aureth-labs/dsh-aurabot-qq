@@ -125,7 +125,7 @@ test('API_VERSION = 3 且向后兼容 MIN_API_VERSION = 1；v1 模块默认 plat
 })
 
 test('内置模块平台声明完备，只开假平台时 QQ 模块跳过（「未启用对应平台」），[*] 模块全部正常运行', async (t) => {
-  const expectedUniversal = ['memory', 'mood', 'purpose', 'autotelic', 'song', 'speakup', 'bili', 'voice', 'imagegen', 'video', 'stickers']
+  const expectedUniversal = ['memory', 'mood', 'purpose', 'autotelic', 'song', 'speakup', 'bili', 'voice', 'imagegen', 'video', 'stickers', 'chat-tools']
   const expectedQq = ['qq-api', 'qq-tools', 'qzone-social', 'diary', 'contacts', 'profile']
   for (const def of BUILTINS) {
     if (expectedUniversal.includes(def.id)) {

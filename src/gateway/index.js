@@ -744,6 +744,13 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
           throw makeSendError('not-sent', 'bad-fetch-request', run.instance, 'fetch(message) 缺少 messageId')
         }
         if (!req.chat && addr) req = { ...req, chat: { kind: addr.kind, id: addr.id } }
+      } else if (req?.kind === 'history') {
+        if (!req.chat && addr && (addr.kind === 'private' || addr.kind === 'group')) {
+          req = { ...req, chat: { kind: addr.kind, id: addr.id } }
+        }
+        if (!String(req.chat?.id || '').trim()) {
+          throw makeSendError('not-sent', 'bad-fetch-request', run.instance, 'fetch(history) 缺少 chat.id')
+        }
       }
       return run.adapter.fetch(req)
     },

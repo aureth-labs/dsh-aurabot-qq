@@ -21,6 +21,7 @@ import {
   MAX_FILE_BYTES,
   MAX_IMAGE_BYTES,
 } from '../../src/adapters/feishu/index.js'
+import { mergeCapsWithFeatures } from '../../src/gateway/features.js'
 
 const APP_ID = 'cli_test'
 const APP_SECRET = 'secret'
@@ -1079,6 +1080,144 @@ test('Step 1A：fetch(message) 解析文本/图片/app机器人/deleted/230027/4
   await assert.rejects(
     () => adapter.fetch({ kind: 'message', messageId: 'om_403' }),
     (e) => e.certainty === 'not-sent' && e.code === '403',
+  )
+
+  await adapter.stop()
+})
+
+test('Phase 3A：飞书 history 开关默认关闭、开启后 fetch(history) 输出 FetchedHistoryPage（群聊/单聊/分页/230027）', async () => {
+  const defaultAdapter = createFeishuAdapter({ client: makeFakeClient() })
+  defaultAdapter.__feishu.setConfig(CFG)
+  const defaultCtx = makeCtx(defaultAdapter)
+  await defaultAdapter.start(defaultCtx)
+  assert.equal(defaultAdapter.caps().history, false, '未开启 history 设置前默认宣称 false')
+  assert.equal(mergeCapsWithFeatures(defaultAdapter.caps(), null).features['message.history.read'], false)
+  await defaultAdapter.stop()
+
+  const client = makeFakeClient()
+  const baseRequest = client.request.bind(client)
+  let histMode = 'page1'
+  client.request = async (req) => {
+    if (req.method === 'GET' && req.url.includes('/open-apis/im/v1/messages?')) {
+      client.calls.push({ ...req })
+      if (histMode === '230027') return { status: 403, json: { code: 230027, msg: 'no permission im:message:readonly' } }
+      if (histMode === 'page1') {
+        return {
+          status: 200,
+          json: {
+            code: 0,
+            data: {
+              has_more: true,
+              page_token: 'pt_page2',
+              items: [
+                {
+                  message_id: 'om_2',
+                  create_time: '1700000200000',
+                  msg_type: 'text',
+                  body: { content: JSON.stringify({ text: '较新一条' }) },
+                  sender: { id: 'ou_bot', id_type: 'open_id', sender_type: 'app' },
+                },
+                {
+                  message_id: 'om_1',
+                  create_time: '1700000100000',
+                  msg_type: 'text',
+                  body: { content: JSON.stringify({ text: '较早一条' }) },
+                  sender: { id: 'ou_u1', id_type: 'open_id', sender_type: 'user' },
+                },
+              ],
+            },
+          },
+        }
+      }
+      if (histMode === 'page2') {
+        return {
+          status: 200,
+          json: {
+            code: 0,
+            data: {
+              has_more: false,
+              items: [
+                {
+                  message_id: 'om_0',
+                  create_time: '1700000050000',
+                  msg_type: 'text',
+                  body: { content: JSON.stringify({ text: '最老一条' }) },
+                  sender: { id: 'ou_u1', id_type: 'open_id', sender_type: 'user' },
+                },
+              ],
+            },
+          },
+        }
+      }
+      return {
+        status: 200,
+        json: {
+          code: 0,
+          data: {
+            has_more: false,
+            items: [
+              {
+                message_id: 'om_p2p_1',
+                create_time: '1700000300000',
+                msg_type: 'text',
+                body: { content: JSON.stringify({ text: '单聊历史消息' }) },
+                sender: { id: 'ou_p2p_user', id_type: 'open_id', sender_type: 'user' },
+              },
+            ],
+          },
+        },
+      }
+    }
+    if (req.method === 'POST' && req.url.includes('/open-apis/im/v1/messages')) {
+      client.calls.push({ ...req })
+      return { status: 200, json: { code: 0, data: { message_id: 'om_sent_p2p', chat_id: 'oc_p2p_from_send' } } }
+    }
+    return baseRequest(req)
+  }
+
+  const adapter = createFeishuAdapter({ client })
+  adapter.__feishu.setConfig({ ...CFG, history: true })
+  const ctx = makeCtx(adapter)
+  await adapter.start(ctx)
+  assert.equal(adapter.caps().history, true)
+  assert.equal(mergeCapsWithFeatures(adapter.caps(), null).features['message.history.read'], true)
+
+  const page1 = await adapter.fetch({ kind: 'history', chat: { kind: 'group', id: 'oc_g1' }, count: 2 })
+  const req1Url = new URL(client.calls.find((c) => c.url.includes('container_id=oc_g1')).url)
+  assert.equal(req1Url.searchParams.get('container_id_type'), 'chat')
+  assert.equal(req1Url.searchParams.get('sort_type'), 'ByCreateTimeDesc')
+  assert.equal(req1Url.searchParams.get('page_size'), '2')
+  assert.equal(page1.hasMore, true)
+  assert.equal(page1.before, 'pt_page2')
+  assert.deepEqual(page1.messages.map((m) => m.messageId), ['om_1', 'om_2'])
+  assert.equal(page1.messages[0].sender?.isBot, false)
+  assert.equal(page1.messages[1].sender?.isBot, true)
+  assert.equal('raw' in page1.messages[0], false)
+
+  histMode = 'page2'
+  const page2 = await adapter.fetch({ kind: 'history', chat: { kind: 'group', id: 'oc_g1' }, count: 2, before: page1.before })
+  const req2Url = new URL(client.calls.at(-1).url)
+  assert.equal(req2Url.searchParams.get('page_token'), 'pt_page2')
+  assert.equal(page2.hasMore, false)
+  assert.equal('before' in page2, false)
+  assert.deepEqual(page2.messages.map((m) => m.messageId), ['om_0'])
+
+  // 单聊未记录 chat_id 时诚实报错；通过 send 返回 chat_id（或入站消息）记录后即可翻单聊历史
+  await assert.rejects(
+    () => adapter.fetch({ kind: 'history', chat: { kind: 'private', id: 'ou_p2p_user' }, count: 5 }),
+    (e) => e.certainty === 'not-sent' && e.code === 'no-chat-id',
+  )
+  await adapter.send({ chat: { kind: 'private', id: 'ou_p2p_user' }, parts: [{ type: 'text', text: 'hi' }] })
+  histMode = 'p2p'
+  const p2pPage = await adapter.fetch({ kind: 'history', chat: { kind: 'private', id: 'ou_p2p_user' }, count: 5 })
+  const reqP2pUrl = new URL(client.calls.at(-1).url)
+  assert.equal(reqP2pUrl.searchParams.get('container_id'), 'oc_p2p_from_send')
+  assert.equal(p2pPage.messages[0]?.parts?.[0]?.text, '单聊历史消息')
+
+  histMode = '230027'
+  await assert.rejects(
+    () => adapter.fetch({ kind: 'history', chat: { kind: 'group', id: 'oc_g1' } }),
+    (e) => e.certainty === 'not-sent' && e.code === '230027',
   )
 
   await adapter.stop()

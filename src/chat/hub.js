@@ -213,7 +213,12 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     return !isBeforeMemoryReset(chatId, uid, at < 1e12 ? at * 1000 : at)
   }
   function filterHistory(chatId, messages) {
-    return messages.filter((message) => message && historyVisible(chatId, message.sender?.user_id ?? message.user_id, message.time))
+    return (Array.isArray(messages) ? messages : []).filter((message) => {
+      if (!message || typeof message !== 'object') return false
+      const uid = message.sender?.account ?? message.sender?.user_id ?? message.user_id
+      const time = message.at ?? message.time
+      return historyVisible(chatId, uid, time)
+    })
   }
 
   const mounted = new Map() // sessionKey → { agent, offs, chatId, toolsKey }  按会话记，agent 对象换了也能清掉旧工具（#90）
@@ -2666,11 +2671,17 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const parsed = raw.includes(':') ? parseChatId(raw) : null
     if (parsed) {
       if (groupNames.has(parsed.id)) return groupNames.get(parsed.id)
-      const defaultPlatform = parseChatId('private:0')?.platform
-      if (parsed.platform !== defaultPlatform || !/^\d+$/.test(parsed.id)) return raw
+      const defPlat = defaultPlatform()
+      if (parsed.platform !== defPlat || !/^\d+$/.test(parsed.id)) return raw
+      if (!isDefaultInstanceChat(raw, parsed.platform) || (gateway && gateway.caps?.(raw) !== null)) {
+        return parsed.id
+      }
     }
     const qid = parsed ? parsed.id : raw
-    if (!/^\d+$/.test(qid) || !onebot) return raw
+    const normCheck = parsed ? raw : (normalizeChatId(`group:${qid}`) || '')
+    if (!/^\d+$/.test(qid) || !onebot || (gateway && normCheck && gateway.caps?.(normCheck) !== null)) {
+      return qid
+    }
     try {
       // 查群名是锦上添花：失败就退回群号，别在网关抖动时白等重试
       const info = await onebot.call('get_group_info', { group_id: Number(qid) }, { retries: 0 })
@@ -2691,11 +2702,62 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   }
   const quoteNeedsHistory = (parsed) => [...(parsed.images || []), ...(parsed.stickers || [])].some((seg) => !quoteSegUsable(seg))
   /**
+   * 网关归一化引用消息里若缺可直接下载的媒体 URL（如 QQ get_msg 只给了裸文件名），
+   * 且当前实例开启了 message.history.read 时，尝试从历史记录页补全。
+   * 对已有媒体下载能力且原生仅带 id+messageId（如飞书）的平台不额外发历史请求。
+   */
+  const fetchedQuoteNeedsHistory = (fetched, feats, isDefaultPlat) => {
+    if (!feats?.['message.history.read']) return false
+    const parts = Array.isArray(fetched?.parts) ? fetched.parts : []
+    return parts.some((p) => {
+      if (!p || (p.type !== 'image' && p.type !== 'sticker')) return false
+      const m = p.media || {}
+      if (m.url || m.bytes || m.path) return false
+      return Boolean(isDefaultPlat || !feats?.['media.fetch'] || !m.id)
+    })
+  }
+  const hasUsableMedia = (fetched) => (Array.isArray(fetched?.parts) ? fetched.parts : [])
+    .some((p) => (p?.type === 'image' || p?.type === 'sticker') && Boolean(p.media?.url || p.media?.bytes || p.media?.path))
+
+  /** 从网关归一化历史分页（FetchedHistoryPage）中按 messageId 捞回目标消息。 */
+  async function quoteFromGatewayHistory(id, normChatId) {
+    const addr = normChatId ? parseChatId(normChatId) : null
+    if (!addr || (addr.kind !== 'group' && addr.kind !== 'private') || !addr.id) return null
+    if (!gateway || typeof gateway.fetch !== 'function' || !gateway.features?.(normChatId)?.['message.history.read']) return null
+    let before
+    for (let pageNo = 0; pageNo < 2; pageNo++) {
+      try {
+        const page = await gateway.fetch(normChatId, {
+          kind: 'history',
+          chat: { kind: addr.kind, id: addr.id },
+          count: 30,
+          ...(before ? { before } : {}),
+        })
+        const msgs = Array.isArray(page?.messages) ? page.messages : []
+        const hit = msgs.find((m) => String(m?.messageId ?? '') === id)
+        if (hit) return hit
+        if (!page?.hasMore || !page?.before || page.before === before) break
+        before = String(page.before)
+      } catch (error) {
+        log.debug(`引用消息网关历史也拉不到（${id}）：`, error?.message || error)
+        break
+      }
+    }
+    return null
+  }
+
+  /**
    * get_msg 对「她发出的表情包/图片」可能只回空 url + 裸文件名（下载不了）。
-   * 这时退回消息历史（get_friend_msg_history / get_group_msg_history），里面带可用 url。
+   * 这时退回消息历史（网关侧 FetchedHistoryPage 或传统 OneBot），里面带可用 url。
    */
   async function quoteFromHistory(id, ctx) {
-    if (!ctx || (!ctx.userId && !ctx.groupId)) return null
+    if (!ctx) return null
+    const rawChatId = ctx.chatId || (ctx.groupId ? `group:${ctx.groupId}` : ctx.userId ? `private:${ctx.userId}` : '')
+    const normChatId = rawChatId ? (normalizeChatId(rawChatId) || String(rawChatId)) : ''
+    const addr = normChatId ? parseChatId(normChatId) : null
+    const useGw = Boolean(gateway && normChatId && (addr?.platform !== defaultPlatform() || gateway.caps?.(normChatId) !== null || !onebot))
+    if (useGw) return quoteFromGatewayHistory(id, normChatId)
+    if ((!ctx.userId && !ctx.groupId) || typeof onebot?.call !== 'function') return null
     const group = Boolean(ctx.groupId)
     const action = group ? 'get_group_msg_history' : 'get_friend_msg_history'
     const base = group ? { group_id: Number(ctx.groupId) } : { user_id: Number(ctx.userId) }
@@ -2818,9 +2880,14 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     }
 
     if (useGatewayQuote) {
-      if (gateway.features?.(normChatId)?.['message.quote.read']) {
+      const feats = gateway.features?.(normChatId) || {}
+      if (feats['message.quote.read']) {
         try {
-          const fetched = await gateway.fetch(normChatId, { kind: 'message', messageId: id })
+          let fetched = await gateway.fetch(normChatId, { kind: 'message', messageId: id })
+          if (fetchedQuoteNeedsHistory(fetched, feats, addr?.platform === defaultPlatform())) {
+            const fromHist = await quoteFromGatewayHistory(id, normChatId)
+            if (fromHist && hasUsableMedia(fromHist)) fetched = fromHist
+          }
           const built = await buildQuotedFromFetched(fetched, normChatId, selfAcc)
           return saveCache(built)
         } catch (error) {
@@ -2831,6 +2898,13 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
             if (recent) {
               const built = await buildQuotedFromFetched(recent, normChatId, selfAcc)
               if (built && built !== 'hidden') return saveCache(built)
+            }
+            if (failKind !== 'permission' && feats['message.history.read']) {
+              const fromHist = await quoteFromGatewayHistory(id, normChatId)
+              if (fromHist) {
+                const built = await buildQuotedFromFetched(fromHist, normChatId, selfAcc)
+                if (built && built !== 'hidden') return saveCache(built)
+              }
             }
           }
           const ttl = failKind === 'network' ? NEG_TTL_SHORT_MS : NEG_TTL_LONG_MS
@@ -2846,6 +2920,13 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       if (recent) {
         const built = await buildQuotedFromFetched(recent, normChatId, selfAcc)
         if (built && built !== 'hidden') return saveCache(built)
+      }
+      if (feats['message.history.read']) {
+        const fromHist = await quoteFromGatewayHistory(id, normChatId)
+        if (fromHist) {
+          const built = await buildQuotedFromFetched(fromHist, normChatId, selfAcc)
+          if (built && built !== 'hidden') return saveCache(built)
+        }
       }
       const instCfg = getConfig()?.platforms?.[addr?.instance || defaultPlatform()]?.caps
       // quoteReply 控制出站是否引用回复，不应连带禁用入站读取被引用消息；这里只看 message.quote.read
@@ -3525,7 +3606,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       log.debug(`忽略 ${msg.chatId}（${allowed.reason}）`)
       return
     }
-    await refreshFriends()
+    if (isDefaultInstanceChat(msg.chatId, msg.platform) && (!gateway || gateway.caps?.(msg.chatId) === null)) {
+      await refreshFriends()
+    }
     if (disposed) return
     // 静默分支也保存直接互动证据，引用识别沿用现有缓存。
     const quotedBot = msg.kind === 'group' && msg.replyId ? await repliedToBot(msg.replyId, msg) : false
@@ -3901,7 +3984,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
 
   /** 群聊这一段的提示词：之前的几句当背景，上次交给她之后群里新说的话全部列出来，让她看完整段再回。 */
   async function groupPrompt(chat, mode, imageRoom = 0, refOffset = 0) {
-    const name = await groupName(chat.groupId)
+    const name = await groupName(chat.chatId || chat.groupId)
     const buf = groupBuf.get(chat.groupId) || []
     // 时间戳可能同一毫秒：直接取上一轮之后的消息，避免紧接着到达的消息丢失。
     const fresh = buf.filter((x) => !x.fed).slice(-20)
@@ -4276,6 +4359,126 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     return out
   }
 
+  /** 把网关归一化的 FetchedMessage 历史列表拍平成「谁：内容」。 */
+  function flatFetchedHistory(list) {
+    const out = []
+    for (const m of Array.isArray(list) ? list : []) {
+      if (!m || typeof m !== 'object') continue
+      const who = m.sender?.isBot ? '你' : String(m.sender?.name || m.sender?.account || '')
+      const text = String(renderParts(m.parts || []).text || '').replace(/\s+/g, ' ').trim().slice(0, 120)
+      if (!who && !text) continue
+      const rawAt = Number(m.at) || 0
+      const at = rawAt > 0 ? (rawAt < 1e12 ? rawAt * 1000 : rawAt) : 0
+      out.push(`${at ? clockLabel(at) + ' ' : ''}${who}：${text}`)
+    }
+    return out
+  }
+
+  /** 供跨平台模块调用的统一历史分页查询（网关历史或默认实例遗留 OneBot 历史，均返回归一化 FetchedHistoryPage）。 */
+  async function fetchHistory(chatId, { count = 20, before } = {}) {
+    const cid = normalizeChatId(chatId) || String(chatId || '')
+    const addr = parseChatId(cid)
+    if (!addr || (addr.kind !== 'group' && addr.kind !== 'private') || !addr.id) return { messages: [], hasMore: false }
+    const n = Math.max(1, Math.min(100, Number(count) || 20))
+    const anchor = before !== undefined && before !== null ? String(before).trim() : ''
+    const isDefInst = isDefaultInstanceChat(cid, addr.platform)
+    const gwCaps = gateway?.caps?.(cid)
+    const useGw = Boolean(gateway && typeof gateway.fetch === 'function' && (!isDefInst || gwCaps !== null || !onebot))
+    if (useGw) {
+      const feats = gateway?.features?.(cid)
+      if (!feats?.['message.history.read'] || gwCaps?.history === false) {
+        throw Object.assign(new Error('当前平台网关不支持读取聊天记录'), { code: 'unsupported-action' })
+      }
+      return await gateway.fetch(cid, {
+        kind: 'history',
+        chat: { kind: addr.kind, id: addr.id },
+        count: n,
+        ...(anchor ? { before: anchor } : {}),
+      })
+    }
+    if (!isDefInst || typeof onebot?.call !== 'function' || !/^\d+$/.test(addr.id)) {
+      throw Object.assign(new Error('当前网关不支持读取聊天记录'), { code: 'unsupported-action' })
+    }
+    const base = addr.kind === 'group' ? { group_id: Number(addr.id) } : { user_id: Number(addr.id) }
+    const anchorNum = anchor && /^-?\d+$/.test(anchor) && Number.isSafeInteger(Number(anchor)) ? Number(anchor) : 0
+    const req = anchorNum ? { ...base, count: n + 1, message_id: anchorNum, reverse_order: true } : { ...base, count: n }
+    const r = await onebot.call(addr.kind === 'group' ? 'get_group_msg_history' : 'get_friend_msg_history', req, { timeoutMs: 15000 })
+    const rawList = Array.isArray(r) ? r : (r?.messages || [])
+    const selfAcc = selfAccountFor(cid)
+    const mapped = rawList.map((m, idx) => {
+      const uid = m?.sender?.user_id ?? m?.user_id
+      const hasUid = uid !== undefined && uid !== null && String(uid) !== ''
+      const account = hasUid ? String(uid) : ''
+      const name = String(m?.sender?.card || m?.sender?.nickname || m?.nickname || account || '')
+      const rawTime = Number(m?.time)
+      const at = Number.isFinite(rawTime) && rawTime > 0 ? (rawTime < 1e12 ? rawTime * 1000 : rawTime) : undefined
+      const parsed = parseMessageEvent({ ...m, message_type: m?.message_type || addr.kind }, selfAcc, { faceName: faces.nameOf })
+      const parts = parsed.text ? [{ type: 'text', text: parsed.text }] : []
+      return {
+        messageId: String(m?.message_id ?? m?.id ?? `legacy-${idx}`),
+        ...(at ? { at } : {}),
+        ...(hasUid ? { sender: { account, ...(name ? { name } : {}), isBot: Boolean(selfAcc && account === selfAcc) } } : {}),
+        parts,
+      }
+    })
+    const filtered = anchor ? mapped.filter((m) => String(m.messageId) !== anchor) : mapped
+    const messages = filtered.slice(-n)
+    const beforeOut = messages.length > 0 && messages[0].messageId ? String(messages[0].messageId) : undefined
+    return {
+      messages,
+      hasMore: filtered.length > n,
+      ...(beforeOut ? { before: beforeOut } : {}),
+    }
+  }
+
+  /** 供跨平台模块查询当前实例可见的群列表。 */
+  async function chatGroups(chatIdOrInstance) {
+    const raw = String(chatIdOrInstance || '')
+    const norm = normalizeChatId(raw) || raw
+    const addr = parseChatId(norm)
+    const inst = addr?.instance || (!raw.includes(':') && raw ? raw : defaultPlatform())
+    const isDefInst = isDefaultInstanceChat(norm, addr?.platform)
+    const useGw = Boolean(gateway && typeof gateway.fetch === 'function' && (!isDefInst || gateway.caps?.(norm) !== null || !onebot))
+    if (useGw) {
+      const r = await gateway.fetch(inst, { kind: 'chats' }).catch(() => null)
+      return Array.isArray(r?.groups) ? r.groups : []
+    }
+    if (isDefInst && typeof onebot?.call === 'function') {
+      const r = await onebot.call('get_group_list', {}, { timeoutMs: 15000 }).catch(() => [])
+      return Array.isArray(r) ? r : []
+    }
+    return []
+  }
+
+  /** 供跨平台模块验证某用户是否真实在指定群内（未支持 member.read 时 fail-closed 返回 false）。 */
+  async function isGroupMember(targetChatId, userId) {
+    const norm = normalizeChatId(targetChatId) || String(targetChatId || '')
+    const addr = parseChatId(norm)
+    if (!addr || addr.kind !== 'group' || !addr.id) return false
+    const isDefInst = isDefaultInstanceChat(norm, addr.platform)
+    const useGw = Boolean(gateway && typeof gateway.fetch === 'function' && (!isDefInst || gateway.caps?.(norm) !== null || !onebot))
+    if (useGw) {
+      if (!gateway.features?.(norm)?.['chat.member.read']) return false
+      try {
+        const m = await gateway.fetch(norm, { kind: 'member', chat: { kind: 'group', id: addr.id }, account: String(userId) })
+        const mid = String(m?.user_id ?? m?.account ?? '')
+        if (mid !== String(userId)) return false
+        return m?.join_time !== undefined ? Number(m.join_time) > 0 : true
+      } catch {
+        return false
+      }
+    }
+    if (isDefInst && typeof onebot?.call === 'function' && /^\d+$/.test(addr.id) && /^\d+$/.test(String(userId))) {
+      try {
+        const m = await onebot.call('get_group_member_info', { group_id: Number(addr.id), user_id: Number(userId), no_cache: true }, { timeoutMs: 10000 })
+        return String(m?.user_id) === String(userId) && Number(m?.join_time) > 0
+      } catch {
+        return false
+      }
+    }
+    return false
+  }
+
   /** 只在这个会话第一次说话时，把最近的历史补给她的上下文。 */
   async function seedHistoryOnce(sessionId, chat, content) {
     const key = sessionKey(sessionId)
@@ -4286,21 +4489,28 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       if (!cfg.enabled || cfg.dryRun) return content
       if (!cfg.chat?.seedHistory) return content
       const cid = normalizeChatId(chat.chatId) || String(chat.chatId || '')
-      if (!isDefaultInstanceChat(cid, chat.platform) || typeof onebot?.call !== 'function') return content
-      const caps = gateway?.caps?.(cid)
-      if (caps !== null) {
-        const feats = gateway?.features?.(cid)
-        if (feats && feats['message.history.read'] === false) return content
-        if (caps && caps.history === false) return content
-      }
-      const count = Math.min(50, Math.max(1, Number(cfg.chat?.seedHistoryCount) || 20))
       const tgt = targetOf(chat.chatId)
-      if (!tgt || !/^\d+$/.test(tgt.id)) return content
-      const r = tgt.kind === 'group'
-        ? await onebot.call('get_group_msg_history', { group_id: Number(tgt.id), count }, { timeoutMs: 8000 })
-        : await onebot.call('get_friend_msg_history', { user_id: Number(tgt.id), count }, { timeoutMs: 8000 })
-      const list = Array.isArray(r) ? r : (r?.messages || [])
-      const lines = flatHistory(filterHistory(chat.chatId, list)).slice(-count)
+      if (!tgt) return content
+      const count = Math.min(50, Math.max(1, Number(cfg.chat?.seedHistoryCount) || 20))
+      const isDefInst = isDefaultInstanceChat(cid, chat.platform)
+      const gwCaps = gateway?.caps?.(cid)
+      const useGw = Boolean(gateway && (!isDefInst || gwCaps !== null || !onebot))
+      let lines = []
+      if (useGw) {
+        const feats = gateway?.features?.(cid)
+        if (!feats?.['message.history.read'] || gwCaps?.history === false) return content
+        if (typeof gateway.fetch !== 'function') return content
+        const page = await gateway.fetch(cid, { kind: 'history', chat: { kind: tgt.kind, id: tgt.id }, count })
+        const list = Array.isArray(page?.messages) ? page.messages : []
+        lines = flatFetchedHistory(filterHistory(chat.chatId, list)).slice(-count)
+      } else {
+        if (!isDefInst || typeof onebot?.call !== 'function' || !/^\d+$/.test(tgt.id)) return content
+        const r = tgt.kind === 'group'
+          ? await onebot.call('get_group_msg_history', { group_id: Number(tgt.id), count }, { timeoutMs: 8000 })
+          : await onebot.call('get_friend_msg_history', { user_id: Number(tgt.id), count }, { timeoutMs: 8000 })
+        const list = Array.isArray(r) ? r : (r?.messages || [])
+        lines = flatHistory(filterHistory(chat.chatId, list)).slice(-count)
+      }
       if (!lines.length) return content
       log.info(`${chat.chatId}：新会话，补看最近 ${lines.length} 条历史`)
       const block = `【你刚上线，先补看最近 ${lines.length} 条${tgt.kind === 'group' ? '群' : '私聊'}记录】\n${lines.join('\n')}\n【补看结束，接着回下面这条】`
@@ -5142,6 +5352,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     resetPersonChat,
     memoryResetAt,
     filterHistory,
+    fetchHistory,
+    chatGroups,
+    isGroupMember,
     joinTopic: (gid) => groupEngaged.set(String(gid), Date.now() + ENGAGE_MS),
     leaveTopic: (gid) => {
       groupEngaged.delete(String(gid))

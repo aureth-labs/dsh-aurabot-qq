@@ -154,7 +154,8 @@
 | `proactive` | `'free'` | 飞书**没有**被动回复窗口（不像 QQ 官方机器人有 5 分钟限制），可用范围内可随时发；真实限制是「可用范围」与「用户屏蔽」，由错误分类兜住 |
 | `replyWindowMs` | `0` | 没有窗口 |
 | `repliesPerMessage` | `0` | 没有「一条消息只能回 N 条」的限制 |
-| `history` / `memberList` / `forwardExpand` | `false` | 官方都有对应接口，本端未实现，**不撒谎** |
+| `history` | `false` | 需 `im:message:readonly`（群全量记录还需 `im:message.group_msg`）；默认关，开通权限后可在实例设置中打开（`fetch({ kind: 'history' })` 输出归一化 `FetchedHistoryPage`） |
+| `memberList` / `forwardExpand` | `false` | 官方都有对应接口，本端未实现，**不撒谎** |
 
 ## 五、身份：open_id 与 union_id
 

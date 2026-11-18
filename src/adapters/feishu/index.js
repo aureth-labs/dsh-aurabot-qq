@@ -191,7 +191,7 @@ export const CAPS_FEISHU = {
   proactive: 'free',
   replyWindowMs: REPLY_WINDOW_MS,
   repliesPerMessage: REPLIES_PER_MESSAGE,
-  history: false,     // 有历史消息接口，本端没实现
+  history: false,     // 读历史需 im:message:readonly（群全量还需 im:message.group_msg），默认关，开通权限后在设置打开
   memberList: false,  // 有群成员接口，本端没实现
   forwardExpand: false, // 合并转发要用「获取指定消息的内容」展开，未实现
   features: {
@@ -826,6 +826,7 @@ export function createFeishuAdapter(options = {}) {
   let wsReconnectTimer = null
   let wsRetry = 0
   const sentFrames = [] // 测试断言应答/心跳帧用
+  const p2pChatIds = new Map() // open_id → p2p chat_id (oc_xxx)，供 GET /im/v1/messages 查私聊历史
 
   // 测试故障注入
   let failSend = null
@@ -927,6 +928,7 @@ export function createFeishuAdapter(options = {}) {
     // 群聊/话题群：chat.id 用 chat_id（oc_ 开头）
     const chatId = isPrivate ? openId : String(msg.chat_id || '')
     if (!chatId) return null
+    if (isPrivate && openId && msg.chat_id) p2pChatIds.set(openId, String(msg.chat_id))
 
     return {
       chat: { kind: isPrivate ? 'private' : 'group', id: chatId, title: msg.chat_name },
@@ -1419,6 +1421,10 @@ export function createFeishuAdapter(options = {}) {
         hint: '需要敏感权限 im:message.group_msg（或含机器人的 im:message.group_msg.include_bot:read）；没批下来就只能收到 @ 她的消息',
       },
       {
+        key: 'history', label: '读取会话历史记录', type: 'boolean', default: false,
+        hint: '需要 im:message:readonly（读群全量历史还需 im:message.group_msg）；确认在飞书开放平台开通后打开',
+      },
+      {
         key: 'maxTextChars', label: '单条文本上限（字符）', type: 'number', default: DEFAULT_TEXT_CHARS,
         hint: '超过就分条发；飞书硬上限是 150KB/条',
       },
@@ -1435,9 +1441,10 @@ export function createFeishuAdapter(options = {}) {
       stopped = false
       const cfg = config()
 
-      // 用户配置只能把能力改小
+      // 用户配置只能把能力改小（listenAllInGroup / history 为需确认应用权限后再开启的扩展门控）
       capsOverride = { ...(capsOverride || {}) }
       if (cfg.listenAllInGroup != null) capsOverride.listenAllInGroup = cfg.listenAllInGroup === true || cfg.listenAllInGroup === 'true'
+      if (cfg.history != null) capsOverride.history = cfg.history === true || cfg.history === 'true'
       if (cfg.proactive === 'none' || cfg.proactive === 'limited') capsOverride.proactive = cfg.proactive
 
       transport = String(cfg.transport || 'websocket') === 'webhook' ? 'webhook' : 'websocket'
@@ -1600,27 +1607,22 @@ export function createFeishuAdapter(options = {}) {
         }
         if (r.code !== 0) throw classifyResponse(r)
         lastMessageId = String(r.json?.data?.message_id || '')
+        if (!isGroup && chat?.id && r.json?.data?.chat_id) {
+          p2pChatIds.set(String(chat.id), String(r.json.data.chat_id))
+        }
       }
       if (!lastMessageId) throw sendError('unknown', 'no-message-id', instance, '飞书没返回 message_id（拿不准）')
       return { messageId: lastMessageId }
     },
 
-    /** 取媒体字节或读取单条消息 */
+    /** 取媒体字节、单条消息或会话历史记录 */
     async fetch(request) {
-      if (request?.kind === 'message') {
-        const messageId = String(request.messageId || '').trim()
-        if (!messageId) throw sendError('not-sent', 'bad-fetch-request', instance, '飞书取消息需要 messageId')
-        const url = `${baseUrl()}/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`
-        const r = await requestAuthedGet(url, '飞书读取消息失败')
-        const item = r?.json?.data?.items?.[0]
-        if (!item || typeof item !== 'object') {
-          throw sendError('not-sent', 'message-not-found', instance, `飞书未返回消息内容（${messageId}）`)
-        }
-        const rawTime = Number(item.create_time)
-        const at = Number.isFinite(rawTime) && rawTime > 0 ? (rawTime < 1e12 ? rawTime * 1000 : rawTime) : undefined
+      const toFetched = (item, fallbackId = '') => {
         const selfOpenId = String(self?.account || '')
+        const rawTime = Number(item?.create_time)
+        const at = Number.isFinite(rawTime) && rawTime > 0 ? (rawTime < 1e12 ? rawTime * 1000 : rawTime) : undefined
         let sender
-        if (item.sender && typeof item.sender === 'object') {
+        if (item?.sender && typeof item.sender === 'object') {
           const idTypeRaw = String(item.sender.id_type || '').trim()
           const idType = idTypeRaw === 'open_id' || idTypeRaw === 'union_id' || idTypeRaw === 'user_id' ? idTypeRaw : undefined
           const account = String(item.sender.id ?? '')
@@ -1632,8 +1634,8 @@ export function createFeishuAdapter(options = {}) {
             ...(idType ? { idType } : {}),
           }
         }
-        const resolvedId = String(item.message_id || messageId)
-        if (item.deleted === true) {
+        const resolvedId = String(item?.message_id || fallbackId)
+        if (item?.deleted === true) {
           return {
             messageId: resolvedId,
             ...(at ? { at } : {}),
@@ -1642,7 +1644,7 @@ export function createFeishuAdapter(options = {}) {
             deleted: true,
           }
         }
-        const parts = toParts(item.msg_type, item.body?.content, item.mentions, {
+        const parts = toParts(item?.msg_type, item?.body?.content, item?.mentions, {
           selfOpenId,
           messageId: resolvedId,
         })
@@ -1651,6 +1653,59 @@ export function createFeishuAdapter(options = {}) {
           ...(at ? { at } : {}),
           ...(sender ? { sender } : {}),
           parts: parts.length ? parts : [{ type: 'other', text: '[空消息]' }],
+        }
+      }
+
+      if (request?.kind === 'message') {
+        const messageId = String(request.messageId || '').trim()
+        if (!messageId) throw sendError('not-sent', 'bad-fetch-request', instance, '飞书取消息需要 messageId')
+        const url = `${baseUrl()}${PATH_SEND_MESSAGE}/${encodeURIComponent(messageId)}`
+        const r = await requestAuthedGet(url, '飞书读取消息失败')
+        const item = r?.json?.data?.items?.[0]
+        if (!item || typeof item !== 'object') {
+          throw sendError('not-sent', 'message-not-found', instance, `飞书未返回消息内容（${messageId}）`)
+        }
+        if (item.chat_id && request.chat?.kind === 'private' && request.chat?.id) {
+          p2pChatIds.set(String(request.chat.id), String(item.chat_id))
+        }
+        return toFetched(item, messageId)
+      }
+      if (request?.kind === 'history') {
+        const chat = request.chat || {}
+        const rawId = String(chat.id || '').trim()
+        if (!rawId) throw sendError('not-sent', 'bad-fetch-request', instance, '飞书取历史记录缺少 chat.id')
+        const containerId = rawId.startsWith('oc_')
+          ? rawId
+          : (chat.kind === 'private' ? (p2pChatIds.get(rawId) || '') : rawId)
+        if (!containerId) {
+          throw sendError('not-sent', 'no-chat-id', instance, '飞书单聊暂未记录会话 chat_id（oc_ 开头）；收到该单聊消息后才能拉取历史')
+        }
+        const pageSize = Math.max(1, Math.min(50, Number(request.count) || 20))
+        const params = new URLSearchParams({
+          container_id_type: 'chat',
+          container_id: containerId,
+          sort_type: 'ByCreateTimeDesc',
+          page_size: String(pageSize),
+        })
+        const beforeToken = request.before !== undefined && request.before !== null ? String(request.before).trim() : ''
+        if (beforeToken) params.set('page_token', beforeToken)
+        const url = `${baseUrl()}${PATH_SEND_MESSAGE}?${params.toString()}`
+        const r = await requestAuthedGet(url, '飞书读取历史消息失败')
+        const data = r?.json?.data || {}
+        const rawItems = Array.isArray(data.items) ? data.items : []
+        const messages = rawItems.map((it, idx) => toFetched(it, `hist-${idx}`))
+        // ByCreateTimeDesc 返回新 → 旧；除明确已按 [旧 → 新] 返回的情况外，统一转为 [旧 → 新]
+        if (messages.length >= 2) {
+          const firstAt = Number(messages[0]?.at) || 0
+          const lastAt = Number(messages[messages.length - 1]?.at) || 0
+          if (!(firstAt > 0 && lastAt > 0 && firstAt < lastAt)) messages.reverse()
+        }
+        const hasMore = Boolean(data.has_more && data.page_token)
+        const before = hasMore ? String(data.page_token) : undefined
+        return {
+          messages,
+          hasMore,
+          ...(before ? { before } : {}),
         }
       }
       if (request?.kind !== 'media') throw new Error(`飞书平台端不支持这种 fetch：${request?.kind}`)
@@ -1692,6 +1747,14 @@ export function createFeishuAdapter(options = {}) {
         ...capsState,
         ...(partial || {}),
         ...(partial?.features ? { features: { ...(capsState.features || {}), ...partial.features } } : {}),
+      }
+      if (capsOverride && partial && typeof partial === 'object') {
+        const { features, ...rest } = partial
+        capsOverride = {
+          ...capsOverride,
+          ...rest,
+          ...(features ? { features: { ...(capsOverride.features || {}), ...features } } : {}),
+        }
       }
       ctx?.capsChanged?.()
     },

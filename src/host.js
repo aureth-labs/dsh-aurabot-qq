@@ -3973,7 +3973,9 @@ export function apply(ctx) {
     const b = await readBody(req)
     const { owner, userId, chat } = simChat(b)
     const level = owner && chat.kind === 'private' ? 'full' : 'social'
-    const tool = mods.buildTools({ chat, level, sessionId: 'sim' }).find((t) => t.name === b.name)
+    const tool = typeof mods.resolveTool === 'function'
+      ? mods.resolveTool({ chat, level, sessionId: 'sim' }, b.name)
+      : mods.buildTools({ chat, level, sessionId: 'sim' }).find((t) => t.name === b.name)
     if (!tool) return { ok: false, message: `这个场合没有 ${b.name} 这个工具` }
     hub.simulateTurn('sim', [userId])
     const { result, sent } = await hub.capture(() => tool.execute(b.args && typeof b.args === 'object' ? b.args : {}, {}), { simulate: true })

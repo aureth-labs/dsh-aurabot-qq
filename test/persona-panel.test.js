@@ -442,7 +442,7 @@ test('面板一键清理按 QQ 隔离，旧流水不再读入，下一条私聊�
     assert.match(fake.turns.at(-1).userText, /QQ 历史里的新消息/)
     assert.doesNotMatch(fake.turns.at(-1).userText, /旧消息|没有时间/)
     const tools = api.modules.buildTools({ chat: { chatId, kind: 'private', userId: ALICE }, level: 'social', sessionId: fake.turns.at(-1).sessionId })
-    const result = await tools.find((tool) => tool.name === 'qq_chat_history').execute({})
+    const result = await tools.find((tool) => tool.name === 'chat_history').execute({})
     assert.match(result.message, /QQ 历史里的新消息/)
     assert.doesNotMatch(result.message, /旧消息|没有时间/)
     assert.equal(api.hub.recentMessagesOf(chatId).at(-1).text, '你好')
