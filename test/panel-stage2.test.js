@@ -273,7 +273,7 @@ test('Manage：四类状态分组（ready / blocked / off / absent）各归其�
   assert.match(text(voiceCard), /可用/)
   assert.match(text(voiceCard), /去设置/)
   // blocked（error）：自驱 → 受限 + 原因 + 排障按钮
-  const autoCard = featureCard(tree, '后台自己立项')
+  const autoCard = featureCard(tree, 'v5 重写，实验性功能')
   assert.ok(autoCard, '自驱卡片要渲染')
   assert.match(text(autoCard), /受限/)
   assert.match(text(autoCard), /启动炸了：boom/, 'error 原因要就地显示')

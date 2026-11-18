@@ -1,4 +1,5 @@
 // 内置模块：自驱引擎 v5（彻底推翻 v3 决策管线，方案 docs/design/autotelic-v5/00-v5-final.md）。
+// 【实验性】v5 是重写后的新架构，行为与配置面可能随版本调整；默认关闭，开了才参与她过日子。
 //
 // v5 生活叙事五环：感知 → 想要 → 行动 → 沉淀 → 分享。本模块是接线层（集成属主）：
 //   · 感知：api.every(60s) → 聊天流水采集 + 情绪观察桥 → observations.jsonl（只积累不决策）
@@ -39,11 +40,11 @@ import { personaDataDir, personaNow, currentPersonaText } from '../../persona/pe
 
 export default {
   id: 'autotelic',
-  name: '自驱引擎',
+  name: '自驱引擎（实验性）',
   version: '0.5.0',
   api: 2,
   platforms: ['*'],
-  description: 'v5：她自己的日子——观察积累 → 定时回味/心念点火 → 三段决策环（生成/把关分离，全灭合法）→ 行动单执行（三级分级+硬禁区）→ 技能三层沉淀（score 锚真实复用终态）→ 反馈回路（抑制/冷度/熔断）+ constraintRules 强制约束 + 接管。默认关闭。',
+  description: '实验性。v5：她自己的日子——观察积累 → 定时回味/心念点火 → 三段决策环（生成/把关分离，全灭合法）→ 行动单执行（三级分级+硬禁区）→ 技能三层沉淀（score 锚真实复用终态）→ 反馈回路（抑制/冷度/熔断）+ constraintRules 强制约束 + 接管。默认关闭；实验性功能，行为与配置面可能随版本调整。',
   files: [
     'autotelic/audit.js', 'autotelic/book.js', 'autotelic/observe.js', 'autotelic/tags.js',
     'autotelic/schedule.js', 'autotelic/plan.js', 'autotelic/constraint.js', 'autotelic/prefix.js',
@@ -90,7 +91,7 @@ export default {
     presetIdOverride: false, // 内部键：hub 的 presetId 覆盖总闸（§9，默认关）
   },
   settings: [
-    { key: 'enabled', label: '启用自驱引擎', type: 'switch', hint: '默认关。开着时她按「定时回味 + 心念点火」过日子：安静时刻回味经历长出念头，多数时候空手而归（这是健康态）' },
+    { key: 'enabled', label: '启用自驱引擎（实验性）', type: 'switch', hint: '默认关，实验性功能。开着时她按「定时回味 + 心念点火」过日子：安静时刻回味经历长出念头，多数时候空手而归（这是健康态）' },
     { key: 'awakeFrom', label: '醒着窗口 从（点）', type: 'number', min: 0, max: 24, hint: '回味只排在醒着窗口内；安静时段连点火都只攒不触发' },
     { key: 'awakeTo', label: '醒着窗口 到（点）', type: 'number', min: 0, max: 24 },
     { key: 'minIntervalMinutes', label: '回味间隔下限（分钟）', type: 'number', min: 5, max: 2880 },
