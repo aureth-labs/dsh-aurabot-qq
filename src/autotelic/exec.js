@@ -199,24 +199,51 @@ export function createExecV5({
   }
 
   /**
+   * 归一化一步的返回值。两种通道的返回形状不同（2026-11-18 真机坑）：
+   *   - hooks.execStep（测试/注入）：{ ok:boolean, observation:string }
+   *   - hub.runSystemTurn（默认通道）：成功 resolve 的是**回复文本字符串**（hub.js sys.resolve(text)），
+   *     抛错才是失败。字符串没有 .ok 字段，按 r?.ok===true 判会把「做成了」误判成失败——
+   *     账本里躺着的 `{"done": true,...}` 原文就是这么被记成 failed 的。
+   * @returns {{ok:boolean, observation:string}}
+   */
+  function normalizeStepResult(r) {
+    if (typeof r === 'string') return { ok: r.trim().length > 0, observation: r }
+    if (r && typeof r === 'object') {
+      if (typeof r.ok === 'boolean') return { ok: r.ok, observation: String(r.observation ?? '') }
+      // 对象但没有 ok 字段（如模型输出了 JSON）：只要不是显式 ok:false，按做成算，别冤死
+      return { ok: r.ok !== false, observation: String(r.observation ?? '') }
+    }
+    return { ok: false, observation: String(r ?? '') }
+  }
+
+  /**
    * 跑一步（含重试 1 次 + 瞬态退避不计失败）。
    * @returns {{ok:boolean, transientFatal?:boolean, observation:string}}
    */
   async function runOneStep(ticket, step, ctx) {
     let attempts = 0 // 真实失败计数（重试 1 次封顶）
     let transients = 0
+    // 预算交给 hub 管（2026-11-18 真机坑）：runSystemTurn 自带超时（timedOutAt）+ 取消归档恢复，
+    // 由它先拒绝才不会留下「没人认领、还占着 system:autotelic-act:workbench 会话」的孤儿轮——
+    // 以前 exec 侧 race（预算 120s）先到点就重试，旧轮还挂在 hub 默认 180s 上，
+    // 重试立刻撞「这个后台会话的上一轮还没结束」，瞬态退避耗尽 → 整单 failed。
+    // 注意：hooks.execStep 注入通道（测试/fake）没有 hub 自管超时，race 保留原语义（直接用预算）。
+    const budgetMs = Number(ticket.budget?.timeoutMs) || 0
+    const viaHub = typeof hooks.execStep !== 'function' && !!hub?.runSystemTurn
+    const hubMs = viaHub ? (budgetMs > 0 ? Math.min(budgetMs, 150_000) : 150_000) : 0
+    const raceMs = viaHub ? (budgetMs > 0 ? budgetMs + 30_000 : 0) /* 仅兜底：hub 的拒绝永远先到 */ : budgetMs
     for (;;) {
       try {
         const r = await withTimeout(
           typeof hooks.execStep === 'function'
             ? Promise.resolve(hooks.execStep(step, ctx))
             : hub?.runSystemTurn
-              ? hub.runSystemTurn('autotelic-act', 'system:autotelic · 工作间', buildStepPrompt(ticket, step), { key: 'workbench', noTools: true })
+              ? hub.runSystemTurn('autotelic-act', 'system:autotelic · 工作间', buildStepPrompt(ticket, step), { timeoutMs: hubMs, key: 'workbench', noTools: true })
               : Promise.resolve({ ok: false, observation: '没有可用执行通道' }),
-          Number(ticket.budget?.timeoutMs) || 0,
+          raceMs,
         )
-        const ok = r?.ok === true
-        if (ok || attempts >= 1) return { ok, observation: String(r?.observation || r || '') }
+        const { ok, observation } = normalizeStepResult(r)
+        if (ok || attempts >= 1) return { ok, observation }
         attempts++
       } catch (error) {
         const msg = String(error?.message || error)

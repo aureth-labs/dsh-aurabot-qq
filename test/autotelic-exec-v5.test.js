@@ -278,6 +278,56 @@ test('形状不合法的行动单直接 rejected：缺 id / 没有步骤', async
   assert.equal((await exec.run({ id: 'no-steps', steps: [] })).status, 'rejected')
 })
 
+test('hub 通道返回字符串（回复文本）算做成，不误判失败（2026-11-18 真机坑）', async () => {
+  // 真机证据：账本 failed 行的 why 里躺着模型成功输出的 {"done": true,...} 原文——
+  // hub.runSystemTurn 成功 resolve 的是文本字符串，旧代码按 r?.ok===true 判成失败。
+  let calls = 0
+  const exec = createExecV5({
+    hub: { runSystemTurn: async () => { calls++; return '{"done": true, "observation": "已把方法记进技能库"}' } },
+    hooks: {}, // 不注入 execStep，走默认 hub 通道
+  })
+  const out = await exec.run(ticket({ id: 'hub-str', steps: [{ desc: '记一条笔记', level: 'write-data' }] }))
+  assert.equal(out.status, 'done', '字符串返回应算做成')
+  assert.equal(calls, 1, '做成后不应重试')
+  assert.match(out.results[0].observation, /记进技能库/)
+})
+
+test('hub 通道抛错仍按失败走（含瞬态退避语义不变）', async () => {
+  let n = 0
+  const exec = createExecV5({
+    hub: { runSystemTurn: async () => { n++; throw new Error('这个后台会话的上一轮还没结束') } },
+    hooks: {},
+  })
+  const out = await exec.run(ticket({ id: 'hub-err', steps: [{ desc: 'x', level: 'read-only' }] }))
+  assert.equal(out.status, 'failed')
+  assert.match(out.why, /还没结束/)
+  assert.ok(n >= 1, '至少调用过一次')
+})
+
+test('hub 通道返回无 ok 字段的对象按做成算（不冤死）', async () => {
+  const exec = createExecV5({
+    hub: { runSystemTurn: async () => ({ observation: '看过了，没问题' }) },
+    hooks: {},
+  })
+  const out = await exec.run(ticket({ id: 'hub-obj' }))
+  assert.equal(out.status, 'done')
+})
+
+test('预算传给 hub 自管超时，exec 侧 race 只兜底不抢跑（2026-11-18 真机坑）', async () => {
+  // 旧 bug：exec 侧 race（预算 120s）先于 hub 默认 180s 到点就重试，
+  // 旧轮次没被取消还占着 system:autotelic-act:workbench → 重试全撞「上一轮还没结束」。
+  const seen = []
+  const exec = createExecV5({
+    hub: { runSystemTurn: async (name, title, prompt, opts) => { seen.push(opts); return '好' } },
+    hooks: {},
+  })
+  await exec.run(ticket({ id: 'budget', budget: { maxSteps: 1, timeoutMs: 120_000 } }))
+  assert.equal(seen.length, 1)
+  assert.equal(seen[0].timeoutMs, 120_000, '预算应传给 hub（hubMs = min(budget,150s)）')
+  await exec.run(ticket({ id: 'nobudget', budget: { maxSteps: 1, timeoutMs: 0 } }))
+  assert.equal(seen[1].timeoutMs, 150_000, '无预算时 hub 默认 150s（低于 hub 内置 180s 上限）')
+})
+
 test('频控跨重启持久（lead 裁决 2026-11-17）：注入 feedback 后，换新执行器实例节流仍在', async () => {
   const { mkdtempSync: mtd, rmSync: rm, writeFileSync: dummy } = await import('node:fs')
   const { createFeedback } = await import('../src/autotelic/feedback.js')
