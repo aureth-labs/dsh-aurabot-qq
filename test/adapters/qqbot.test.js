@@ -966,3 +966,58 @@ test('QQBot 群管适配器能力：bot_state / mute(RFC3339<=30d) / unmute / ki
   assert.equal(adapter.groupAdmin.observedGroups().length, 0)
   await adapter.stop()
 })
+
+test('WebSocket Resume：READY 记下 session_id 与 seq，op=7/断线重连发 op=6 Resume，op=9 回退 op=2 Identify', async () => {
+  FakeWebSocket.instances = []
+  const client = makeFakeClient()
+  const adapter = createQqbotAdapter({ client, WebSocketImpl: FakeWebSocket })
+  const ctx = makeCtx(adapter, { ...BASE_CONFIG, transport: 'websocket' })
+  await adapter.start(ctx)
+
+  const ws1 = FakeWebSocket.instances.at(-1)
+  ws1.onmessage({ data: JSON.stringify({ op: 10, s: 1, d: { heartbeat_interval: 60000 } }) })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  const id1 = ws1.sent.find((x) => x.op === 2)
+  assert.ok(id1, '首次连接应发 op=2 Identify')
+
+  ws1.onmessage({
+    data: JSON.stringify({
+      op: 0,
+      s: 42,
+      t: 'READY',
+      d: { session_id: 'sess-xyz-1', user: { id: 'BOT_WS_1', username: 'WS机器人' } },
+    }),
+  })
+  assert.equal((await adapter.whoami()).account, 'BOT_WS_1')
+
+  // 收到 op=7 Reconnect → 关闭当前 socket → 等待指数退避重连（首个间隔 1000ms）
+  ws1.onmessage({ data: JSON.stringify({ op: 7 }) })
+  ws1.onclose?.()
+  await new Promise((resolve) => setTimeout(resolve, 1150))
+  const ws2 = FakeWebSocket.instances.at(-1)
+  assert.notEqual(ws2, ws1, '应新建重连 WebSocket')
+  ws2.onmessage({ data: JSON.stringify({ op: 10, d: { heartbeat_interval: 60000 } }) })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  const resumePkt = ws2.sent.find((x) => x.op === 6)
+  assert.deepEqual(resumePkt, {
+    op: 6,
+    d: { token: 'QQBot token-1', session_id: 'sess-xyz-1', seq: 42 },
+  })
+  assert.equal(ws2.sent.some((x) => x.op === 2), false, 'Resume 时不应退回 Identify')
+
+  // 收到 RESUMED 后可继续收到补发与实时事件并刷新 seq
+  ws2.onmessage({ data: JSON.stringify({ op: 0, s: 45, t: 'C2C_MESSAGE_CREATE', d: C2C_EVENT }) })
+  assert.equal(ctx.emitted.length, 1)
+
+  // 收到 op=9 Invalid Session → 清掉旧 session_id/seq 并回退 op=2 Identify
+  ws2.onmessage({ data: JSON.stringify({ op: 9, d: false }) })
+  ws2.onclose?.()
+  await new Promise((resolve) => setTimeout(resolve, 1150))
+  const ws3 = FakeWebSocket.instances.at(-1)
+  ws3.onmessage({ data: JSON.stringify({ op: 10, d: { heartbeat_interval: 60000 } }) })
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.ok(ws3.sent.some((x) => x.op === 2), 'op=9 后应回退发 op=2 Identify')
+  assert.equal(ws3.sent.some((x) => x.op === 6), false)
+
+  await adapter.stop()
+})

@@ -373,6 +373,8 @@ test('Phase 3：工具去重、legacy qq_* 执行路由兼容、7 个 QQ 模块�
       ownerQQ: '10000001',
       ownerName: '阿白',
       merge: { enabled: false },
+      voice: { enabled: false },
+      stickers: { autoChance: 0 },
       files: { enabled: true, dirs: [ws] },
       allow: {
         private: ['10000001', 'feishu:private:ou_owner'],

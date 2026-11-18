@@ -131,16 +131,18 @@ export function isOwnerChatMuted(identity, isMuted) {
 export function allowMatches(list, msg, kind) {
   const entries = (list || []).map((x) => String(x).trim()).filter(Boolean)
   if (!entries.length) return false
-  const platform = String(msg.platform || parseChatId(msg.chatId)?.platform || '').trim()
+  const parsed = parseChatId(msg.chatId)
+  const platform = String(msg.platform || parsed?.platform || '').trim()
+  const instance = String(msg.instance || parsed?.instance || '').trim()
   const account = String(kind === 'group' ? msg.groupId : msg.userId || '').trim()
   const chatId = normalizeChatId(msg.chatId) || (platform && account ? normalizeChatId(`${platform}:${kind}:${account}`) : '')
   if (chatId && entries.some((entry) => normalizeChatId(entry) === chatId)) return true
   const person = msg.sender?.person || msg.person
   if (person && entries.includes(String(person))) return true
-  // 裸编号只沿用到默认平台（旧 QQ 形态），避免飞书/官方机器人的
-  // ou_xxx / openid 被当成另一个平台的号码串误放行。
+  // 裸编号只沿用到默认平台实例（旧 QQ 形态），避免飞书/官方机器人/多实例的
+  // ou_xxx / openid / qq#2 同号被误放行。
   const legacyPlatform = parseChatId('private:0')?.platform || ''
-  if ((platform && platform !== legacyPlatform) || !account) return false
+  if ((platform && platform !== legacyPlatform) || (instance && instance !== legacyPlatform) || !account) return false
   return entries.includes(account)
 }
 
@@ -175,7 +177,7 @@ export function groupOwnerTools(cfg, chat) {
   const mode = cfg?.group?.ownerTools
   if (mode !== 'owner') return 'off'
   const list = (cfg?.group?.ownerToolsGroups || []).map(String).filter(Boolean)
-  if (list.length && !list.includes(String(chat.groupId || ''))) return 'off'
+  if (list.length && !allowMatches(list, chat, 'group')) return 'off'
   return mode
 }
 

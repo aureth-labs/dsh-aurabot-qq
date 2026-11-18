@@ -569,8 +569,9 @@ export function createQqbotAdapter(options = {}) {
 
   // ───── WebSocket 事件源（transport='websocket'） ─────
   /**
-   * 官方 Bot Gateway：GET /gateway 拿 wss 地址 → op=10 Hello → op=2 Identify
-   * → op=1 心跳 / op=11 ACK → op=0 事件。断线后指数退避重连。
+   * 官方 Bot Gateway：GET /gateway 拿 wss 地址 → op=10 Hello → op=2 Identify / op=6 Resume
+   * → op=1 心跳 / op=11 ACK → op=0 事件。保存 session_id 与 seq，断线或 op=7 时优先走 Resume，
+   * 收到 op=9 Invalid Session 时清空会话状态并退回 op=2 Identify。
    */
   async function gatewayEvents(onEvent) {
     if (typeof WebSocketImpl !== 'function') throw new Error('qqbot：当前运行时没有 WebSocket，无法使用 transport=websocket')
@@ -580,6 +581,8 @@ export function createQqbotAdapter(options = {}) {
     let retryTimer = null
     let retry = 0
     let seq = 0
+    let sessionId = ''
+    let shouldResume = false
 
     const clearHeartbeat = () => { if (heartbeat) { clearInterval(heartbeat); heartbeat = null } }
     const send = (payload) => {
@@ -590,6 +593,9 @@ export function createQqbotAdapter(options = {}) {
     const close = () => {
       clearHeartbeat()
       if (retryTimer) { clearTimeout(retryTimer); retryTimer = null }
+      sessionId = ''
+      seq = 0
+      shouldResume = false
       try { socket?.close() } catch (error) {}
       socket = null
     }
@@ -625,35 +631,58 @@ export function createQqbotAdapter(options = {}) {
         let payload
         try { payload = JSON.parse(String(event?.data ?? '')) } catch (error) { return }
         const op = Number(payload?.op)
-        if (Number.isFinite(Number(payload?.s))) seq = Number(payload.s)
+        if (payload?.s != null && Number.isFinite(Number(payload.s))) seq = Number(payload.s)
         if (op === 10) {
           const interval = Math.max(1000, Number(payload?.d?.heartbeat_interval) || 30000)
           clearHeartbeat()
           heartbeat = setInterval(() => send({ op: 1, d: seq || null }), interval)
           heartbeat.unref?.()
           const intents = Number(cfgOf().intents) || WS_INTENTS_GROUP_AND_C2C
+          const resuming = Boolean(sessionId && shouldResume)
           authedToken().then((access) => {
             if (stopped || socket !== ws) return
-            send({
-              op: 2,
-              d: {
-                token: `QQBot ${access}`,
-                intents,
-                shard: [0, 1],
-                properties: { os: process.platform, browser: 'aurabot', device: 'aurabot' },
-              },
-            })
+            if (resuming) {
+              send({
+                op: 6,
+                d: {
+                  token: `QQBot ${access}`,
+                  session_id: sessionId,
+                  seq,
+                },
+              })
+            } else {
+              send({
+                op: 2,
+                d: {
+                  token: `QQBot ${access}`,
+                  intents,
+                  shard: [0, 1],
+                  properties: { os: process.platform, browser: 'aurabot', device: 'aurabot' },
+                },
+              })
+            }
             retry = 0
           }).catch((error) => {
-            logWs('warn', `WebSocket Identify 失败：${error.message}`)
+            logWs('warn', `WebSocket ${resuming ? 'Resume' : 'Identify'} 失败：${error.message}`)
             try { ws.close() } catch (closeError) {}
           })
         } else if (op === 0) {
+          if (payload.t === 'READY' && payload?.d?.session_id) {
+            sessionId = String(payload.d.session_id)
+            shouldResume = true
+          } else if (payload.t === 'RESUMED') {
+            shouldResume = true
+          }
           onEvent(payload)
         } else if (op === 7) {
+          shouldResume = Boolean(sessionId)
           try { ws.close() } catch (error) {}
         } else if (op === 9) {
-          seq = 0
+          if (payload?.d !== true || shouldResume) {
+            sessionId = ''
+            seq = 0
+            shouldResume = false
+          }
           try { ws.close() } catch (error) {}
         }
       }
@@ -661,6 +690,7 @@ export function createQqbotAdapter(options = {}) {
       ws.onclose = () => {
         socket = null
         clearHeartbeat()
+        if (sessionId) shouldResume = true
         scheduleReconnect('closed')
       }
     }
@@ -1085,7 +1115,13 @@ export function createQqbotAdapter(options = {}) {
         }
         const stop = await connector((payload) => {
           if (!running) return
-          if (Number(payload?.op) === 0) handleDispatch(payload.t, payload.d, payload)
+          if (Number(payload?.op) === 0) {
+            if (payload.t === 'READY' && payload?.d?.user) {
+              if (payload.d.user.id) self.account = String(payload.d.user.id)
+              if (payload.d.user.username) self.name = String(payload.d.user.username)
+            }
+            handleDispatch(payload.t, payload.d, payload)
+          }
           else if (Number(payload?.op) === 12) { /* READY / ACK，忽略 */ }
         })
         if (typeof stop === 'function') offs.push(stop)

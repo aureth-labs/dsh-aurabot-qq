@@ -196,8 +196,8 @@ export const CAPS_FEISHU = {
   replyWindowMs: REPLY_WINDOW_MS,
   repliesPerMessage: REPLIES_PER_MESSAGE,
   history: false,     // 读历史需 im:message:readonly（群全量还需 im:message.group_msg），默认关，开通权限后在设置打开
-  memberList: false,  // 有群成员接口，本端没实现
-  forwardExpand: false, // 合并转发要用「获取指定消息的内容」展开，未实现
+  memberList: true,   // GET /open-apis/im/v1/chats/:chat_id/members（返回 open_id 与名字，不含群管理身份）
+  forwardExpand: true, // GET /open-apis/im/v1/messages/:message_id 展开 merge_forward 子消息
   features: {
     'media.fetch': true,
     'sticker.collect': true,
@@ -590,8 +590,9 @@ export function toParts(messageType, contentRaw, mentions, options = {}) {
     }
 
     case 'merge_forward':
-      // 官方：content 固定为 "Merged and Forwarded Message"，子消息要调「获取指定消息的内容」展开
-      parts.push({ type: 'other', text: '[合并转发]', native: content })
+      // 有 message_id 时输出标准化 forward Part，供网关 fetch(forward) 调用 /im/v1/messages/:id 展开子消息
+      if (messageId) parts.push({ type: 'forward', id: messageId, summary: '[合并转发]' })
+      else parts.push({ type: 'other', text: '[合并转发]', native: content })
       break
 
     case 'share_chat': parts.push({ type: 'other', text: '[群名片]', native: content }); break
@@ -1724,6 +1725,54 @@ export function createFeishuAdapter(options = {}) {
           rememberP2pChat(String(request.chat.id), String(item.chat_id))
         }
         return toFetched(item, messageId)
+      }
+      if (request?.kind === 'forward') {
+        const messageId = String(request.id || '').trim()
+        if (!messageId) throw sendError('not-sent', 'bad-fetch-request', instance, '飞书展开合并转发需要 id（message_id）')
+        const url = `${baseUrl()}${PATH_SEND_MESSAGE}/${encodeURIComponent(messageId)}`
+        const r = await requestAuthedGet(url, '飞书展开合并转发失败')
+        const rawItems = Array.isArray(r?.json?.data?.items) ? r.json.data.items : []
+        if (!rawItems.length) {
+          throw sendError('not-sent', 'message-not-found', instance, `飞书未返回合并转发内容（${messageId}）`)
+        }
+        // 官方 GET /im/v1/messages/:id 返回包装消息及带 upper_message_id === id 的子消息列表
+        const subItems = rawItems.filter((it) => it && (it.upper_message_id === messageId || (String(it.message_id || '') !== messageId && it.msg_type !== 'merge_forward')))
+        const list = subItems.length ? subItems : rawItems.filter((it) => it && String(it.message_id || '') !== messageId)
+        const messages = list.map((it, idx) => toFetched(it, `fwd-${idx}`))
+        if (messages.length >= 2) {
+          const firstAt = Number(messages[0]?.at) || 0
+          const lastAt = Number(messages[messages.length - 1]?.at) || 0
+          if (firstAt > 0 && lastAt > 0 && firstAt > lastAt) messages.reverse()
+        }
+        return { messages }
+      }
+      if (request?.kind === 'members') {
+        const chat = request.chat || {}
+        if (chat.kind !== 'group') throw sendError('not-sent', 'no-member', instance, '飞书私聊没有群成员列表')
+        const chatId = String(chat.id || '').trim()
+        if (!chatId) throw sendError('not-sent', 'bad-fetch-request', instance, '飞书获取群成员缺少 chat.id')
+        const members = []
+        let pageToken = ''
+        for (let pageNo = 0; pageNo < 5; pageNo++) {
+          const params = new URLSearchParams({ member_id_type: 'open_id', page_size: '100' })
+          if (pageToken) params.set('page_token', pageToken)
+          const url = `${baseUrl()}${PATH_CHATS}/${encodeURIComponent(chatId)}/members?${params.toString()}`
+          const r = await requestAuthedGet(url, '飞书获取群成员列表失败')
+          const data = r?.json?.data || {}
+          for (const item of Array.isArray(data.items) ? data.items : []) {
+            const acc = String(item?.member_id || '').trim()
+            if (!acc) continue
+            const idType = String(item?.member_id_type || '').trim()
+            members.push({
+              account: acc,
+              name: String(item?.name || ''),
+              ...(idType ? { idType } : {}),
+            })
+          }
+          if (!data.has_more || !data.page_token) break
+          pageToken = String(data.page_token)
+        }
+        return members
       }
       if (request?.kind === 'chats') {
         const groups = []

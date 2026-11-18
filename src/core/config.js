@@ -666,10 +666,10 @@ export function normalize(raw) {  const c = deepMerge(DEFAULTS, raw)
   if (!isObj(g.ownerBrief)) g.ownerBrief = { enabled: true, lines: 24, groups: [] }
   g.ownerBrief.enabled = bool(g.ownerBrief.enabled, true)
   g.ownerBrief.lines = num(g.ownerBrief.lines, 24, 1, 30)
-  g.ownerBrief.groups = qqList(g.ownerBrief.groups)
+  g.ownerBrief.groups = allowList(g.ownerBrief.groups)
   // 群聊里的本机工具：默认关；只有明确写了 owner 才开（all 已移除，写 all 也按 off 处理）
   g.ownerTools = g.ownerTools === 'owner' ? 'owner' : 'off'
-  g.ownerToolsGroups = qqList(g.ownerToolsGroups)
+  g.ownerToolsGroups = allowList(g.ownerToolsGroups)
   c.voice.autoChance = num(c.voice.autoChance, 0.15, 0, 1)
   c.voice.autoMaxChars = num(c.voice.autoMaxChars, 80, 1, BIG)
   c.voice.emojiSeparate = c.voice.emojiSeparate !== false

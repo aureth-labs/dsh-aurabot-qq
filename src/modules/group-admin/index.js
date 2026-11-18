@@ -1,8 +1,9 @@
 // 内置模块：群管。主人开口时禁言、解禁、踢人、改头衔、发公告；支持 QQ 直连与 QQ 官方机器人双后端。
 
-import { defineTool, str, int } from '../../tools/tools.js'
-import { allowMatches, isOwner } from '../../chat/access.js'
-import { normalizeChatId, parseChatId } from '../../gateway/address.js'
+const _lib = globalThis.aurabot?.lib
+const { defineTool, str, int } = _lib ? _lib('tools/tools.js') : await import('../../tools/tools.js')
+const { allowMatches, isOwner } = _lib ? _lib('chat/access.js') : await import('../../chat/access.js')
+const { normalizeChatId, parseChatId } = _lib ? _lib('gateway/address.js') : await import('../../gateway/address.js')
 
 const UNSUPPORTED_QQBOT_ACTIONS = Object.freeze({
   whole_ban: '全体禁言',

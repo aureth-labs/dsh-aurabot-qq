@@ -590,13 +590,40 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     }
   }
 
-  async function membersOf(groupId) {
-    const hit = groupMembers.get(groupId)
+  async function membersOf(target) {
+    const raw = String(target ?? '').trim()
+    if (!raw) return []
+    const parsed = raw.includes(':') ? parseChatId(raw) : null
+    const norm = parsed ? (normalizeChatId(raw) || raw) : (normalizeChatId(`group:${raw}`) || `group:${raw}`)
+    const qid = parsed ? parsed.id : raw
+    const cacheKey = norm || raw
+    const hit = groupMembers.get(cacheKey)
     if (hit && Date.now() - hit.at < 10 * 60_000) return hit.list
+    const isDefInst = parsed ? isDefaultInstanceChat(norm || raw, parsed.platform) : true
+    const gwCaps = gateway?.caps?.(norm || raw) ?? null
+    const useGw = Boolean(gateway && typeof gateway.fetch === 'function' && (!isDefInst || gwCaps !== null || !onebot))
+    if (useGw) {
+      if (!gwCaps?.memberList && !gateway?.features?.(norm || raw)?.['chat.member.list']) return hit?.list || []
+      try {
+        const r = await gateway.fetch(norm || raw, { kind: 'members', chat: { kind: 'group', id: qid } })
+        const rawList = Array.isArray(r) ? r : (Array.isArray(r?.items) ? r.items : [])
+        const list = rawList.map((m) => ({
+          ...m,
+          user_id: m?.user_id ?? m?.account ?? m?.id ?? '',
+          nickname: m?.nickname ?? m?.name ?? '',
+        }))
+        groupMembers.set(cacheKey, { at: Date.now(), list })
+        return list
+      } catch (error) {
+        log.debug('拉群成员失败，@ 按文字发：', error.message)
+        return hit?.list || []
+      }
+    }
+    if (!isDefInst || !/^\d+$/.test(qid) || !onebot) return []
     try {
-      const r = await onebot.call('get_group_member_list', { group_id: Number(groupId) }, { timeoutMs: 15000 })
+      const r = await onebot.call('get_group_member_list', { group_id: Number(qid) }, { timeoutMs: 15000 })
       const list = Array.isArray(r) ? r : r?.data || []
-      groupMembers.set(groupId, { at: Date.now(), list })
+      groupMembers.set(cacheKey, { at: Date.now(), list })
       return list
     } catch (error) {
       log.debug('拉群成员失败，@ 按文字发：', error.message)
@@ -807,7 +834,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
       const dir = dataDir('chatlog')
       mkdirSync(dir, { recursive: true })
-      const forgotten = String(chatId).startsWith('private:') && getConfig().memory?.enabled && getConfig().memory?.instantCommands !== false && parseMemoryCommand(text)?.action === 'forget'
+      const forgotten = parseChatId(chatId)?.kind === 'private' && getConfig().memory?.enabled && getConfig().memory?.instantCommands !== false && parseMemoryCommand(text)?.action === 'forget'
       const row = { t: timestamp, chatId, who, ...(uid ? { uid: String(uid) } : {}), text: redact(String(text).slice(0, 500)), ...(via ? { via } : {}), ...(proactive ? { proactive } : {}), ...(interaction?.length ? { interaction: [...new Set(interaction.map(String))] } : {}), ...(forgotten ? { forgottenAt: Date.now() } : {}) }
       appendFileSync(join(dir, `${day}.jsonl`), JSON.stringify(row) + '\n', 'utf8')
       chatLogRevision++
@@ -1902,8 +1929,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (!text.trim()) return settleOutboundFailed(verdict)
     // 文字里的 <face:名字> 换成 QQ 系统表情，和文字在同一条消息里；系统表情关着就去掉标签
     let segs = getConfig().stickers.faces ? textToSegments(text, faces.idOf) : [{ type: 'text', data: { text: stripFaceTags(text) } }]
-    // 群里的 @名字 / <at:QQ号> 换成真 @（对方会收到提醒）
-    if (chatId.startsWith('group:') && hasMention(text)) segs = expandMentions(segs, await membersOf(chatId.slice(6)), missed)
+    // 群里的 @名字 / <at:账号> 换成真 @（对方会收到提醒）
+    if (parseChatId(chatId)?.kind === 'group' && hasMention(text)) segs = expandMentions(segs, await membersOf(chatId), missed)
     if (!segs.length || (segs.length === 1 && segs[0].type === 'text' && !segs[0].data.text.trim())) return settleOutboundFailed(verdict)
     // 真正出去的是 sendSegments：把 verdict 交下去让它按真实结果结算（sent / failed / uncertain）
     return sendSegments(chatId, [...quote(replyId), ...mention(userId, segs), ...segs], (replyId ? '[引用] ' : '') + text.slice(0, 60), verdict ? { ...opts, outboundVerdict: verdict } : opts)
@@ -2219,8 +2246,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
 
   function silenceTurn(chatId) {
     log.info(`${chatId}：她选择不说话`)
-    if (chatId.startsWith('group:')) {
-      const gid = chatId.slice(6)
+    const addr = parseChatId(chatId)
+    if (addr?.kind === 'group') {
+      const gid = addr.id
       groupEngaged.delete(gid)
       groupEngagedRun.delete(gid)
       groupInterjects.set(gid, [...(groupInterjects.get(gid) || []), Date.now()].slice(-60))
@@ -2350,7 +2378,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       const all = texts.map((t) => t.value).join('，')
       if (all.length <= cfg.voice.autoMaxChars && Math.random() < cfg.voice.autoChance * mood().voice) items = [{ kind: 'voice', value: all }]
     }
-    const inGroup = chatId.startsWith('group:')
+    const chatAddr = parseChatId(chatId)
+    const inGroup = chatAddr?.kind === 'group'
+    const chatGid = chatAddr?.id || ''
     // 群里别刷屏：一段最多 3 条
     if (inGroup && items.length > 3) items = items.slice(0, 3)
     // 按概率补一张表情（群里已经有两条以上就不补了）
@@ -2376,7 +2406,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (!items.length) return silenceTurn(chatId)
     // 一段只有一个人明确 @ / 引用她时，第一条回复引用并 @ 那个人；多人同时叫她不猜。
     // 模型明确选了引用编号时尊重它，不再自动引用另一条。
-    const refs = inGroup ? groupRefs.get(chatId.slice(6)) || {} : {}
+    const refs = inGroup ? groupRefs.get(chatGid) || {} : {}
     const explicit = items.some((item) => item.replyTo)
     const firstSendable = items.findIndex((item) => item.kind === 'text' || item.kind === 'voice' || item.kind === 'image' || (item.kind === 'sticker' && cfg.stickers.enabled && Boolean(item.value && typeof item.value === 'object' ? item.value : stickers.match(item.value))))
     const missedAt = [] // 写了 @ 却没对上群里人的名字
@@ -2418,7 +2448,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     // 一条都没发出去：不记流水，她没说出口的话不能算说过
     if (failures.length && failures.length >= items.filter((i) => i.kind !== 'poke').length) return { missedAt, failed: failures.length, errors: failures, sent: sentTexts.join(' ') }
     if (inGroup) {
-      const gid = chatId.slice(6)
+      const gid = chatGid
       const said = (groupSaid.get(gid) || []).filter((t) => Date.now() - t < 3600_000)
       said.push(Date.now())
       groupSaid.set(gid, said)

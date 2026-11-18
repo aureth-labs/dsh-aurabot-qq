@@ -429,7 +429,7 @@
 
 ## 五、已知缺口（本包未做，后续可补）
 
-1. **WebSocket 会话恢复未实现**：已内置连接、Identify、心跳和断线重连；`op=6 Resume` 尚未使用。
+1. **WebSocket 会话恢复（已接入）**：已内置连接、`Identify`、`READY` 保存 `session_id` 与 `s` 序号、心跳上报 `seq`、`op=7 Reconnect`/断线后发 `op=6 Resume` 续接会话，以及 `op=9 Invalid Session` 清空状态回退 `op=2 Identify`。
 2. **富媒体分片上传未实现**：URL 和内联 Base64（≤10MB）可用；更大的本地文件需要 `upload_prepare` 三步分片。
 3. **语音条（silk）未实现**：`voice: 'file'`，只有音频文件形态。
 4. **群管理能力边界（部分已接）**：已接 `getBotState`（`/bot_state`）、`getGroupInfo`（`/info`）、`listMembers`（`/members`）、`muteMember`/`unmuteMember`（`/restrict_chat_setting`）、`kickMember`（`/batch_remove_members`），`group-admin` 模块已声明 `platforms: ['qq', 'qqbot']` 并持久化 `qqbot-groups.json` 群绑定（群管动作禁 403 重试，映射 `11253` 为 `group-admin-forbidden`）；群黑名单（`member_blacklist`）、入群审批（`join_requests`）、全员禁言写设置、群公告与专属头衔暂未接入。

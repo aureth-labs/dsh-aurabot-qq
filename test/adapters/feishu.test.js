@@ -1303,3 +1303,107 @@ test('Phase 3 P2-1 & P2-4：飞书 fetch(chats) 分页群列表与 p2pChatIds �
   assert.equal(page.messages[0]?.parts?.[0]?.text, '重启后仍能查到单聊历史')
   await a2.stop()
 })
+
+test('飞书扩展能力：merge_forward 展开（fetch(forward)）与群成员列表（fetch(members)）', async () => {
+  const client = makeFakeClient()
+  const baseRequest = client.request.bind(client)
+  client.request = async (req) => {
+    if (req.method === 'GET' && req.url.includes('/open-apis/im/v1/messages/om_mf_1')) {
+      client.calls.push({ ...req })
+      return {
+        status: 200,
+        json: {
+          code: 0,
+          data: {
+            items: [
+              {
+                message_id: 'om_mf_1',
+                msg_type: 'merge_forward',
+                create_time: '1700000000000',
+                body: { content: 'Merged and Forwarded Message' },
+              },
+              {
+                message_id: 'om_sub_2',
+                upper_message_id: 'om_mf_1',
+                msg_type: 'text',
+                create_time: '1700000000200',
+                body: { content: JSON.stringify({ text: '第二条子消息' }) },
+                sender: { id: 'ou_b', id_type: 'open_id', sender_type: 'user' },
+              },
+              {
+                message_id: 'om_sub_1',
+                upper_message_id: 'om_mf_1',
+                msg_type: 'text',
+                create_time: '1700000000100',
+                body: { content: JSON.stringify({ text: '第一条子消息' }) },
+                sender: { id: 'ou_a', id_type: 'open_id', sender_type: 'user' },
+              },
+            ],
+          },
+        },
+      }
+    }
+    if (req.method === 'GET' && req.url.includes('/open-apis/im/v1/chats/oc_g_members/members')) {
+      client.calls.push({ ...req })
+      const u = new URL(req.url)
+      if (!u.searchParams.get('page_token')) {
+        return {
+          status: 200,
+          json: {
+            code: 0,
+            data: {
+              has_more: true,
+              page_token: 'mp2',
+              items: [{ member_id: 'ou_m1', member_id_type: 'open_id', name: '张三' }],
+            },
+          },
+        }
+      }
+      return {
+        status: 200,
+        json: {
+          code: 0,
+          data: {
+            has_more: false,
+            items: [{ member_id: 'ou_m2', member_id_type: 'open_id', name: '李四' }],
+          },
+        },
+      }
+    }
+    return baseRequest(req)
+  }
+
+  const adapter = createFeishuAdapter({ client })
+  adapter.__feishu.setConfig(CFG)
+  const ctx = makeCtx(adapter)
+  await adapter.start(ctx)
+
+  const caps = adapter.caps()
+  assert.equal(caps.memberList, true)
+  assert.equal(caps.forwardExpand, true)
+  const feat = mergeCapsWithFeatures(caps, null).features
+  assert.equal(feat['message.forward.expand'], true)
+  assert.equal(feat['chat.member.list'], true)
+  assert.equal(feat['chat.member.read'], false, 'members 接口不含角色，chat.member.read 保持诚实 false')
+
+  // 带 messageId 的 merge_forward 转成可展开的 forward Part
+  const mfParts = toParts('merge_forward', JSON.stringify({ content: 'Merged and Forwarded Message' }), [], { messageId: 'om_mf_1' })
+  assert.deepEqual(mfParts, [{ type: 'forward', id: 'om_mf_1', summary: '[合并转发]' }])
+
+  const fwd = await adapter.fetch({ kind: 'forward', id: 'om_mf_1' })
+  assert.deepEqual(fwd.messages.map((m) => m.messageId), ['om_sub_1', 'om_sub_2'], '应排除外层并按时间升序排列')
+  assert.equal(fwd.messages[0].parts[0].text, '第一条子消息')
+
+  const members = await adapter.fetch({ kind: 'members', chat: { kind: 'group', id: 'oc_g_members' } })
+  assert.deepEqual(members, [
+    { account: 'ou_m1', name: '张三', idType: 'open_id' },
+    { account: 'ou_m2', name: '李四', idType: 'open_id' },
+  ])
+
+  await assert.rejects(
+    () => adapter.fetch({ kind: 'members', chat: { kind: 'private', id: 'ou_m1' } }),
+    (e) => e.certainty === 'not-sent' && e.code === 'no-member',
+  )
+
+  await adapter.stop()
+})

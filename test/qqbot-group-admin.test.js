@@ -327,9 +327,10 @@ test('宿主机 HTTP 全链路：纯 QQBot 安装 group-admin 后正确挂载 ST
   const wsDir = join(dir, 'ws')
   mkdirSync(wsDir, { recursive: true })
   mkdirSync(join(dir, 'modules', 'group-admin'), { recursive: true })
+  // 直接整文件复制为本地自定义模块，验证无需社区库包装即可经 globalThis.aurabot.lib 运行
   writeFileSync(
     join(dir, 'modules', 'group-admin', 'index.mjs'),
-    `export { default } from ${JSON.stringify(new URL('../src/modules/group-admin/index.js', import.meta.url).href)}\n`,
+    readFileSync(new URL('../src/modules/group-admin/index.js', import.meta.url), 'utf8'),
   )
   const prevDir = process.env.AURABOT_DATA_DIR
   const prevWs = process.env.AURABOT_WORKSPACE

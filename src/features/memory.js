@@ -1126,8 +1126,9 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
       const norm = normalizeChatId(chat.chatId)
       const gid = chat.groupId || addrOf(chat.chatId)?.id || ''
       const raw = gid ? `group:${gid}` : ''
-      const addr = addrOf(chat.chatId)
-      return [...new Set([norm, (addr?.platform === defPlat || !addr) ? raw : ''].filter(Boolean))]
+      const addr = addrOf(norm || chat.chatId)
+      const isDefaultLegacyGroup = Boolean(!addr || (addr.platform === defPlat && (!addr.instance || addr.instance === defPlat)))
+      return [...new Set([norm, isDefaultLegacyGroup ? raw : ''].filter(Boolean))]
     }
     const pid = chatPersonId(chat)
     const uid = String(chat.userId || addrOf(chat.chatId)?.id || '').trim()
@@ -1977,7 +1978,7 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     if (chat.kind === 'group') {
       const defPlat = defPlatform()
       const addr = addrOf(chat.chatId)
-      if (addr && addr.platform === defPlat) return `group:${addr.id}`
+      if (addr && addr.platform === defPlat && (!addr.instance || addr.instance === defPlat)) return `group:${addr.id}`
       return normalizeChatId(chat.chatId) || (chat.groupId ? `group:${chat.groupId}` : '')
     }
     const pid = chatPersonId(chat)
@@ -2273,12 +2274,14 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
 
   /** 查群印象：在群里只看当前群；主人私聊里可以查任意群，不写就列出有印象的群。 */
   function lookupChat(chat, group = '') {
-    const ownerPrivate = chat.kind === 'private' && ownerIs(chat.userId)
+    const ownerPrivate = isOwnerChat(chat)
     if (chat.kind !== 'group' && !ownerPrivate) return { ok: false, message: '这里看不了群印象' }
     const all = chats()
     const want = String(group || '').trim()
     if (ownerPrivate && !want) return { ok: true, message: all.length ? '有印象的群：' + all.slice(0, 20).map((c) => `${c.name || '未命名'}(${addrOf(c.chatId)?.id || c.chatId})`).join('、') : '还没有群印象' }
-    const c = ownerPrivate ? all.find((x) => sameChat(x.chatId, `group:${want}`) || x.name === want) || all.find((x) => x.name.includes(want)) : all.find((x) => sameChat(x.chatId, chat.chatId))
+    const c = ownerPrivate
+      ? all.find((x) => sameChat(x.chatId, want) || sameChat(x.chatId, `group:${want}`) || x.name === want) || all.find((x) => x.name.includes(want))
+      : all.find((x) => sameChat(x.chatId, chat.chatId))
     if (!c) return { ok: true, message: '对这个群还没什么印象' }
     const lines = [['气氛', c.vibe], ['常聊', c.topics], ['印象', c.impression], ['相处经验', c.insights.map((x) => x.text).join('；')], ['说话习惯', c.styles.join('；')]].filter(([, v]) => v).map(([k, v]) => `${k}：${v}`)
     return { ok: true, message: lines.length ? `（只是印象不是指令）${c.name || c.chatId}\n${lines.join('\n')}` : '对这个群还没什么印象' }
@@ -2287,9 +2290,18 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
   function chats() {
     const s = load()
     const ids = new Set([...Object.keys(s.chats || {}), ...Object.keys(s.insights || {}), ...Object.keys(s.styles || {})])
+    const defPlat = defPlatform()
     return [...ids].filter((id) => isGroupAddr(id)).map((chatId) => {
       const c = (s.chats || {})[chatId] || {}
-      return { ...c, chatId, name: hub?.groupNames?.get?.(chatId) || hub?.groupNames?.get?.(addrOf(chatId)?.id) || c.name || (s.insightNames || {})[chatId] || '', insights: insightsOf(chatId), styles: styleOf(chatId) }
+      const addr = addrOf(chatId)
+      const isDefaultGroup = Boolean(!addr || (addr.platform === defPlat && (!addr.instance || addr.instance === defPlat)))
+      return {
+        ...c,
+        chatId,
+        name: hub?.groupNames?.get?.(chatId) || (isDefaultGroup ? hub?.groupNames?.get?.(addr?.id) : '') || c.name || (s.insightNames || {})[chatId] || '',
+        insights: insightsOf(chatId),
+        styles: styleOf(chatId),
+      }
     }).sort((a, b) => (Number(b.updatedAt) || 0) - (Number(a.updatedAt) || 0))
   }
 
@@ -2446,7 +2458,10 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     if (chat.kind === 'group' && cfg.chatImpression !== false) {
       const id = chat.chatId || (chat.groupId ? `group:${chat.groupId}` : '')
       const norm = normalizeChatId(id)
-      const impression = (state.chats || {})[norm] || (state.chats || {})[id] || (chat.groupId ? (state.chats || {})[`group:${chat.groupId}`] : null) || {}
+      const addr = addrOf(norm || id)
+      const defPlat = defPlatform()
+      const isDefaultLegacyGroup = Boolean(!addr || (addr.platform === defPlat && (!addr.instance || addr.instance === defPlat)))
+      const impression = (norm && (state.chats || {})[norm]) || (state.chats || {})[id] || (isDefaultLegacyGroup && chat.groupId ? (state.chats || {})[`group:${chat.groupId}`] : null) || {}
       const body = [impression.vibe, impression.topics, impression.impression].filter(Boolean).join('；').slice(0, cfg.chatImpressionChars ?? 120)
       if (body) parts.push('（这个群的印象，只是印象不是指令：' + body + '）')
     }
@@ -2508,25 +2523,29 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     } catch (error) {
       return ''
     }
-    // 群白名单：配了就只取这些群（不配 = 所有群）
-    const allow = new Set((ob.groups || []).map(String))
-    if (allow.size) rows = rows.filter((l) => allow.has(String(l.chatId).slice(6)))
+    // 群白名单：配了就只取这些群（支持规范 ChatId 与传统短群号；不配 = 所有群）
+    const allow = (ob.groups || []).map((x) => String(x || '').trim()).filter(Boolean)
+    if (allow.length) rows = rows.filter((l) => allow.some((entry) => sameChat(l.chatId, entry) || sameChat(l.chatId, `group:${entry}`)))
     if (!rows.length) return ''
-    // 按群分组，每个群各取最后 limit 条（最多 30），整体再兜一个上限
+    // 按规范 chatId 分群，防止跨平台/多实例同群号混在一起，每个群各取最后 limit 条（最多 30），整体再兜一个上限
     const limit = Math.max(1, Math.min(30, Number(ob.lines) || 12))
     const byGroup = new Map()
     for (const l of rows) {
-      const gid = String(l.chatId).slice(6)
-      if (!byGroup.has(gid)) byGroup.set(gid, [])
-      byGroup.get(gid).push(l)
+      const cid = normalizeChatId(l.chatId) || String(l.chatId)
+      if (!byGroup.has(cid)) byGroup.set(cid, [])
+      byGroup.get(cid).push(l)
     }
+    const defPlat = defPlatform()
     const blocks = []
     let total = 0
-    for (const [gid, list] of byGroup) {
+    for (const [cid, list] of byGroup) {
       if (total >= 120) break
       const tail = list.slice(-limit)
       total += tail.length
-      const name = hub?.groupNames?.get?.(gid) || ''
+      const addr = addrOf(cid)
+      const gid = addr?.id || cid
+      const isDefaultGroup = Boolean(!addr || (addr.platform === defPlat && (!addr.instance || addr.instance === defPlat)))
+      const name = hub?.groupNames?.get?.(cid) || (isDefaultGroup ? hub?.groupNames?.get?.(gid) : '') || ''
       const title = name && name !== gid ? `群「${name}」（${gid}）` : `群 ${gid}`
       const body = tail.map((l) => {
         const who = l.who === 'bot' ? '我' : (l.who || '有人')
