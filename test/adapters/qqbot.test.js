@@ -882,3 +882,87 @@ test('配置里的 listenAllInGroup 会刷新网关 caps', async () => {
   assert.equal(adapter.caps().features['sticker.collect'], false)
   assert.equal(adapter.caps().features['sticker.sync.native'], false)
 })
+
+test('QQBot 群管适配器能力：bot_state / mute(RFC3339<=30d) / unmute / kick / 错误映射 / observedGroups', async () => {
+  const fixedNow = Date.parse('2026-11-18T12:00:00.000Z')
+  const client = makeFakeClient()
+  const baseRequest = client.request.bind(client)
+  let nextResp = null
+  client.request = async (req) => {
+    if (nextResp) {
+      client.calls.push(req)
+      const r = typeof nextResp === 'function' ? nextResp(req) : nextResp
+      nextResp = null
+      return r
+    }
+    return baseRequest(req)
+  }
+
+  const adapter = createQqbotAdapter({ client, now: () => fixedNow })
+  const ctx = makeCtx(adapter, { appId: 'app-1', clientSecret: 'sec-1', transport: 'webhook', botSecret: 's'.repeat(32) })
+  await adapter.start(ctx)
+
+  // 1) observedGroups：收到 GROUP_AT_MESSAGE_CREATE 记录，GROUP_DEL_ROBOT / stop 清理
+  adapter.platform.deliver('GROUP_AT_MESSAGE_CREATE', {
+    id: 'msg-g1',
+    author: { member_openid: 'MEM_1', member_role: 'member' },
+    content: '看看群里',
+    group_openid: 'GRP_OPENID_1',
+    timestamp: '2026-11-18T12:00:00+08:00',
+  })
+  assert.deepEqual(adapter.groupAdmin.observedGroups().map((x) => x.openid), ['GRP_OPENID_1'])
+
+  // 2) getBotState：返回 owner / admin / member；11253 -> forbidden；11254 -> not-admin；429 -> rate-limited；404 -> unsupported
+  nextResp = { status: 200, data: { member_role: 'admin', member_openid: 'BOT_M1' } }
+  const st = await adapter.groupAdmin.getBotState('GRP_OPENID_1')
+  assert.equal(st.role, 'admin')
+  assert.equal(st.memberOpenid, 'BOT_M1')
+
+  nextResp = { status: 403, data: { code: 11253, message: 'no whitelist permission' } }
+  await assert.rejects(() => adapter.groupAdmin.getBotState('GRP_OPENID_1'), (e) => e.code === 'group-admin-forbidden')
+
+  nextResp = { status: 403, data: { code: 11254, message: 'bot is not admin' } }
+  await assert.rejects(() => adapter.groupAdmin.getBotState('GRP_OPENID_1'), (e) => e.code === 'group-admin-not-admin')
+
+  nextResp = { status: 429, data: { message: 'rate limit' } }
+  await assert.rejects(() => adapter.groupAdmin.getBotState('GRP_OPENID_1'), (e) => e.code === 'group-admin-rate-limited')
+
+  nextResp = { status: 404, data: { message: 'unsupported' } }
+  await assert.rejects(() => adapter.groupAdmin.getBotState('GRP_OPENID_1'), (e) => e.code === 'group-admin-unsupported')
+
+  // 3) muteMember（RFC3339 绝对时间，上限 30 天）、unmuteMember、kickMember（member_openids）
+  const beforeMuteCalls = client.calls.length
+  nextResp = { status: 200, data: {} }
+  await adapter.groupAdmin.muteMember('GRP_OPENID_1', 'MEM_TARGET_1', 99 * 86400 * 1000)
+  const muteCall = client.calls.slice(beforeMuteCalls).find((c) => c.path.endsWith('/restrict_chat_setting'))
+  assert.equal(muteCall.method, 'POST')
+  assert.deepEqual(muteCall.body, {
+    members: [{
+      op: 'add',
+      member_openid: 'MEM_TARGET_1',
+      mute_expire_at: new Date(fixedNow + 30 * 86400 * 1000).toISOString(),
+    }],
+  })
+
+  // 禁言遇到 403 / 11253 绝不自动重试第二次 POST
+  const beforeForbiddenMute = client.calls.length
+  nextResp = { status: 403, data: { code: 11253, message: 'no permission' } }
+  await assert.rejects(() => adapter.groupAdmin.muteMember('GRP_OPENID_1', 'MEM_TARGET_1', 60_000), (e) => e.code === 'group-admin-forbidden')
+  const forbiddenPosts = client.calls.slice(beforeForbiddenMute).filter((c) => c.path.endsWith('/restrict_chat_setting'))
+  assert.equal(forbiddenPosts.length, 1, '403 写操作不得自动重试')
+
+  nextResp = { status: 200, data: {} }
+  await adapter.groupAdmin.unmuteMember('GRP_OPENID_1', 'MEM_TARGET_1')
+  const unmuteCall = client.calls.at(-1)
+  assert.deepEqual(unmuteCall.body, { members: [{ op: 'del', member_openid: 'MEM_TARGET_1' }] })
+
+  nextResp = { status: 200, data: {} }
+  await adapter.groupAdmin.kickMember('GRP_OPENID_1', 'MEM_TARGET_1', { addBlackList: true })
+  const kickCall = client.calls.at(-1)
+  assert.equal(kickCall.path, '/v2/groups/GRP_OPENID_1/batch_remove_members')
+  assert.deepEqual(kickCall.body, { member_openids: ['MEM_TARGET_1'], add_to_member_blacklist: true })
+
+  adapter.platform.deliver('GROUP_DEL_ROBOT', { group_openid: 'GRP_OPENID_1' })
+  assert.equal(adapter.groupAdmin.observedGroups().length, 0)
+  await adapter.stop()
+})

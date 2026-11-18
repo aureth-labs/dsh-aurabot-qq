@@ -511,16 +511,23 @@ test('Phase 3：工具去重、legacy qq_* 执行路由兼容、7 个 QQ 模块�
   assert.equal(botAdapter.sent.length, 0)
 })
 
-test('Phase 4：纯 QQBot 环境下 7 个 QQ 专属模块不运行且全被动场景隐藏 send_message / chat_history', async (t) => {
+test('Phase 4：纯 QQBot 环境下 6 个 QQ 专属内置模块不运行、group-admin 可在纯 QQBot 加载且全被动场景隐藏 send_message / chat_history', async (t) => {
   const { fake, app } = await bootHost(t, {
-    cfg: {
-      enabled: true,
-      dryRun: false,
-      setupDone: true,
-      ownerName: '阿白',
-      merge: { enabled: false },
-      allow: { private: ['qqbot:private:u_bot_owner'], groups: ['qqbot:group:g_bot'] },
-      platforms: { qq: { enabled: false }, qqbot: { enabled: true } },
+    cfg: ({ dataDir }) => {
+      mkdirSync(join(dataDir, 'modules', 'group-admin'), { recursive: true })
+      writeFileSync(
+        join(dataDir, 'modules', 'group-admin', 'index.mjs'),
+        `export { default } from ${JSON.stringify(new URL('../src/modules/group-admin/index.js', import.meta.url).href)}\n`,
+      )
+      return {
+        enabled: true,
+        dryRun: false,
+        setupDone: true,
+        ownerName: '阿白',
+        merge: { enabled: false },
+        allow: { private: ['qqbot:private:u_bot_owner'], groups: ['qqbot:group:g_bot'] },
+        platforms: { qq: { enabled: false }, qqbot: { enabled: true } },
+      }
     },
   })
   app.gateway.identity.claimOwner('qqbot', 'u_bot_owner')
@@ -532,10 +539,12 @@ test('Phase 4：纯 QQBot 环境下 7 个 QQ 专属模块不运行且全被动�
   }))
   await app.gateway.sync()
 
-  for (const id of ['contacts', 'diary', 'group-admin', 'profile', 'qq-api', 'qq-tools', 'qzone-social']) {
+  for (const id of ['contacts', 'diary', 'profile', 'qq-api', 'qq-tools', 'qzone-social']) {
     const row = app.modules.status().find((m) => m.id === id)
     assert.ok(!row || row.running === null, `${id} 在纯 QQBot 下不应运行`)
   }
+  const groupAdminRow = app.modules.status().find((m) => m.id === 'group-admin')
+  assert.equal(groupAdminRow?.running, 'user', '适配 QQBot 后已安装的 group-admin 应在纯 QQBot 下运行')
   const chatToolsRow = app.modules.status().find((m) => m.id === 'chat-tools')
   assert.equal(chatToolsRow?.running, 'builtin', '跨平台 chat-tools 应在纯 QQBot 下正常运行')
 

@@ -762,6 +762,12 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
       return run.adapter.native(action, params, opts)
     },
 
+    groupAdmin(chatIdOrInstance) {
+      const { run } = resolveTarget(chatIdOrInstance)
+      if (!run || !platformsConfig()[run.instance]?.enabled || run.state !== 'connected') return null
+      return run.adapter?.groupAdmin || null
+    },
+
     toParts(chatIdOrInstance, nativeMessage) {
       const { run } = resolveTarget(chatIdOrInstance)
       if (!run) throw new Error(`认不出实例：${chatIdOrInstance}`)

@@ -320,11 +320,13 @@ export function createQqbotAdapter(options = {}) {
   let capsOverride = null // 用户配置或探测结果叠在默认 caps 上
   let transport = 'websocket'
 
-  // 被动回复记账
+  // 被动回复记账 & 群管候选项
   const seenAt = new Map() // inResponseTo(messageId) → 入站时间
   const msgSeq = new Map() // `${kind}\u0000${chatId}\u0000${inResponseTo}` → 已用 msg_seq
   const replyCount = new Map() // 同上 → 已发条数（repliesPerMessage 用）
   const proactiveCount = new Map() // `${yyyymmdd}\u0000${kind}\u0000${chatId}` → 当日主动条数
+  const observedGroups = new Map() // group_openid -> { openid, at, preview }
+  const MAX_MUTE_MS = 30 * 24 * 60 * 60 * 1000
   // 测试故障注入
   let failSend = null
 
@@ -398,19 +400,171 @@ export function createQqbotAdapter(options = {}) {
     return token.value
   }
 
-  /** 带 token 调接口；401/403 时强制换一次 token 再试（token 过期是最常见的失败） */
-  async function authedRequest({ path, method = 'POST', body, query, timeoutMs, retried = false }) {
+  /** 带 token 调接口；401（或允许时 403）强制换一次 token 再试 */
+  async function authedRequest({ path, method = 'POST', body, query, timeoutMs, retryOn403 = true, retried = false }) {
     const accessToken = await ensureToken({ force: retried })
     const res = await client.request({
       path, method, body, query,
       headers: { Authorization: `QQBot ${accessToken}` },
       timeoutMs: timeoutMs || DEFAULT_TIMEOUT_MS,
     })
-    if ((res?.status === 401 || res?.status === 403) && !retried) {
+    if ((res?.status === 401 || (retryOn403 && res?.status === 403)) && !retried) {
       token = { value: '', expiresAt: 0 }
-      return authedRequest({ path, method, body, query, timeoutMs, retried: true })
+      return authedRequest({ path, method, body, query, timeoutMs, retryOn403, retried: true })
     }
     return res
+  }
+
+  function recordObservedGroup(groupOpenid, preview = '') {
+    const openid = String(groupOpenid || '').trim()
+    if (!openid) return
+    observedGroups.delete(openid)
+    while (observedGroups.size >= 200) observedGroups.delete(observedGroups.keys().next().value)
+    observedGroups.set(openid, {
+      openid,
+      at: now(),
+      ...(preview ? { preview: String(preview).trim().slice(0, 60) } : {}),
+    })
+  }
+
+  function toGroupAdminError(res, actionLabel = '群管操作') {
+    const raw = res?.data && typeof res.data === 'object' ? res.data : {}
+    const status = Number(res?.status || 0)
+    const apiCode = raw.code != null ? String(raw.code) : (raw.errcode != null ? String(raw.errcode) : '')
+    const msg = String(raw.message || raw.msg || '')
+    const err = (code, message) => Object.assign(new Error(message), { code, rawCode: apiCode || (status ? String(status) : ''), status, certainty: 'not-sent', instance })
+    if (status === 404 || /unsupported|not.?supported|暂不支持/i.test(msg)) {
+      return err('group-admin-unsupported', `QQ 官方机器人暂不支持${actionLabel}${msg ? '：' + msg : ''}`)
+    }
+    if (apiCode === '11254' || /not.?admin|非管理员|不是管理员|无群管权限|only admin/i.test(msg)) {
+      return err('group-admin-not-admin', `机器人不是管理员，无法${actionLabel}${msg ? '：' + msg : ''}`)
+    }
+    if (apiCode === '11253' || status === 403 || /11253|whitelist|白名单|接口权限|forbidden|permission/i.test(msg)) {
+      return err('group-admin-forbidden', `QQ 官方机器人未获得群管理接口权限（${apiCode || status || '11253'}）${msg ? '：' + msg : ''}`)
+    }
+    if (status === 429 || /rate.?limit|too many|频率|频控/i.test(msg)) {
+      return err('group-admin-rate-limited', `${actionLabel}触发平台频率限制，请稍后再试${msg ? '：' + msg : ''}`)
+    }
+    return err('group-admin-failed', `${actionLabel}失败${msg ? '：' + msg : `（HTTP ${status || '?'}）`}`)
+  }
+
+  async function requestGroupAdmin({ path, method = 'GET', body, query, actionLabel }) {
+    if (!running || !connected) {
+      throw Object.assign(new Error('QQ 官方机器人未连接'), { code: 'group-admin-failed', certainty: 'not-sent', instance })
+    }
+    const timeoutMs = Math.max(1, Number(cfgOf().timeoutMs) || DEFAULT_TIMEOUT_MS)
+    let res
+    try {
+      // 禁言/踢人等写接口禁止因 403 重试，避免重复执行或多次撞 11253
+      res = await authedRequest({ path, method, body, query, timeoutMs, retryOn403: false })
+    } catch (error) {
+      if (error?.code && String(error.code).startsWith('group-admin-')) throw error
+      throw Object.assign(new Error(`${actionLabel}失败：${error?.message || error}`), { code: 'group-admin-failed', certainty: 'not-sent', instance })
+    }
+    const raw = res?.data && typeof res.data === 'object' ? res.data : {}
+    const apiCodeStr = raw.code != null ? String(raw.code).trim() : (raw.errcode != null ? String(raw.errcode).trim() : '')
+    if (Number(res?.status || 200) >= 400 || (apiCodeStr !== '' && apiCodeStr !== '0')) {
+      throw toGroupAdminError(res, actionLabel)
+    }
+    return raw.data && typeof raw.data === 'object' ? raw.data : raw
+  }
+
+  const groupAdmin = {
+    supportedActions: Object.freeze({ ban: true, unban: true, kick: true, wholeBan: false, title: false, notice: false }),
+    observedGroups: () => [...observedGroups.values()],
+    async getBotState(groupOpenid) {
+      const gid = String(groupOpenid || '').trim()
+      if (!gid) throw Object.assign(new Error('缺少群 group_openid'), { code: 'group-admin-failed', certainty: 'not-sent', instance })
+      const data = await requestGroupAdmin({
+        path: `/v2/groups/${encodeURIComponent(gid)}/bot_state`,
+        method: 'GET',
+        actionLabel: '查询机器人群内身份',
+      })
+      const rawRole = String(data.member_role || '').trim().toLowerCase()
+      const role = rawRole === 'owner' || rawRole === 'admin' || rawRole === 'member'
+        ? rawRole
+        : (data.is_owner ? 'owner' : data.is_admin ? 'admin' : 'member')
+      return {
+        role,
+        groupOpenid: gid,
+        ...(data.member_openid ? { memberOpenid: String(data.member_openid) } : {}),
+        ...(typeof data.allow_proactive_msg === 'boolean' ? { allowProactiveMsg: data.allow_proactive_msg } : {}),
+        ...(data.recv_msg_setting ? { recvMsgSetting: String(data.recv_msg_setting) } : {}),
+      }
+    },
+    async getGroupInfo(groupOpenid) {
+      const gid = String(groupOpenid || '').trim()
+      if (!gid) throw Object.assign(new Error('缺少群 group_openid'), { code: 'group-admin-failed', certainty: 'not-sent', instance })
+      const data = await requestGroupAdmin({
+        path: `/v2/groups/${encodeURIComponent(gid)}/info`,
+        method: 'GET',
+        actionLabel: '查询群信息',
+      })
+      return {
+        groupOpenid: String(data.group_openid || gid),
+        name: String(data.group_name || data.name || ''),
+        ...(Number.isFinite(Number(data.member_count)) ? { memberCount: Number(data.member_count) } : {}),
+      }
+    },
+    async listMembers(groupOpenid, { startIndex = 0, limit = 50 } = {}) {
+      const gid = String(groupOpenid || '').trim()
+      if (!gid) throw Object.assign(new Error('缺少群 group_openid'), { code: 'group-admin-failed', certainty: 'not-sent', instance })
+      const data = await requestGroupAdmin({
+        path: `/v2/groups/${encodeURIComponent(gid)}/members`,
+        method: 'GET',
+        query: {
+          start_index: Math.max(0, Number(startIndex) || 0),
+          limit: Math.max(1, Math.min(100, Number(limit) || 50)),
+        },
+        actionLabel: '查询群成员列表',
+      })
+      const items = Array.isArray(data.members) ? data.members : (Array.isArray(data.items) ? data.items : [])
+      return items
+        .map((m) => ({
+          openid: String(m?.member_openid || m?.openid || '').trim(),
+          nick: String(m?.nick || m?.username || ''),
+          role: String(m?.role || m?.member_role || ''),
+        }))
+        .filter((m) => m.openid)
+    },
+    async muteMember(groupOpenid, memberOpenid, durationMs) {
+      const gid = String(groupOpenid || '').trim()
+      const uid = String(memberOpenid || '').trim()
+      if (!gid || !uid) throw Object.assign(new Error('缺少群或成员 member_openid'), { code: 'group-admin-failed', certainty: 'not-sent', instance })
+      const ms = Math.max(60_000, Math.min(MAX_MUTE_MS, Number(durationMs) || 10 * 60_000))
+      const muteExpireAt = new Date(now() + ms).toISOString()
+      await requestGroupAdmin({
+        path: `/v2/groups/${encodeURIComponent(gid)}/restrict_chat_setting`,
+        method: 'POST',
+        body: { members: [{ op: 'add', member_openid: uid, mute_expire_at: muteExpireAt }] },
+        actionLabel: '禁言群成员',
+      })
+    },
+    async unmuteMember(groupOpenid, memberOpenid) {
+      const gid = String(groupOpenid || '').trim()
+      const uid = String(memberOpenid || '').trim()
+      if (!gid || !uid) throw Object.assign(new Error('缺少群或成员 member_openid'), { code: 'group-admin-failed', certainty: 'not-sent', instance })
+      await requestGroupAdmin({
+        path: `/v2/groups/${encodeURIComponent(gid)}/restrict_chat_setting`,
+        method: 'POST',
+        body: { members: [{ op: 'del', member_openid: uid }] },
+        actionLabel: '解除群成员禁言',
+      })
+    },
+    async kickMember(groupOpenid, memberOpenid, opts = {}) {
+      const gid = String(groupOpenid || '').trim()
+      const uid = String(memberOpenid || '').trim()
+      if (!gid || !uid) throw Object.assign(new Error('缺少群或成员 member_openid'), { code: 'group-admin-failed', certainty: 'not-sent', instance })
+      await requestGroupAdmin({
+        path: `/v2/groups/${encodeURIComponent(gid)}/batch_remove_members`,
+        method: 'POST',
+        body: {
+          member_openids: [uid],
+          ...(opts?.addBlackList ? { add_to_member_blacklist: true } : {}),
+        },
+        actionLabel: '移除群成员',
+      })
+    },
   }
 
   // ───── WebSocket 事件源（transport='websocket'） ─────
@@ -765,9 +919,14 @@ export function createQqbotAdapter(options = {}) {
     if (t === 'GROUP_AT_MESSAGE_CREATE' || t === 'GROUP_MESSAGE_CREATE') {
       const groupOpenid = String(d?.group_openid || '')
       const senderOpenid = String(d?.author?.member_openid || d?.author?.id || '')
+      recordObservedGroup(groupOpenid, d?.content || '')
       try {
         ctx.log?.info?.(`qqbot 群事件：${t} group_openid=${groupOpenid || '(空)'} sender=${senderOpenid || '(空)'}`)
       } catch (error) {}
+    } else if (t === 'GROUP_ADD_ROBOT') {
+      recordObservedGroup(d?.group_openid)
+    } else if (t === 'GROUP_DEL_ROBOT') {
+      if (d?.group_openid) observedGroups.delete(String(d.group_openid))
     }
     const message = translate(t, d)
     if (message) {
@@ -960,6 +1119,7 @@ export function createQqbotAdapter(options = {}) {
       msgSeq.clear()
       replyCount.clear()
       proactiveCount.clear()
+      observedGroups.clear()
       ctx?.state('stopped')
     },
 
@@ -1066,6 +1226,8 @@ export function createQqbotAdapter(options = {}) {
     toParts(nativeMessage) {
       return eventToParts(nativeMessage?.d || nativeMessage || {}, { selfOpenid: self.account || cfgOf().selfOpenid }).parts
     },
+
+    groupAdmin,
   }
 
   // ───────────────────────── 测试后门（与 _template / fake-adapter 同名同语义） ─────────────────────────

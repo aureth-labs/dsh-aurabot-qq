@@ -2541,7 +2541,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             h(Btn, { kind: 'primary', disabled: busy || !valid || groups.includes(id), onClick: async () => { if (await apply(id, 'group', { chat: true })) setInput('') } }, '添加群聊')),
           groups.map((qq) => h(Row, { key: qq, label: qq }, h(Btn, { small: true, disabled: busy, onClick: () => apply(qq, 'group', { chat: false }) }, '移除'))),
         ),
-        modOn(st, 'group-admin') ? h(GroupRoles, null) : null,
+        modOn(st, 'group-admin') ? h(GroupRoles, { toast }) : null,
       )
     }
 
@@ -3094,21 +3094,101 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h('td', null, c.desc))))))
     }
 
-    /** 她在每个白名单群里的身份：群主 / 管理员才能禁言踢人。 */
-    function GroupRoles() {
-      const [list, setList] = useState(null)
-      const load = () => { setList(null); get('/groups/roles').then((r) => setList(r.list || [])) }
+    /** 她在每个白名单/绑定群里的身份：群主 / 管理员才能做群管；兼容 QQ 直连与 QQ 官方机器人。 */
+    function GroupRoles({ toast } = {}) {
+      const [data, setData] = useState(null)
+      const [openid, setOpenid] = useState('')
+      const [alias, setAlias] = useState('')
+      const [groupName, setGroupName] = useState('')
+      const [inst, setInst] = useState('')
+      const [saving, setSaving] = useState(false)
+      const load = () => {
+        setData(null)
+        get('/groups/roles').then((r) => {
+          const list = r.list || []
+          const bindings = r.bindings || []
+          const candidates = r.candidates || []
+          const qqbotInstances = r.qqbotInstances || []
+          setData({ list, bindings, candidates, qqbotInstances })
+          if (!inst && qqbotInstances.length) setInst(qqbotInstances[0].instance)
+        }).catch(() => setData({ list: [], bindings: [], candidates: [], qqbotInstances: [] }))
+      }
       useEffect(load, [])
-      return h(Card, { title: '群管权限', desc: 'ta在群里是群主或管理员时，主人才能让ta禁言、踢人、发公告；改专属头衔要群主。按已保存的群白名单查。',
-        right: h(Btn, { small: true, kind: 'ghost', onClick: load }, '刷新') },
-        !list ? h('div', { className: 'ab-muted ab-small' }, h('i', { className: 'ab-spin' }), ' 查询中…')
-          : list.length === 0 ? h('div', { className: 'ab-muted ab-small' }, '群白名单是空的。')
-          : h('table', { className: 'ab-table' },
-            h('thead', null, h('tr', null, ['群', 'ta的身份', '群管'].map((x) => h('th', { key: x }, x)))),
-            h('tbody', null, list.map((g) => h('tr', { key: g.groupId },
-              h('td', null, (g.name && g.name !== g.groupId ? g.name + ' ' : '') + '(' + g.groupId + ')'),
-              h('td', null, g.label),
-              h('td', null, g.canManage ? h('span', { className: 'ab-badge' }, '可以') : h('span', { className: 'ab-muted ab-small' }, '不行')))))))
+
+      const bindGroup = async () => {
+        if (!openid.trim()) return
+        setSaving(true)
+        const r = await post('/groups/qqbot/bind', {
+          instance: inst || data?.qqbotInstances?.[0]?.instance || 'qqbot',
+          openid: openid.trim(),
+          alias: alias.trim(),
+          name: groupName.trim(),
+        })
+        setSaving(false)
+        toast && toast(r.message || (r.ok ? '绑定好了' : '绑定失败'), r.ok ? 'ok' : 'err')
+        if (r.ok) {
+          setOpenid(''); setAlias(''); setGroupName('')
+          load()
+        }
+      }
+
+      const unbindGroup = async (chatId) => {
+        setSaving(true)
+        const r = await post('/groups/qqbot/unbind', { chatId })
+        setSaving(false)
+        toast && toast(r.message || (r.ok ? '已解除绑定' : '解绑失败'), r.ok ? 'ok' : 'err')
+        if (r.ok) load()
+      }
+
+      const list = data?.list || null
+      const bindings = data?.bindings || []
+      const candidates = data?.candidates || []
+      const qqbotInstances = data?.qqbotInstances || []
+      const showQqbotCard = qqbotInstances.length > 0 || bindings.length > 0 || candidates.length > 0
+
+      return h('div', { className: 'ab-grid' },
+        h(Card, { title: '群管权限', desc: 'ta在群里是群主或管理员时，主人才能让ta执行群管；QQ 官方机器人支持禁言、解禁与踢人（公告/头衔暂不支持）。',
+          right: h(Btn, { small: true, kind: 'ghost', onClick: load }, '刷新') },
+          !list ? h('div', { className: 'ab-muted ab-small' }, h('i', { className: 'ab-spin' }), ' 查询中…')
+            : list.length === 0 ? h('div', { className: 'ab-muted ab-small' }, '群白名单和绑定表都是空的。')
+            : h('table', { className: 'ab-table' },
+              h('thead', null, h('tr', null, ['群', '接入方式', 'ta的身份', '群管', '说明'].map((x) => h('th', { key: x }, x)))),
+              h('tbody', null, list.map((g) => h('tr', { key: g.groupId },
+                h('td', null, (g.name && g.name !== g.groupId ? g.name + ' ' : '') + '(' + (g.displayId || g.groupId) + ')'),
+                h('td', null, g.backendLabel || 'QQ 直连'),
+                h('td', null, g.label),
+                h('td', null, g.canManage ? h('span', { className: 'ab-badge' }, '可以') : h('span', { className: 'ab-muted ab-small' }, '不行')),
+                h('td', { className: 'ab-muted ab-small' }, g.reason || (g.backend === 'gateway-admin' && g.canManage ? '仅按 member_openid 操作，不支持公告/头衔/全员禁言' : ''))))))),
+        showQqbotCard ? h(Card, {
+          title: 'QQ 官方机器人群绑定',
+          desc: 'QQ 官方机器人只能按群成员 member_openid 操作，请在群里 @ 对方或从成员列表选择；不能直接按 QQ 号操作。绑定后可用于按正式 group_openid 或数字别名查询与群管。',
+        },
+          candidates.length ? h(Row, { label: '最近收到消息的候选群', hint: '点一个自动填入 group_openid，可在下方补充展示别名（如数字群号）。' },
+            h('div', { className: 'ab-flex', style: { flexWrap: 'wrap' } },
+              candidates.map((c) => h(Btn, {
+                key: c.chatId,
+                small: true,
+                kind: c.bound ? 'ghost' : 'primary',
+                onClick: () => { setInst(c.instance); setOpenid(c.openid); if (c.alias) setAlias(c.alias); if (c.name) setGroupName(c.name) },
+              }, `${c.name || c.openid.slice(0, 10) + '…'}${c.bound ? '（已绑）' : ''}`)))) : null,
+          qqbotInstances.length > 1 ? h(Row, { label: '机器人实例' },
+            h('select', { className: 'ab-select', value: inst || qqbotInstances[0]?.instance || 'qqbot', onChange: (e) => setInst(e.target.value) },
+              qqbotInstances.map((x) => h('option', { key: x.instance, value: x.instance }, x.name + ' (' + x.instance + ')')))) : null,
+          h(Row, { label: 'group_openid', hint: '在群里 @ 机器人发一条消息即可从候选列表看到。' },
+            h('input', { className: 'ab-input', placeholder: '输入 QQ 官方群 group_openid', value: openid, onChange: (e) => setOpenid(e.target.value) })),
+          h(Row, { label: '展示别名 / 数字群号（可选）', hint: '仅用于面板显示及关联白名单里的旧数字群号，不参与官方 API 调用。' },
+            h('input', { className: 'ab-input', placeholder: '例如 1136292994（可选）', value: alias, onChange: (e) => setAlias(e.target.value) })),
+          h(Row, { label: '群名称（可选）' },
+            h('div', { className: 'ab-flex' },
+              h('input', { className: 'ab-input', placeholder: '留空时若已连接且有权限会自动获取', value: groupName, onChange: (e) => setGroupName(e.target.value) }),
+              h(Btn, { kind: 'primary', disabled: saving || !openid.trim(), onClick: bindGroup }, saving ? '保存中…' : '保存绑定'))),
+          bindings.length ? bindings.map((b) => h(Row, {
+            key: b.chatId,
+            label: (b.name || b.alias || b.openid) + (b.active ? '' : '（实例已停用或移除）'),
+            hint: `${b.instance} · ${b.openid}${b.alias ? ' · 别名 ' + b.alias : ''}`,
+          }, h(Btn, { small: true, disabled: saving, onClick: () => unbindGroup(b.chatId) }, '解除绑定'))) : null,
+        ) : null,
+      )
     }
 
     /** 按群头衔不理：勾选的群里，专属头衔是某个词的成员（别的机器人）她不理。头衔可以从群里现有的里面点一个。 */

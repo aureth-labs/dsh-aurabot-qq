@@ -389,6 +389,19 @@ export interface PlatformAdapter {
   toParts?(nativeMessage: unknown): Part[]
   /** 平台独有的本事。只有声明了 platforms 含本平台的模块能经 api.native 调到这里 */
   native?(action: string, params?: any, opts?: { timeoutMs?: number }): Promise<any>
+  /** 可选群管理能力（例如 QQ 官方机器人 bot_state / 禁言 / 踢人） */
+  groupAdmin?: GroupAdminCapability
+}
+
+export interface GroupAdminCapability {
+  supportedActions?: { ban?: boolean; unban?: boolean; kick?: boolean; wholeBan?: boolean; title?: boolean; notice?: boolean }
+  getBotState(groupOpenid: string): Promise<{ role: 'owner' | 'admin' | 'member' | ''; groupOpenid: string; memberOpenid?: string }>
+  getGroupInfo?(groupOpenid: string): Promise<{ groupOpenid: string; name?: string; memberCount?: number }>
+  listMembers?(groupOpenid: string, opts?: { startIndex?: number; limit?: number }): Promise<Array<{ openid: string; nick?: string; role?: string }>>
+  muteMember?(groupOpenid: string, memberOpenid: string, durationMs: number): Promise<void>
+  unmuteMember?(groupOpenid: string, memberOpenid: string): Promise<void>
+  kickMember?(groupOpenid: string, memberOpenid: string, opts?: { addBlackList?: boolean }): Promise<void>
+  observedGroups?(): Array<{ openid: string; at: number; preview?: string }>
 }
 
 // ───────────────────────── 8. 网关 ─────────────────────────
@@ -437,6 +450,8 @@ export interface Gateway {
   fetch(chatIdOrInstance: string, request: FetchRequest & { kind: 'history' }): Promise<FetchedHistoryPage>
   fetch(chatIdOrInstance: string, request: FetchRequest): Promise<any>
   native(instance: Instance, action: string, params?: any, opts?: { timeoutMs?: number }): Promise<any>
+  /** 只读暴露实例的群管理能力对象（实例未连接或未实现时返回 null，避免模块直接摸 adapter 对象） */
+  groupAdmin?(chatIdOrInstance: string): GroupAdminCapability | null
   /** 转给该实例平台端的 toParts；平台端没实现时抛错 */
   toParts(chatIdOrInstance: string, nativeMessage: unknown): Part[]
 

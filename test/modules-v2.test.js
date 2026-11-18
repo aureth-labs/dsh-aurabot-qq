@@ -134,7 +134,7 @@ test('内置模块平台声明完备，只开假平台时 QQ 模块跳过（「�
       assert.deepEqual(def.platforms, ['qq'], `${def.id} 应声明 platforms: ['qq']`)
     }
   }
-  assert.deepEqual(groupAdminDef.platforms, ['qq'])
+  assert.deepEqual(groupAdminDef.platforms, ['qq', 'qqbot'])
 
   const { gateway } = makeTestGateway(t, { platforms: { fake: { enabled: true }, qq: { enabled: false } }, ids: ['fake', 'qq'] })
   await gateway.sync()

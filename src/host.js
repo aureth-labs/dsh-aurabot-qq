@@ -1138,7 +1138,7 @@ export function apply(ctx) {
     }
   }
   ctx.effect(() => ctx.interval(() => { probeWarmup().catch(() => {}) }, 2000), 'aurabot: 网关预热探测')
-  const groupRoles = createGroupRoles({ onebot, getConfig, log: logger.child('chat') })
+  const groupRoles = createGroupRoles({ onebot, getGateway: () => platformGateway, getConfig, dataDir, log: logger.child('chat') })
   const local = createLocal({ getConfig, log: logger })
   const mutes = createMutes()
 
