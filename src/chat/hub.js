@@ -290,6 +290,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   const groupEngagedRun = new Map() // groupId → 没人叫她、连着接了几次话
   const ENGAGE_MS = 3 * 60_000
   const groupNames = new Map()
+  const chatsFetchedAt = new Map() // instance -> last gateway.fetch('chats') ms
+  const GROUP_NAMES_TTL_MS = 10 * 60_000
   const friendIds = new Set()
   let friendsAt = 0
   let friendsPending = null
@@ -1009,7 +1011,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       const t = cleanLegacyTitle(String(chat.title || '后台'), plat)
       return t.startsWith(systemPrefix) ? t : systemPrefix + t
     }
-    if (chat.kind === 'group') return `${label} 群 · ${groupNames.get(chat.groupId) || chat.groupId}`
+    if (chat.kind === 'group') return `${label} 群 · ${groupNames.get(chat.chatId) || groupNames.get(chat.groupId) || chat.groupId}`
     return isOwnerPrivateChat(ownerRef(), chat) ? `${label} · ${owner}私聊` : `${label} 私聊 · ${chat.nickname || chat.userId}`
   }
 
@@ -2669,25 +2671,47 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (!raw) return ''
     if (groupNames.has(raw)) return groupNames.get(raw)
     const parsed = raw.includes(':') ? parseChatId(raw) : null
-    if (parsed) {
-      if (groupNames.has(parsed.id)) return groupNames.get(parsed.id)
-      const defPlat = defaultPlatform()
-      if (parsed.platform !== defPlat || !/^\d+$/.test(parsed.id)) return raw
-      if (!isDefaultInstanceChat(raw, parsed.platform) || (gateway && gateway.caps?.(raw) !== null)) {
-        return parsed.id
-      }
+    const norm = parsed ? (normalizeChatId(raw) || raw) : (normalizeChatId(`group:${raw}`) || '')
+    if (norm && groupNames.has(norm)) return groupNames.get(norm)
+    const defPlat = defaultPlatform()
+    if (parsed && groupNames.has(parsed.id) && isDefaultInstanceChat(norm || raw, parsed.platform)) {
+      return groupNames.get(parsed.id)
     }
     const qid = parsed ? parsed.id : raw
-    const normCheck = parsed ? raw : (normalizeChatId(`group:${qid}`) || '')
-    if (!/^\d+$/.test(qid) || !onebot || (gateway && normCheck && gateway.caps?.(normCheck) !== null)) {
-      return qid
+    const isDefInst = parsed ? isDefaultInstanceChat(norm || raw, parsed.platform) : true
+    const useGw = Boolean(gateway && typeof gateway.fetch === 'function' && (!isDefInst || (norm && gateway.caps?.(norm) !== null) || !onebot))
+    if (useGw) {
+      const inst = parsed?.instance || defPlat
+      const instPlat = parsed?.platform || defPlat
+      const last = chatsFetchedAt.get(inst) || 0
+      if (!last || Date.now() - last >= GROUP_NAMES_TTL_MS) {
+        chatsFetchedAt.set(inst, Date.now())
+        try {
+          const groups = await chatGroups(norm || inst)
+          for (const g of groups) {
+            const gId = String(g?.group_id ?? g?.id ?? '').trim()
+            const gName = String(g?.group_name ?? g?.name ?? '').trim()
+            if (!gId || !gName) continue
+            const gNorm = formatChatId({ instance: inst, platform: instPlat, kind: 'group', id: gId }) || `${inst}:group:${gId}`
+            groupNames.set(gNorm, gName)
+            if (isDefaultInstanceChat(gNorm, instPlat)) groupNames.set(gId, gName)
+          }
+        } catch {}
+      }
+      return (norm && groupNames.get(norm)) || groupNames.get(raw) || (parsed?.platform === defPlat ? parsed.id : raw)
+    }
+    if (!/^\d+$/.test(qid) || !onebot || !isDefInst) {
+      return parsed?.platform === defPlat ? parsed.id : (qid || raw)
     }
     try {
       // 查群名是锦上添花：失败就退回群号，别在网关抖动时白等重试
       const info = await onebot.call('get_group_info', { group_id: Number(qid) }, { retries: 0 })
-      if (info?.group_name) groupNames.set(qid, info.group_name)
+      if (info?.group_name) {
+        groupNames.set(qid, info.group_name)
+        if (norm) groupNames.set(norm, info.group_name)
+      }
     } catch (error) {}
-    return groupNames.get(qid) || groupNames.get(raw) || raw
+    return groupNames.get(qid) || (norm && groupNames.get(norm)) || groupNames.get(raw) || raw
   }
 
   // ---------- 引用消息 ----------
@@ -3486,6 +3510,13 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   async function onGatewayMessage(m) {
     if (disposed || !m) return
     try { gateway?.noteSeen?.(m.sender.person, m.chatId, Number(m.at) || Date.now()) } catch {}
+    if (m.chat?.kind === 'group' && m.chat?.title && m.chatId) {
+      const title = String(m.chat.title).trim()
+      if (title) {
+        groupNames.set(String(m.chatId), title)
+        if (isDefaultInstanceChat(m.chatId, m.platform) && m.chat.id) groupNames.set(String(m.chat.id), title)
+      }
+    }
     const instSelf = selfAccountFor(m.instance || m.chatId)
     const senderAcc = String(m.sender?.account || '')
     const isEcho = Boolean(instSelf && senderAcc && senderAcc === instSelf)

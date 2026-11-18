@@ -640,3 +640,56 @@ test('Phase 3 P2 收口：飞书按群名跨群 / qq#2 caps=null 口径一致 / 
   assert.equal(byNameRes.ok, true)
   assert.match(byNameRes.message, /按群名翻到的飞书记录/)
 })
+
+test('Phase 3 P2-7：网关模式 hub.groupName() 经 chats / 入站 title 解析并按实例隔离群名，不回落 legacy onebot', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aurabot-p3-gname-'))
+  const prevDir = process.env.AURABOT_DATA_DIR
+  process.env.AURABOT_DATA_DIR = dir
+  const onebotCalls = []
+  const chatCalls = []
+  const fakeOnebot = { async call(action, params) { onebotCalls.push({ action, params }); return {} } }
+  const gw = {
+    caps: () => ({ history: true }),
+    features: () => ({ 'message.history.read': true }),
+    async fetch(target, req) {
+      if (req?.kind !== 'chats') return null
+      chatCalls.push(target)
+      if (target === 'qq#2') return { groups: [{ id: '777', name: '二号机同名群' }], friends: [] }
+      if (target === 'feishu') return { groups: [{ id: 'oc_1', name: '飞书产品群' }], friends: [] }
+      return { groups: [{ group_id: 777, group_name: '默认QQ群名' }], friends: [] }
+    },
+  }
+  const cfg = normalize({ enabled: true, dryRun: false, allow: { groups: ['qq:group:777', 'qq#2:group:777', 'feishu:group:oc_1'] } })
+  const dsh = createFakeDsh({ brain: async () => 'ok' })
+  const hub = createHub({ dsh: dsh.ctx, getConfig: () => cfg, log: silent, onebot: fakeOnebot, gateway: gw, onActivity: () => {}, isMuted: () => false })
+  t.after(() => {
+    hub.dispose()
+    if (prevDir === undefined) delete process.env.AURABOT_DATA_DIR
+    else process.env.AURABOT_DATA_DIR = prevDir
+  })
+
+  assert.equal(await hub.groupName('qq:group:777'), '默认QQ群名')
+  assert.equal(await hub.groupName('qq#2:group:777'), '二号机同名群')
+  assert.equal(await hub.groupName('feishu:group:oc_1'), '飞书产品群')
+  // 同 TTL 内再查命中缓存，不再重复打 chats
+  const callsAfterFirst = chatCalls.length
+  assert.equal(await hub.groupName('qq:group:777'), '默认QQ群名')
+  assert.equal(chatCalls.length, callsAfterFirst)
+  assert.equal(onebotCalls.length, 0)
+
+  // 入站自带 chat.title 直接缓存到对应 chatId 作用域，不覆盖别的实例
+  await hub.onGatewayMessage({
+    v: 1,
+    instance: 'qq#2',
+    platform: 'qq',
+    chatId: 'qq#2:group:999',
+    kind: 'group',
+    chat: { kind: 'group', id: '999', title: '入站群标题' },
+    sender: { account: '10001', name: 'A', role: 'member', isOwner: false },
+    messageId: 'm_title_1',
+    at: Date.now(),
+    mentionedMe: false,
+    parts: [{ type: 'text', text: 'hi' }],
+  })
+  assert.equal(await hub.groupName('qq#2:group:999'), '入站群标题')
+})
