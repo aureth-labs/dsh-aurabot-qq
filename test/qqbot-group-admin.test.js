@@ -565,3 +565,130 @@ test('group-admin 审查加固：P1 拒绝 qq#2 串台退回 onebot；P2-5 /grou
   })
   assert.equal(rolesReload.bindings()[0].name, '自动回填官方群名', '回填的群名应持久化到 qqbot-groups.json')
 })
+
+test('复审 6.3 P2：默认 QQ 网关无 groupAdmin 且无直连 onebot 时直接返回 backend=none 与明确提示', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aurabot-default-qq-none-'))
+  const { default: groupAdminMod } = await import('../src/modules/group-admin/index.js')
+  const { normalize } = await import('../src/core/config.js')
+
+  const cfg = normalize({
+    enabled: false,
+    dryRun: false,
+    ownerQQ: '10000001',
+    allow: { private: ['10000001'], groups: ['qq:group:1136292994', '888999'] },
+    platforms: { qq: { enabled: true } },
+  })
+  cfg.enabled = false
+  cfg.platforms = { qq: { enabled: true } }
+
+  let stoppedCalls = 0
+  const stoppedOb = {
+    state: 'stopped',
+    async call() {
+      stoppedCalls++
+      throw new Error('stopped onebot must not be called')
+    },
+  }
+  const qqGw = {
+    instances: () => [{ instance: 'qq', platform: 'qq', enabled: true, state: 'connected' }],
+    groupAdmin: () => null,
+  }
+
+  // 1) 无 direct onebot（null）与宿主 stopped onebot 均不得解析为 'onebot'
+  for (const obImpl of [null, stoppedOb]) {
+    const roles = createGroupRoles({
+      onebot: obImpl,
+      getGateway: () => qqGw,
+      getConfig: () => cfg,
+      dataDir: (...p) => join(dir, ...p),
+      log: silent,
+    })
+
+    for (const key of ['qq:group:1136292994', '888999']) {
+      const spec = roles.resolveBackend(key)
+      assert.equal(spec.backend, 'none', `${key} 应返回 backend=none`)
+      assert.equal(spec.unbound, undefined)
+      assert.match(spec.reason, /默认 QQ 网关未提供群管理能力/)
+
+      const info = await roles.inspect(key, { fresh: true })
+      assert.equal(info.backend, 'none')
+      assert.equal(info.label, '不可用')
+      assert.equal(info.supported, false)
+      assert.match(info.reason, /默认 QQ 网关未提供群管理能力/)
+    }
+  }
+  assert.equal(stoppedCalls, 0)
+
+  // 2) group-admin 工具与 /groups/roles 透出明确不可用文案而非回落 QQ 直连
+  const roles = createGroupRoles({
+    onebot: stoppedOb,
+    getGateway: () => qqGw,
+    getConfig: () => cfg,
+    dataDir: (...p) => join(dir, ...p),
+    log: silent,
+  })
+  const routes = new Map()
+  const toolBuilders = []
+  const prevGlobal = globalThis.aurabot
+  globalThis.aurabot = undefined
+  t.after(() => {
+    if (prevGlobal === undefined) delete globalThis.aurabot
+    else globalThis.aurabot = prevGlobal
+  })
+  groupAdminMod.setup({
+    id: 'group-admin',
+    log: silent,
+    config: () => cfg,
+    defineTool: (spec) => spec,
+    tool: (fn) => { toolBuilders.push(fn); return () => {} },
+    context: () => () => {},
+    rule: () => () => {},
+    command: () => () => {},
+    on: () => () => {},
+    emit() {},
+    onDispose: () => () => {},
+    use: () => null,
+    lazy: () => ({}),
+    has: () => false,
+    platformOf: () => '',
+    caps: () => null,
+    features: () => ({}),
+    can: () => false,
+    route: (path, handler) => { routes.set(path, handler); return () => {} },
+    core: {
+      groupRoles: roles,
+      onebot: stoppedOb,
+      gateway: qqGw,
+      hub: {
+        chats: () => [],
+        sessions: () => [],
+        groupName: async (g) => String(g),
+        turnSendersAllOwner: () => true,
+      },
+      http: {
+        body: async (req) => req?.body || {},
+        query: (req) => req?.query || {},
+        send() {},
+      },
+      getConfig: () => cfg,
+    },
+  })
+
+  const BuiltTools = toolBuilders.flatMap((b) => {
+    const res = typeof b === 'function' ? b({ chat: { kind: 'private', chatId: 'qq:private:10000001' }, level: 'full', sessionId: 's1' }) : b
+    return Array.isArray(res) ? res : (res ? [res] : [])
+  })
+  const adminTool = BuiltTools.find((x) => x?.name === 'qq_group_admin')
+  const toolRes = await adminTool.execute({ action: 'ban', group_id: 'qq:group:1136292994', user_id: '12345' })
+  assert.equal(toolRes.ok, false)
+  assert.match(toolRes.message, /默认 QQ 网关未提供群管理能力/)
+  assert.equal(stoppedCalls, 0)
+
+  const rolesResp = await routes.get('/groups/roles')({ query: { fresh: '1' } })
+  assert.equal(rolesResp.ok, true)
+  const row = rolesResp.list.find((x) => x.groupId === 'qq:group:1136292994')
+  assert.equal(row?.backend, 'none')
+  assert.equal(row?.backendLabel, '不可用')
+  assert.equal(row?.label, '不可用')
+  assert.match(row?.reason || '', /默认 QQ 网关未提供群管理能力/)
+})

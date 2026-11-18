@@ -206,6 +206,20 @@ export function createGroupRoles({ onebot = null, gateway = null, getGateway = n
     const parsed = raw.includes(':') && norm ? parseChatId(norm) : null
     const isDefaultInstance = parsed ? (!parsed.instance || parsed.instance === defPlat) : true
 
+    const gwDefInst = gw && typeof gw.instances === 'function' ? gw.instances().find((x) => x.instance === defPlat) : null
+    const gwDefGa = gw?.groupAdmin?.(defPlat) || null
+    const hasOnebotFn = Boolean(onebot && typeof onebot.call === 'function')
+    const onebotConnected = hasOnebotFn && (onebot.state === undefined || onebot.state === 'connected')
+    const defaultQqUnavailableReason = () => {
+      if (gwDefInst?.enabled && !onebotConnected) {
+        return '当前默认 QQ 网关未提供群管理能力，且未连接旧版直连 OneBot'
+      }
+      if (!hasOnebotFn || (!cfg?.enabled && !onebotConnected)) {
+        return '旧版直连 QQ 未启用或未连接，当前群无可用群管后端'
+      }
+      return ''
+    }
+
     // 非默认实例（含 qq#2）及非默认平台（qqbot / feishu 等）严禁落回默认 OneBot
     if (parsed && (!isDefaultInstance || parsed.platform !== defPlat)) {
       const chatId = `${parsed.instance}:group:${parsed.id}`
@@ -257,6 +271,32 @@ export function createGroupRoles({ onebot = null, gateway = null, getGateway = n
     }
 
     if (parsed && parsed.platform === defPlat && isDefaultInstance) {
+      const b = allBindings[norm]
+      if (gwDefGa) {
+        return {
+          backend: 'gateway-admin',
+          platform: defPlat,
+          instance: parsed.instance || defPlat,
+          openid: parsed.id,
+          chatId: norm,
+          groupAdmin: gwDefGa,
+          alias: b?.alias || '',
+          name: b?.name || '',
+          cacheKey: `gw:${parsed.instance || defPlat}:${parsed.id}`,
+        }
+      }
+      const unavail = defaultQqUnavailableReason()
+      if (unavail) {
+        return {
+          backend: 'none',
+          platform: defPlat,
+          instance: parsed.instance || defPlat,
+          gid: parsed.id,
+          chatId: norm,
+          cacheKey: `none:${norm}`,
+          reason: unavail,
+        }
+      }
       return {
         backend: 'onebot',
         platform: defPlat,
@@ -290,7 +330,6 @@ export function createGroupRoles({ onebot = null, gateway = null, getGateway = n
     const plats = cfg?.platforms
     const hasPlatMap = Boolean(plats && typeof plats === 'object')
     const defPlatCfg = hasPlatMap ? plats[defPlat] : null
-    const gwDefInst = gw && typeof gw.instances === 'function' ? gw.instances().find((x) => x.instance === defPlat) : null
     const hasOtherPlatCfg = Boolean(hasPlatMap && Object.entries(plats).some(([k, v]) => k !== defPlat && v && v.enabled !== false))
     const hasOtherActiveGw = activeAdminInstances().length > 0
       || Boolean(gw && typeof gw.instances === 'function' && gw.instances().some((x) => x.enabled && x.platform !== defPlat))
@@ -300,10 +339,11 @@ export function createGroupRoles({ onebot = null, gateway = null, getGateway = n
           ? Boolean(gwDefInst.enabled)
           : Boolean(!hasOtherActiveGw && !hasOtherPlatCfg && (cfg.enabled === true || (cfg.enabled === undefined && (!plats || Object.keys(plats).length === 0)))))
     const onebotReady = !hasOtherActiveGw || (
-      (onebot?.state === undefined || onebot.state === 'connected')
+      onebotConnected
       && (!gwDefInst || (gwDefInst.enabled && gwDefInst.state === 'connected'))
     )
-    const isOnebotActive = Boolean(onebot && defPlatEnabledInCfg && onebotReady)
+    const bareUnavailReason = defaultQqUnavailableReason()
+    const isOnebotActive = Boolean(onebot && defPlatEnabledInCfg && onebotReady && !bareUnavailReason)
 
     if (isOnebotActive) {
       const obKey = defPlat ? `${defPlat}:group:${raw}` : raw
@@ -318,6 +358,18 @@ export function createGroupRoles({ onebot = null, gateway = null, getGateway = n
     }
 
     const hasGwAdminCap = hasOtherActiveGw || hasOtherPlatCfg || Object.keys(allBindings).length > 0
+    if (!hasGwAdminCap && defPlatEnabledInCfg && bareUnavailReason) {
+      const obKey = defPlat ? `${defPlat}:group:${raw}` : raw
+      return {
+        backend: 'none',
+        platform: defPlat,
+        instance: defPlat,
+        gid: raw,
+        chatId: obKey,
+        cacheKey: `none:${obKey || raw}`,
+        reason: bareUnavailReason,
+      }
+    }
     return {
       backend: 'none',
       unbound: true,
