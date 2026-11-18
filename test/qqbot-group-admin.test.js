@@ -692,3 +692,209 @@ test('复审 6.3 P2：默认 QQ 网关无 groupAdmin 且无直连 onebot 时直�
   assert.equal(row?.label, '不可用')
   assert.match(row?.reason || '', /默认 QQ 网关未提供群管理能力/)
 })
+
+test('默认 QQ 网关（无直连 onebot）与 qq#2 多实例经 gateway.groupAdmin + native 完整执行群管且互不串台', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aurabot-qq-gw-admin-'))
+  const { createQqAdapter } = await import('../src/adapters/qq/index.js')
+  const identity = createIdentity({ dataDir: dir, log: silent })
+  t.after(() => identity.close?.())
+  identity.claimOwner('qq', '10000001')
+
+  let legacyCalls = 0
+  const stoppedLegacyOb = {
+    state: 'stopped',
+    async call() {
+      legacyCalls++
+      throw new Error('stopped legacy onebot must not be called')
+    },
+  }
+
+  const mkClient = (selfUin, roleVal, callLog) => {
+    const handlers = { state: new Set(), event: new Set() }
+    return {
+      state: 'connected',
+      isConnected: () => true,
+      start() { queueMicrotask(() => handlers.state.forEach((f) => f('connected'))) },
+      stop() { handlers.state.forEach((f) => f('stopped')) },
+      on(ev, fn) { handlers[ev]?.add(fn); return () => handlers[ev]?.delete(fn) },
+      off(ev, fn) { handlers[ev]?.delete(fn) },
+      async call(action, params) {
+        callLog.push({ action, params })
+        if (action === 'get_login_info') return { status: 'ok', retcode: 0, data: { user_id: Number(selfUin), nickname: `Bot_${selfUin}` } }
+        if (action === 'get_version_info') return { status: 'ok', retcode: 0, data: { app_name: 'NapCat', app_version: '1.0' } }
+        if (action === 'can_send_image' || action === 'can_send_record') return { status: 'ok', retcode: 0, data: { yes: true } }
+        if (action === 'get_group_info') return { status: 'ok', retcode: 0, data: { group_id: params.group_id, group_name: `群_${selfUin}` } }
+        if (action === 'get_group_member_info') return { status: 'ok', retcode: 0, data: { user_id: params.user_id, role: roleVal } }
+        if (action === 'get_group_member_list' || action === 'get_group_list' || action === 'get_friend_list') return { status: 'ok', retcode: 0, data: [] }
+        return { status: 'ok', retcode: 0, data: {} }
+      },
+    }
+  }
+
+  const q1Calls = []
+  const q2Calls = []
+  const cfg = normalize({
+    enabled: false,
+    dryRun: false,
+    ownerQQ: '10000001',
+    allow: { private: ['10000001'], groups: ['qq:group:777', 'qq#2:group:777'] },
+    platforms: { qq: { enabled: true }, 'qq#2': { enabled: true } },
+  })
+  cfg.enabled = false
+  cfg.platforms = { qq: { enabled: true }, 'qq#2': { enabled: true } }
+
+  const gw2 = createGateway({
+    config: cfg,
+    dataDir: (...p) => join(dir, 'gw2', ...p),
+    http: { route: () => () => {} },
+    identity,
+    log: silent,
+  })
+  let regIdx = 0
+  gw2.register(() => createQqAdapter({ client: regIdx++ <= 1 ? mkClient('20000001', 'owner', q1Calls) : mkClient('30000002', 'admin', q2Calls) }))
+  await gw2.sync()
+  t.after(() => gw2.stopAll())
+  await new Promise((r) => setTimeout(r, 80))
+
+  const roles = createGroupRoles({
+    onebot: stoppedLegacyOb,
+    getGateway: () => gw2,
+    getConfig: () => cfg,
+    dataDir: (...p) => join(dir, ...p),
+    log: silent,
+  })
+
+  // qq、裸群号、qq#2 全部解析到各自 gateway-admin，绝不走 stopped onebot
+  assert.equal(roles.resolveBackend('qq:group:777').backend, 'gateway-admin')
+  assert.equal(roles.resolveBackend('qq:group:777').instance, 'qq')
+  assert.equal(roles.resolveBackend('777').backend, 'gateway-admin')
+  assert.equal(roles.resolveBackend('777').instance, 'qq')
+  assert.equal(roles.resolveBackend('qq#2:group:777').backend, 'gateway-admin')
+  assert.equal(roles.resolveBackend('qq#2:group:777').instance, 'qq#2')
+
+  const routes = new Map()
+  const toolBuilders = []
+  groupAdminDef.setup({
+    id: 'group-admin',
+    log: silent,
+    config: () => cfg,
+    defineTool: (s) => s,
+    tool: (fn) => toolBuilders.push(fn),
+    context: () => {},
+    rule: () => {},
+    command: () => {},
+    on: () => {},
+    emit() {},
+    onDispose: () => {},
+    use: () => null,
+    lazy: () => ({}),
+    has: () => false,
+    route: (path, handler) => routes.set(path, handler),
+    core: {
+      hub: { turnSendersAllOwner: () => true, groupName: async (g) => String(g) },
+      onebot: stoppedLegacyOb,
+      groupRoles: roles,
+      gateway: gw2,
+      identity,
+      http: { body: async (r) => r?.body || {}, query: (r) => r?.query || {}, send() {} },
+    },
+  })
+
+  const buildTools = (cid) => toolBuilders.flatMap((b) => [b({ chat: { chatId: cid, kind: 'group', groupId: '777', platform: 'qq' }, level: 'social', sessionId: cid })].flat().filter(Boolean))
+  const q1Tool = buildTools('qq:group:777').find((x) => x.name === 'qq_group_admin')
+  const q2Tool = buildTools('qq#2:group:777').find((x) => x.name === 'qq_group_admin')
+
+  // 默认 qq 网关（群主）：支持禁言与全体禁言/发公告/改头衔
+  assert.equal((await q1Tool.execute({ action: 'ban', user_id: '556677', minutes: 3 })).ok, true)
+  assert.ok(q1Calls.some((c) => c.action === 'set_group_ban' && c.params.group_id === 777 && c.params.user_id === 556677 && c.params.duration === 180))
+  assert.equal((await q1Tool.execute({ action: 'whole_ban' })).ok, true)
+  assert.ok(q1Calls.some((c) => c.action === 'set_group_whole_ban' && c.params.group_id === 777 && c.params.enable === true))
+  assert.equal((await q1Tool.execute({ action: 'notice', text: '测试公告' })).ok, true)
+  assert.ok(q1Calls.some((c) => c.action === '_send_group_notice' && c.params.content === '测试公告'))
+
+  // qq#2 网关（管理员）：只打向 q2Calls，且改头衔按管理员权限拒绝、发公告只打 qq#2 不串 q1Calls
+  const q2StartIdx = q1Calls.length
+  assert.equal((await q2Tool.execute({ action: 'kick', user_id: '889900' })).ok, true)
+  assert.ok(q2Calls.some((c) => c.action === 'set_group_kick' && c.params.group_id === 777 && c.params.user_id === 889900))
+  assert.equal((await q2Tool.execute({ action: 'title', user_id: '889900', text: '头衔' })).ok, false)
+  assert.equal((await q2Tool.execute({ action: 'notice', text: '二号机公告' })).ok, true)
+  assert.ok(q2Calls.some((c) => c.action === '_send_group_notice' && c.params.content === '二号机公告'))
+  assert.equal(q1Calls.length, q2StartIdx, 'qq#2 执行期间不得打到 qq 实例')
+  assert.equal(legacyCalls, 0, '不得打到未启动的 legacy onebot')
+
+  // /groups/roles 返回 backendLabel='QQ 网关' 且不把 qq/qq#2 放进 qqbotInstances 绑定下拉框
+  const rolesResp = await routes.get('/groups/roles')()
+  assert.equal(rolesResp.ok, true)
+  assert.equal(rolesResp.qqbotInstances.length, 0)
+  const q1Row = rolesResp.list.find((x) => x.groupId === 'qq:group:777')
+  const q2Row = rolesResp.list.find((x) => x.groupId === 'qq#2:group:777')
+  assert.equal(q1Row?.backendLabel, 'QQ 网关')
+  assert.equal(q1Row?.name, '群_20000001')
+  assert.equal(q2Row?.backendLabel, 'QQ 网关')
+  assert.equal(q2Row?.name, '群_30000002')
+})
+
+test('QQBot 群名自动补全：/groups/roles 候选群自动拉取并缓存 getGroupInfo，且 adapter.observedGroups 保留群名', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aurabot-qqbot-cand-name-'))
+  const identity = makeIdentity()
+  const cfg = normalize({ enabled: false, platforms: { qqbot: { enabled: true, appId: 'app1', clientSecret: 'sec1', transport: 'webhook', botSecret: 'd'.repeat(32) } } })
+  cfg.platforms = { qqbot: { enabled: true, appId: 'app1', clientSecret: 'sec1', transport: 'webhook', botSecret: 'd'.repeat(32) } }
+
+  let infoCalls = 0
+  let botAdapter = null
+  const gw = createGateway({ config: cfg, dataDir: (...p) => join(dir, 'gw', ...p), http: { route: () => () => {} }, identity, log: silent })
+  gw.register(() => (botAdapter = createQqbotAdapter({
+    client: makeQqbotClient(async (req) => {
+      if (req.path === '/v2/groups/OPENID_CAND_1/info') {
+        infoCalls++
+        return { status: 200, data: { group_openid: 'OPENID_CAND_1', group_name: '自动补全候选群' } }
+      }
+      if (req.path === '/v2/groups/OPENID_CAND_2/info') {
+        return { status: 403, data: { code: 11253, message: 'forbidden' } }
+      }
+      return { status: 404, data: null }
+    }),
+  })))
+  await gw.sync()
+  t.after(() => gw.stopAll())
+
+  botAdapter.platform.deliver('GROUP_AT_MESSAGE_CREATE', {
+    id: 'm_c1', author: { member_openid: 'MEM_1', member_role: 'member' }, content: 'hi', group_openid: 'OPENID_CAND_1', timestamp: '2026-11-18T12:00:00+08:00',
+  })
+  botAdapter.platform.deliver('GROUP_AT_MESSAGE_CREATE', {
+    id: 'm_c2', author: { member_openid: 'MEM_2', member_role: 'member' }, content: 'hi', group_openid: 'OPENID_CAND_2', timestamp: '2026-11-18T12:01:00+08:00',
+  })
+
+  const roles = createGroupRoles({ getGateway: () => gw, getConfig: () => cfg, dataDir: (...p) => join(dir, ...p), log: silent })
+  const routes = new Map()
+  groupAdminDef.setup({
+    id: 'group-admin',
+    log: silent,
+    config: () => cfg,
+    defineTool: (s) => s,
+    tool: () => {},
+    context: () => {},
+    rule: () => {},
+    route: (p, h) => routes.set(p, h),
+    core: {
+      hub: { turnSendersAllOwner: () => true, groupName: async (g) => String(g) },
+      groupRoles: roles,
+      gateway: gw,
+      http: { body: async (r) => r?.body || {}, query: (r) => r?.query || {} },
+    },
+  })
+
+  const r1 = await routes.get('/groups/roles')()
+  assert.equal(r1.ok, true)
+  const cand1 = r1.candidates.find((c) => c.openid === 'OPENID_CAND_1')
+  const cand2 = r1.candidates.find((c) => c.openid === 'OPENID_CAND_2')
+  assert.equal(cand1?.name, '自动补全候选群')
+  assert.equal(cand2?.name, '')
+  assert.equal(infoCalls, 1)
+  assert.equal(botAdapter.groupAdmin.observedGroups().find((g) => g.openid === 'OPENID_CAND_1')?.name, '自动补全候选群')
+
+  // TTL 内再次访问不重复调 /info
+  const r2 = await routes.get('/groups/roles')()
+  assert.equal(r2.candidates.find((c) => c.openid === 'OPENID_CAND_1')?.name, '自动补全候选群')
+  assert.equal(infoCalls, 1)
+})

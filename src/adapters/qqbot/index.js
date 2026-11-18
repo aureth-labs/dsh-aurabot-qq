@@ -415,15 +415,18 @@ export function createQqbotAdapter(options = {}) {
     return res
   }
 
-  function recordObservedGroup(groupOpenid, preview = '') {
+  function recordObservedGroup(groupOpenid, preview = '', name = '') {
     const openid = String(groupOpenid || '').trim()
     if (!openid) return
+    const prev = observedGroups.get(openid)
+    const nextName = String(name || prev?.name || '').trim()
     observedGroups.delete(openid)
     while (observedGroups.size >= 200) observedGroups.delete(observedGroups.keys().next().value)
     observedGroups.set(openid, {
       openid,
       at: now(),
-      ...(preview ? { preview: String(preview).trim().slice(0, 60) } : {}),
+      ...(preview ? { preview: String(preview).trim().slice(0, 60) } : (prev?.preview ? { preview: prev.preview } : {})),
+      ...(nextName ? { name: nextName } : {}),
     })
   }
 
@@ -500,9 +503,14 @@ export function createQqbotAdapter(options = {}) {
         method: 'GET',
         actionLabel: '查询群信息',
       })
+      const resolvedName = String(data.group_name || data.name || '')
+      if (resolvedName && observedGroups.has(gid)) {
+        const prevObs = observedGroups.get(gid)
+        observedGroups.set(gid, { ...prevObs, name: resolvedName })
+      }
       return {
         groupOpenid: String(data.group_openid || gid),
-        name: String(data.group_name || data.name || ''),
+        name: resolvedName,
         ...(Number.isFinite(Number(data.member_count)) ? { memberCount: Number(data.member_count) } : {}),
       }
     },
@@ -951,12 +959,12 @@ export function createQqbotAdapter(options = {}) {
     if (t === 'GROUP_AT_MESSAGE_CREATE' || t === 'GROUP_MESSAGE_CREATE') {
       const groupOpenid = String(d?.group_openid || '')
       const senderOpenid = String(d?.author?.member_openid || d?.author?.id || '')
-      recordObservedGroup(groupOpenid, d?.content || '')
+      recordObservedGroup(groupOpenid, d?.content || '', d?.group_name || '')
       try {
         ctx.log?.info?.(`qqbot 群事件：${t} group_openid=${groupOpenid || '(空)'} sender=${senderOpenid || '(空)'}`)
       } catch (error) {}
     } else if (t === 'GROUP_ADD_ROBOT') {
-      recordObservedGroup(d?.group_openid)
+      recordObservedGroup(d?.group_openid, '', d?.group_name || '')
     } else if (t === 'GROUP_DEL_ROBOT') {
       if (d?.group_openid) observedGroups.delete(String(d.group_openid))
     }

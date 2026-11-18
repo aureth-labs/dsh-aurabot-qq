@@ -703,4 +703,28 @@ test('Phase 3 P2-7：网关模式 hub.groupName() 经 chats / 入站 title 解�
     parts: [{ type: 'text', text: 'hi' }],
   })
   assert.equal(await hub.groupName('qq#2:group:999'), '入站群标题')
+
+  // 无 fetch(chats) 的 QQ 官方机器人，hub.groupName() 自动回退 gateway.groupAdmin().getGroupInfo() 并缓存
+  let gaInfoCalls = 0
+  const gwWithGa = {
+    ...gw,
+    caps: (cid) => (String(cid).startsWith('qqbot:') ? { proactive: 'limited' } : gw.caps(cid)),
+    async fetch(target, req) {
+      if (target === 'qqbot' || String(target).startsWith('qqbot:')) return null
+      return gw.fetch(target, req)
+    },
+    groupAdmin: (target) => (String(target).startsWith('qqbot') ? {
+      async getGroupInfo(id) {
+        gaInfoCalls++
+        if (id === 'OPENID_GN_FAIL') throw Object.assign(new Error('forbidden'), { code: 'group-admin-forbidden' })
+        return { groupOpenid: id, name: '官方群真实名称' }
+      },
+    } : null),
+  }
+  const hubBot = createHub({ dsh: dsh.ctx, getConfig: () => cfg, log: silent, onebot: fakeOnebot, gateway: gwWithGa, onActivity: () => {}, isMuted: () => false })
+  t.after(() => hubBot.dispose())
+  assert.equal(await hubBot.groupName('qqbot:group:OPENID_GN_1'), '官方群真实名称')
+  assert.equal(await hubBot.groupName('qqbot:group:OPENID_GN_1'), '官方群真实名称')
+  assert.equal(gaInfoCalls, 1)
+  assert.equal(await hubBot.groupName('qqbot:group:OPENID_GN_FAIL'), 'qqbot:group:OPENID_GN_FAIL')
 })

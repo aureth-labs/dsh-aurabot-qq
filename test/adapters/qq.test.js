@@ -628,3 +628,67 @@ test('Phase 3A：QQ fetch(history) 统一输出按时间升序的 FetchedHistory
 
   await adapter.stop()
 })
+
+test('QQ 平台端 groupAdmin：botState / getGroupInfo / listMembers / mute / unmute / kick 及 unsupported 懒降级', async () => {
+  const calls = []
+  let failTitleUnsupported = false
+  const client = makeFakeClient()
+  const origCall = client.call.bind(client)
+  client.call = async (action, params, opts) => {
+    calls.push({ action, params })
+    if (action === 'get_group_member_info') return { status: 'ok', retcode: 0, data: { user_id: params.user_id, role: 'owner' } }
+    if (action === 'get_group_info') return { status: 'ok', retcode: 0, data: { group_id: params.group_id, group_name: '网关QQ测试群', member_count: 18 } }
+    if (action === 'get_group_member_list') {
+      return {
+        status: 'ok', retcode: 0,
+        data: [
+          { user_id: 10000, nickname: '机器人', role: 'owner' },
+          { user_id: 20001, card: '群名片B', nickname: '原昵称', role: 'member' },
+        ],
+      }
+    }
+    if (action === 'set_group_ban' || action === 'set_group_kick') return { status: 'ok', retcode: 0, data: {} }
+    if (action === 'set_group_special_title' && failTitleUnsupported) {
+      throw Object.assign(new Error('不支持的API'), { data: { retcode: 1404, message: 'unsupported' } })
+    }
+    return origCall(action, params, opts)
+  }
+
+  const adapter = createQqAdapter({ client })
+  await adapter.start(makeCtx(adapter))
+
+  const st = await adapter.groupAdmin.getBotState('7001')
+  assert.deepEqual(st, { role: 'owner', groupOpenid: '7001', memberOpenid: '10000' })
+
+  const gInfo = await adapter.groupAdmin.getGroupInfo('7001')
+  assert.deepEqual(gInfo, { groupOpenid: '7001', name: '网关QQ测试群', memberCount: 18 })
+
+  const members = await adapter.groupAdmin.listMembers('7001', { startIndex: 0, limit: 10 })
+  assert.deepEqual(members, [
+    { openid: '10000', nick: '机器人', role: 'owner' },
+    { openid: '20001', nick: '群名片B', role: 'member' },
+  ])
+
+  await adapter.groupAdmin.muteMember('7001', '20001', 120_000)
+  await adapter.groupAdmin.unmuteMember('7001', '20001')
+  const banCalls = calls.filter((c) => c.action === 'set_group_ban')
+  assert.deepEqual(banCalls, [
+    { action: 'set_group_ban', params: { group_id: 7001, user_id: 20001, duration: 120 } },
+    { action: 'set_group_ban', params: { group_id: 7001, user_id: 20001, duration: 0 } },
+  ])
+
+  await adapter.groupAdmin.kickMember('7001', '20001', { addBlackList: true })
+  const kickCalls = calls.filter((c) => c.action === 'set_group_kick')
+  assert.deepEqual(kickCalls, [
+    { action: 'set_group_kick', params: { group_id: 7001, user_id: 20001, reject_add_request: true } },
+  ])
+
+  // native(set_group_special_title) 遇 1404 时懒降级 supportedActions.title
+  assert.equal(adapter.groupAdmin.supportedActions.title, true)
+  failTitleUnsupported = true
+  await assert.rejects(() => adapter.native('set_group_special_title', { group_id: 7001, user_id: 20001, special_title: '测试' }))
+  assert.equal(adapter.groupAdmin.supportedActions.title, false)
+
+  await assert.rejects(() => adapter.groupAdmin.getBotState('not-num'), (e) => e.code === 'bad-fetch-request')
+  await adapter.stop()
+})

@@ -359,7 +359,7 @@ export function supportedActions(probe) {
     set.add('modify_custom_face')
     set.add('delete_custom_face')
   }
-  for (const a of ['send_private_msg', 'send_group_msg', 'send_msg', 'get_login_info', 'get_version_info', 'get_status', 'get_friend_list', 'get_group_list', 'get_group_info', 'get_group_member_info', 'get_stranger_info', 'can_send_image', 'can_send_record']) set.add(a)
+  for (const a of ['send_private_msg', 'send_group_msg', 'send_msg', 'get_login_info', 'get_version_info', 'get_status', 'get_friend_list', 'get_group_list', 'get_group_info', 'get_group_member_info', 'get_group_member_list', 'get_stranger_info', 'can_send_image', 'can_send_record', 'set_group_ban', 'set_group_whole_ban', 'set_group_kick', 'set_group_special_title', '_send_group_notice']) set.add(a)
   return set
 }
 

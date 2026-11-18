@@ -13,9 +13,11 @@ const UNSUPPORTED_QQBOT_ACTIONS = Object.freeze({
 })
 
 function backendLabelOf(info, spec) {
-  if (info?.backend === 'gateway-admin' || spec?.backend === 'gateway-admin') return 'QQ 官方机器人'
+  const b = info?.backend || spec?.backend
+  const p = info?.platform || spec?.platform
+  if (b === 'gateway-admin') return p === 'qqbot' ? 'QQ 官方机器人' : (p === 'qq' ? 'QQ 网关' : `${p || '平台'}网关`)
   if (info?.unbound || spec?.unbound) return '未绑定 QQ 官方群'
-  if (info?.backend === 'none' || spec?.backend === 'none') return '不可用'
+  if (b === 'none') return '不可用'
   return 'QQ 直连'
 }
 
@@ -31,6 +33,8 @@ export default {
   description: '主人要求时做群管理：QQ 直连支持禁言/解禁/全体禁言/踢人/改头衔/发公告；QQ 官方机器人支持禁言/解禁/踢人（qq_group_admin）',
   setup(api) {
     const { hub, onebot, groupRoles, gateway, http } = api.core
+    const groupNameCache = new Map() // chatId -> { name, at }
+    const GROUP_NAME_CACHE_TTL_MS = 10 * 60_000
     const qqCall = (action, params, opts) => (typeof api.native === 'function' ? api.native('qq', action, params, opts) : onebot.call(action, params, opts))
     const readReqBody = async (req) => {
       if (typeof http?.body === 'function') return (await http.body(req)) || {}
@@ -70,7 +74,7 @@ export default {
       const info = roleInfoSync(chat)
       const role = info?.role || ''
       if (!role) {
-        if (info?.backend === 'gateway-admin' && info.reason) {
+        if (info?.backend === 'gateway-admin' && info?.platform !== 'qq' && info.reason) {
           return `当前群的 QQ 官方机器人群管理暂不可用（${info.reason}）；主人让你禁言或踢人时，直接如实说明原因。`
         }
         return ''
@@ -78,7 +82,7 @@ export default {
       if (!groupRoles.canManage(role)) {
         return '你在这个群只是普通成员，没有管理权限：禁言、踢人这些做不了，主人要求时直接说明。'
       }
-      if (info?.backend === 'gateway-admin') {
+      if (info?.backend === 'gateway-admin' && info?.platform !== 'qq') {
         return `你在这个群是${groupRoles.label(role)}。主人要求时可以用 qq_group_admin 禁言、解禁或踢人（QQ 官方机器人不支持全体禁言、改专属头衔和发群公告；操作对象只能填群成员的 member_openid，不能填 QQ 号）。`
       }
       return `你在这个群是${groupRoles.label(role)}，主人要求时可以用群管工具。`
@@ -119,8 +123,63 @@ export default {
           const whole = action === 'whole_ban' || action === 'whole_unban'
           const targetUserRaw = String(member_openid || user_id || '').trim()
 
-          // ── 分支 A：QQ 官方机器人（gateway-admin） ──
+          // ── 分支 A：网关群管（QQBot 官方机器人 或 OneBot 网关实例 qq / qq#2）──
           if (spec?.backend === 'gateway-admin') {
+            if (spec.platform === 'qq') {
+              const gid = Number(spec?.gid || spec?.openid || parsedAddr?.id || rawGroup)
+              if (!gid) return { ok: false, message: '不知道是哪个群' }
+              const uid = Number(targetUserRaw || 0)
+              if (!whole && action !== 'notice' && !uid) return { ok: false, message: '要说清楚对谁（QQ 号）' }
+              if (uid && isOwner(api.core.identity, String(uid), 'qq') && action !== 'unban' && action !== 'title') {
+                return { ok: false, message: '不能对主人做这个' }
+              }
+              const ga = spec.groupAdmin || gateway?.groupAdmin?.(spec.instance)
+              if (!ga) return { ok: false, message: 'QQ 网关未连接，无法执行群管' }
+              const sa = ga.supportedActions || {}
+              const capBlocked = (action === 'ban' && sa.ban === false)
+                || (action === 'unban' && sa.unban === false)
+                || (action === 'kick' && sa.kick === false)
+                || (whole && sa.wholeBan === false)
+                || (action === 'title' && sa.title === false)
+                || (action === 'notice' && sa.notice === false)
+              if (capBlocked) return { ok: false, message: `当前 QQ 网关不支持群管操作（${action}）` }
+
+              const info = await inspectRole(rawGroup, { fresh: true })
+              const role = info.role
+              if (role && !groupRoles.canManage(role)) return { ok: false, message: '我在这个群只是普通成员，没有管理权限' }
+              if (role === 'admin' && action === 'title') return { ok: false, message: '改专属头衔要群主才行，我只是管理员' }
+              if (cfg.dryRun) return { ok: true, message: `试运行：本来要通过 QQ 网关（${spec.instance}）对群 ${gid} 做 ${action}` }
+
+              try {
+                if (action === 'ban') {
+                  await ga.muteMember(String(gid), String(uid), Math.max(1, Number(minutes) || 10) * 60_000)
+                } else if (action === 'unban') {
+                  await ga.unmuteMember(String(gid), String(uid))
+                } else if (action === 'kick') {
+                  await ga.kickMember(String(gid), String(uid), { addBlackList: false })
+                } else if (whole || action === 'title' || action === 'notice') {
+                  if (typeof gateway?.native !== 'function') {
+                    return { ok: false, message: `当前 QQ 网关不支持群管操作（${action}）` }
+                  }
+                  if (action === 'whole_ban' || action === 'whole_unban') {
+                    await gateway.native(spec.instance, 'set_group_whole_ban', { group_id: gid, enable: action === 'whole_ban' })
+                  } else if (action === 'title') {
+                    await gateway.native(spec.instance, 'set_group_special_title', { group_id: gid, user_id: uid, special_title: String(text || '') })
+                  } else if (action === 'notice') {
+                    await gateway.native(spec.instance, '_send_group_notice', { group_id: gid, content: String(text || '') })
+                  }
+                } else {
+                  return { ok: false, message: '不认识的操作' }
+                }
+              } catch (error) {
+                if (error?.code === 'unsupported-action' || error?.code === 'group-admin-unsupported') {
+                  return { ok: false, message: `当前 QQ 网关不支持群管操作（${action}）` }
+                }
+                return { ok: false, message: error?.message || `群管操作失败（${action}）` }
+              }
+              return { ok: true, message: '做好了' }
+            }
+
             if (UNSUPPORTED_QQBOT_ACTIONS[action]) {
               return { ok: false, message: `QQ 官方机器人当前不支持${UNSUPPORTED_QQBOT_ACTIONS[action]}` }
             }
@@ -231,13 +290,21 @@ export default {
         const role = info.role || ''
         let name = info.name || spec?.name || ''
         if ((!name || name === spec?.openid || name === String(gid)) && spec?.backend === 'gateway-admin' && spec.groupAdmin?.getGroupInfo) {
-          try {
-            const gInfo = await spec.groupAdmin.getGroupInfo(spec.openid)
-            if (gInfo?.name) {
-              name = gInfo.name
-              if (spec.chatId) groupRoles?.touchBindingName?.(spec.chatId, gInfo.name)
-            }
-          } catch {}
+          const cachedName = spec.chatId ? groupNameCache.get(spec.chatId) : null
+          if (cachedName && Date.now() - cachedName.at < GROUP_NAME_CACHE_TTL_MS && cachedName.name) {
+            name = cachedName.name
+          } else {
+            try {
+              const gInfo = await spec.groupAdmin.getGroupInfo(spec.openid)
+              if (gInfo?.name) {
+                name = gInfo.name
+                if (spec.chatId) {
+                  groupNameCache.set(spec.chatId, { name: gInfo.name, at: Date.now() })
+                  groupRoles?.touchBindingName?.(spec.chatId, gInfo.name)
+                }
+              }
+            } catch {}
+          }
         }
         if (!name) name = await hub.groupName(String(gid)).catch(() => String(gid))
         const displayId = info.alias ? `${info.alias} · ${info.groupOpenid}` : String(gid)
@@ -261,15 +328,38 @@ export default {
 
       const qqbotInstances = typeof gateway?.instances === 'function'
         ? gateway.instances()
-            .filter((x) => x?.enabled && (x.platform === 'qqbot' || Boolean(gateway.groupAdmin?.(x.instance))))
+            .filter((x) => x?.enabled && x.platform !== 'qq' && (x.platform === 'qqbot' || Boolean(gateway.groupAdmin?.(x.instance))))
             .map((x) => ({ instance: x.instance, platform: x.platform, name: x.name, state: x.state }))
         : []
+
+      const rawCandidates = typeof groupRoles?.candidates === 'function' ? groupRoles.candidates() : []
+      const candidates = await Promise.all(rawCandidates.map(async (c) => {
+        if (c.name) return c
+        const cached = groupNameCache.get(c.chatId)
+        if (cached && Date.now() - cached.at < GROUP_NAME_CACHE_TTL_MS) {
+          return cached.name ? { ...c, name: cached.name } : c
+        }
+        const ga = gateway?.groupAdmin?.(c.instance)
+        if (!ga || typeof ga.getGroupInfo !== 'function') return c
+        try {
+          const gInfo = await ga.getGroupInfo(c.openid)
+          const gName = String(gInfo?.name || '').trim()
+          groupNameCache.set(c.chatId, { name: gName, at: Date.now() })
+          if (gName) {
+            if (c.bound) groupRoles?.touchBindingName?.(c.chatId, gName)
+            return { ...c, name: gName }
+          }
+        } catch {
+          groupNameCache.set(c.chatId, { name: '', at: Date.now() })
+        }
+        return c
+      }))
 
       return {
         ok: true,
         list,
         bindings: typeof groupRoles?.bindings === 'function' ? groupRoles.bindings() : [],
-        candidates: typeof groupRoles?.candidates === 'function' ? groupRoles.candidates() : [],
+        candidates,
         qqbotInstances,
       }
     })
@@ -278,7 +368,7 @@ export default {
       if (!groupRoles?.saveBinding) return { ok: false, message: '当前环境不支持群绑定' }
       const body = await readReqBody(req)
       const gwList = typeof gateway?.instances === 'function' ? gateway.instances() : []
-      const defaultInst = gwList.find((x) => x?.enabled && (x.platform === 'qqbot' || gateway.groupAdmin?.(x.instance)))?.instance || 'qqbot'
+      const defaultInst = gwList.find((x) => x?.enabled && x.platform !== 'qq' && (x.platform === 'qqbot' || gateway.groupAdmin?.(x.instance)))?.instance || 'qqbot'
       const instance = String(body.instance || defaultInst).trim()
       const openid = String(body.openid || body.groupOpenid || '').trim()
       const alias = String(body.alias || '').trim()

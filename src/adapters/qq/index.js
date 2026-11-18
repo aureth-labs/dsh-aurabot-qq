@@ -32,8 +32,8 @@ import { buildParts } from './outbound.js'
 import { createNative } from './native.js'
 import { makeSendError, toSendError } from './errors.js'
 import {
-  CAPS_CONSERVATIVE, FILE_MAX_BYTES, cacheMatchesGateway, capsFromProbes, probeGateway,
-  readCapsCache, supportedActions, writeCapsCache,
+  CAPS_CONSERVATIVE, FILE_MAX_BYTES, cacheMatchesGateway, capsFromProbes, classifyProbeError,
+  probeGateway, readCapsCache, supportedActions, writeCapsCache,
 } from './probe.js'
 import { createSnowlumaSidecar, snowlumaEnabled } from './snowluma.js'
 
@@ -757,6 +757,90 @@ export function createQqAdapter(options = {}) {
     },
   })
 
+  const ensureGroupAdminId = (groupId) => {
+    if (!running || !connected || !client) throw makeSendError('not-sent', 'offline', instance, 'QQ 网关未连接')
+    const gid = String(groupId || '').trim()
+    if (!/^\d+$/.test(gid)) throw makeSendError('not-sent', 'bad-fetch-request', instance, 'QQ 群号必须为纯数字')
+    return Number(gid)
+  }
+
+  const callGroupAdminAction = async (action, params, opts = { timeoutMs: 10000 }) => {
+    try {
+      return await call(action, params, opts)
+    } catch (error) {
+      if (classifyProbeError(error) === 'unsupported') {
+        downgradedUnsupported.add(action)
+        probeState?.supported?.delete?.(action)
+        throw Object.assign(new Error(`当前 QQ 网关不支持 ${action}`), { code: 'group-admin-unsupported', certainty: 'not-sent', instance })
+      }
+      throw toSendError(error, { instance, isDefiniteFailure })
+    }
+  }
+
+  const groupAdmin = {
+    get supportedActions() {
+      return {
+        ban: !downgradedUnsupported.has('set_group_ban'),
+        unban: !downgradedUnsupported.has('set_group_ban'),
+        kick: !downgradedUnsupported.has('set_group_kick'),
+        wholeBan: !downgradedUnsupported.has('set_group_whole_ban'),
+        title: !downgradedUnsupported.has('set_group_special_title'),
+        notice: !downgradedUnsupported.has('_send_group_notice'),
+      }
+    },
+    async getBotState(groupId) {
+      const gidNum = ensureGroupAdminId(groupId)
+      const botId = selfId || (await loginInfo().catch(() => null))?.account || ''
+      if (!/^\d+$/.test(botId)) throw makeSendError('not-sent', 'offline', instance, 'QQ 网关尚未获取到机器人 QQ 号')
+      const r = await callGroupAdminAction('get_group_member_info', { group_id: gidNum, user_id: Number(botId), no_cache: true })
+      const role = ['owner', 'admin', 'member'].includes(r?.role) ? r.role : 'member'
+      return { role, groupOpenid: String(gidNum), memberOpenid: String(botId) }
+    },
+    async getGroupInfo(groupId) {
+      const gidNum = ensureGroupAdminId(groupId)
+      const r = await callGroupAdminAction('get_group_info', { group_id: gidNum })
+      return {
+        groupOpenid: String(gidNum),
+        name: String(r?.group_name || r?.name || ''),
+        ...(Number.isFinite(Number(r?.member_count)) ? { memberCount: Number(r.member_count) } : {}),
+      }
+    },
+    async listMembers(groupId, { startIndex = 0, limit = 50 } = {}) {
+      const gidNum = ensureGroupAdminId(groupId)
+      const raw = await callGroupAdminAction('get_group_member_list', { group_id: gidNum }, { timeoutMs: 20000 })
+      const arr = Array.isArray(raw) ? raw : (Array.isArray(raw?.data) ? raw.data : [])
+      const start = Math.max(0, Number(startIndex) || 0)
+      const cap = Math.max(1, Math.min(200, Number(limit) || 50))
+      return arr
+        .slice(start, start + cap)
+        .map((m) => ({
+          openid: String(m?.user_id ?? '').trim(),
+          nick: String(m?.card || m?.nickname || ''),
+          role: String(m?.role || ''),
+        }))
+        .filter((m) => m.openid)
+    },
+    async muteMember(groupId, memberId, durationMs) {
+      const gidNum = ensureGroupAdminId(groupId)
+      const uidStr = String(memberId || '').trim()
+      if (!/^\d+$/.test(uidStr)) throw makeSendError('not-sent', 'bad-fetch-request', instance, '成员 QQ 号无效')
+      const secs = Math.max(60, Math.min(2592000, Math.round((Number(durationMs) || 600_000) / 1000)))
+      await callGroupAdminAction('set_group_ban', { group_id: gidNum, user_id: Number(uidStr), duration: secs })
+    },
+    async unmuteMember(groupId, memberId) {
+      const gidNum = ensureGroupAdminId(groupId)
+      const uidStr = String(memberId || '').trim()
+      if (!/^\d+$/.test(uidStr)) throw makeSendError('not-sent', 'bad-fetch-request', instance, '成员 QQ 号无效')
+      await callGroupAdminAction('set_group_ban', { group_id: gidNum, user_id: Number(uidStr), duration: 0 })
+    },
+    async kickMember(groupId, memberId, opts = {}) {
+      const gidNum = ensureGroupAdminId(groupId)
+      const uidStr = String(memberId || '').trim()
+      if (!/^\d+$/.test(uidStr)) throw makeSendError('not-sent', 'bad-fetch-request', instance, '成员 QQ 号无效')
+      await callGroupAdminAction('set_group_kick', { group_id: gidNum, user_id: Number(uidStr), reject_add_request: Boolean(opts?.addBlackList) })
+    },
+  }
+
   const adapter = {
     id,
     name: 'QQ',
@@ -867,6 +951,8 @@ export function createQqAdapter(options = {}) {
     fetch,
 
     native,
+
+    groupAdmin,
 
     /** 旧接口 sendSegments 的兼容口：OneBot 消息段 → parts（入站翻译用同一个函数）。 */
     toParts(nativeMessage) {

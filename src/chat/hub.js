@@ -291,6 +291,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   const ENGAGE_MS = 3 * 60_000
   const groupNames = new Map()
   const chatsFetchedAt = new Map() // instance -> last gateway.fetch('chats') ms
+  const groupInfoFetchedAt = new Map() // chatId -> last gateway.groupAdmin.getGroupInfo ms
   const GROUP_NAMES_TTL_MS = 10 * 60_000
   const friendIds = new Set()
   let friendsAt = 0
@@ -2725,6 +2726,23 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
             const gNorm = formatChatId({ instance: inst, platform: instPlat, kind: 'group', id: gId }) || `${inst}:group:${gId}`
             groupNames.set(gNorm, gName)
             if (isDefaultInstanceChat(gNorm, instPlat)) groupNames.set(gId, gName)
+          }
+        } catch {}
+      }
+      const hit = (norm && groupNames.get(norm)) || groupNames.get(raw)
+      if (hit) return hit
+      const ga = typeof gateway?.groupAdmin === 'function' ? gateway.groupAdmin(norm || inst) : null
+      const infoKey = norm || `${inst}:group:${qid}`
+      const lastInfo = groupInfoFetchedAt.get(infoKey) || 0
+      if (ga && typeof ga.getGroupInfo === 'function' && (!lastInfo || Date.now() - lastInfo >= GROUP_NAMES_TTL_MS)) {
+        groupInfoFetchedAt.set(infoKey, Date.now())
+        try {
+          const info = await ga.getGroupInfo(qid)
+          const gName = String(info?.name || '').trim()
+          if (gName) {
+            groupNames.set(infoKey, gName)
+            if (isDefaultInstanceChat(infoKey, instPlat)) groupNames.set(qid, gName)
+            return gName
           }
         } catch {}
       }
