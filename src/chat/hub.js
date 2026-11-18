@@ -4400,8 +4400,10 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       throw Object.assign(new Error('当前网关不支持读取聊天记录'), { code: 'unsupported-action' })
     }
     const base = addr.kind === 'group' ? { group_id: Number(addr.id) } : { user_id: Number(addr.id) }
-    const anchorNum = anchor && /^-?\d+$/.test(anchor) && Number.isSafeInteger(Number(anchor)) ? Number(anchor) : 0
-    const req = anchorNum ? { ...base, count: n + 1, message_id: anchorNum, reverse_order: true } : { ...base, count: n }
+    const anchorParam = anchor && /^-?\d+$/.test(anchor) && !/^-?0+$/.test(anchor)
+      ? (Number.isSafeInteger(Number(anchor)) ? Number(anchor) : anchor)
+      : ''
+    const req = anchorParam ? { ...base, count: n + 1, message_id: anchorParam, reverse_order: true } : { ...base, count: n }
     const r = await onebot.call(addr.kind === 'group' ? 'get_group_msg_history' : 'get_friend_msg_history', req, { timeoutMs: 15000 })
     const rawList = Array.isArray(r) ? r : (r?.messages || [])
     const selfAcc = selfAccountFor(cid)
@@ -4421,7 +4423,18 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         parts,
       }
     })
-    const filtered = anchor ? mapped.filter((m) => String(m.messageId) !== anchor) : mapped
+    if (mapped.length >= 2) {
+      const firstAt = Number(mapped[0]?.at) || 0
+      const lastAt = Number(mapped[mapped.length - 1]?.at) || 0
+      if (firstAt > 0 && lastAt > 0 && firstAt > lastAt) mapped.reverse()
+    }
+    let filtered = mapped
+    if (anchor) {
+      const anchorIdx = mapped.findIndex((m) => String(m.messageId) === anchor)
+      filtered = anchorIdx >= 0
+        ? mapped.slice(0, anchorIdx)
+        : mapped.filter((m) => String(m.messageId) !== anchor)
+    }
     const messages = filtered.slice(-n)
     const beforeOut = messages.length > 0 && messages[0].messageId ? String(messages[0].messageId) : undefined
     return {

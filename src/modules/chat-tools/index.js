@@ -178,19 +178,25 @@ export default {
       return api.core?.gateway?.caps?.(chatId) || null
     }
 
+    const defPlat = parseChatId('private:0')?.platform || ''
+    const isDefaultInstance = (addr, plat = addr?.platform || defPlat) => Boolean(
+      (!addr && (!defPlat || plat === defPlat))
+      || (addr && defPlat && addr.platform === defPlat && (!addr.instance || addr.instance === defPlat))
+    )
+
     const historyAvailable = (chat, passedFeatures) => {
       const cid = String(chat?.chatId || '')
       const norm = cid ? (normalizeChatId(cid) || cid) : ''
       const addr = norm ? parseChatId(norm) : null
-      const plat = chat?.platform || addr?.platform || 'qq'
+      const plat = chat?.platform || addr?.platform || defPlat
+      const isDefInst = isDefaultInstance(addr, plat)
       const gw = api.core?.gateway
       const gwCaps = gw && typeof gw.caps === 'function' && norm ? gw.caps(norm) : null
       const feat = passedFeatures || (typeof api.features === 'function' && norm ? api.features(norm) : null)
-      if (gwCaps !== null) return Boolean(feat?.['message.history.read'])
-      // 传统无网关 / G3 未就绪直连 QQ 兜底（经 hub.fetchHistory 或单测直接传入的 onebot）
-      if (plat === 'qq' && (typeof hub?.fetchHistory === 'function' || typeof onebot?.call === 'function')) {
-        const inst = addr?.instance || 'qq'
-        const userCaps = api.config?.()?.platforms?.[inst]?.caps
+      if (gwCaps !== null || !isDefInst || (gw && !onebot)) return Boolean(feat?.['message.history.read'])
+      // 传统无网关 / 宿主直连默认实例兜底（经 hub.fetchHistory 或单测直接传入的 onebot）
+      if (typeof hub?.fetchHistory === 'function' || typeof onebot?.call === 'function') {
+        const userCaps = api.config?.()?.platforms?.[defPlat]?.caps
         return userCaps?.history !== false && userCaps?.features?.['message.history.read'] !== false
       }
       return false
@@ -224,7 +230,8 @@ export default {
 
             if (group) {
               const isOwnerTurn = level === 'full' || Boolean(hub.turnSendersAllOwner?.(sessionId))
-              const curUseGw = Boolean(gw && (curAddr?.platform !== 'qq' || gw.caps?.(curCid) !== null || !onebot))
+              const curIsDef = isDefaultInstance(curAddr, chat.platform)
+              const curUseGw = Boolean(gw && (!curIsDef || gw.caps?.(curCid) !== null || !onebot))
               const hit = await resolveCrossGroup({
                 hub,
                 gw,
@@ -236,7 +243,8 @@ export default {
                 showNames: isOwnerTurn,
               })
               if (hit.error) return { ok: false, message: hit.error }
-              const tgtUseGw = Boolean(gw && (hit.addr.platform !== 'qq' || gw.caps?.(hit.chatId) !== null || !onebot))
+              const tgtIsDef = isDefaultInstance(hit.addr, hit.addr.platform)
+              const tgtUseGw = Boolean(gw && (!tgtIsDef || gw.caps?.(hit.chatId) !== null || !onebot))
               const tgtFeats = tgtUseGw && typeof gw?.features === 'function' ? gw.features(hit.chatId) : null
               if (!historyAvailable({ chatId: hit.chatId, platform: hit.addr.platform }, tgtFeats)) {
                 return { ok: false, message: '目标聊天当前不支持读取历史记录' }
@@ -261,12 +269,13 @@ export default {
               targetAddr = hit.addr
             }
 
-            if (targetAddr.platform === 'qq' && anchor && (!/^-?\d+$/.test(anchor) || !Number.isSafeInteger(Number(anchor)) || Number(anchor) === 0)) {
+            if (defPlat && targetAddr.platform === defPlat && anchor && (!/^-?\d+$/.test(anchor) || /^-?0+$/.test(anchor))) {
               return { ok: false, message: 'before 要填有效的消息 ID' }
             }
 
             const useHubFetch = typeof hub?.fetchHistory === 'function'
-            const useGwHistory = useHubFetch || Boolean(gw && typeof gw.fetch === 'function' && (targetAddr.platform !== 'qq' || gw.caps?.(targetCid) !== null || !onebot))
+            const targetIsDef = isDefaultInstance(targetAddr, targetAddr.platform)
+            const useGwHistory = useHubFetch || Boolean(gw && typeof gw.fetch === 'function' && (!targetIsDef || gw.caps?.(targetCid) !== null || !onebot))
             if (useGwHistory) {
               let page
               try {
@@ -313,7 +322,10 @@ export default {
             if (typeof onebot?.call !== 'function' || !/^\d+$/.test(targetAddr.id)) {
               return { ok: false, message: '当前网关不支持读取聊天记录' }
             }
-            const pageReq = { count: anchor ? n + 1 : n, ...(anchor ? { message_id: Number(anchor), reverse_order: true } : {}) }
+            const anchorParam = anchor && /^-?\d+$/.test(anchor)
+              ? (Number.isSafeInteger(Number(anchor)) ? Number(anchor) : anchor)
+              : 0
+            const pageReq = { count: anchor ? n + 1 : n, ...(anchorParam ? { message_id: anchorParam, reverse_order: true } : {}) }
             let r
             try {
               r = targetAddr.kind === 'group'
@@ -323,9 +335,14 @@ export default {
               if (error?.code === 'unsupported-action') return { ok: false, message: '当前 QQ 网关不支持读取聊天记录' }
               throw error
             }
-            const history = Array.isArray(r) ? r : (r?.messages || [])
+            const history = [...(Array.isArray(r) ? r : (r?.messages || []))]
+            if (history.length >= 2) {
+              const firstT = Number(history[0]?.time) || 0
+              const lastT = Number(history[history.length - 1]?.time) || 0
+              if (firstT > 0 && lastT > 0 && firstT > lastT) history.reverse()
+            }
             const visible = hub.filterHistory?.(targetCid, history) ?? history
-            const msgs = visible.filter((m) => !anchor || String(m.message_id) !== String(Number(anchor))).slice(-n)
+            const msgs = visible.filter((m) => !anchor || String(m.message_id) !== anchor).slice(-n)
             if (!msgs.length) return { ok: true, message: '没翻到聊天记录' }
             const self = String(curCfg.botQQ || '')
             const lines = msgs.map((m) => {

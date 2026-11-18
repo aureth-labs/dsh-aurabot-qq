@@ -53,6 +53,8 @@
 //      机器人不在群里 → 230002。这些都按 not-sent 分类，绝不谎报成功。
 
 import { createDecipheriv, createHash, timingSafeEqual } from 'node:crypto'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { dirname, isAbsolute } from 'node:path'
 
 // ───────────────────────── 平台常量（全部来自官方文档，见 ADAPTER-FEISHU.md） ─────────────────────────
 
@@ -63,6 +65,8 @@ export const DEFAULT_BASE_URL = 'https://open.feishu.cn'
 export const PATH_TENANT_TOKEN = '/open-apis/auth/v3/tenant_access_token/internal'
 /** 发送消息（POST，query receive_id_type）—— /open-apis/im/v1/messages */
 export const PATH_SEND_MESSAGE = '/open-apis/im/v1/messages'
+/** 获取机器人所在群列表（GET，page_size/page_token） */
+export const PATH_CHATS = '/open-apis/im/v1/chats'
 /** 上传图片（multipart，image_type=message|avatar）→ image_key */
 export const PATH_UPLOAD_IMAGE = '/open-apis/im/v1/images'
 /** 上传文件（multipart，file_type + file_name + file）→ file_key */
@@ -827,6 +831,56 @@ export function createFeishuAdapter(options = {}) {
   let wsRetry = 0
   const sentFrames = [] // 测试断言应答/心跳帧用
   const p2pChatIds = new Map() // open_id → p2p chat_id (oc_xxx)，供 GET /im/v1/messages 查私聊历史
+  const P2P_CHATS_MAX = 2000
+
+  function p2pCachePath() {
+    try {
+      const p = typeof ctx?.dataDir === 'function' ? String(ctx.dataDir('p2p-chats.json') || '') : ''
+      return p && isAbsolute(p) ? p : ''
+    } catch {
+      return ''
+    }
+  }
+
+  function saveP2pChats() {
+    const file = p2pCachePath()
+    if (!file) return
+    try {
+      mkdirSync(dirname(file), { recursive: true })
+      writeFileSync(file, JSON.stringify(Object.fromEntries(p2pChatIds)), 'utf8')
+    } catch (error) {
+      log().debug?.('保存飞书单聊 chat_id 映射失败：', error?.message || error)
+    }
+  }
+
+  function loadP2pChats() {
+    const file = p2pCachePath()
+    if (!file || !existsSync(file)) return
+    try {
+      const parsed = JSON.parse(readFileSync(file, 'utf8'))
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return
+      for (const [openId, chatId] of Object.entries(parsed)) {
+        const oid = String(openId || '').trim()
+        const cid = String(chatId || '').trim()
+        if (!oid || !cid || p2pChatIds.has(oid)) continue
+        if (p2pChatIds.size >= P2P_CHATS_MAX) p2pChatIds.delete(p2pChatIds.keys().next().value)
+        p2pChatIds.set(oid, cid)
+      }
+    } catch (error) {
+      log().debug?.('读取飞书单聊 chat_id 映射失败：', error?.message || error)
+    }
+  }
+
+  function rememberP2pChat(openId, chatId) {
+    const oid = String(openId || '').trim()
+    const cid = String(chatId || '').trim()
+    if (!oid || !cid) return
+    const changed = p2pChatIds.get(oid) !== cid
+    p2pChatIds.delete(oid)
+    while (p2pChatIds.size >= P2P_CHATS_MAX) p2pChatIds.delete(p2pChatIds.keys().next().value)
+    p2pChatIds.set(oid, cid)
+    if (changed) saveP2pChats()
+  }
 
   // 测试故障注入
   let failSend = null
@@ -928,7 +982,7 @@ export function createFeishuAdapter(options = {}) {
     // 群聊/话题群：chat.id 用 chat_id（oc_ 开头）
     const chatId = isPrivate ? openId : String(msg.chat_id || '')
     if (!chatId) return null
-    if (isPrivate && openId && msg.chat_id) p2pChatIds.set(openId, String(msg.chat_id))
+    if (isPrivate && openId && msg.chat_id) rememberP2pChat(openId, String(msg.chat_id))
 
     return {
       chat: { kind: isPrivate ? 'private' : 'group', id: chatId, title: msg.chat_name },
@@ -1439,6 +1493,7 @@ export function createFeishuAdapter(options = {}) {
       instance = String(ctx.instance || id)
       running = true
       stopped = false
+      loadP2pChats()
       const cfg = config()
 
       // 用户配置只能把能力改小（listenAllInGroup / history 为需确认应用权限后再开启的扩展门控）
@@ -1608,7 +1663,7 @@ export function createFeishuAdapter(options = {}) {
         if (r.code !== 0) throw classifyResponse(r)
         lastMessageId = String(r.json?.data?.message_id || '')
         if (!isGroup && chat?.id && r.json?.data?.chat_id) {
-          p2pChatIds.set(String(chat.id), String(r.json.data.chat_id))
+          rememberP2pChat(String(chat.id), String(r.json.data.chat_id))
         }
       }
       if (!lastMessageId) throw sendError('unknown', 'no-message-id', instance, '飞书没返回 message_id（拿不准）')
@@ -1666,9 +1721,32 @@ export function createFeishuAdapter(options = {}) {
           throw sendError('not-sent', 'message-not-found', instance, `飞书未返回消息内容（${messageId}）`)
         }
         if (item.chat_id && request.chat?.kind === 'private' && request.chat?.id) {
-          p2pChatIds.set(String(request.chat.id), String(item.chat_id))
+          rememberP2pChat(String(request.chat.id), String(item.chat_id))
         }
         return toFetched(item, messageId)
+      }
+      if (request?.kind === 'chats') {
+        const groups = []
+        let pageToken = ''
+        for (let pageNo = 0; pageNo < 5; pageNo++) {
+          const params = new URLSearchParams({ page_size: '100' })
+          if (pageToken) params.set('page_token', pageToken)
+          const url = `${baseUrl()}${PATH_CHATS}?${params.toString()}`
+          const r = await requestAuthedGet(url, '飞书获取群列表失败')
+          const data = r?.json?.data || {}
+          for (const item of Array.isArray(data.items) ? data.items : []) {
+            const cid = String(item?.chat_id || '').trim()
+            if (!cid) continue
+            groups.push({
+              id: cid,
+              name: String(item?.name || ''),
+              ...(item?.description ? { description: String(item.description) } : {}),
+            })
+          }
+          if (!data.has_more || !data.page_token) break
+          pageToken = String(data.page_token)
+        }
+        return { groups, friends: [] }
       }
       if (request?.kind === 'history') {
         const chat = request.chat || {}
@@ -1678,7 +1756,7 @@ export function createFeishuAdapter(options = {}) {
           ? rawId
           : (chat.kind === 'private' ? (p2pChatIds.get(rawId) || '') : rawId)
         if (!containerId) {
-          throw sendError('not-sent', 'no-chat-id', instance, '飞书单聊暂未记录会话 chat_id（oc_ 开头）；收到该单聊消息后才能拉取历史')
+          throw sendError('not-sent', 'no-chat-id', instance, '飞书单聊暂未记录会话 chat_id（oc_ 开头）；先收到或发出一条该单聊消息后才能翻历史')
         }
         const pageSize = Math.max(1, Math.min(50, Number(request.count) || 20))
         const params = new URLSearchParams({

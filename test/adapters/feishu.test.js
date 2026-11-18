@@ -4,6 +4,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createCipheriv, createHash } from 'node:crypto'
+import { mkdtempSync, existsSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { runAdapterContract, makeCtx } from '../contract/adapter-kit.js'
 import {
   createFeishuAdapter,
@@ -1221,4 +1224,82 @@ test('Phase 3A：飞书 history 开关默认关闭、开启后 fetch(history) �
   )
 
   await adapter.stop()
+})
+
+test('Phase 3 P2-1 & P2-4：飞书 fetch(chats) 分页群列表与 p2pChatIds 跨重启持久化', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'aurabot-feishu-p2p-'))
+  const makeChatsClient = () => {
+    const base = makeFakeClient()
+    return {
+      calls: base.calls,
+      async request(req) {
+        if (req.method === 'GET' && req.url.includes('/open-apis/im/v1/chats?')) {
+          base.calls.push({ ...req })
+          const u = new URL(req.url)
+          if (!u.searchParams.get('page_token')) {
+            return { status: 200, json: { code: 0, data: { has_more: true, page_token: 'c_p2', items: [{ chat_id: 'oc_a', name: '项目一组', description: 'desc-a' }] } } }
+          }
+          return { status: 200, json: { code: 0, data: { has_more: false, items: [{ chat_id: 'oc_b', name: '设计二组' }] } } }
+        }
+        if (req.method === 'POST' && req.url.includes('/open-apis/im/v1/messages')) {
+          base.calls.push({ ...req })
+          return { status: 200, json: { code: 0, data: { message_id: 'om_sent_p2p', chat_id: 'oc_p2p_persisted' } } }
+        }
+        if (req.method === 'GET' && req.url.includes('/open-apis/im/v1/messages?')) {
+          base.calls.push({ ...req })
+          return {
+            status: 200,
+            json: {
+              code: 0,
+              data: {
+                has_more: false,
+                items: [{
+                  message_id: 'om_after_restart',
+                  create_time: '1700000100000',
+                  msg_type: 'text',
+                  body: { content: JSON.stringify({ text: '重启后仍能查到单聊历史' }) },
+                  sender: { id: 'ou_persist', id_type: 'open_id', sender_type: 'user' },
+                }],
+              },
+            },
+          }
+        }
+        return base.request(req)
+      },
+    }
+  }
+
+  const client1 = makeChatsClient()
+  const a1 = createFeishuAdapter({ client: client1 })
+  a1.__feishu.setConfig({ ...CFG, history: true })
+  const ctx1 = makeCtx(a1)
+  ctx1.dataDir = (...parts) => join(dir, ...parts)
+  await a1.start(ctx1)
+
+  const chats = await a1.fetch({ kind: 'chats' })
+  assert.deepEqual(chats, {
+    groups: [
+      { id: 'oc_a', name: '项目一组', description: 'desc-a' },
+      { id: 'oc_b', name: '设计二组' },
+    ],
+    friends: [],
+  })
+
+  await a1.send({ chat: { kind: 'private', id: 'ou_persist' }, parts: [{ type: 'text', text: '记录 p2p' }] })
+  assert.equal(existsSync(join(dir, 'p2p-chats.json')), true)
+  await a1.stop()
+
+  // 创建全新实例模拟进程重启，仅靠数据目录即可直接查该用户单聊历史
+  const client2 = makeChatsClient()
+  const a2 = createFeishuAdapter({ client: client2 })
+  a2.__feishu.setConfig({ ...CFG, history: true })
+  const ctx2 = makeCtx(a2)
+  ctx2.dataDir = (...parts) => join(dir, ...parts)
+  await a2.start(ctx2)
+
+  const page = await a2.fetch({ kind: 'history', chat: { kind: 'private', id: 'ou_persist' }, count: 5 })
+  const histUrl = new URL(client2.calls.find((c) => c.url.includes('/open-apis/im/v1/messages?')).url)
+  assert.equal(histUrl.searchParams.get('container_id'), 'oc_p2p_persisted')
+  assert.equal(page.messages[0]?.parts?.[0]?.text, '重启后仍能查到单聊历史')
+  await a2.stop()
 })

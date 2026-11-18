@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHub } from '../src/chat/hub.js'
 import { normalize } from '../src/core/config.js'
+import chatTools from '../src/modules/chat-tools/index.js'
 import { createFakeDsh } from './helpers/fake-dsh.js'
 import { makeFakeAdapter } from './helpers/fake-adapter.js'
 
@@ -542,4 +543,100 @@ test('Phase 4：纯 QQBot 环境下 7 个 QQ 专属模块不运行且全被动�
   assert.ok(botTools.includes('search_chatlog'))
   assert.ok(!botTools.includes('chat_history'), 'qqbot history=false 时不挂 chat_history')
   assert.ok(!botTools.includes('send_message'), '全实例均为 proactive=none 时不挂主动 send_message')
+})
+
+test('Phase 3 P2 收口：飞书按群名跨群 / qq#2 caps=null 口径一致 / legacy 倒序重排 / 64 位 before 字符串 ID', async (t) => {
+  // 1) P2-2：qq#2 在网关 caps=null 且 onebot 存在时，historyAvailable 不误按默认 QQ 放行
+  let toolBuilder = null
+  const dir = mkdtempSync(join(tmpdir(), 'aurabot-p3-p2-'))
+  const prevDir = process.env.AURABOT_DATA_DIR
+  process.env.AURABOT_DATA_DIR = dir
+  const legacyCalls = []
+  const legacyOnebot = {
+    async call(action, params) {
+      legacyCalls.push({ action, params })
+      // P2-3：故意返回倒序（新 -> 旧），且 P2-5 用超过 JS 安全整数的 64 位字符串 ID 作为锚点
+      return {
+        messages: [
+          { message_id: '9007199254740993123', time: 1700000300, sender: { user_id: 10000001, nickname: '阿白' }, message: [{ type: 'text', data: { text: '锚点本身' } }] },
+          { message_id: '9007199254740993122', time: 1700000200, sender: { user_id: 20000002, nickname: 'Bot' }, message: [{ type: 'text', data: { text: '第二条' } }] },
+          { message_id: '9007199254740993121', time: 1700000100, sender: { user_id: 10000001, nickname: '阿白' }, message: [{ type: 'text', data: { text: '第一条' } }] },
+        ],
+      }
+    },
+  }
+  const fakeGw = {
+    caps: () => null,
+    features: () => ({}),
+    async fetch(cid, req) {
+      if (req?.kind === 'chats') return { groups: [{ id: 'oc_2', name: '项目设计二群' }], friends: [] }
+      if (req?.kind === 'history') return { hasMore: false, messages: [{ messageId: 'om_fs_name', at: 1700000100000, sender: { account: 'ou_u2', name: '同事B', isBot: false }, parts: [{ type: 'text', text: '按群名翻到的飞书记录' }] }] }
+      return null
+    },
+  }
+  const cfg = normalize({
+    enabled: true,
+    dryRun: false,
+    botQQ: '20000002',
+    allow: { groups: ['777', 'feishu:group:oc_2'] },
+    platforms: { qq: { enabled: true }, 'qq#2': { enabled: true }, feishu: { enabled: true } },
+  })
+  const dsh = createFakeDsh({ brain: async () => 'ok' })
+  const hub = createHub({
+    dsh: dsh.ctx,
+    getConfig: () => cfg,
+    log: silent,
+    onebot: legacyOnebot,
+    gateway: fakeGw,
+    onActivity: () => {},
+    isMuted: () => false,
+  })
+  t.after(() => {
+    hub.dispose()
+    if (prevDir === undefined) delete process.env.AURABOT_DATA_DIR
+    else process.env.AURABOT_DATA_DIR = prevDir
+  })
+
+  chatTools.setup({
+    core: { hub, onebot: legacyOnebot, gateway: fakeGw },
+    config: () => cfg,
+    tool: (fn) => { toolBuilder = fn },
+    features: (cid) => (String(cid).startsWith('feishu:') ? { 'message.history.read': true } : { 'message.history.read': false }),
+  })
+
+  // qq#2 caps=null 时不挂 chat_history（与 hub.fetchHistory 一致，避免挂载即失败）
+  const qq2Tools = toolBuilder({ chat: { chatId: 'qq#2:group:888', kind: 'group', groupId: '888', platform: 'qq' }, level: 'social', sessionId: 's_qq2' })
+  assert.equal(qq2Tools.some((x) => x.name === 'chat_history'), false)
+
+  // P2-3 & P2-5：默认实例传统 QQ 支持超大 64 位字符串 before，并把倒序响应重排为 [旧 -> 新]
+  const qqDefTools = toolBuilder({ chat: { chatId: 'qq:group:777', kind: 'group', groupId: '777', platform: 'qq' }, level: 'full', sessionId: 's_qq1' })
+  const qqHistTool = qqDefTools.find((x) => x.name === 'chat_history')
+  assert.ok(qqHistTool)
+  const badZero = await qqHistTool.execute({ before: '0' })
+  assert.equal(badZero.ok, false)
+  const bigIdRes = await qqHistTool.execute({ count: 2, before: '9007199254740993123' })
+  assert.equal(bigIdRes.ok, true)
+  assert.equal(legacyCalls.at(-1).params.message_id, '9007199254740993123', '超过 MAX_SAFE_INTEGER 的游标须原样以字符串透传，不可精度截断')
+  assert.equal(bigIdRes.oldest_message_id, '9007199254740993121')
+  assert.ok(bigIdRes.message.indexOf('第一条') < bigIdRes.message.indexOf('第二条'), 'legacy fetchHistory 应统一按时间升序 [旧 -> 新] 输出')
+
+  // P2-1：飞书按群名（「设计二群」）解析并跨群读取（走 hub.chatGroups -> adapter fetch(chats)）
+  const fsGwWithCaps = {
+    ...fakeGw,
+    caps: () => ({ history: true, features: { 'message.history.read': true } }),
+    features: () => ({ 'message.history.read': true }),
+  }
+  const hubFs = createHub({ dsh: dsh.ctx, getConfig: () => cfg, log: silent, gateway: fsGwWithCaps, onActivity: () => {}, isMuted: () => false })
+  t.after(() => hubFs.dispose())
+  let fsBuilder = null
+  chatTools.setup({
+    core: { hub: hubFs, gateway: fsGwWithCaps },
+    config: () => cfg,
+    tool: (fn) => { fsBuilder = fn },
+    features: () => ({ 'message.history.read': true }),
+  })
+  const fsHistTool = fsBuilder({ chat: { chatId: 'feishu:private:ou_owner', kind: 'private', userId: 'ou_owner', platform: 'feishu' }, level: 'full', sessionId: 's_fs' }).find((x) => x.name === 'chat_history')
+  const byNameRes = await fsHistTool.execute({ group: '设计二群' })
+  assert.equal(byNameRes.ok, true)
+  assert.match(byNameRes.message, /按群名翻到的飞书记录/)
 })

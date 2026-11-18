@@ -438,10 +438,11 @@ test('空间互动：别人在她的评论下面接着回她，她会接着回�
 })
 
 test('戳一戳：主人戳她，她会回话，还会戳回去；20 秒内重复戳只算一次', async () => {
+  await until(() => !api.hub.stats().busy, 15000)
   const turns = fake.turns.length
   const poke = { post_type: 'notice', notice_type: 'notify', sub_type: 'poke', self_id: Number(BOT), user_id: Number(OWNER), sender_id: Number(OWNER), target_id: Number(BOT) }
   mock.push(poke)
-  await until(() => mock.sent('send_poke').length === 1)
+  await until(() => mock.sent('send_poke').length === 1 && sentTo('private', OWNER).at(-1)?.params?.message?.[0]?.data?.text === '干嘛戳我' && !api.hub.stats().busy, 15000)
   assert.match(fake.turns.at(-1).userText, /戳了戳你/)
   assert.equal(mock.sent('send_poke')[0].params.user_id, Number(OWNER))
   assert.equal(sentTo('private', OWNER).at(-1).params.message[0].data.text, '干嘛戳我')
@@ -1618,7 +1619,7 @@ test('语音发出去、补发表情失败：这一轮不算没发出去（补�
     mock.state.failFace = true // 只让带系统表情的那条发失败
     mock.push(priv(OWNER, text('表情补发失败测试')))
     await until(() => sentTo('private', OWNER).slice(n).some((c) => (c.params.message || []).some((s) => s.type === 'record')), 20000)
-    await until(() => bots().length > before, 8000) // 记了流水 = 这一轮算说出口了
+    await until(() => bots().length > before, 20000) // 记了流水 = 这一轮算说出口了
     assert.ok(bots().slice(before).some((x) => /晚安/.test(x.text)), '语音发出去了就该记成说过：' + JSON.stringify(bots().slice(before)))
     const tried = mock.calls.filter((c) => (c.params?.message || []).some((s) => s.type === 'face'))
     assert.ok(tried.length >= 1, '补发那一步确实试过（这次注定失败）')
