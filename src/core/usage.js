@@ -144,6 +144,8 @@ const TOOL_MODULES = {
   qq_draw_image: 'imagegen',
   generate_video: 'video',
   qq_generate_video: 'video',
+  song_cover: 'song',
+  qq_song_cover: 'song',
   send_sticker: 'stickers',
   list_stickers: 'stickers',
   edit_sticker: 'stickers',

@@ -634,7 +634,7 @@ test('P2-4: 安全边界与 C 类既有上下文（resolveConfirmChat / approval
   const preview = (await fake.call('/memory/assoc/preview?q=测试')).json()
   assert.equal(preview.ok, true)
 
-  // 5) qq_song_cover 保持 C 类原地触发（chat.chatId）
+  // 5) song_cover 保持 C 类原地触发（chat.chatId）
   let songBuilder = null
   const songSent = []
   songMod.setup({
@@ -659,8 +659,8 @@ test('P2-4: 安全边界与 C 类既有上下文（resolveConfirmChat / approval
     tool: (b) => { songBuilder = b },
   })
   const tools = songBuilder({ chat: { kind: 'group', groupId: '555', chatId: 'group:555' }, sessionId: 's-group' })
-  const coverTool = Array.isArray(tools) ? tools.find((x) => x.name === 'qq_song_cover') : tools
-  assert.equal(coverTool?.name, 'qq_song_cover', 'group 会话应挂载 qq_song_cover 工具')
+  const coverTool = Array.isArray(tools) ? tools.find((x) => x.name === 'song_cover') : tools
+  assert.equal(coverTool?.name, 'song_cover', 'group 会话应挂载 song_cover 工具')
   // 验证 /song/request 走 A 类而被 blocked（即使在同一模块下，工具和面板请求分流）
   assert.equal(typeof coverTool.execute, 'function')
   assert.equal(songSent.length, 0)
