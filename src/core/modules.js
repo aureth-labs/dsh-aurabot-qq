@@ -1254,6 +1254,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
         cleanup(() => exports?.dispose?.())
         return null
       }
+      registerToolAliases(rec)
       rec.exports = exports
       log.info(`模块「${def.name || id}」${source !== 'user' ? '' : existsSync(join(rec.dir, '.aurabot-source.json')) ? '（模块市场）' : '（自己写的）'}已启动`)
       emit('module/start', id)
@@ -1278,6 +1279,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     try {
       const r = def.setup(makeApi(id, 'builtin', rec))
       if (r && typeof r.then === 'function') throw new Error('内置模块的 setup 要同步返回')
+      registerToolAliases(rec)
       rec.exports = r ?? {}
     } catch (error) {
       stop(id, { quiet: true })
@@ -1321,7 +1323,11 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     // 旧快照删掉（加载过的代码已经在内存里，删文件不影响）
     try { for (const n of readdirSync(root)) if (join(root, n) !== snap) rmSync(join(root, n), { recursive: true, force: true }) } catch (error) {}
     const mod = await import(pathToFileURL(join(snap, relative(u.dir, u.file))).href)
-    return { def: mod.default, stamp }
+    const rawDef = mod.default
+    const def = rawDef && typeof rawDef === 'object' && mod.toolAliases && !rawDef.toolAliases
+      ? { ...rawDef, toolAliases: mod.toolAliases }
+      : rawDef
+    return { def, stamp }
   }
 
   async function startUser(u) {
@@ -1573,17 +1579,95 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     })
   }
 
-  const TOOL_ALIASES = Object.freeze({
-    qq_chat_history: 'chat_history',
-    qq_search_chatlog: 'search_chatlog',
-    qq_send_file: 'send_file',
-    qq_send_message: 'send_message',
-  })
+  const TOOL_NAME_RE = /^[a-z][a-z0-9_]*$/
+  /** 模块声明的旧工具名 → 权威工具名映射表（alias -> { target, moduleId, rec }）。 */
+  const toolAliasMap = new Map()
+
+  function collectStaticTools(rec) {
+    const names = new Set()
+    let hasDynamic = false
+    for (const b of rec.tools) {
+      if (typeof b === 'function') { hasDynamic = true; continue }
+      for (const t of [].concat(b || [])) {
+        if (t && t.name) names.add(String(t.name))
+      }
+    }
+    return { names, hasDynamic }
+  }
+
+  /** 启动收尾时校验静态工具重名与模块声明的 toolAliases，不合法则抛错阻断启动。 */
+  function registerToolAliases(rec) {
+    const { names: staticNames, hasDynamic } = collectStaticTools(rec)
+    for (const name of staticNames) {
+      for (const other of live.values()) {
+        if (other === rec || other.id === rec.id) continue
+        if (other.staticToolNames?.has(name)) {
+          throw new Error(`工具「${name}」与模块「${other.id}」冲突`)
+        }
+      }
+      for (const [alias, entry] of toolAliasMap.entries()) {
+        if (entry.rec === rec || entry.moduleId === rec.id) continue
+        if (live.get(entry.moduleId) !== entry.rec) continue
+        if (alias === name) throw new Error(`工具「${name}」与模块「${entry.moduleId}」的别名冲突`)
+        if (entry.target === name) throw new Error(`工具「${name}」与模块「${entry.moduleId}」的别名「${alias}」目标冲突`)
+      }
+    }
+    rec.staticToolNames = staticNames
+
+    const rawAliases = rec.def?.toolAliases
+    if (rawAliases === undefined || rawAliases === null) return
+    if (!isObj(rawAliases)) throw new Error('toolAliases 必须是键值对对象')
+
+    const parsed = []
+    for (const [rawAlias, rawTarget] of Object.entries(rawAliases)) {
+      const alias = String(rawAlias || '').trim()
+      const target = String(rawTarget || '').trim()
+      if (!TOOL_NAME_RE.test(alias)) throw new Error(`工具别名「${rawAlias}」格式不合法`)
+      if (!TOOL_NAME_RE.test(target)) throw new Error(`工具别名「${alias}」的目标「${rawTarget}」格式不合法`)
+      if (alias === target) throw new Error(`工具别名「${alias}」不能指向自身`)
+      const existing = toolAliasMap.get(alias)
+      if (existing && existing.rec !== rec && existing.moduleId !== rec.id && live.get(existing.moduleId) === existing.rec) {
+        throw new Error(`工具别名「${alias}」已被模块「${existing.moduleId}」占用`)
+      }
+      if (staticNames.has(alias)) throw new Error(`工具别名「${alias}」不能与本模块权威工具名重复`)
+      for (const other of live.values()) {
+        if (other === rec || other.id === rec.id) continue
+        if (other.staticToolNames?.has(alias)) throw new Error(`工具别名「${alias}」与模块「${other.id}」的工具冲突`)
+        if (other.staticToolNames?.has(target)) throw new Error(`工具别名「${alias}」不能指向模块「${other.id}」的工具「${target}」`)
+      }
+      if (!hasDynamic && !staticNames.has(target)) {
+        throw new Error(`工具别名「${alias}」指向的「${target}」在本模块不存在`)
+      }
+      parsed.push([alias, target])
+    }
+
+    const added = []
+    for (const [alias, target] of parsed) {
+      const entry = { target, moduleId: rec.id, rec }
+      toolAliasMap.set(alias, entry)
+      added.push([alias, entry])
+    }
+    if (added.length) {
+      rec.offs.push(() => {
+        for (const [alias, entry] of added) {
+          if (toolAliasMap.get(alias) === entry) toolAliasMap.delete(alias)
+        }
+      })
+    }
+  }
+
+  function toolAliases() {
+    const out = {}
+    for (const [alias, entry] of toolAliasMap.entries()) {
+      if (live.get(entry.moduleId) === entry.rec) out[alias] = entry.target
+    }
+    return out
+  }
 
   // ---------- 汇总给插件其他部分用 ----------
-  function buildTools(where) {
+  function buildToolsWithOwners(where) {
     const out = []
-    const names = new Set()
+    const owners = new Map()
     const chatId = where?.chat?.chatId || where?.chatId || ''
     const p = where?.chat?.platform || platformOf(chatId)
     const features = where?.features || featuresFor(chatId)
@@ -1598,24 +1682,29 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
           for (const t of [].concat(r || [])) {
             if (!t || !t.name) continue
             if (!matchesFilter(t, { platform: p, features })) continue
-            if (names.has(t.name)) { log.debug(`工具 ${t.name} 重名，模块「${rec.id}」的没挂`); continue }
-            names.add(t.name)
+            if (owners.has(t.name)) { log.debug(`工具 ${t.name} 重名，模块「${rec.id}」的没挂`); continue }
+            owners.set(t.name, rec.id)
             out.push(p && typeof t.execute === 'function' ? { ...t, execute: (...a) => platformContext.run(p, () => t.execute(...a)) } : t)
           }
         }
       }
     })
-    return out
+    return { tools: out, owners }
   }
-  /** 解析会话可用工具：先精确匹配权威工具名，未命中时再按旧 qq_* 工具别名回落兼容执行路由。 */
+  function buildTools(where) {
+    return buildToolsWithOwners(where).tools
+  }
+  /** 解析会话可用工具：先精确匹配权威工具名，未命中时再按同模块登记的旧工具别名回落兼容执行路由。 */
   function resolveTool(where, name) {
     const wanted = String(name || '').trim()
     if (!wanted) return undefined
-    const tools = buildTools(where)
+    const { tools, owners } = buildToolsWithOwners(where)
     const exact = tools.find((t) => t.name === wanted)
     if (exact) return exact
-    const alias = TOOL_ALIASES[wanted]
-    return alias ? tools.find((t) => t.name === alias) : undefined
+    const entry = toolAliasMap.get(wanted)
+    if (!entry || live.get(entry.moduleId) !== entry.rec) return undefined
+    if (owners.get(entry.target) !== entry.moduleId) return undefined
+    return tools.find((t) => t.name === entry.target)
   }
   function contextFor(args) {
     const parts = []
@@ -1900,7 +1989,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     boot, sync, reload, stop, dispose, status, create, fork, promptFor, panelSource,
     use: exportsOf, has: (id) => live.has(id), running: (id) => live.get(id)?.source || null, generation: () => generation,
     capabilitiesOf,
-    emit, claim, filter, filterSync, buildTools, resolveTool,
+    emit, claim, filter, filterSync, buildTools, resolveTool, toolAliases,
     // 插件核心自己听事件（不属于任何模块，不会被撤掉）
     listen: (event, fn) => { const item = { id: '@core', fn }; listeners.set(event, [...(listeners.get(event) || []), item]); return () => listeners.set(event, (listeners.get(event) || []).filter((x) => x !== item)) }, contextFor, rules, commands, dshTools, builtinOff, activePlatforms: () => [...activePlatforms()], handle,
     hasRoute: (path) => routes.has(path),

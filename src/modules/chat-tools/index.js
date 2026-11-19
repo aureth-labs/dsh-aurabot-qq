@@ -14,6 +14,7 @@ export const LEGACY_TOOL_ALIASES = Object.freeze({
   qq_send_file: 'send_file',
   qq_send_message: 'send_message',
 })
+export const toolAliases = LEGACY_TOOL_ALIASES
 
 /** 判断 target（支持裸 qq:.../private:.../group:... 与规范 ChatId）是否落在主人私聊或白名单内。 */
 function resolveAuthorizedTarget({ target, cfg, identity }) {
@@ -167,6 +168,7 @@ export default {
   features: {
     optional: ['message.history.read'],
   },
+  toolAliases: LEGACY_TOOL_ALIASES,
   description: '跨平台基础聊天能力：按历史能力动态挂载 chat_history，本地流水搜索 search_chatlog，主人授权下主动发消息（send_message）与发文件（send_file）',
   setup(api) {
     const { hub, onebot, identity } = api.core || {}
