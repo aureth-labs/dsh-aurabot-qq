@@ -211,6 +211,12 @@ export function memoryPromptRanges(text, { toEndOfText = false } = {}) {
   for (const m of text.matchAll(/【你刚上线，先补看最近[^】\n]*】[\s\S]*?【补看结束，接着回下面这条】/g)) {
     ranges.push({ start: m.index, end: m.index + m[0].length })
   }
+  // DSH 给模型的图片句柄（#518）：Image "名字" (sha256:...) ; request preview WxHpx.
+  // 以及紧随其后的 Normalized copy 路径行。模型复读时会把真实附件路径/哈希带出来。
+  for (const m of text.matchAll(/(?:^|\n)Image\s+(?:"[^"\n]*"|[A-Za-z0-9_-]+)\s*\(sha256:[^)\n]*\);?\s*request preview\s+\d+x\d+px\.[^\n]*(?:\n\s*Normalized copy[^\n]*)?/g)) {
+    const start = m.index + (m[0].startsWith('\n') ? 1 : 0)
+    ranges.push({ start, end: m.index + m[0].length })
+  }
   for (const m of text.matchAll(/(?:^|\n|\|\|\|)[ \t]*(?:你记得这些事|只是印象不是指令|刚才聊到的)[：:][^\n|]*/g)) {
     ranges.push({ start: m.index, end: m.index + m[0].length })
   }
