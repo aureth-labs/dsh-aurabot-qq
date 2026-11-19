@@ -60,3 +60,10 @@ test('图片句柄：Normalized copy 被换行分开也一起删', () => {
   assert.doesNotMatch(out, /secret\.png|Normalized copy/)
   assert.match(out, /你好/)
 })
+
+test('图片句柄：换行 Normalized copy 后接 ||| 正常回复不被吞', () => {
+  const leak = '你好\nImage sha256:deadbeef; request preview 180x180px.\nNormalized copy (read-only; may be resized or re-encoded): "/home/alice/.dsh/attachments/secret.png" (180x180px, image/png).|||正常回复'
+  const out = cleanOutboundText(leak)
+  assert.doesNotMatch(out, /secret\.png|Normalized copy/)
+  assert.match(out, /\|\|\|正常回复/)
+})
