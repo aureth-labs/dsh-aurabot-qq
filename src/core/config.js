@@ -1223,6 +1223,9 @@ export function commitConfig(cfg, previous = loadConfig()) {
 /** 给面板看的版本：密码 / token 不回传原文，只告诉有没有填。 */
 export function publicConfig(cfg) {
   const c = structuredClone(cfg)
+  // vector.mode 是派生值、在 cfg 上不可枚举；structuredClone 会丢掉它，
+  // 面板切到「在线服务」后重载又回退「本地模型」（#520）。回传时显式补成可枚举字段。
+  if (c.memory?.vector && cfg?.memory?.vector?.mode) c.memory.vector.mode = cfg.memory.vector.mode
   delete c.ownerAuthorization
   // 面板上的「试运行」只表示「试运行但不调试」：调试开着时它显示为关
   c.dryRun = Boolean(c.dryRun && !c.debug)

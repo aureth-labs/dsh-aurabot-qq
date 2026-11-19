@@ -10000,18 +10000,16 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         // unchangedPaths 只清脏标记（值本来就一致），其余本地草稿（含提交期间的新改动）原样保留。
         if (r.configRevision != null) configRevRef.current = r.configRevision
         const snap = clone(r.config || draftSnapRef.current || {})
-        const committed = (r.committedPaths || []).map(ptrToDots)
-        draftBaseRef.current = clone(snap)
-        setDraft((current) => {
-          if (!current) return clone(snap)
-          let next = current
-          for (const dots of committed) next = setPath(next, dots, getPath(snap, dots))
-          return next
-        })
+        // #520：保存回执里的 config 是脱敏后的 publicConfig（secret 字段为空、带 *Set 标志），
+        // 不能直接拿来当 dirty 比较的基线，否则草稿里含原文的 secret 永远和它不相等，
+        // 「有改动还没保存」提示就永远不消失。基线用本次保存的完整草稿（含 secret 原文）。
+        const savedDraft = clone(override || draft)
+        draftBaseRef.current = savedDraft
+        setDraft((current) => (current === draft ? clone(savedDraft) : current))
+        dirtyRef.current = false
         setSt((prev) => (prev ? { ...prev, config: clone(snap) } : prev))
         toast(r.message || '保存好了', 'ok')
-        // 按约定再读一次 /panel/config 校准快照（在途合并；在编辑的草稿不会被覆盖）
-        loadConfigDraft()
+        // 不再立即 loadConfigDraft：它内部会用脱敏快照覆盖基线，再次把 dirty 钉死。
         return true
       }
       saveRef.current = save
