@@ -502,8 +502,8 @@ export function createBili({ getConfig, hub, memory, log, dsh, api: injected, vi
 
   /** 太大就缩到 1024 以内、JPEG；缩不了返回 null。 */
   async function shrinkFace(buf) {
-    const { findFfmpeg, findSharp, shrinkImage, shrinkWithSharp } = await import('../core/img.js')
-    const ffmpeg = findFfmpeg(cfg().bili && cfg().bili.ffmpegPath)
+    const { findFfmpegForConfig, findSharp, shrinkImage, shrinkWithSharp } = await import('../core/img.js')
+    const ffmpeg = findFfmpegForConfig(cfg())
     let small = ffmpeg ? await shrinkImage(buf, 1024, ffmpeg) : null
     if (!small) small = await shrinkWithSharp(await findSharp(), buf, 1024)
     return small && small.length <= FACE_MAX ? small : null

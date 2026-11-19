@@ -64,7 +64,8 @@ export const DEFAULTS = {
   //   X-Forwarded-For 的最后一跳作为真实来源。留空 = 从不相信任何转发头（最安全）。
   // publicHostname：面板经反代对外时的域名（如 panel.example.com），可填多个、逗号分隔；CSRF 同源校验把
   //   这个域名的 Origin 也算同源。留空 = 只有回环 Origin 算同源。
-  security: { dangerConfirm: true, ssrfMode: 'strict', panelRemoteAccess: false, trustedProxy: '', publicHostname: '' },
+  // cleanDshCookiesOnExit：退出 DSH 后清理 localhost 上的 dsh-auth-* 累积 Cookie；默认关。
+  security: { dangerConfirm: true, ssrfMode: 'strict', panelRemoteAccess: false, trustedProxy: '', publicHostname: '', cleanDshCookiesOnExit: false },
   // 浏览器（全局）：useDshSidebar = 需要浏览器的模块（逛网页 / 刷抖音 / 小红书 / 小黑盒验证）
   // 连 DSH 侧边浏览器的共享实例（ego，画面在 DSH 右侧实时可见），不为每个模块各开一个独立窗口。
   browser: { useDshSidebar: false },
@@ -201,7 +202,7 @@ export const DEFAULTS = {
   },
   // 本地接口：数据目录 local/ 里的脚本接管这几项（文件要在、开关要开）
   local: { tts: false, image: false, song: false, asr: false, video: false, videoTimeoutMin: 20 },
-  // 外置工具：只存可执行文件路径；留空则自动查找（FFmpeg 还会兼容旧的 bili.ffmpegPath）
+  // 外置工具：只存可执行文件路径；留空则自动查找。
   tools: {
     ffmpeg: { path: '' },
     ffprobe: { path: '' },
@@ -237,7 +238,7 @@ export const DEFAULTS = {
     like: false, // 顺手点赞
     vision: false, // 可选：ffmpeg 抽帧交给视觉模型
     visionFrames: 6,
-    ffmpegPath: '', // 留空从 PATH 查找
+    ffmpegPath: '', // 旧配置兼容字段；加载时会迁移到 tools.ffmpeg.path
     shotChance: 0.35, // 刷完发截图给主人；0 = 不自动发
     shotLibrary: 300,
     // 想发到群里的时候不直接发：先攒成待批，私聊问主人「发几号」。默认关，开了才考虑。
@@ -616,6 +617,7 @@ export function normalize(raw) {  const c = deepMerge(DEFAULTS, raw)
   c.security.panelRemoteAccess = bool(c.security.panelRemoteAccess, false)
   c.security.trustedProxy = String(c.security.trustedProxy || '').trim()
   c.security.publicHostname = String(c.security.publicHostname || '').trim().toLowerCase()
+  c.security.cleanDshCookiesOnExit = bool(c.security.cleanDshCookiesOnExit, false)
   // 浏览器后端开关（老配置没有 browser 段也要补出默认值）
   if (!isObj(c.browser)) c.browser = {}
   c.browser.useDshSidebar = bool(c.browser.useDshSidebar, false)
@@ -775,7 +777,10 @@ export function normalize(raw) {  const c = deepMerge(DEFAULTS, raw)
   Object.assign(b, splitBiliCookie(b))
   for (const k of ['enabled', 'autoBrowse', 'comment', 'reply', 'shareToOwner', 'like', 'vision', 'danmakuEnabled', 'autoDanmaku']) b[k] = bool(b[k], DEFAULTS.bili[k])
   b.visionFrames = Math.round(num(b.visionFrames, 6, 1, 100))
-  b.ffmpegPath = String(b.ffmpegPath || '').trim()
+  // 旧 B 站独立 ffmpeg 路径迁移到外置工具；以后只保留 tools.ffmpeg.path。
+  const legacyFfmpeg = String(b.ffmpegPath || '').trim()
+  if (legacyFfmpeg && !c.tools.ffmpeg.path) c.tools.ffmpeg.path = legacyFfmpeg
+  b.ffmpegPath = ''
   b.shotChance = num(b.shotChance, 0.35, 0, 1)
   b.shotLibrary = Math.round(num(b.shotLibrary, 300, 1, BIG))
   if (!isObj(b.groupShare)) b.groupShare = {}

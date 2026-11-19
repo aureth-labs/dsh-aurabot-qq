@@ -63,6 +63,7 @@ import { createQqbotAdapter } from './adapters/qqbot/index.js'
 import { createBridgeAdapter } from './adapters/bridge/index.js'
 import { ensureUpgradedStorage } from './features/import-qq.js'
 import { clearToolsCache, listTools, probeTool } from './core/tools.js'
+import { installDshCookieCleanup, findPython } from './core/dsh-cookies.js'
 import { runToolInstall, toolJobs } from './core/tools-managed.js'
 import { startQuickTunnel, stopQuickTunnel, tunnelState } from './core/quick-tunnel.js'
 import { createHandover } from './features/handover.js'
@@ -193,6 +194,15 @@ export function apply(ctx) {
   if (authOwnerKey(cfg) && !ownerAuthorizationRevision(cfg)) {
     try { cfg = saveConfig(cfg, cfg) }
     catch { log.warn('初始化主人授权记录失败，本次启动使用会话授权') }
+  }
+  // DSH 退出后清理累积的 dsh-auth-* Cookie；默认关闭，只在开关打开时拉起 helper。
+  installDshCookieCleanup({
+    getConfig: () => cfg,
+    dataDir: () => dataDir(),
+    log: logger.child('dsh-cookies'),
+  })
+  if (cfg.security?.cleanDshCookiesOnExit && process.platform === 'win32' && !findPython(cfg)) {
+    log.warn('DSH Cookie 清理已开启，但没找到 Python；退出时不会执行清理')
   }
   const configuredSelfInstances = (conf) => {
     const out = []

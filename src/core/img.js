@@ -8,6 +8,16 @@ import { mimeOf } from '../chat/inbound.js'
 
 const EXE = process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg'
 
+/** 统一读取 ffmpeg 配置：外置工具页优先，兼容旧 bili.ffmpegPath。 */
+export function configuredFfmpegPath(cfg = {}) {
+  return String(cfg?.tools?.ffmpeg?.path || cfg?.bili?.ffmpegPath || '').trim()
+}
+
+/** 用完整配置或旧 B 站配置找 ffmpeg。 */
+export function findFfmpegForConfig(cfg = {}) {
+  return findFfmpeg(configuredFfmpegPath(cfg))
+}
+
 /** ffmpeg 在哪：配置里填的 > PATH 里的 > 几个常见安装位置。找不到返回 ''。 */
 export function findFfmpeg(configured = '', { pathEnv = process.env.PATH || '', exists = existsSync } = {}) {
   const sep = process.platform === 'win32' ? ';' : ':'

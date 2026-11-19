@@ -9,7 +9,7 @@ import { paintingPath } from './paintings.js'
 import { createCodexAuth } from './codex-auth.js'
 import { createCodexImage } from './codex-image.js'
 import { mimeOf } from '../chat/inbound.js'
-import { imageToolBlock } from '../core/img.js'
+import { imageToolBlock, configuredFfmpegPath } from '../core/img.js'
 import { canSeeImages } from '../core/llm.js'
 import { imageSizeFor, normalizeRequestedSize } from './image-shape.js'
 export { imageToolBlock }
@@ -276,7 +276,7 @@ export function createImageGen({ getConfig, log, local, dsh, fetchImpl, codexAut
 
   // 保留本地调用方的附件辅助接口，与模块工具共用同一份图片登记实现。
   const canSee = async () => Boolean(dsh && (await canSeeImages(dsh, getConfig())) === true)
-  const toolImage = async (buf) => dsh ? imageToolBlock(dsh, buf, { ffmpegPath: getConfig().bili?.ffmpegPath, log }) : null
+  const toolImage = async (buf) => dsh ? imageToolBlock(dsh, buf, { ffmpegPath: configuredFfmpegPath(getConfig()), log }) : null
   return { generate, canSee, toolImage, enabled, notReadyReason, codexAuth: auth, dispose: () => auth.dispose?.() }
 }
 

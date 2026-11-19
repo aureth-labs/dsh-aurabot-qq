@@ -7,7 +7,7 @@
 import { spawn } from 'node:child_process'
 import { UA } from './api.js'
 import { askModel, canSeeImages } from '../core/llm.js'
-import { findFfmpeg } from '../core/img.js'
+import { findFfmpeg, findFfmpegForConfig } from '../core/img.js'
 import { assertPublicUrl } from '../core/net.js'
 
 // ffmpeg 的查找已经抽到 core/img.js（生图那边也要用），这里保留导出，老的引用不受影响
@@ -94,10 +94,12 @@ export async function describeFrames(dsh, { info, frames, cfg }) {
   return String(text || '').trim()
 }
 
-/** 面板用：开关 + ffmpeg 找到了没。 */
-export function visionState(biliCfg) {
-  const ffmpeg = findFfmpeg(biliCfg && biliCfg.ffmpegPath)
-  return { enabled: Boolean(biliCfg && biliCfg.vision), ffmpeg, ready: Boolean(biliCfg && biliCfg.vision && ffmpeg) }
+/** 面板用：开关 + ffmpeg 找到了没；支持完整配置或单独的 bili 配置。 */
+export function visionState(config) {
+  const full = config && (config.bili || config.tools) ? config : { bili: config || {} }
+  const c = full.bili || {}
+  const ffmpeg = findFfmpegForConfig(full)
+  return { enabled: Boolean(c.vision), ffmpeg, ready: Boolean(c.vision && ffmpeg) }
 }
 
 /**
@@ -135,7 +137,7 @@ export async function lookWithVision({ dsh, api, info, getConfig, log, deps = {}
   const c = (full && full.bili) || {}
   if (!c.vision || !dsh || !api || typeof api.playurl !== 'function') return empty
   if (!info || !info.cid) return empty
-  const ffmpeg = (deps.findFfmpeg || findFfmpeg)(c.ffmpegPath)
+  const ffmpeg = deps.findFfmpeg ? deps.findFfmpeg(c.ffmpegPath) : findFfmpegForConfig(full)
   if (!ffmpeg) {
     log?.debug('看画面跳过：没找到 ffmpeg')
     return empty

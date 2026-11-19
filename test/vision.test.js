@@ -4,6 +4,8 @@ import assert from 'node:assert/strict'
 import { join } from 'node:path'
 import { frameTimes, pickVideoStream, findFfmpeg, visionState, lookWithVision, describeFrames, progressiveWindows, windowAt } from '../src/bili/vision.js'
 import { digestOf } from '../src/bili/duty.js'
+import { normalize } from '../src/core/config.js'
+import { readFileSync } from 'node:fs'
 
 test('frameTimes：跳过首尾 5%，均匀铺开，不重复', () => {
   const t = frameTimes(600, 6)
@@ -47,6 +49,21 @@ test('findFfmpeg：配置的路径优先，都找不到返回空串', () => {
   const dir = process.platform === 'win32' ? 'D:\\bin' : '/opt/bin'
   const inPath = join(dir, exe)
   assert.equal(findFfmpeg('', { pathEnv: dir, exists: (p) => p === inPath }), inPath, '从 PATH 里找')
+})
+
+test('旧 bili.ffmpegPath 迁移到外置工具，B 站面板不再单独填写', () => {
+  const migrated = normalize({ bili: { ffmpegPath: 'C:\\old\\ffmpeg.exe' } })
+  assert.equal(migrated.tools.ffmpeg.path, 'C:\\old\\ffmpeg.exe')
+  assert.equal(migrated.bili.ffmpegPath, '')
+  const preferNew = normalize({
+    bili: { ffmpegPath: 'C:\\old\\ffmpeg.exe' },
+    tools: { ffmpeg: { path: 'D:\\new\\ffmpeg.exe' } },
+  })
+  assert.equal(preferNew.tools.ffmpeg.path, 'D:\\new\\ffmpeg.exe', '新配置优先')
+  assert.equal(preferNew.bili.ffmpegPath, '')
+  const client = readFileSync(new URL('../client/client.js', import.meta.url), 'utf8')
+  assert.doesNotMatch(client, /bili\.ffmpegPath/)
+  assert.match(client, /ffmpeg 路径统一在「系统 → 外置工具」/)
 })
 
 test('visionState：开关和 ffmpeg 都就绪才算 ready', () => {
