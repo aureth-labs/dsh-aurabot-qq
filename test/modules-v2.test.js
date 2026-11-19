@@ -124,14 +124,18 @@ test('API_VERSION = 3 且向后兼容 MIN_API_VERSION = 1；v1 模块默认 plat
   assert.match(checkDef({ id: 'future', api: 4, setup() {} }), /v4/)
 })
 
-test('内置模块平台声明完备，只开假平台时 QQ 模块跳过（「未启用对应平台」），[*] 模块全部正常运行', async (t) => {
+test('内置模块平台声明完备，只开假平台时 QQ/QQBot 模块跳过（「未启用对应平台」），[*] 模块全部正常运行', async (t) => {
   const expectedUniversal = ['memory', 'mood', 'purpose', 'autotelic', 'song', 'speakup', 'bili', 'voice', 'imagegen', 'video', 'stickers', 'chat-tools']
   const expectedQq = ['qq-api', 'qq-tools', 'qzone-social', 'diary', 'contacts', 'profile']
+  const expectedQqDual = ['group-admin']
+  assert.ok(BUILTINS.some((d) => d.id === 'group-admin'), 'group-admin 应在 BUILTINS 中')
   for (const def of BUILTINS) {
     if (expectedUniversal.includes(def.id)) {
       assert.deepEqual(def.platforms, ['*'], `${def.id} 应声明 platforms: ['*']`)
     } else if (expectedQq.includes(def.id)) {
       assert.deepEqual(def.platforms, ['qq'], `${def.id} 应声明 platforms: ['qq']`)
+    } else if (expectedQqDual.includes(def.id)) {
+      assert.deepEqual(def.platforms, ['qq', 'qqbot'], `${def.id} 应声明 platforms: ['qq', 'qqbot']`)
     }
   }
   assert.deepEqual(groupAdminDef.platforms, ['qq', 'qqbot'])
@@ -145,7 +149,7 @@ test('内置模块平台声明完备，只开假平台时 QQ 模块跳过（「�
   })
   await mods.boot()
   const list = mods.status()
-  for (const id of expectedQq) {
+  for (const id of [...expectedQq, ...expectedQqDual]) {
     const item = list.find((m) => m.id === id)
     assert.equal(item.running, null, `只开 fake 时 ${id} 不应启动`)
     assert.equal(item.skipReason, '未启用对应平台', `${id} 应标明未启用对应平台`)

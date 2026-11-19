@@ -229,10 +229,10 @@ test('替换内置要确认；卸载默认保留设置，purge 才清', async ()
 })
 
 test('迁移：只装在用的，只装一次，卸载后不再装；失败下次重试', async () => {
-  const packs = [pack('douyin', '2.0.0'), pack('heybox', '1.0.0'), pack('group-admin', '1.0.0'), pack('pet', '1.0.0')]
-  const s = setup(packs, { cfg: { setupDone: true, douyin: { enabled: true }, heybox: { enabled: false }, modules: { 'group-admin': { enabled: false } } } })
+  const packs = [pack('douyin', '2.0.0'), pack('heybox', '1.0.0'), pack('pet', '1.0.0')]
+  const s = setup(packs, { cfg: { setupDone: true, douyin: { enabled: true }, heybox: { enabled: false } } })
   assert.deepEqual((await s.c.migrate()).map((x) => x.id), ['douyin'])
-  assert.deepEqual(s.cfg().communityMigrated, { pet: 'skipped', douyin: 'installed', heybox: 'skipped', 'group-admin': 'skipped' })
+  assert.deepEqual(s.cfg().communityMigrated, { pet: 'skipped', douyin: 'installed', heybox: 'skipped' })
   await s.c.remove('douyin')
   assert.deepEqual(await s.c.migrate(), [])
   assert.equal(existsSync(join(userDir(), 'douyin')), false)

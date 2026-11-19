@@ -62,7 +62,6 @@ export const MOVED = {
   pet: () => existsSync(dataDir('modules-data', 'pet', 'app')), // 装过桌宠客户端才算在用
   douyin: (cfg) => cfg.douyin?.enabled === true,
   heybox: (cfg) => cfg.heybox?.enabled === true,
-  'group-admin': (cfg) => cfg.setupDone === true,
 }
 
 /** 只比 x.y.z：1.2.0-beta.1 算满足 minPluginVersion 1.2.0，模块不用跟着测试版改版本要求。 */

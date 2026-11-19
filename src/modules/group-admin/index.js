@@ -1,5 +1,7 @@
 // 内置模块：群管。主人开口时禁言、解禁、踢人、改头衔、发公告；支持 QQ 直连与 QQ 官方机器人双后端。
 
+import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs'
+
 const _lib = globalThis.aurabot?.lib
 const { defineTool, str, int } = _lib ? _lib('tools/tools.js') : await import('../../tools/tools.js')
 const { allowMatches, isOwner } = _lib ? _lib('chat/access.js') : await import('../../chat/access.js')
@@ -14,6 +16,9 @@ const UNSUPPORTED_QQBOT_ACTIONS = Object.freeze({
 
 const MENTION_TTL_MS = 3 * 60_000
 const MAX_OBSERVED_PER_GROUP = 200
+const MAX_OBSERVED_GROUPS = 200
+const OBSERVED_TTL_MS = 30 * 24 * 60 * 60_000
+const OBSERVED_TOUCH_SAVE_MS = 5 * 60_000
 
 const unwrapMentionToken = (s) => {
   const m = /^<@!?([0-9A-Za-z_-]+)>$/.exec(String(s || '').trim())
@@ -70,24 +75,113 @@ export default {
     const lastOwnerMentions = new Map() // normChatId -> { at, mentions: Array<{ openid, nick }> }
 
     const normChatKey = (cid) => normalizeChatId(String(cid || '')) || String(cid || '')
-    const recordObservedMember = (chatId, openid, nick = '') => {
+    const observedFile = () => (typeof api.dataDir === 'function' ? api.dataDir('observed-members.json') : '')
+
+    const pruneObserved = (now = Date.now()) => {
+      for (const [chatKey, map] of observedMembers.entries()) {
+        for (const [uid, rec] of map.entries()) {
+          if (!rec || !rec.openid || !Number.isFinite(rec.at) || now - rec.at > OBSERVED_TTL_MS) {
+            map.delete(uid)
+          }
+        }
+        while (map.size > MAX_OBSERVED_PER_GROUP) {
+          const oldest = map.keys().next().value
+          if (oldest === undefined) break
+          map.delete(oldest)
+        }
+        if (map.size === 0) observedMembers.delete(chatKey)
+      }
+      while (observedMembers.size > MAX_OBSERVED_GROUPS) {
+        const oldestChat = observedMembers.keys().next().value
+        if (oldestChat === undefined) break
+        observedMembers.delete(oldestChat)
+      }
+    }
+
+    const saveObservedMembers = () => {
+      const f = observedFile()
+      if (!f) return
+      try {
+        pruneObserved()
+        const groups = {}
+        for (const [chatKey, map] of observedMembers.entries()) {
+          groups[chatKey] = [...map.values()].map((m) => ({
+            openid: m.openid,
+            nick: m.nick || '',
+            at: m.at,
+          }))
+        }
+        const payload = JSON.stringify({ version: 1, groups })
+        const tmp = `${f}.tmp`
+        try {
+          writeFileSync(tmp, payload, 'utf8')
+          renameSync(tmp, f)
+        } catch {
+          writeFileSync(f, payload, 'utf8')
+        }
+      } catch (error) {
+        api.log?.warn?.('保存 QQ 官方群成员观察缓存失败：', error?.message || error)
+      }
+    }
+
+    const loadObservedMembers = () => {
+      const f = observedFile()
+      if (!f || !existsSync(f)) return
+      try {
+        const parsed = JSON.parse(readFileSync(f, 'utf8'))
+        const rawGroups = parsed?.groups
+        if (!rawGroups || typeof rawGroups !== 'object') return
+        const now = Date.now()
+        for (const [rawChatKey, items] of Object.entries(rawGroups)) {
+          const key = normChatKey(rawChatKey)
+          if (!key || !Array.isArray(items)) continue
+          const map = new Map()
+          for (const item of items) {
+            const uid = String(item?.openid || '').trim()
+            const nick = String(item?.nick || '').trim()
+            const at = Number(item?.at)
+            if (!uid || !Number.isFinite(at) || now - at > OBSERVED_TTL_MS) continue
+            if (map.has(uid)) map.delete(uid)
+            map.set(uid, { openid: uid, nick, at })
+          }
+          if (map.size) observedMembers.set(key, map)
+        }
+        pruneObserved(now)
+      } catch (error) {
+        api.log?.warn?.('读取 QQ 官方群成员观察缓存失败：', error?.message || error)
+      }
+    }
+    loadObservedMembers()
+
+    const recordObservedMember = (chatId, openid, nick = '', { save = true } = {}) => {
       const key = normChatKey(chatId)
       const uid = String(openid || '').trim()
-      if (!key || !uid || uid === 'all') return
+      if (!key || !uid || uid === 'all') return false
+      const now = Date.now()
       let map = observedMembers.get(key)
       if (!map) {
         map = new Map()
-        observedMembers.set(key, map)
+      } else {
+        observedMembers.delete(key)
+      }
+      observedMembers.set(key, map)
+      while (observedMembers.size > MAX_OBSERVED_GROUPS) {
+        const oldestChat = observedMembers.keys().next().value
+        if (oldestChat === undefined) break
+        observedMembers.delete(oldestChat)
       }
       const prev = map.get(uid)
       const cleanNick = String(nick || '').trim() || prev?.nick || ''
       if (prev) map.delete(uid)
-      map.set(uid, { openid: uid, nick: cleanNick, at: Date.now() })
+      map.set(uid, { openid: uid, nick: cleanNick, at: now })
       while (map.size > MAX_OBSERVED_PER_GROUP) {
         const oldest = map.keys().next().value
         if (oldest === undefined) break
         map.delete(oldest)
       }
+      const dirty = !prev || cleanNick !== (prev.nick || '') || now - (prev.at || 0) >= OBSERVED_TOUCH_SAVE_MS
+      if (save && dirty) saveObservedMembers()
+      return dirty
     }
 
     const extractMentionsFromMessage = (msg) => {
@@ -169,6 +263,7 @@ export default {
 
     async function fetchQqbotMembers(ga, groupOpenid, chatId) {
       const merged = new Map()
+      let observedDirty = false
       const upsert = (item, persist = false) => {
         const openid = String(item?.openid || item?.member_openid || '').trim()
         if (!openid) return
@@ -176,7 +271,9 @@ export default {
         const nick = String(item?.nick || item?.username || '').trim() || prev.nick || ''
         const role = String(item?.role || item?.member_role || '').trim() || prev.role || ''
         merged.set(openid, { openid, nick, role })
-        if (persist && nick) recordObservedMember(chatId, openid, nick)
+        if (persist && nick && recordObservedMember(chatId, openid, nick, { save: false })) {
+          observedDirty = true
+        }
       }
 
       let apiError = ''
@@ -201,6 +298,7 @@ export default {
       } else {
         apiError = '当前网关不支持查询群成员列表'
       }
+      if (observedDirty) saveObservedMembers()
 
       const obs = observedMembers.get(normChatKey(chatId))
       if (obs) {
@@ -280,11 +378,22 @@ export default {
       return { error: `群成员列表里没找到「${cleaned}」，请确认昵称或在群里 @ 对方 / 用 list_members 查看 member_openid` }
     }
 
+    const platformEntries = (prefix) => Object.entries(api.config?.()?.platforms || {})
+      .filter(([id, val]) => val && val.enabled === true && (id === prefix || id.startsWith(`${prefix}#`)))
+
+    const hasQqDirectEnabled = () => platformEntries('qq').length > 0 || Boolean(onebot?.connected?.())
+    const hasQqbotEnabled = () => platformEntries('qqbot').length > 0
+
     const isQqbotOnlyChat = (chat) => {
-      if (chat?.kind !== 'group') return false
-      const info = roleInfoSync(chat)
-      if (info?.backend === 'gateway-admin' && info?.platform !== 'qq') return true
-      return String(chat?.platform || parseChatId(normChatKey(chat?.chatId))?.platform || '') === 'qqbot'
+      const info = chat?.kind === 'group' ? roleInfoSync(chat) : null
+      const chatPlat = String(chat?.platform || parseChatId(normChatKey(chat?.chatId))?.platform || '')
+      if (chat?.kind === 'group') {
+        if (info?.backend === 'gateway-admin' && info?.platform !== 'qq') return true
+        return chatPlat === 'qqbot'
+      }
+      if (chatPlat === 'qqbot') return true
+      if (chatPlat === 'qq') return false
+      return !hasQqDirectEnabled() && hasQqbotEnabled()
     }
 
     // 她在这个群的身份：没管理权限或无官方接口权限时直接如实说明
@@ -332,7 +441,7 @@ export default {
               description: 'ban 单人禁言，unban 解禁，whole_ban 全体禁言（仅 QQ 直连），whole_unban 解除全体禁言（仅 QQ 直连），kick 踢出，title 改专属头衔（仅 QQ 直连），notice 发公告（仅 QQ 直连），list_members 列出群成员及 member_openid',
             },
         group_id: qqbotOnly
-          ? str('规范群地址（如 qqbot:group:xxx）；在群里用时可省略，默认当前群')
+          ? str('规范群地址（如 qqbot:group:xxx）或已绑定群号；在群里用时可省略，默认当前群')
           : str('群号或规范群地址（如 qqbot:group:xxx）；在群里用时可省略，默认当前群'),
         user_id: qqbotOnly
           ? str('操作对象：填对方群昵称 / @昵称 / member_openid，若主人刚 @ 了对方也可省略自动匹配（不可填纯数字 QQ 号）')

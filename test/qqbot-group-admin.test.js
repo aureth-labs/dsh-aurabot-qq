@@ -5,7 +5,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createGateway } from '../src/gateway/index.js'
@@ -1135,8 +1135,9 @@ test('QQBot group_admin 工具 schema 收窄、@ 过期提示、member_openid �
   await gw.sync()
   t.after(() => gw.stopAll())
 
+  let onebotConnected = true
   const fakeOnebot = {
-    connected: () => true,
+    connected: () => onebotConnected,
     on: () => {},
     getGroupMemberInfo: async () => ({ role: 'admin', nickname: 'Bot' }),
   }
@@ -1165,15 +1166,27 @@ test('QQBot group_admin 工具 schema 收窄、@ 过期提示、member_openid �
   const pickAdmin = (ctx) => [toolFactory(ctx)].flat().filter(Boolean).find((x) => x.name === 'group_admin')
   const qqbotGroupTool = pickAdmin({ chat: { chatId: 'qqbot:group:GRP_SCHEMA', kind: 'group', groupId: 'GRP_SCHEMA', platform: 'qqbot' }, level: 'social', sessionId: 's_qb' })
   const qqGroupTool = pickAdmin({ chat: { chatId: 'qq:group:555', kind: 'group', groupId: '555', platform: 'qq' }, level: 'social', sessionId: 's_qq' })
-  const privTool = pickAdmin({ chat: { chatId: 'qqbot:private:OWNER_OPENID', kind: 'private', userId: 'OWNER_OPENID', platform: 'qqbot' }, level: 'full', sessionId: 's_priv' })
+  const qqbotPrivTool = pickAdmin({ chat: { chatId: 'qqbot:private:OWNER_OPENID', kind: 'private', userId: 'OWNER_OPENID', platform: 'qqbot' }, level: 'full', sessionId: 's_priv_qb' })
+  const qqPrivTool = pickAdmin({ chat: { chatId: 'qq:private:10000001', kind: 'private', userId: '10000001', platform: 'qq' }, level: 'full', sessionId: 's_priv_qq' })
 
-  // 1) QQBot 群只暴露 ban / unban / kick / list_members 且省略 text；QQ 直连群与私聊保留完整 8 动作与 text
+  // 1) QQBot 群与 QQBot 私聊只暴露 ban / unban / kick / list_members 且省略 text；QQ 直连群与私聊保留完整 8 动作与 text
   assert.deepEqual(qqbotGroupTool.parameters.properties.action.enum, ['ban', 'unban', 'kick', 'list_members'])
   assert.equal('text' in qqbotGroupTool.parameters.properties, false)
+  assert.deepEqual(qqbotPrivTool.parameters.properties.action.enum, ['ban', 'unban', 'kick', 'list_members'])
+  assert.equal('text' in qqbotPrivTool.parameters.properties, false)
   assert.deepEqual(qqGroupTool.parameters.properties.action.enum, ['ban', 'unban', 'whole_ban', 'whole_unban', 'kick', 'title', 'notice', 'list_members'])
   assert.ok('text' in qqGroupTool.parameters.properties)
-  assert.deepEqual(privTool.parameters.properties.action.enum, ['ban', 'unban', 'whole_ban', 'whole_unban', 'kick', 'title', 'notice', 'list_members'])
-  assert.ok('text' in privTool.parameters.properties)
+  assert.deepEqual(qqPrivTool.parameters.properties.action.enum, ['ban', 'unban', 'whole_ban', 'whole_unban', 'kick', 'title', 'notice', 'list_members'])
+  assert.ok('text' in qqPrivTool.parameters.properties)
+
+  // 纯 QQBot 环境下的非平台私聊（如 DSH 控制台会话）同样收窄
+  cfg.platforms.qq.enabled = false
+  onebotConnected = false
+  const consoleQqbotOnlyTool = pickAdmin({ chat: { chatId: 'dsh:owner', kind: 'private' }, level: 'full', sessionId: 's_dsh' })
+  assert.deepEqual(consoleQqbotOnlyTool.parameters.properties.action.enum, ['ban', 'unban', 'kick', 'list_members'])
+  assert.equal('text' in consoleQqbotOnlyTool.parameters.properties, false)
+  cfg.platforms.qq.enabled = true
+  onebotConnected = true
 
   // 2) api.context 提示说「群禁言」时先问清是全体禁言还是单人禁言，明确全体禁言做不了
   const ctxBeforeRole = contexts.map((fn) => fn({ chat: { chatId: 'qqbot:group:GRP_SCHEMA', kind: 'group', groupId: 'GRP_SCHEMA', platform: 'qqbot' } })).join('\n')
@@ -1223,4 +1236,145 @@ test('QQBot group_admin 工具 schema 收窄、@ 过期提示、member_openid �
   assert.equal(err11253.ok, false)
   assert.match(err11253.message, /11253/)
   assert.doesNotMatch(err11253.message, /可能无效或不在本群/)
+})
+
+test('QQBot group_admin 观察成员缓存持久化（重启保留、30 天 TTL 过期清理、11253 兜底仍生效）', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aurabot-qqbot-obs-persist-'))
+  const modDataDir = join(dir, 'mod-data')
+  mkdirSync(modDataDir, { recursive: true })
+  const dataDirFn = (...p) => join(modDataDir, ...p)
+
+  const mountInstance = async () => {
+    const identity = createIdentity({ dataDir: dir, log: silent })
+    t.after(() => identity.close?.())
+    if (!identity.owner()) identity.claimOwner('qqbot', 'OWNER_OPENID')
+
+    const apiCalls = []
+    const cfg = normalize({
+      enabled: false,
+      dryRun: false,
+      allow: { groups: ['qqbot:group:GRP_PERSIST'] },
+      platforms: { qq: { enabled: false }, qqbot: { enabled: true, appId: 'app1', clientSecret: 'sec1', transport: 'webhook', botSecret: 'g'.repeat(32) } },
+    })
+    cfg.platforms = { qq: { enabled: false }, qqbot: { enabled: true, appId: 'app1', clientSecret: 'sec1', transport: 'webhook', botSecret: 'g'.repeat(32) } }
+
+    const gw = createGateway({ config: cfg, dataDir: (...p) => join(dir, 'gw', ...p), http: { route: () => () => {} }, identity, log: silent })
+    gw.register(() => createQqbotAdapter({
+      client: makeQqbotClient(async (req) => {
+        apiCalls.push({ method: req.method, path: req.path, body: req.body })
+        if (req.path.endsWith('/bot_state')) return { status: 200, data: { member_role: 'admin' } }
+        if (req.path.endsWith('/restrict_chat_setting')) return { status: 200, data: {} }
+        if (req.path.endsWith('/members')) return { status: 403, data: { code: 11253, message: 'members forbidden' } }
+        return { status: 404, data: null }
+      }),
+    }))
+    await gw.sync()
+    t.after(() => gw.stopAll())
+
+    const groupRoles = createGroupRoles({ getGateway: () => gw, getConfig: () => cfg, dataDir: (...p) => join(dir, 'roles', ...p), log: silent })
+    const messageListeners = []
+    let adminTool = null
+    groupAdminDef.setup({
+      core: {
+        hub: { turnSendersAllOwner: () => true, groupName: async (g) => String(g) },
+        groupRoles,
+        gateway: gw,
+        identity,
+        http: { body: async (r) => r?.body || {}, query: (r) => r?.query || {} },
+      },
+      config: () => cfg,
+      dataDir: dataDirFn,
+      on: (ev, fn) => { if (ev === 'message') messageListeners.push(fn) },
+      tool: (fn) => {
+        const list = [fn({ chat: { chatId: 'qqbot:group:GRP_PERSIST', kind: 'group', groupId: 'GRP_PERSIST', platform: 'qqbot' }, level: 'social', sessionId: 's_p' })].flat().filter(Boolean)
+        const hit = list.find((x) => x.name === 'group_admin')
+        if (hit) adminTool = hit
+      },
+      context: () => {},
+      route: () => {},
+    })
+    return { adminTool, apiCalls, messageListeners }
+  }
+
+  // 实例 1：观察群友发言与主人 @ 提及并落盘
+  const inst1 = await mountInstance()
+  for (const fn of inst1.messageListeners) {
+    await fn({
+      kind: 'group',
+      platform: 'qqbot',
+      chatId: 'qqbot:group:GRP_PERSIST',
+      userId: 'MEM_PERSIST_1',
+      nickname: '老朋友',
+      sender: { isOwner: false },
+      parts: [{ type: 'text', text: '大家好' }],
+    })
+    await fn({
+      kind: 'group',
+      platform: 'qqbot',
+      chatId: 'qqbot:group:GRP_PERSIST',
+      userId: 'OWNER_OPENID',
+      nickname: '主人',
+      sender: { isOwner: true },
+      parts: [{ type: 'mention', account: 'MEM_PERSIST_2', name: '被提及友' }],
+    })
+  }
+  const obsPath = dataDirFn('observed-members.json')
+  assert.equal(existsSync(obsPath), true, '应写入 observed-members.json')
+
+  // 手动塞入一条超过 30 天的陈旧记录，重启加载时应被 TTL 淘汰
+  const disk = JSON.parse(readFileSync(obsPath, 'utf8'))
+  disk.groups['qqbot:group:GRP_PERSIST'].push({ openid: 'MEM_EXPIRED_OLD', nick: '远古路人', at: Date.now() - 31 * 24 * 60 * 60_000 })
+  writeFileSync(obsPath, JSON.stringify(disk), 'utf8')
+
+  // 实例 2：模拟重启（无新消息事件、且 /members 返回 11253），仍可用持久化缓存按昵称 ban 与 list_members
+  const inst2 = await mountInstance()
+  const banPersisted = await inst2.adminTool.execute({ action: 'ban', user_id: '老朋友', minutes: 4 })
+  assert.equal(banPersisted.ok, true, banPersisted.message)
+  assert.equal(inst2.apiCalls.filter((c) => c.path.endsWith('/restrict_chat_setting')).at(-1)?.body?.members?.[0]?.member_openid, 'MEM_PERSIST_1')
+
+  const lm = await inst2.adminTool.execute({ action: 'list_members' })
+  assert.equal(lm.ok, true)
+  const openids = lm.members.map((m) => m.openid)
+  assert.ok(openids.includes('MEM_PERSIST_1'))
+  assert.ok(openids.includes('MEM_PERSIST_2'))
+  assert.equal(openids.includes('MEM_EXPIRED_OLD'), false, '超过 30 天未出现的记录应被淘汰')
+})
+
+test('group-admin 已进 BUILTINS：纯 QQBot 不建 modules/group-admin 目录也可内置加载并挂载 /groups/roles', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aurabot-builtin-ga-'))
+  const wsDir = join(dir, 'ws')
+  mkdirSync(wsDir, { recursive: true })
+  const prevDir = process.env.AURABOT_DATA_DIR
+  const prevWs = process.env.AURABOT_WORKSPACE
+  const prevGlobal = globalThis.aurabot
+  process.env.AURABOT_DATA_DIR = dir
+  process.env.AURABOT_WORKSPACE = wsDir
+  writeFileSync(join(dir, 'config.json'), JSON.stringify({
+    enabled: false,
+    dryRun: false,
+    setupDone: true,
+    allow: { groups: ['99887766'], private: ['qqbot:private:OWNER_BUILTIN'] },
+    platforms: { qq: { enabled: false }, qqbot: { enabled: true, appId: 'app1', clientSecret: 'sec1', transport: 'webhook', botSecret: 'h'.repeat(32) } },
+  }))
+  const fake = createFakeDsh({ brain: async () => 'ok' })
+  const host = await import('../src/host.js')
+  const app = host.apply(fake.ctx)
+  t.after(async () => {
+    fake.dispose()
+    await app.gateway?.stopAll?.()
+    if (prevDir === undefined) delete process.env.AURABOT_DATA_DIR
+    else process.env.AURABOT_DATA_DIR = prevDir
+    if (prevWs === undefined) delete process.env.AURABOT_WORKSPACE
+    else process.env.AURABOT_WORKSPACE = prevWs
+    if (prevGlobal === undefined) delete globalThis.aurabot
+    else globalThis.aurabot = prevGlobal
+  })
+  await app.ready
+
+  const row = app.modules.status().find((m) => m.id === 'group-admin')
+  assert.equal(row?.running, 'builtin', '不安装社区目录时 group-admin 应作为 builtin 自动运行')
+  const roles = (await fake.call('/groups/roles')).json()
+  assert.equal(roles.ok, true)
+  assert.equal(roles.list.length, 1)
+  assert.equal(roles.list[0].backendLabel, '未绑定 QQ 官方群')
 })

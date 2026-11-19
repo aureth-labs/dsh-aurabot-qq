@@ -6,7 +6,6 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { BUILTINS } from '../src/modules/index.js'
-import groupAdminMod from '../src/modules/group-admin/index.js'
 import { createModules } from '../src/core/modules.js'
 import { createGateway } from '../src/gateway/index.js'
 import { normalize } from '../src/core/config.js'
@@ -20,7 +19,8 @@ const TOOL_NAME_RE = /^[a-z][a-z0-9_]*$/
 const PLATFORM_PREFIX_RE = /^(qq|feishu|qqbot)_/
 const noopLog = { debug() {}, info() {}, warn() {}, error() {}, child() { return this } }
 
-const ALL_MODS = [...BUILTINS, groupAdminMod]
+assert.ok(BUILTINS.some((m) => m.id === 'group-admin'), 'group-admin 应已加入 BUILTINS')
+const ALL_MODS = BUILTINS
 
 /**
  * 跨平台模块里按平台显式门控的平台专属动作白名单：
