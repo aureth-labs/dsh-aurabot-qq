@@ -37,19 +37,32 @@ window.__ModuleLoader__.load({
     // 把 publicConfig 的 *Set 标志对应的 secret 字段清空（保留「已设置」状态）。
     // 保存回执的基线只能带脱敏后的 secret 值，否则会把明文长期留在草稿里，
     // 下次改同段其它字段时又整段回传，覆盖别的客户端刚轮换的新密钥（#520 复审）。
-    const maskSecretFields = (value) => {
-      const walk = (node) => {
+    const maskSecretFields = (value, source = null) => {
+      const walk = (node, src) => {
         if (!node || typeof node !== 'object') return
         for (const [k, v] of Object.entries(node)) {
-          if (v && typeof v === 'object') walk(v)
+          if (v && typeof v === 'object') walk(v, src && typeof src === 'object' ? src[k] : null)
           if (k.endsWith('Set') && typeof v === 'boolean') {
             const base = k.slice(0, -3)
-            if (base && Object.hasOwn(node, base)) node[base] = ''
+            // 只清「本来就是这次提交的旧值」；用户在保存期间新敲的 secret 不动。
+            if (base && Object.hasOwn(node, base) && (!source || !src || node[base] === src[base])) node[base] = ''
           }
         }
       }
-      walk(value)
+      walk(value, source)
       return value
+    }
+    // 把服务端 publicConfig 的 *Set / *Hint 标志同步到本地草稿（保留「已设置」提示）。
+    const copySecretFlags = (target, source) => {
+      const walk = (node, src) => {
+        if (!node || typeof node !== 'object' || !src || typeof src !== 'object') return
+        for (const [k, v] of Object.entries(src)) {
+          if (v && typeof v === 'object') walk(node[k], v)
+          else if ((k.endsWith('Set') || k.endsWith('Hint')) && Object.hasOwn(node, k)) node[k] = v
+        }
+      }
+      walk(target, source)
+      return target
     }
     // ---------------- 面板轻量读取层（首屏提速，2026-11-16） ----------------
     // 同 URL 在途合并：相同地址只放行一个在途请求，周期轮询重叠时复用同一个 Promise，防止连环打。
@@ -10024,9 +10037,16 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         let savedDraft = maskSecretFields(clone(override || draft))
         for (const dots of committed) savedDraft = setPath(savedDraft, dots, getPath(snap, dots))
         maskSecretFields(savedDraft)
+        copySecretFlags(savedDraft, snap)
         draftBaseRef.current = savedDraft
-        // 用新对象触发 useMemo（它的依赖只有 draft）；保存期间用户又改的部分原样保留。
-        setDraft((current) => (current === draft ? clone(savedDraft) : { ...current }))
+        // 用新对象触发 useMemo（它的依赖只有 draft）；保存期间用户又改的部分原样保留，
+        // 已经提交的旧 secret 也要从 current 清掉，避免下次整段回传覆盖别处轮换的新 key。
+        setDraft((current) => {
+          if (current === draft) return clone(savedDraft)
+          const next = clone(current)
+          maskSecretFields(next, draft)
+          return next
+        })
         dirtyRef.current = false
         setSt((prev) => (prev ? { ...prev, config: clone(snap) } : prev))
         toast(r.message || '保存好了', 'ok')

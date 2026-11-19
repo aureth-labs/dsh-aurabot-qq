@@ -41,9 +41,26 @@ test('vector.mode 真的落盘：mergeFromPanel 后 commitConfig 返回 local，
     const raw = JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8'))
     assert.equal(raw.memory.vector.mode, 'local', 'config.json 必须带 mode')
     assert.equal(loadConfig().memory.vector.mode, 'local', '重载后仍是 local')
+    // 只改无关字段再保存，不能把 local 推回 remote（deepMerge structuredClone 会丢非枚举 mode）
+    const later = mergeFromPanel(saved, { ownerName: '测试改名' })
+    const saved2 = commitConfig(later, saved)
+    assert.equal(saved2.memory.vector.mode, 'local', '无关字段局部保存后 mode 仍 local')
+    assert.equal(loadConfig().memory.vector.mode, 'local', '重载仍 local')
   } finally {
     if (oldDir === undefined) delete process.env.AURABOT_DATA_DIR
     else process.env.AURABOT_DATA_DIR = oldDir
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test('显式 local 模式不会回退远端（隐私承诺）', () => {
+  const src = readFileSync(new URL('../src/features/memory-vector.js', import.meta.url), 'utf8')
+  assert.match(src, /if \(hasBase && c\.mode !== 'local'\) return createVectorIndex/)
+  assert.match(src, /hasBase && c\.mode !== 'local' \? createVectorIndex/)
+})
+
+test('保存回执同步 *Set 标志并在在途草稿里清掉已提交的旧 secret', () => {
+  const src = CLIENT()
+  assert.match(src, /copySecretFlags\(savedDraft, snap\)/)
+  assert.match(src, /maskSecretFields\(next, draft\)/)
 })
