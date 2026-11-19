@@ -305,7 +305,7 @@ test('B 站模块：截图库路由预览 / 删除、工具固定发当前会话
   assert.equal(image.body.toString(), 'preview')
   assert.equal((await routes.get('/bili/shot/image')({ query: { file: '../outside' } }, {})).status, 404)
   const tools = builders[0]({ chat: { kind: 'group', chatId: 'group:123' } })
-  const tool = tools.find((t) => t.name === 'qq_send_shot')
+  const tool = tools.find((t) => t.name === 'bili_send_shot')
   assert.deepEqual(Object.keys(tool.parameters.properties), ['query'])
   assert.equal((await tool.execute({})).sent, true)
   assert.equal(sent[0].chatId, 'group:123')

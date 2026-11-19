@@ -27,9 +27,6 @@ const ALL_MODS = [...BUILTINS, groupAdminMod]
  * 规则：T1/T2 只许缩短，不许加长；T3 清空删除。
  */
 const MIGRATION_ALLOWLIST = new Set([
-  // T2-5: bili
-  'qq_send_shot',
-  'qq_list_shots',
   // T2-6: group-admin
   'qq_group_admin',
 ])
@@ -422,5 +419,8 @@ test('usage.moduleOfTool 覆盖已迁移工具的权威名与旧别名', () => {
   assert.equal(moduleOfTool('close_reminder'), '主动搭话')
   assert.equal(moduleOfTool('qq_set_reminder'), '主动搭话')
   assert.equal(moduleOfTool('qq_close_reminder'), '主动搭话')
+  assert.equal(moduleOfTool('bili_send_shot'), '刷 B 站')
+  assert.equal(moduleOfTool('bili_list_shots'), '刷 B 站')
   assert.equal(moduleOfTool('qq_send_shot'), '刷 B 站')
+  assert.equal(moduleOfTool('qq_list_shots'), '刷 B 站')
 })

@@ -215,8 +215,11 @@ test('工具归属：聊天里调用某模块的工具时，它的消耗算到�
   assert.equal(usage.moduleOfTool('bili_watch'), '刷 B 站')
   assert.equal(usage.moduleOfTool('bili_comment'), '刷 B 站')
   assert.equal(usage.moduleOfTool('bili_danmaku'), '刷 B 站')
-  // bili 模块注册的 B 站截图工具，名字是 qq_ 开头，得靠例外表
+  // bili 截图：新权威名与旧别名都归属「刷 B 站」
+  assert.equal(usage.moduleOfTool('bili_send_shot'), '刷 B 站')
+  assert.equal(usage.moduleOfTool('bili_list_shots'), '刷 B 站')
   assert.equal(usage.moduleOfTool('qq_send_shot'), '刷 B 站')
+  assert.equal(usage.moduleOfTool('qq_list_shots'), '刷 B 站')
   assert.equal(usage.moduleOfTool('draw_image'), '生图')
   assert.equal(usage.moduleOfTool('qq_draw_image'), '生图')
   // 表情包：新权威名与旧别名都归属「表情包」

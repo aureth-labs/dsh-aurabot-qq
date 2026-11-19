@@ -13,13 +13,19 @@ import { createQrLogin } from '../../bili/qr-login.js'
 import { dataDir } from '../../core/store.js'
 import { normalizeChatId } from '../../gateway/address.js'
 
+export const toolAliases = Object.freeze({
+  qq_send_shot: 'bili_send_shot',
+  qq_list_shots: 'bili_list_shots',
+})
+
 export default {
   id: 'bili',
   name: 'B站',
   version: '1.1.0',
   api: 3,
   platforms: ['*'],
-  description: '看别人发的 B 站视频；定时自己刷、评论、回评论；可选发弹幕；抽帧看画面、发截图；按权限改自己的头像 / 签名（bili_watch / bili_comment / bili_danmaku / qq_send_shot / bili_set_avatar / bili_set_sign）',
+  toolAliases,
+  description: '看别人发的 B 站视频；定时自己刷、评论、回评论；可选发弹幕；抽帧看画面、发截图；按权限改自己的头像 / 签名（bili_watch / bili_comment / bili_danmaku / bili_send_shot / bili_set_avatar / bili_set_sign）',
   tab: 'bili',
   files: ['bili/duty.js', 'bili/group-share.js', 'bili/api.js', 'bili/vision.js', 'bili/shots.js', 'bili/danmaku.js', 'bili/login-pause.js', 'bili/qr-login.js'],
   setup(api) {
@@ -83,7 +89,7 @@ export default {
         }),
         // 截图：刷 B 站看画面时截下来的那些帧，存在本机，随时能挑一张发出来
         defineTool({
-          name: 'qq_send_shot',
+          name: 'bili_send_shot',
           description: '把你在 B 站视频里截到的画面发到当前聊天。主人说「发张截图」「给我看看你刷到的」「刚才那个视频长啥样」这类话时用。query 填视频标题里的词或想看的内容，不填就挑最近的一张。',
           properties: { query: str('可选：视频标题关键词，或想看的内容') },
           required: [],
@@ -93,7 +99,7 @@ export default {
           },
         }),
         defineTool({
-          name: 'qq_list_shots',
+          name: 'bili_list_shots',
           description: '看看你手上还有哪些 B 站截图（来自哪个视频、第几秒）。挑截图之前可以先看一眼。',
           properties: { query: str('可选，按视频标题筛选') },
           required: [],
@@ -103,6 +109,10 @@ export default {
           },
         }),
       ]
+    })
+    api.context?.(({ chat }) => {
+      if (!api.config().bili.enabled || !chat || chat.kind === 'system') return ''
+      return '- 需要看 B 站视频用 bili_watch，查看或发送 B 站截图用 bili_list_shots / bili_send_shot；不要在正文里写 /bili 或 /shot 之类的斜杠命令。'
     })
 
     // 改 B 站头像 / 签名：权限在面板「权限」页（关 / 仅主人私聊 / 所有人），默认仅主人私聊

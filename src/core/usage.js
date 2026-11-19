@@ -138,7 +138,9 @@ export function moduleOfTool(name) {
 
 // 工具名 → 模块 id：只收「前缀猜不出来」和「前缀会猜错」的，其余走前缀
 const TOOL_MODULES = {
-  // bili 模块注册的，但名字是 qq_ 开头（B 站截图）
+  // bili 模块注册的 B 站截图工具（含历史 qq_* 别名）
+  bili_send_shot: 'bili',
+  bili_list_shots: 'bili',
   qq_send_shot: 'bili',
   qq_list_shots: 'bili',
   draw_image: 'imagegen',
