@@ -27,8 +27,6 @@ const ALL_MODS = [...BUILTINS, groupAdminMod]
  * 规则：T1/T2 只许缩短，不许加长；T3 清空删除。
  */
 const MIGRATION_ALLOWLIST = new Set([
-  // T2-1: video
-  'qq_generate_video',
   // T2-2: song
   'qq_song_cover',
   // T2-3: imagegen
@@ -422,6 +420,7 @@ test('usage.moduleOfTool 覆盖已迁移工具的权威名与旧别名', () => {
     assert.equal(moduleOfTool(name), '表情包', `${name} 应归属 表情包`)
   }
   assert.equal(moduleOfTool('qq_draw_image'), '生图')
+  assert.equal(moduleOfTool('generate_video'), '生视频')
   assert.equal(moduleOfTool('qq_generate_video'), '生视频')
   assert.equal(moduleOfTool('qq_send_shot'), '刷 B 站')
 })

@@ -9,21 +9,32 @@ import { defineTool, str } from '../../tools/tools.js'
 /** 脚本的返回值统一成文件路径：字符串或 { file }。 */
 export const videoFile = (r) => String(typeof r === 'string' ? r : r?.file || '').trim()
 
+export const toolAliases = Object.freeze({
+  qq_generate_video: 'generate_video',
+})
+
 export default {
   id: 'video',
   name: '生视频',
   version: '1.0.0',
   api: 3,
   platforms: ['*'],
-  description: '用本地脚本生成视频并发到聊天（qq_generate_video）',
+  toolAliases,
+  description: '用本地脚本生成视频并发到聊天（generate_video）',
   setup(api) {
     const { hub, local } = api.core
     let running = false
     let stopped = false
     api.onDispose?.(() => { stopped = true })
     api.context?.(({ chat }) => {
-      if (!local.active('video') || !privateCapabilityAllowed(api.config(), chat, 'video')) return ''
-      return '当前私聊对象已经获得主人的视频生成授权。对方请求生成视频时可以使用 qq_generate_video，以当前授权为准。'
+      if (!local.active('video') || !chat || chat.kind === 'system') return ''
+      const lines = [
+        '- 需要生成视频时直接调 generate_video 工具，不要在正文里写 /video 或 /generate_video 之类的斜杠命令。',
+      ]
+      if (privateCapabilityAllowed(api.config(), chat, 'video')) {
+        lines.push('- 当前私聊对象已经获得主人的视频生成授权。对方请求生成视频时可以使用 generate_video，以当前授权为准。')
+      }
+      return lines.join('\n')
     })
 
     async function sendPart(chatId, file, part, note) {
@@ -81,11 +92,11 @@ export default {
     }
 
     api.rule(() => (local.active('video')
-      ? ['- 你能用 qq_generate_video 生成视频，主人和已授权的私聊对象可以使用。生成很慢，通常要十几分钟，开始前先告诉对方要等多久；做好会自动发出来，不用再发一次。']
+      ? ['- 你能用 generate_video 生成视频，主人和已授权的私聊对象可以使用。生成很慢，通常要十几分钟，开始前先告诉对方要等多久；做好会自动发出来，不用再发一次。']
       : []))
 
     api.tool(({ chat, sessionId }) => (local.active('video') && chat.kind !== 'system' ? defineTool({
-      name: 'qq_generate_video',
+      name: 'generate_video',
       description: '生成一段视频，做好后自动发到当前聊天。很慢，通常要十几分钟，开始前先告诉对方要等。主人和已授权的私聊对象可以使用。',
       properties: { prompt: str('视频内容描述'), seconds: str('可选：时长（秒）') },
       required: ['prompt'],
