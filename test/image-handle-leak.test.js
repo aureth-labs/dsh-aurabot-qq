@@ -53,3 +53,10 @@ test('图片句柄：超出限制的 [image omitted to fit request image limits;
   assert.doesNotMatch(out, /secret\.png|image omitted/)
   assert.match(out, /好/)
 })
+
+test('图片句柄：Normalized copy 被换行分开也一起删', () => {
+  const leak = '你好\nImage sha256:deadbeef; request preview 180x180px.\nNormalized copy (read-only; may be resized or re-encoded): "/home/alice/.dsh/attachments/secret.png" (180x180px, image/png).'
+  const out = cleanOutboundText(leak)
+  assert.doesNotMatch(out, /secret\.png|Normalized copy/)
+  assert.match(out, /你好/)
+})

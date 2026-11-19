@@ -249,7 +249,7 @@ export function imageHandleRanges(text) {
   const ranges = []
   const raw = String(text ?? '')
   // 有名：Image "名字" (sha256:...) ; 无名（dsh-llm 的真实格式）：Image sha256:...
-  for (const m of raw.matchAll(/Image\s+(?:"[^"\n]*"\s*\(sha256:[^)\n]*\)|sha256:[^\s;)]*)\s*;\s*request preview\s+\d+x\d+px\.[^\n]*?(?=\|\|\||\n|$)/g)) {
+  for (const m of raw.matchAll(/Image\s+(?:"[^"\n]*"\s*\(sha256:[^)\n]*\)|sha256:[^\s;)]*)\s*;\s*request preview\s+\d+x\d+px\.[^\n]*?(?:\n[ \t]*Normalized copy[^\n]*)?(?=\|\|\||\n|$)/g)) {
     ranges.push({ start: m.index, end: m.index + m[0].length })
   }
   // 图片超出限制时的占位：... Normalized copy ... 真实路径
