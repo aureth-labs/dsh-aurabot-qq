@@ -194,6 +194,25 @@ test('主人自己拉机器人进群：自动接受并加白名单（去重/防�
   assert.ok(manualRetry.cfg().allow.groups.includes('92929292'))
 })
 
+test('主人拉群邀请已不在待处理队列：按已处理收口，不弹失败通知', async () => {
+  const s = setupContacts({
+    callImpl: async () => {
+      throw new Error('set_group_add_request 失败：matching group request not found')
+    },
+  })
+  s.event(groupEvent({
+    sub_type: 'invite',
+    flag: 'invite:already-handled',
+    user_id: Number(OWNER),
+    group_id: 93939393,
+    invited_id: Number(BOT),
+  }))
+  await flush()
+  assert.equal(s.sent.length, 0, '已不在待处理队列的邀请不应再通知主人失败')
+  assert.match((await s.tools(ownerChat).qq_list_group_requests.execute({})).message, /没有待处理/)
+  assert.ok(s.cfg().allow.groups.includes('93939393'), '按已处理收口后仍应加入群白名单')
+})
+
 test('加群申请：仅主人、权限变化、试运行和失败重试', async () => {
   let fail = true
   const s = setupContacts({ cfg: { profilePerms: { qqFriendRequest: 'all' } }, callImpl: () => { if (fail) throw new Error('网关失败') } })

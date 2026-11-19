@@ -136,6 +136,23 @@ export default {
 
     const ownerInviteAccepted = loadOwnerAccepted()
     const ownerInviteInFlight = new Set()
+    const isMissingGroupRequest = (error) => /matching group request(?: sequence)? not found|group request sequence .* not found/i.test(String(error?.message || ''))
+
+    const markOwnerInviteAccepted = (flag, groupId) => {
+      ownerInviteInFlight.delete(flag)
+      ownerInviteAccepted.add(flag)
+      while (ownerInviteAccepted.size > PENDING_MAX) {
+        const oldest = ownerInviteAccepted.values().next().value
+        if (oldest === undefined) break
+        ownerInviteAccepted.delete(oldest)
+      }
+      saveOwnerAccepted()
+      const pending = loadGroupPending()
+      if (pending.some((x) => x.flag === flag)) {
+        saveGroupPending(pending.filter((x) => x.flag !== flag))
+      }
+      autoWhitelistGroup(groupId)
+    }
 
     const onGroupRequest = (ev) => {
       if (!ev.flag || !['add', 'invite'].includes(ev.sub_type)) return
@@ -162,20 +179,16 @@ export default {
           reqPromise = Promise.reject(error)
         }
         reqPromise.then(() => {
-          ownerInviteInFlight.delete(flag)
-          ownerInviteAccepted.add(flag)
-          while (ownerInviteAccepted.size > PENDING_MAX) {
-            const oldest = ownerInviteAccepted.values().next().value
-            if (oldest === undefined) break
-            ownerInviteAccepted.delete(oldest)
-          }
-          saveOwnerAccepted()
-          const pending = loadGroupPending()
-          if (pending.some((x) => x.flag === flag)) {
-            saveGroupPending(pending.filter((x) => x.flag !== flag))
-          }
-          autoWhitelistGroup(groupId)
+          markOwnerInviteAccepted(flag, groupId)
         }).catch((error) => {
+          // 邀请已经不在待处理队列里（常见于 QQ 已自动处理 / 机器人已经在群里）：
+          // set_group_add_request 会返回 matching group request not found。
+          // 这不是失败，按已处理收口，别再给主人弹一条“自动接受失败”。
+          if (isMissingGroupRequest(error)) {
+            api.log.info?.(`主人拉群邀请已不在待处理队列（群 ${groupId}），按已处理收口`)
+            markOwnerInviteAccepted(flag, groupId)
+            return
+          }
           ownerInviteInFlight.delete(flag)
           api.log.warn(`自动接受主人拉群邀请失败（群 ${groupId}）：${error?.message || error}`)
           const list = loadGroupPending()
