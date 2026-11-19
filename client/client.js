@@ -10045,6 +10045,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           if (current === draft) return clone(savedDraft)
           const next = clone(current)
           maskSecretFields(next, draft)
+          copySecretFlags(next, snap)
           return next
         })
         dirtyRef.current = false

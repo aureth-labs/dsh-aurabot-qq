@@ -64,3 +64,15 @@ test('保存回执同步 *Set 标志并在在途草稿里清掉已提交的旧 s
   assert.match(src, /copySecretFlags\(savedDraft, snap\)/)
   assert.match(src, /maskSecretFields\(next, draft\)/)
 })
+
+test('旧客户端只传 baseUrl（不带 mode）仍能切到在线服务', () => {
+  const base = normalize({ ownerQQ: '10001', memory: { vector: { enabled: true } } })
+  assert.equal(base.memory.vector.mode, 'local')
+  assert.equal(base.memory.vector.modeExplicit, false)
+  const merged = mergeFromPanel(base, { memory: { vector: { enabled: true, baseUrl: 'https://example.invalid/v1', model: 'test' } } })
+  assert.equal(merged.memory.vector.mode, 'remote', '老调用体没有 mode 时应按 baseUrl 推 remote')
+})
+
+test('在途编辑回执也同步 *Set 标志，避免假 dirty', () => {
+  assert.match(CLIENT(), /copySecretFlags\(next, snap\)/)
+})
