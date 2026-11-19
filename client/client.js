@@ -34,6 +34,23 @@ window.__ModuleLoader__.load({
         .then((data) => { if (!data || data.ok !== false) bustCache(); return data })
         .catch((e) => ({ ok: false, message: '连不上插件：' + e.message }))
     const clone = (o) => JSON.parse(JSON.stringify(o))
+    // 把 publicConfig 的 *Set 标志对应的 secret 字段清空（保留「已设置」状态）。
+    // 保存回执的基线只能带脱敏后的 secret 值，否则会把明文长期留在草稿里，
+    // 下次改同段其它字段时又整段回传，覆盖别的客户端刚轮换的新密钥（#520 复审）。
+    const maskSecretFields = (value) => {
+      const walk = (node) => {
+        if (!node || typeof node !== 'object') return
+        for (const [k, v] of Object.entries(node)) {
+          if (v && typeof v === 'object') walk(v)
+          if (k.endsWith('Set') && typeof v === 'boolean') {
+            const base = k.slice(0, -3)
+            if (base && Object.hasOwn(node, base)) node[base] = ''
+          }
+        }
+      }
+      walk(value)
+      return value
+    }
     // ---------------- 面板轻量读取层（首屏提速，2026-11-16） ----------------
     // 同 URL 在途合并：相同地址只放行一个在途请求，周期轮询重叠时复用同一个 Promise，防止连环打。
     const inflight = new Map()
@@ -10000,12 +10017,16 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         // unchangedPaths 只清脏标记（值本来就一致），其余本地草稿（含提交期间的新改动）原样保留。
         if (r.configRevision != null) configRevRef.current = r.configRevision
         const snap = clone(r.config || draftSnapRef.current || {})
-        // #520：保存回执里的 config 是脱敏后的 publicConfig（secret 字段为空、带 *Set 标志），
-        // 不能直接拿来当 dirty 比较的基线，否则草稿里含原文的 secret 永远和它不相等，
-        // 「有改动还没保存」提示就永远不消失。基线用本次保存的完整草稿（含 secret 原文）。
-        const savedDraft = clone(override || draft)
+        const committed = (r.committedPaths || []).map(ptrToDots)
+        // #520：dirty 基线不能直接用脱敏 snap，否则草稿里填过的 secret 永远和它不相等，
+        // 「有改动还没保存」一直显示。基线用本次完整草稿，但已提交字段以服务端归一化快照为准，
+        // 并清空 secret 原文（保留 *Set 标志），避免明文留在草稿里、后续保存覆盖新密钥。
+        let savedDraft = maskSecretFields(clone(override || draft))
+        for (const dots of committed) savedDraft = setPath(savedDraft, dots, getPath(snap, dots))
+        maskSecretFields(savedDraft)
         draftBaseRef.current = savedDraft
-        setDraft((current) => (current === draft ? clone(savedDraft) : current))
+        // 用新对象触发 useMemo（它的依赖只有 draft）；保存期间用户又改的部分原样保留。
+        setDraft((current) => (current === draft ? clone(savedDraft) : { ...current }))
         dirtyRef.current = false
         setSt((prev) => (prev ? { ...prev, config: clone(snap) } : prev))
         toast(r.message || '保存好了', 'ok')

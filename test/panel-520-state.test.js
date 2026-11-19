@@ -1,8 +1,10 @@
 // #520：面板两个状态问题——保存后 dirty 基线不能用脱敏快照；vector.mode 要能从 publicConfig 读回。
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
-import { normalize, publicConfig } from '../src/core/config.js'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { commitConfig, loadConfig, mergeFromPanel, normalize, publicConfig } from '../src/core/config.js'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 const CLIENT = () => readFileSync(new URL('../client/client.js', import.meta.url), 'utf8')
 
@@ -17,7 +19,31 @@ test('publicConfig 回传可枚举的 vector.mode（在线服务不会回退本�
 
 test('保存回执的 dirty 基线用完整草稿而不是脱敏快照', () => {
   const src = CLIENT()
-  assert.match(src, /const savedDraft = clone\(override \|\| draft\)/, '基线要用完整草稿')
+  assert.match(src, /let savedDraft = maskSecretFields\(clone\(override \|\| draft\)\)/, '基线用完整草稿并清空 secret 原文')
   assert.match(src, /draftBaseRef\.current = savedDraft/, '基线指向完整草稿')
+  assert.match(src, /for \(const dots of committed\) savedDraft = setPath/, '已提交字段以服务端归一化快照为准')
   assert.match(src, /不再立即 loadConfigDraft/, '保存后不能马上用脱敏快照覆盖基线')
+})
+
+
+test('vector.mode 真的落盘：mergeFromPanel 后 commitConfig 返回 local，config.json 带 mode，重载仍 local', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'aurabot-520-'))
+  const oldDir = process.env.AURABOT_DATA_DIR
+  try {
+    process.env.AURABOT_DATA_DIR = dir
+    const base = normalize({ ownerQQ: '10001', memory: { vector: { enabled: true, baseUrl: 'https://example.invalid/v1', model: 'm', apiKey: 'k' } } })
+    assert.equal(base.memory.vector.mode, 'remote')
+    const incoming = structuredClone(publicConfig(base))
+    incoming.memory.vector.mode = 'local'
+    const merged = mergeFromPanel(base, incoming)
+    const saved = commitConfig(merged, base)
+    assert.equal(saved.memory.vector.mode, 'local', 'commitConfig 不能把只改模式的提交当成没变化')
+    const raw = JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8'))
+    assert.equal(raw.memory.vector.mode, 'local', 'config.json 必须带 mode')
+    assert.equal(loadConfig().memory.vector.mode, 'local', '重载后仍是 local')
+  } finally {
+    if (oldDir === undefined) delete process.env.AURABOT_DATA_DIR
+    else process.env.AURABOT_DATA_DIR = oldDir
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

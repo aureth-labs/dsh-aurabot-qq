@@ -1191,6 +1191,14 @@ export function ownerAuthorizationRevision(cfg) {
     && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/u.test(binding.revision) ? binding.revision : ''
 }
 
+// vector.mode 是 normalize 里的不可枚举派生值；JSON.stringify 会丢掉它，
+// 面板切「本地/在线」就永远写不进 config.json（#520）。落盘前复制一份并把它变成可枚举字段。
+function withVectorMode(c) {
+  const mode = c?.memory?.vector?.mode
+  if (!mode) return c
+  return { ...c, memory: { ...c.memory, vector: { ...c.memory.vector, mode } } }
+}
+
 export function saveConfig(cfg, previous = loadConfig()) {
   const c = normalize(cfg)
   // Only the previous authoritative configuration can carry an authorization forward.
@@ -1198,7 +1206,7 @@ export function saveConfig(cfg, previous = loadConfig()) {
     const revision = c.ownerQQ === previous.ownerQQ ? ownerAuthorizationRevision(previous) : ''
     c.ownerAuthorization = { owner: c.ownerQQ, revision: revision || randomUUID() }
   } else delete c.ownerAuthorization
-  writeJson(FILE(), c)
+  writeJson(FILE(), withVectorMode(c))
   return c
 }
 
@@ -1215,7 +1223,8 @@ export function configRevision() { return configRevisionCounter }
  */
 export function commitConfig(cfg, previous = loadConfig()) {
   const c = saveConfig(cfg, previous)
-  if (previous && JSON.stringify(c) === JSON.stringify(previous)) return previous
+  // JSON.stringify 看不到不可枚举的 vector.mode；比较时要把它带上，否则只切本地/在线会被当成没变化。
+  if (previous && JSON.stringify(withVectorMode(c)) === JSON.stringify(withVectorMode(previous))) return previous
   configRevisionCounter++
   return c
 }
