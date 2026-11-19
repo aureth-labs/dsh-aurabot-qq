@@ -203,3 +203,26 @@ test('配置变了再调 sync 只动有变化的实例', async () => {
   const stOther = gateway.instances().find((i) => i.instance === 'other')
   assert.equal(stOther.caps.voice, false, 'other 用了新配置')
 })
+
+test('所有平台实例的连接状态都写日志，不只 QQ 直连', async () => {
+  const feishu = fakeFactory({ id: 'feishu' })
+  const qqbot = fakeFactory({ id: 'qqbot' })
+  const { gateway, log } = makeGateway({
+    platforms: { feishu: { enabled: true }, qqbot: { enabled: true } },
+    adapters: [feishu, qqbot],
+  })
+  await gateway.sync()
+  for (const platform of ['feishu', 'qqbot']) {
+    assert.ok(
+      log.infos.some((line) => line.includes(`平台实例 ${platform}`) && line.includes('已连接')),
+      `${platform} 的连接状态要进 info 日志，实际：${JSON.stringify(log.infos)}`,
+    )
+  }
+  await gateway.stopAll()
+  for (const platform of ['feishu', 'qqbot']) {
+    assert.ok(
+      log.infos.some((line) => line.includes(`平台实例 ${platform}`) && line.includes('已停止')),
+      `${platform} 的停止状态要进 info 日志，实际：${JSON.stringify(log.infos)}`,
+    )
+  }
+})

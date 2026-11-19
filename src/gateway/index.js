@@ -191,9 +191,27 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
     }
   }
 
+  const STATE_LABELS = {
+    connecting: '正在连接',
+    connected: '已连接',
+    disconnected: '已断开',
+    stopped: '已停止',
+    unconfigured: '未配置',
+  }
+
+  /** 每个平台实例的状态变化都要落日志，不只 QQ 直连。 */
+  function logState(run, state, detail) {
+    const key = `${state}\u0000${detail || ''}`
+    if (run.lastLoggedState === key) return
+    run.lastLoggedState = key
+    const label = STATE_LABELS[state] || state
+    logger.info(`平台实例 ${run.instance}（${run.platform}）${label}${detail ? `（${detail}）` : ''}`)
+  }
+
   function handleState(run, state, detail) {
     run.state = state
     run.detail = detail
+    logState(run, state, detail)
     notifyState(run)
     emitCapsChanged(run.instance, { platform: run.platform, state: run.state, caps: run.caps })
     if (state === 'connected') void postConnect(run)
@@ -225,6 +243,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
     } catch (error) {
       run.state = 'disconnected'
       run.detail = `whoami 失败：${error?.message || error}`
+      logState(run, run.state, run.detail)
       notifyState(run)
       emitCapsChanged(run.instance, { platform: run.platform, state: run.state, caps: run.caps })
       return false
@@ -237,6 +256,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
       try { await run.adapter.stop() } catch (error) { logger.warn('断开失败：', error?.message || error) }
       run.state = 'disconnected'
       run.detail = `whoami 不符：登录的是 ${me.account}，配置的是 ${expected}`
+      logState(run, run.state, run.detail)
       // 标记「这个实例不会自己好」：再连也还是同一个错账号。出站时不当成可重连的断线，
       // 直接抛 not-sent 且不入队（否则队列会在每次重连时空转一轮，还可能发错人）。
       run.dead = true
@@ -383,6 +403,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
     } catch (error) {
       logger.warn(`实例 ${instanceName} 停止出错：`, error?.message || error)
     }
+    logState(run, 'stopped', reason || '实例已停止')
     runs.delete(instanceName)
     idle.set(instanceName, { state: 'stopped', detail: reason || '实例已停止' })
     emitCapsChanged(instanceName, { platform: run.platform, state: 'stopped', caps: null })

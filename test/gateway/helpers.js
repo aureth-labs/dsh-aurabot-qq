@@ -103,9 +103,12 @@ export function makeGateway({ platforms = {}, adapters = [], identity, now, repl
     },
   }
   const lines = []
+  const infos = []
   const log = {
     debug() {},
-    info() {},
+    info(...a) {
+      infos.push(a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' '))
+    },
     warn(...a) {
       lines.push(a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' '))
     },
@@ -121,7 +124,7 @@ export function makeGateway({ platforms = {}, adapters = [], identity, now, repl
     replyHoldMs,
   })
   for (const factory of adapters) gateway.register(factory)
-  return { gateway, identity: gateway.identity, http, log: { lines } }
+  return { gateway, identity: gateway.identity, http, log: { lines, infos } }
 }
 
 /**
