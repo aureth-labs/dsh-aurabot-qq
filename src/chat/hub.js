@@ -1835,6 +1835,10 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const failures = []
     const interacted = new Set()
     const sentTexts = [] // 实际成功发出的文字/语音正文：桥接与返回值只认这些，没发出去的话不能算说过
+    // 实际发出去的条目（#349）：流水只能记这些。以前这里用的是「打算发的全部 items」，
+    // 网关在中间断掉时后半截其实没发出去，流水却把全文记成「她说过的话」，
+    // 事后既查不出哪段丢了，读 saidElsewhere / lastBotToOwner 的路径也会以为话说完了。
+    const sentItems = []
     await failStore.run(failures, async () => {
       for (let i = 0; i < items.length; i++) {
         if (disposed) return
@@ -1860,6 +1864,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         if (outputScope.getStore().sent > sentBefore) {
           if (selected?.uid) interacted.add(String(selected.uid))
           if ((it.kind === 'text' || it.kind === 'voice') && String(it.value || '').trim()) sentTexts.push(it.value)
+          sentItems.push(it)
         }
         if (i < items.length - 1 && !opts.simulate) await pause(bubbleDelay(items[i + 1].kind === 'text' ? items[i + 1].value : '') * mood().delay)
       }
@@ -1880,14 +1885,21 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (sentTexts.length && typeof opts.onDelivered === 'function') {
       try { opts.onDelivered() } catch (error) { log.warn('发送回执处理出错：', error.message) }
     }
-    const said = itemsToLine(items, (q) => stickers.match(q))
-    logChat(chatId, 'bot', said, '', { interaction: [...interacted] })
+    // #349：只把真的发出去的条目记成「她说过的话」。一条都没发出去时上面已经 return，这里不会再写空流水。
+    const said = itemsToLine(sentItems, (q) => stickers.match(q))
+    if (said) logChat(chatId, 'bot', said, '', { interaction: [...interacted] })
+    // 部分失败要留痕：主人只看到「话说了一半」时，至少能在日志里看到少了几段。
+    const unattempted = items.length - sentItems.length
+    if (failures.length && unattempted > 0) {
+      log.warn(`${chatId}：这一轮有 ${unattempted}/${items.length} 段没发出去（${failures[0]}），流水只记了实际发出的 ${sentItems.length} 段`)
+    }
     // 不是这个聊天自己那一轮发的（主人在私聊里让她去群里说、扩展模块代发）：记下来，下次这个聊天交给她时告诉她自己说过什么。
     // 只记实际发出去的文本（sentTexts），且试运行（dryRun）没真发也不记——她没说出口的话不能算说过（#211 review）。
     if (!opts.own && sentTexts.length && !cfg.dryRun) saidElsewhere.set(chatId, [...(saidElsewhere.get(chatId) || []), { at: Date.now(), text: sentTexts.join(' ').slice(0, 300) }].slice(-5))
     lastChatAt = Date.now()
     if (chatId.startsWith('private:')) lastPrivateAt.set(chatId.slice(8), Date.now())
-    if (chatId === `private:${cfg.ownerQQ}`) lastBotToOwner = { at: Date.now(), text: items.filter((i) => i.kind === 'text' || i.kind === 'voice').map((i) => i.value).join('\n') }
+    // #349：同上，只记真发出去的，别让没送到的后半截冒充「她刚跟主人说过」。
+    if (chatId === `private:${cfg.ownerQQ}`) lastBotToOwner = { at: Date.now(), text: sentItems.filter((i) => i.kind === 'text' || i.kind === 'voice').map((i) => i.value).join('\n') }
     onActivity?.({ kind: 'out', chatId, reply: text, userText: opts.userText || '' })
     return { missedAt, failed: failures.length, errors: failures, sent: sentTexts.join(' '), ...receipt }
   }
