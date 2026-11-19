@@ -243,10 +243,12 @@ function eventToParts(d, { selfOpenid } = {}) {
   const parts = []
   let content = typeof d?.content === 'string' ? d.content : ''
   let mentionedMe = false
+  const seenMentionAccounts = new Set()
+  const mentionsMeta = Array.isArray(d?.mentions) ? d.mentions : []
 
-  // 1) 文本里的 @ 标记（全量模式才有；群@事件里 content 已去掉 @机器人 前缀）
+  // 1) 文本里的 @ 标记（全量模式可能有 `<@openid>` 或 `<@!openid>`；群@事件里 content 已去掉 @机器人 前缀）
   if (content.includes('<@')) {
-    const tokenRe = /<@(all|[0-9A-Za-z_-]+)>/g
+    const tokenRe = /<@!?(all|[0-9A-Za-z_-]+)>/g
     let last = 0
     for (let m = tokenRe.exec(content); m; m = tokenRe.exec(content)) {
       const before = content.slice(last, m.index)
@@ -258,7 +260,9 @@ function eventToParts(d, { selfOpenid } = {}) {
         // @ 的是机器人自己：不进 parts，只标 mentionedMe
         mentionedMe = true
       } else {
-        const name = Array.isArray(d?.mentions) ? d.mentions.find((u) => u && (u.id === who || u.member_openid === who || u.user_openid === who))?.username : undefined
+        seenMentionAccounts.add(who)
+        const hit = mentionsMeta.find((u) => u && (u.id === who || u.member_openid === who || u.user_openid === who))
+        const name = hit?.username || hit?.nick
         parts.push({ type: 'mention', account: who, name: name ? String(name) : undefined })
       }
       last = m.index + m[0].length
@@ -268,6 +272,16 @@ function eventToParts(d, { selfOpenid } = {}) {
     content = ''
   }
   if (content) parts.push({ type: 'text', text: content })
+
+  // 1b) GROUP_AT_MESSAGE_CREATE 等场景里平台可能只把被 @ 成员放在 d.mentions 数组而不在 content 写 <@openid>
+  for (const u of mentionsMeta) {
+    if (!u || typeof u !== 'object' || u.bot === true) continue
+    const acc = String(u.member_openid || u.user_openid || u.id || '').trim()
+    if (!acc || acc === 'all' || (selfOpenid && acc === selfOpenid) || seenMentionAccounts.has(acc)) continue
+    seenMentionAccounts.add(acc)
+    const name = u.username || u.nick
+    parts.push({ type: 'mention', account: acc, name: name ? String(name) : undefined })
+  }
 
   // 2) 附件（图片/视频/语音/文件）
   for (const att of Array.isArray(d?.attachments) ? d.attachments : []) parts.push(attachmentToPart(att))

@@ -898,3 +898,196 @@ test('QQBot 群名自动补全：/groups/roles 候选群自动拉取并缓存 ge
   assert.equal(r2.candidates.find((c) => c.openid === 'OPENID_CAND_1')?.name, '自动补全候选群')
   assert.equal(infoCalls, 1)
 })
+
+test('QQBot group_admin 自动解析 member_openid（@提及 / 成员列表 / 近期发言）与 list_members 动作', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aurabot-qqbot-resolve-'))
+  const identity = createIdentity({ dataDir: dir, log: silent })
+  t.after(() => identity.close?.())
+  identity.claimOwner('qqbot', 'OWNER_OPENID')
+
+  let membersMode = 'normal' // 'normal' | 'duplicate' | '11253'
+  let ownerAll = true
+  const apiCalls = []
+  const cfg = normalize({
+    enabled: false,
+    dryRun: false,
+    allow: { groups: ['qqbot:group:GRP_R1', 'qqbot:group:GRP_R2'] },
+    platforms: {
+      qq: { enabled: false },
+      qqbot: { enabled: true, appId: 'app1', clientSecret: 'sec1', transport: 'webhook', botSecret: 'e'.repeat(32) },
+    },
+  })
+  cfg.platforms = {
+    qq: { enabled: false },
+    qqbot: { enabled: true, appId: 'app1', clientSecret: 'sec1', transport: 'webhook', botSecret: 'e'.repeat(32) },
+  }
+
+  const gw = createGateway({
+    config: cfg,
+    dataDir: (...p) => join(dir, 'gw', ...p),
+    http: { route: () => () => {} },
+    identity,
+    log: silent,
+  })
+  gw.register(() => createQqbotAdapter({
+    client: makeQqbotClient(async (req) => {
+      apiCalls.push({ method: req.method, path: req.path, body: req.body })
+      if (req.path.endsWith('/bot_state')) return { status: 200, data: { member_role: 'admin' } }
+      if (req.path.endsWith('/restrict_chat_setting')) return { status: 200, data: {} }
+      if (req.path.endsWith('/members')) {
+        if (membersMode === '11253') return { status: 403, data: { code: 11253, message: 'members forbidden' } }
+        if (membersMode === 'duplicate') {
+          return {
+            status: 200,
+            data: {
+              members: [
+                { member_openid: 'MEM_DUP_1', nick: '小明', role: 'member' },
+                { member_openid: 'MEM_DUP_2', nick: '小明', role: 'member' },
+              ],
+            },
+          }
+        }
+        return {
+          status: 200,
+          data: {
+            members: [
+              { member_openid: 'OWNER_OPENID', nick: '主人', role: 'owner' },
+              { member_openid: 'MEM_ALICE_OID', nick: 'alice_2025', role: 'member' },
+              { member_openid: 'MEM_BOB_OID', nick: '阿呆', role: 'member' },
+            ],
+          },
+        }
+      }
+      return { status: 404, data: null }
+    }),
+  }))
+  await gw.sync()
+  t.after(() => gw.stopAll())
+
+  const groupRoles = createGroupRoles({ getGateway: () => gw, getConfig: () => cfg, dataDir: (...p) => join(dir, ...p), log: silent })
+  const messageListeners = []
+  const contexts = []
+  let adminTool = null
+  groupAdminDef.setup({
+    core: {
+      hub: { turnSendersAllOwner: () => ownerAll, groupName: async (g) => String(g) },
+      groupRoles,
+      gateway: gw,
+      identity,
+      http: { body: async (r) => r?.body || {}, query: (r) => r?.query || {} },
+    },
+    config: () => cfg,
+    on: (ev, fn) => { if (ev === 'message') messageListeners.push(fn) },
+    tool: (fn) => {
+      const list = [fn({ chat: { chatId: 'qqbot:group:GRP_R1', kind: 'group', groupId: 'GRP_R1', platform: 'qqbot' }, level: 'social', sessionId: 's_r1' })].flat().filter(Boolean)
+      const hit = list.find((t) => t.name === 'group_admin')
+      if (hit) adminTool = hit
+    },
+    context: (fn) => contexts.push(fn),
+    route: () => {},
+  })
+  assert.ok(adminTool)
+  assert.ok(messageListeners.length >= 1)
+
+  const emitMsg = async (msg) => {
+    for (const fn of messageListeners) {
+      const claimed = await fn(msg)
+      assert.equal(claimed, false, '群管只观察成员与 @ 提及，绝不截胡消息')
+    }
+  }
+
+  // 1) 主人在群消息里 @ 了阿呆 → 即使不传 user_id/member_openid，也能自动解析并在 context 中露出
+  await emitMsg({
+    kind: 'group',
+    platform: 'qqbot',
+    chatId: 'qqbot:group:GRP_R1',
+    userId: 'OWNER_OPENID',
+    nickname: '主人',
+    sender: { isOwner: true },
+    parts: [
+      { type: 'text', text: '禁言 ' },
+      { type: 'mention', account: 'MEM_BOB_OID', name: '阿呆' },
+      { type: 'text', text: ' 5 分钟' },
+    ],
+  })
+  const ctxWithMention = contexts.map((fn) => fn({ chat: { chatId: 'qqbot:group:GRP_R1', kind: 'group', groupId: 'GRP_R1', platform: 'qqbot' } })).join('\n')
+  assert.match(ctxWithMention, /MEM_BOB_OID/)
+  assert.match(ctxWithMention, /阿呆/)
+
+  // 另一群 GRP_R2 不得串入 GRP_R1 的 @ 提及
+  const otherGroupCtx = contexts.map((fn) => fn({ chat: { chatId: 'qqbot:group:GRP_R2', kind: 'group', groupId: 'GRP_R2', platform: 'qqbot' } })).join('\n')
+  assert.doesNotMatch(otherGroupCtx, /MEM_BOB_OID/)
+
+  const banByImplicitMention = await adminTool.execute({ action: 'ban', minutes: 5 })
+  assert.equal(banByImplicitMention.ok, true, banByImplicitMention.message)
+  assert.equal(apiCalls.filter((c) => c.path.endsWith('/restrict_chat_setting')).at(-1)?.body?.members?.[0]?.member_openid, 'MEM_BOB_OID')
+
+  // 2) 通过 @昵称 / 昵称 / 带斜杠样式 <@!openid> 自动解析（含像 openid 长度的 alice_2025 昵称）
+  const banByNick = await adminTool.execute({ action: 'ban', user_id: '@alice_2025', minutes: 3 })
+  assert.equal(banByNick.ok, true, banByNick.message)
+  assert.equal(apiCalls.filter((c) => c.path.endsWith('/restrict_chat_setting')).at(-1)?.body?.members?.[0]?.member_openid, 'MEM_ALICE_OID')
+
+  const unbanByMentionTag = await adminTool.execute({ action: 'unban', user_id: '<@!MEM_ALICE_OID>' })
+  assert.equal(unbanByMentionTag.ok, true, unbanByMentionTag.message)
+  assert.deepEqual(apiCalls.filter((c) => c.path.endsWith('/restrict_chat_setting')).at(-1)?.body?.members?.[0], { op: 'del', member_openid: 'MEM_ALICE_OID' })
+
+  // 3) list_members 全量与 query 筛选 + 非主人拒绝
+  const lmAll = await adminTool.execute({ action: 'list_members' })
+  assert.equal(lmAll.ok, true)
+  assert.equal(lmAll.count, 3)
+  assert.match(lmAll.message, /MEM_ALICE_OID/)
+  const lmFilter = await adminTool.execute({ action: 'list_members', query: 'alice' })
+  assert.equal(lmFilter.ok, true)
+  assert.equal(lmFilter.count, 1)
+  assert.equal(lmFilter.members[0].openid, 'MEM_ALICE_OID')
+
+  ownerAll = false
+  const lmDenied = await adminTool.execute({ action: 'list_members' })
+  assert.equal(lmDenied.ok, false)
+  assert.match(lmDenied.message, /只有主人/)
+  ownerAll = true
+
+  // 4) 一轮同时 @ 多人且未传 user_id → 拒绝猜人并给出候选列表
+  await emitMsg({
+    kind: 'group',
+    platform: 'qqbot',
+    chatId: 'qqbot:group:GRP_R1',
+    userId: 'OWNER_OPENID',
+    nickname: '主人',
+    sender: { isOwner: true },
+    parts: [
+      { type: 'mention', account: 'MEM_BOB_OID', name: '阿呆' },
+      { type: 'mention', account: 'MEM_ALICE_OID', name: 'alice_2025' },
+    ],
+  })
+  const multiReject = await adminTool.execute({ action: 'ban', minutes: 5 })
+  assert.equal(multiReject.ok, false)
+  assert.match(multiReject.message, /MEM_BOB_OID/)
+  assert.match(multiReject.message, /MEM_ALICE_OID/)
+
+  // 5) 成员重名（两个 小明）→ 拒绝猜测，列出全部重名 openid 供确认
+  membersMode = 'duplicate'
+  const dupReject = await adminTool.execute({ action: 'ban', user_id: '小明', minutes: 5 })
+  assert.equal(dupReject.ok, false)
+  assert.match(dupReject.message, /MEM_DUP_1/)
+  assert.match(dupReject.message, /MEM_DUP_2/)
+
+  // 6) listMembers 返回 11253 无权限时：降级用近期发言人观察缓存解析，并在 list_members 返回观察列表
+  membersMode = '11253'
+  await emitMsg({
+    kind: 'group',
+    platform: 'qqbot',
+    chatId: 'qqbot:group:GRP_R1',
+    userId: 'MEM_SPEAKER_OID',
+    nickname: '近期发言友',
+    sender: { isOwner: false },
+    parts: [{ type: 'text', text: '大家好' }],
+  })
+  const banByObserved = await adminTool.execute({ action: 'ban', user_id: '近期发言友', minutes: 2 })
+  assert.equal(banByObserved.ok, true, banByObserved.message)
+  assert.equal(apiCalls.filter((c) => c.path.endsWith('/restrict_chat_setting')).at(-1)?.body?.members?.[0]?.member_openid, 'MEM_SPEAKER_OID')
+
+  const lmObserved = await adminTool.execute({ action: 'list_members', query: '近期发言友' })
+  assert.equal(lmObserved.ok, true)
+  assert.equal(lmObserved.members[0]?.openid, 'MEM_SPEAKER_OID')
+})

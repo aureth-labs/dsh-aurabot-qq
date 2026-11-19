@@ -555,6 +555,45 @@ test('事件转换：全量群消息里的 <@openid> / <@all> 拆成 mention，@
   assert.equal(ctx.emitted.at(-1).mentionedMe, false)
 })
 
+test('事件转换：支持 <@!openid> 写法与 GROUP_AT_MESSAGE_CREATE d.mentions 数组兜底解析', async () => {
+  const { adapter, ctx } = await boot()
+
+  // 1) <@!openid> 写法与 d.mentions 同人不去重
+  adapter.platform.deliver('GROUP_MESSAGE_CREATE', {
+    id: 'MENTION-BANG-1',
+    author: { member_openid: 'OWNER_1', member_role: 'owner', username: '群主' },
+    content: '<@!BOT-OPENID> 禁言 <@!MEM_OPENID_1> 5 分钟',
+    group_openid: 'G7',
+    timestamp: '2026-11-19T12:00:00+08:00',
+    mentions: [{ member_openid: 'MEM_OPENID_1', username: '小明' }, { id: 'BOT-OPENID', bot: true, username: '机器人' }],
+  })
+  const m1 = ctx.emitted.at(-1)
+  assert.equal(m1.mentionedMe, true)
+  assert.deepEqual(
+    m1.parts.filter((p) => p.type === 'mention'),
+    [{ type: 'mention', account: 'MEM_OPENID_1', name: '小明' }],
+  )
+
+  // 2) content 没有 <@openid> 标记，但 d.mentions 带了被 @ 成员（排除 bot）
+  adapter.platform.deliver('GROUP_AT_MESSAGE_CREATE', {
+    id: 'MENTION-META-1',
+    author: { member_openid: 'OWNER_1', member_role: 'owner', username: '群主' },
+    content: '禁言这个刷屏的',
+    group_openid: 'G7',
+    timestamp: '2026-11-19T12:01:00+08:00',
+    mentions: [
+      { id: 'BOT-OPENID', bot: true, username: '机器人' },
+      { member_openid: 'MEM_OPENID_2', nick: '小红' },
+    ],
+  })
+  const m2 = ctx.emitted.at(-1)
+  assert.equal(m2.mentionedMe, true)
+  assert.deepEqual(
+    m2.parts.filter((p) => p.type === 'mention'),
+    [{ type: 'mention', account: 'MEM_OPENID_2', name: '小红' }],
+  )
+})
+
 test('事件转换：卡片 / 引用消息 / 未知事件', async () => {
   const { adapter, ctx } = await boot()
 

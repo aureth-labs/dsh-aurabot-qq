@@ -12,6 +12,32 @@ const UNSUPPORTED_QQBOT_ACTIONS = Object.freeze({
   notice: '发群公告',
 })
 
+const MENTION_TTL_MS = 3 * 60_000
+const MAX_OBSERVED_PER_GROUP = 200
+
+const unwrapMentionToken = (s) => {
+  const m = /^<@!?([0-9A-Za-z_-]+)>$/.exec(String(s || '').trim())
+  return m ? m[1] : String(s || '').trim()
+}
+
+const isStrictOpenid = (s) => /^[0-9A-Fa-f]{24,64}$/.test(s)
+const looksLikeOpenid = (s) => /^[0-9A-Za-z_-]{8,}$/.test(s) && (/[0-9_-]/.test(s) || /^[0-9A-F]{16,}$/i.test(s))
+
+function matchMemberCandidates(list, rawQuery) {
+  const query = String(rawQuery || '').trim()
+  if (!query || !Array.isArray(list) || !list.length) return null
+  const exactId = list.find((m) => m?.openid === query)
+  if (exactId) return { openid: exactId.openid, nick: exactId.nick || '' }
+  const qLower = query.toLowerCase()
+  const exactNicks = list.filter((m) => String(m?.nick || '').trim().toLowerCase() === qLower)
+  if (exactNicks.length === 1) return { openid: exactNicks[0].openid, nick: exactNicks[0].nick || '' }
+  if (exactNicks.length > 1) return { ambiguous: exactNicks }
+  const partialNicks = list.filter((m) => String(m?.nick || '').trim().toLowerCase().includes(qLower))
+  if (partialNicks.length === 1) return { openid: partialNicks[0].openid, nick: partialNicks[0].nick || '' }
+  if (partialNicks.length > 1) return { ambiguous: partialNicks }
+  return null
+}
+
 function backendLabelOf(info, spec) {
   const b = info?.backend || spec?.backend
   const p = info?.platform || spec?.platform
@@ -35,11 +61,77 @@ export default {
     optional: ['chat.member.list'],
   },
   toolAliases,
-  description: '主人要求时做群管理：QQ 直连支持禁言/解禁/全体禁言/踢人/改头衔/发公告；QQ 官方机器人支持禁言/解禁/踢人（group_admin）',
+  description: '主人要求时做群管理：QQ 直连支持禁言/解禁/全体禁言/踢人/改头衔/发公告；QQ 官方机器人支持禁言/解禁/踢人/查成员，并支持从 @ 提及与成员列表自动解析 member_openid（group_admin）',
   setup(api) {
     const { hub, onebot, groupRoles, gateway, http } = api.core
     const groupNameCache = new Map() // chatId -> { name, at }
     const GROUP_NAME_CACHE_TTL_MS = 10 * 60_000
+    const observedMembers = new Map() // normChatId -> Map<openid, { openid, nick, at }>
+    const lastOwnerMentions = new Map() // normChatId -> { at, mentions: Array<{ openid, nick }> }
+
+    const normChatKey = (cid) => normalizeChatId(String(cid || '')) || String(cid || '')
+    const recordObservedMember = (chatId, openid, nick = '') => {
+      const key = normChatKey(chatId)
+      const uid = String(openid || '').trim()
+      if (!key || !uid || uid === 'all') return
+      let map = observedMembers.get(key)
+      if (!map) {
+        map = new Map()
+        observedMembers.set(key, map)
+      }
+      const prev = map.get(uid)
+      const cleanNick = String(nick || '').trim() || prev?.nick || ''
+      if (prev) map.delete(uid)
+      map.set(uid, { openid: uid, nick: cleanNick, at: Date.now() })
+      while (map.size > MAX_OBSERVED_PER_GROUP) {
+        const oldest = map.keys().next().value
+        if (oldest === undefined) break
+        map.delete(oldest)
+      }
+    }
+
+    const extractMentionsFromMessage = (msg) => {
+      const out = []
+      const seen = new Set()
+      const pushMention = (acc, name = '') => {
+        const openid = unwrapMentionToken(String(acc || '').trim())
+        if (!openid || openid === 'all' || seen.has(openid)) return
+        seen.add(openid)
+        out.push({ openid, nick: String(name || '').trim() })
+      }
+      const parts = Array.isArray(msg?.parts) && msg.parts.length
+        ? msg.parts
+        : (Array.isArray(msg?.raw?.__gateway?.parts) ? msg.raw.__gateway.parts : [])
+      for (const p of parts) {
+        if (p?.type === 'mention') pushMention(p.account, p.name)
+      }
+      for (const seg of Array.isArray(msg?.raw?.message) ? msg.raw.message : []) {
+        if (seg?.type === 'at' && seg.data) pushMention(seg.data.qq, seg.data.name)
+      }
+      return out
+    }
+
+    const freshOwnerMentions = (chatId) => {
+      const key = normChatKey(chatId)
+      const entry = key ? lastOwnerMentions.get(key) : null
+      if (!entry || Date.now() - entry.at > MENTION_TTL_MS) return []
+      return entry.mentions || []
+    }
+
+    api.on?.('message', (msg) => {
+      if (!msg || msg.kind !== 'group' || !msg.chatId) return false
+      const key = normChatKey(msg.chatId)
+      const plat = String(msg.platform || parseChatId(key)?.platform || 'qq')
+      if (plat === 'qq') return false
+      if (msg.userId) recordObservedMember(key, msg.userId, msg.nickname || '')
+      const mentions = extractMentionsFromMessage(msg)
+      for (const m of mentions) recordObservedMember(key, m.openid, m.nick)
+      const fromOwner = Boolean(msg.sender?.isOwner || isOwner(api.core.identity, msg.userId, plat))
+      if (fromOwner && mentions.length) {
+        lastOwnerMentions.set(key, { at: Date.now(), mentions })
+      }
+      return false
+    })
     const qqCall = (action, params, opts) => (typeof api.native === 'function' ? api.native('qq', action, params, opts) : onebot.call(action, params, opts))
     const readReqBody = async (req) => {
       if (typeof http?.body === 'function') return (await http.body(req)) || {}
@@ -73,14 +165,129 @@ export default {
       }
     }
 
+    async function fetchQqbotMembers(ga, groupOpenid, chatId) {
+      const merged = new Map()
+      const upsert = (item, persist = false) => {
+        const openid = String(item?.openid || item?.member_openid || '').trim()
+        if (!openid) return
+        const prev = merged.get(openid) || {}
+        const nick = String(item?.nick || item?.username || '').trim() || prev.nick || ''
+        const role = String(item?.role || item?.member_role || '').trim() || prev.role || ''
+        merged.set(openid, { openid, nick, role })
+        if (persist && nick) recordObservedMember(chatId, openid, nick)
+      }
+
+      let apiError = ''
+      let apiFetched = false
+      if (ga && typeof ga.listMembers === 'function' && groupOpenid) {
+        let startIndex = 0
+        for (let page = 0; page < 3; page++) {
+          let batch
+          try {
+            batch = await ga.listMembers(groupOpenid, { startIndex, limit: 100 })
+            apiFetched = true
+          } catch (error) {
+            apiError = error?.message || '查询群成员列表失败'
+            break
+          }
+          if (!Array.isArray(batch) || !batch.length) break
+          const beforeSize = merged.size
+          for (const m of batch) upsert(m, true)
+          if (batch.length < 100 || merged.size === beforeSize) break
+          startIndex += batch.length
+        }
+      } else {
+        apiError = '当前网关不支持查询群成员列表'
+      }
+
+      const obs = observedMembers.get(normChatKey(chatId))
+      if (obs) {
+        // 先拷快照再合并，绝不在遍历 obs 的同时修改 obs 造成死循环
+        for (const m of [...obs.values()]) upsert(m, false)
+      }
+      return { members: [...merged.values()], fromApi: apiFetched && !apiError, error: apiError }
+    }
+
+    async function resolveQqbotTarget({ rawUserId, rawMemberOpenid, chatId, groupOpenid, ga, identity, platform, action }) {
+      const formatCandidates = (list) => list.slice(0, 6).map((m) => (m.nick ? `${m.nick}(${m.openid})` : m.openid)).join('、')
+
+      if (String(rawMemberOpenid || '').trim()) {
+        const explicit = unwrapMentionToken(rawMemberOpenid)
+        if (/^\d{5,15}$/.test(explicit)) {
+          return { error: 'QQ 官方机器人不能按 QQ 号操作，请在群里 @ 对方、填群成员昵称，或先用 list_members 查出 member_openid' }
+        }
+        return { openid: explicit, nick: '', via: 'explicit' }
+      }
+
+      const raw = unwrapMentionToken(rawUserId)
+      const mentions = freshOwnerMentions(chatId)
+      if (!raw) {
+        let candidates = mentions
+        if (candidates.length > 1 && (action === 'ban' || action === 'kick')) {
+          const nonOwner = candidates.filter((m) => !isOwner(identity, m.openid, platform))
+          if (nonOwner.length >= 1) candidates = nonOwner
+        }
+        if (candidates.length === 1) return { openid: candidates[0].openid, nick: candidates[0].nick, via: 'mention' }
+        if (candidates.length > 1) {
+          return { error: `这一轮 @ 了多位成员，请明确指定要操作谁：${formatCandidates(candidates)}` }
+        }
+        return { error: '要说清楚对谁操作：可在群里 @ 对方、填对方群昵称，或先用 list_members 查出 member_openid' }
+      }
+
+      const cleaned = unwrapMentionToken(raw.replace(/^@+/, '').trim())
+      if (/^\d{5,15}$/.test(cleaned)) {
+        return { error: 'QQ 官方机器人不能按 QQ 号操作，请在群里 @ 对方、填群成员昵称，或先用 list_members 查出 member_openid' }
+      }
+
+      const mentionHit = matchMemberCandidates(mentions, cleaned)
+      if (mentionHit?.ambiguous) {
+        return { error: `这一轮 @ 的成员中有重名，请改用 member_openid 指定：${formatCandidates(mentionHit.ambiguous)}` }
+      }
+      if (mentionHit) return { ...mentionHit, via: 'mention' }
+
+      const obsMap = observedMembers.get(normChatKey(chatId))
+      const obsExact = obsMap?.get(cleaned)
+      if (obsExact) return { openid: obsExact.openid, nick: obsExact.nick, via: 'observed' }
+      if (isOwner(identity, cleaned, platform)) return { openid: cleaned, nick: '', via: 'explicit' }
+
+      if (isStrictOpenid(cleaned)) {
+        return { openid: cleaned, nick: obsExact?.nick || '', via: 'explicit' }
+      }
+
+      const { members, fromApi, error } = await fetchQqbotMembers(ga, groupOpenid, chatId)
+      const hit = matchMemberCandidates(members, cleaned)
+      if (hit?.ambiguous) {
+        return { error: `匹配到多位群成员，请改用 member_openid 指定：${formatCandidates(hit.ambiguous)}` }
+      }
+      if (hit) return { ...hit, via: fromApi ? 'members' : 'observed' }
+
+      if (looksLikeOpenid(cleaned)) {
+        return { openid: cleaned, nick: '', via: 'explicit' }
+      }
+
+      if (error) {
+        return { error: `按「${cleaned}」找不到对应的 member_openid（${error}）；请在群里 @ 对方或直接提供 member_openid` }
+      }
+      return { error: `群成员列表里没找到「${cleaned}」，请确认昵称或在群里 @ 对方 / 用 list_members 查看 member_openid` }
+    }
+
     // 她在这个群的身份：没管理权限或无官方接口权限时直接如实说明
     api.context(({ chat }) => {
       if (chat.kind !== 'group') return ''
       const info = roleInfoSync(chat)
       const role = info?.role || ''
+      const isQqbotGroup = (info?.backend === 'gateway-admin' && info?.platform !== 'qq')
+        || String(chat?.platform || parseChatId(normChatKey(chat?.chatId))?.platform || '') === 'qqbot'
+      const mentions = isQqbotGroup ? freshOwnerMentions(chat.chatId) : []
+      const mentionHint = mentions.length
+        ? `\n本轮主人刚刚 @ 的群成员：${mentions.map((m) => (m.nick ? `${m.nick}（member_openid=${m.openid}）` : `member_openid=${m.openid}`)).join('、')}。`
+        : ''
       if (!role) {
         if (info?.backend === 'gateway-admin' && info?.platform !== 'qq' && info.reason) {
           return `当前群的 QQ 官方机器人群管理暂不可用（${info.reason}）；主人让你禁言或踢人时，直接如实说明原因。`
+        }
+        if (isQqbotGroup && mentions.length) {
+          return `QQ 官方机器人群可用 group_admin 执行单人禁言（ban）/ 解禁（unban）/ 踢人（kick）/ 查成员（list_members），接受对方昵称/@昵称或 member_openid（不支持全体禁言、不能填 QQ 号）。${mentionHint}`
         }
         return ''
       }
@@ -88,7 +295,7 @@ export default {
         return '你在这个群只是普通成员，没有管理权限：禁言、踢人这些做不了，主人要求时直接说明。'
       }
       if (info?.backend === 'gateway-admin' && info?.platform !== 'qq') {
-        return `你在这个群是${groupRoles.label(role)}。主人要求时可以用 group_admin 禁言、解禁或踢人（QQ 官方机器人不支持全体禁言、改专属头衔和发群公告；操作对象只能填群成员的 member_openid，不能填 QQ 号；不要写 /ban 等斜杠命令）。`
+        return `你在这个群是${groupRoles.label(role)}。主人要求时可以用 group_admin 做单人禁言（ban）、解禁（unban）、踢人（kick）或查成员（list_members）；可直接填对方昵称/@昵称或 member_openid，若主人刚在消息里 @ 了对方也可以直接调工具自动识别（不支持全体禁言 whole_ban、改专属头衔和发群公告；不能填 QQ 号；不要写 /ban 等斜杠命令）。${mentionHint}`
       }
       return `你在这个群是${groupRoles.label(role)}，主人要求时可以用 group_admin 做群管操作（不要写 /ban 等斜杠命令）。`
     })
@@ -98,17 +305,18 @@ export default {
       if (!(chat.kind === 'group' || level === 'full')) return []
       return defineTool({
         name: 'group_admin',
-        description: '群管理：禁言（ban）/ 解禁（unban）/ 踢人（kick），QQ 直连群还支持全体禁言（whole_ban/whole_unban）/ 改头衔（title）/ 发公告（notice）。只有主人单独发话时才能用。',
+        description: '群管理：单人禁言（ban）/ 解禁（unban）/ 踢人（kick）/ 查成员（list_members）；QQ 直连群还支持全体禁言（whole_ban/whole_unban）/ 改头衔（title）/ 发公告（notice）。QQ 官方机器人群可直接填群昵称/@昵称、填 member_openid，或在主人 @ 对方后省略目标自动识别。只有主人单独发话时才能用。',
         properties: {
-          action: { type: 'string', enum: ['ban', 'unban', 'whole_ban', 'whole_unban', 'kick', 'title', 'notice'], description: 'ban 禁言，unban 解禁，whole_ban 全体禁言，whole_unban 解除全体禁言，kick 踢出，title 改专属头衔，notice 发公告' },
+          action: { type: 'string', enum: ['ban', 'unban', 'whole_ban', 'whole_unban', 'kick', 'title', 'notice', 'list_members'], description: 'ban 单人禁言，unban 解禁，whole_ban 全体禁言（仅 QQ 直连），whole_unban 解除全体禁言（仅 QQ 直连），kick 踢出，title 改专属头衔（仅 QQ 直连），notice 发公告（仅 QQ 直连），list_members 列出群成员及 member_openid' },
           group_id: str('群号或规范群地址（如 qqbot:group:xxx）；在群里用时可省略，默认当前群'),
-          user_id: str('操作对象 ID：QQ 直连群填对方 QQ 号；QQ 官方机器人群只能填成员 member_openid（全体禁言和发公告不需要）'),
-          member_openid: str('可选，QQ 官方机器人群目标成员的 member_openid'),
+          user_id: str('操作对象：QQ 直连群填对方 QQ 号；QQ 官方机器人群可填对方群昵称 / @昵称 / member_openid，若主人刚 @ 了对方也可省略自动匹配（不可填纯数字 QQ 号）'),
+          member_openid: str('可选，明确指定 QQ 官方机器人群目标成员的 member_openid'),
+          query: str('可选，action=list_members 时按昵称或 ID 筛选成员'),
           minutes: int('禁言分钟数，默认 10；QQ 官方机器人最长 43200（30 天）'),
           text: str('头衔内容或公告内容（QQ 官方机器人不支持）'),
         },
         required: ['action'],
-        execute: async ({ action, group_id, user_id, member_openid, minutes, text }) => {
+        execute: async ({ action, group_id, user_id, member_openid, query, minutes, text }) => {
           if (!hub.turnSendersAllOwner(sessionId)) return { ok: false, message: '只有主人能让我做群管操作' }
           const cfg = api.config()
           const rawGroup = String(group_id || '').trim() || (chat.kind === 'group' ? String(chat.chatId || chat.groupId || '').trim() : '')
@@ -133,13 +341,30 @@ export default {
             if (spec.platform === 'qq') {
               const gid = Number(spec?.gid || spec?.openid || parsedAddr?.id || rawGroup)
               if (!gid) return { ok: false, message: '不知道是哪个群' }
+              const ga = spec.groupAdmin || gateway?.groupAdmin?.(spec.instance)
+              if (!ga) return { ok: false, message: 'QQ 网关未连接，无法执行群管' }
+              if (action === 'list_members') {
+                if (typeof ga.listMembers !== 'function') {
+                  return { ok: false, message: '当前 QQ 网关不支持查询群成员列表' }
+                }
+                const list = await ga.listMembers(String(gid), { limit: 100 }).catch(() => [])
+                const q = String(query || text || '').trim().toLowerCase()
+                const filtered = q ? list.filter((m) => String(m.nick || '').toLowerCase().includes(q) || String(m.openid || '').toLowerCase().includes(q)) : list
+                const shown = filtered.slice(0, 50)
+                return {
+                  ok: true,
+                  count: filtered.length,
+                  members: shown,
+                  message: shown.length
+                    ? `共 ${filtered.length} 位成员：${shown.map((m) => (m.nick ? `${m.nick}(${m.openid})` : m.openid)).join('、')}`
+                    : '没有匹配的群成员',
+                }
+              }
               const uid = Number(targetUserRaw || 0)
               if (!whole && action !== 'notice' && !uid) return { ok: false, message: '要说清楚对谁（QQ 号）' }
               if (uid && isOwner(api.core.identity, String(uid), 'qq') && action !== 'unban' && action !== 'title') {
                 return { ok: false, message: '不能对主人做这个' }
               }
-              const ga = spec.groupAdmin || gateway?.groupAdmin?.(spec.instance)
-              if (!ga) return { ok: false, message: 'QQ 网关未连接，无法执行群管' }
               const sa = ga.supportedActions || {}
               const capBlocked = (action === 'ban' && sa.ban === false)
                 || (action === 'unban' && sa.unban === false)
@@ -185,19 +410,53 @@ export default {
               return { ok: true, message: '做好了' }
             }
 
+            const ga = spec.groupAdmin || gateway?.groupAdmin?.(spec.instance)
+            if (action === 'list_members') {
+              if (!ga) return { ok: false, message: 'QQ 官方机器人未连接，无法查询群成员' }
+              const { members, error } = await fetchQqbotMembers(ga, spec.openid, targetChatId)
+              const q = String(query || text || '').trim().toLowerCase()
+              const filtered = q
+                ? members.filter((m) => String(m.nick || '').toLowerCase().includes(q) || String(m.openid || '').toLowerCase().includes(q))
+                : members
+              if (!filtered.length && error) {
+                return { ok: false, message: `${error}；也可以直接在群里 @ 对方让助手识别 member_openid` }
+              }
+              const shown = filtered.slice(0, 50)
+              const lines = shown.map((m) => {
+                const label = m.nick ? `${m.nick}（${m.openid}）` : m.openid
+                return m.role ? `${label}[${m.role}]` : label
+              })
+              const note = error ? `（官方成员列表接口受限：${error}；以下为近期群内 @/发言缓存）` : ''
+              return {
+                ok: true,
+                count: filtered.length,
+                members: shown,
+                message: shown.length ? `${note}共 ${filtered.length} 位成员：${lines.join('、')}` : '没有找到匹配的群成员',
+              }
+            }
+
             if (UNSUPPORTED_QQBOT_ACTIONS[action]) {
               return { ok: false, message: `QQ 官方机器人当前不支持${UNSUPPORTED_QQBOT_ACTIONS[action]}` }
             }
             if (!['ban', 'unban', 'kick'].includes(action)) {
               return { ok: false, message: '不认识的操作' }
             }
-            if (!targetUserRaw) {
-              return { ok: false, message: '要说清楚对谁操作，请提供该成员的 member_openid（可在群里 @ 对方获得）' }
+
+            const resolved = await resolveQqbotTarget({
+              rawUserId: user_id,
+              rawMemberOpenid: member_openid,
+              chatId: targetChatId,
+              groupOpenid: spec.openid,
+              ga,
+              identity: api.core.identity,
+              platform: targetPlat,
+              action,
+            })
+            if (resolved.error) {
+              return { ok: false, message: resolved.error }
             }
-            if (/^\d{5,15}$/.test(targetUserRaw)) {
-              return { ok: false, message: 'QQ 官方机器人不能按 QQ 号操作，请提供该成员的 member_openid（可在群里 @ 对方或从成员列表选择）' }
-            }
-            if (isOwner(api.core.identity, targetUserRaw, targetPlat) && action !== 'unban') {
+            const resolvedOpenid = resolved.openid
+            if (isOwner(api.core.identity, resolvedOpenid, targetPlat) && action !== 'unban') {
               return { ok: false, message: '不能对主人做这个' }
             }
 
@@ -205,22 +464,24 @@ export default {
             const info = await inspectRole(rawGroup, { fresh: true })
             if (!info.role) return { ok: false, message: info.reason || '当前无法确认机器人在该群的管理身份' }
             if (!groupRoles.canManage(info.role)) return { ok: false, message: '我在这个群只是普通成员，没有管理权限' }
-            if (cfg.dryRun) return { ok: true, message: `试运行：本来要通过 QQ 官方机器人对群 ${spec.openid} 成员 ${targetUserRaw} 做 ${action}` }
+            if (cfg.dryRun) return { ok: true, message: `试运行：本来要通过 QQ 官方机器人对群 ${spec.openid} 成员 ${resolvedOpenid} 做 ${action}` }
 
-            const ga = spec.groupAdmin || gateway?.groupAdmin?.(spec.instance)
             if (!ga) return { ok: false, message: 'QQ 官方机器人未连接，无法执行群管' }
 
             try {
               if (action === 'ban') {
                 const mins = Math.min(43200, Math.max(1, Number(minutes) || 10))
-                await ga.muteMember(spec.openid, targetUserRaw, mins * 60_000)
+                await ga.muteMember(spec.openid, resolvedOpenid, mins * 60_000)
               } else if (action === 'unban') {
-                await ga.unmuteMember(spec.openid, targetUserRaw)
+                await ga.unmuteMember(spec.openid, resolvedOpenid)
               } else if (action === 'kick') {
-                await ga.kickMember(spec.openid, targetUserRaw)
+                await ga.kickMember(spec.openid, resolvedOpenid)
               }
             } catch (error) {
               return { ok: false, message: error?.message || `群管操作失败（${action}）` }
+            }
+            if (resolved.via === 'mention' || resolved.via === 'members' || resolved.via === 'observed') {
+              return { ok: true, message: `做好了（对象：${resolved.nick ? `${resolved.nick} / ${resolvedOpenid}` : resolvedOpenid}）` }
             }
             return { ok: true, message: '做好了' }
           }
@@ -235,6 +496,24 @@ export default {
           // ── 分支 B：传统 QQ OneBot ──
           const gid = Number(spec?.gid || parsedAddr?.id || rawGroup)
           if (!gid) return { ok: false, message: '不知道是哪个群' }
+          if (action === 'list_members') {
+            const list = await qqCall('get_group_member_list', { group_id: gid }).catch(() => [])
+            const arr = Array.isArray(list) ? list : []
+            const q = String(query || text || '').trim().toLowerCase()
+            const mapped = arr.map((m) => ({
+              openid: String(m?.user_id || ''),
+              nick: String(m?.card || m?.nickname || ''),
+              role: String(m?.role || ''),
+            })).filter((m) => m.openid)
+            const filtered = q ? mapped.filter((m) => m.nick.toLowerCase().includes(q) || m.openid.includes(q)) : mapped
+            const shown = filtered.slice(0, 50)
+            return {
+              ok: true,
+              count: filtered.length,
+              members: shown,
+              message: shown.length ? `共 ${filtered.length} 位成员：${shown.map((m) => (m.nick ? `${m.nick}(${m.openid})` : m.openid)).join('、')}` : '没有匹配的群成员',
+            }
+          }
           const uid = Number(targetUserRaw || 0)
           if (!whole && action !== 'notice' && !uid) return { ok: false, message: '要说清楚对谁（QQ 号）' }
           if (uid && isOwner(api.core.identity, String(uid), 'qq') && action !== 'unban' && action !== 'title') return { ok: false, message: '不能对主人做这个' }
