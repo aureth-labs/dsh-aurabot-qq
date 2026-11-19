@@ -3859,10 +3859,17 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       }
       const jAll = jr ? [...(jr.daily || []).map((d) => jLine('daily', d)), ...(jr.dreams || []).map((d) => jLine('dream', d))] : null
       // ---------- 控件：数值 = 滑块 + 文本框；时间 = 原生 time 控件 + 一键清空 ----------
-      const A = 'ext.autotelic.'
-      const aut = getPath(draft, A, {}) || {}
+      const A = 'ext.autotelic'
+      // 兼容旧版本面板 bug：设置被写进 ext.autotelic[""]，读取时把空键里的值并回父级。
+      const mergeLegacy = (v) => {
+        if (!v || typeof v !== 'object' || !v[''] || typeof v[''] !== 'object') return v || {}
+        const rest = { ...v }
+        delete rest['']
+        return { ...v[''], ...rest }
+      }
+      const aut = mergeLegacy(getPath(draft, A, {}))
       const ap = (patch) => setDraft((previous) => {
-        const cur = getPath(previous, A, {}) || {}
+        const cur = mergeLegacy(getPath(previous, A, {}))
         return setPath(previous, A, { ...cur, ...patch })
       })
       const dv = (k) => { const v = aut[k]; return v == null ? AUTOTELIC_DEFAULTS[k] : v }

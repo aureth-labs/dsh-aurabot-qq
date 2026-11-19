@@ -1083,6 +1083,13 @@ export function normalize(raw) {
   }
   if (!isObj(c.ext)) c.ext = {}
   for (const k of Object.keys(c.ext)) if (!isObj(c.ext[k])) delete c.ext[k] // 传 null = 删掉这个模块的设置
+  // 兼容自驱引擎旧面板 bug（#512）：设置被写进 ext.autotelic[""]，把空键里的值并回父级。
+  const autotelicExt = c.ext.autotelic
+  if (isObj(autotelicExt) && isObj(autotelicExt[''])) {
+    const legacy = autotelicExt['']
+    delete autotelicExt['']
+    for (const [k, v] of Object.entries(legacy)) if (!Object.hasOwn(autotelicExt, k)) autotelicExt[k] = v
+  }
   c.safeMode = bool(c.safeMode, false)
   // 花费估算的价格表：手动填了就用手填的（手填的部分覆盖内置价），没填就用内置 DeepSeek 价
   if (!isObj(c.usage)) c.usage = { pricing: {} }
