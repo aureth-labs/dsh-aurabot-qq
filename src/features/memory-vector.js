@@ -366,15 +366,17 @@ export function createVectorIndexByMode({ getConfig, log, fetchImpl = globalThis
       // 模型文件所有人格共用（数据目录根下），向量索引跟着人格走
       const idx = createLocalVectorIndex({ dataDir: dataDir(), indexDir: directory, log })
       if (!idx.ready || !idx.ready()) {
-        // 本地模型还没装好时，如果老配置里有在线服务，就先用它，别把用户的向量检索弄没
-        if (hasBase) return createVectorIndex({ getConfig, log, fetchImpl, directory })
+        // 用户显式选了本地模式就绝不回退远端：界面承诺「本地离线」，静默把私密查询
+        // 发到在线服务是隐私问题（#520 复审）。老配置（mode 没写、只有 baseUrl）的 mode 是
+        // normalize 派生的 remote，不在此分支。
+        if (hasBase && c.mode !== 'local') return createVectorIndex({ getConfig, log, fetchImpl, directory })
         log?.debug?.('本地向量不可用：' + (idx.error || '模型未就绪') + '，这次只走关键词')
         return null
       }
       return idx
     } catch (error) {
       log?.warn?.('本地向量初始化失败，退回关键词检索：' + error.message)
-      return hasBase ? createVectorIndex({ getConfig, log, fetchImpl, directory }) : null
+      return hasBase && c.mode !== 'local' ? createVectorIndex({ getConfig, log, fetchImpl, directory }) : null
     }
   }
   return createVectorIndex({ getConfig, log, fetchImpl, directory })

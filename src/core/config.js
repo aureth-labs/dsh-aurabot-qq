@@ -900,12 +900,18 @@ export function normalize(raw) {
   // mode 是**派生值**（本地小模型 / 在线服务），不是用户直接填的配置项：
   // 定义成不可枚举属性，这样 Object.entries / deepEqual 看不到它（升级兼容测试要求
   // 配置结构和 DEFAULTS 完全一致），但 cfg.memory.vector.mode 仍能正常读。
+  // rawVec.modeExplicit === false 表示这是 normalize 出来的对象（不是用户原始输入）：
+  // 再 normalize 时不要把派生 mode 误当成显式选择（#520 旧客户端兼容）。
+  const explicitMode = (declaredMode === 'remote' || declaredMode === 'local') && rawVec.modeExplicit !== false
   Object.defineProperty(vector, 'mode', {
-    value: declaredMode === 'remote' || declaredMode === 'local' ? declaredMode : (vector.baseUrl ? 'remote' : 'local'),
+    value: explicitMode ? declaredMode : (vector.baseUrl ? 'remote' : 'local'),
     enumerable: false,
     writable: true,
     configurable: true,
   })
+  // 区分「用户明确选了 local/remote」和「没写 mode、按 baseUrl 推出来的默认」。
+  // 前者在 partial 保存时必须保留；后者要让老客户端只传 baseUrl 仍能切到 remote（#520 兼容）。
+  Object.defineProperty(vector, 'modeExplicit', { value: explicitMode, enumerable: false, writable: true, configurable: true })
   if (!isObj(c.memory.rerank)) c.memory.rerank = structuredClone(DEFAULTS.memory.rerank)
   const rerank = c.memory.rerank
   rerank.enabled = bool(rerank.enabled, false)
@@ -1191,14 +1197,32 @@ export function ownerAuthorizationRevision(cfg) {
     && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/u.test(binding.revision) ? binding.revision : ''
 }
 
+// vector.mode 是 normalize 里的不可枚举派生值；JSON.stringify 会丢掉它，
+// 面板切「本地/在线」就永远写不进 config.json（#520）。落盘前复制一份并把它变成可枚举字段。
+function withVectorMode(c) {
+  const mode = c?.memory?.vector?.mode
+  // 只持久化用户显式选择过的 mode；默认 local 是从空 baseUrl 推出来的派生值，写盘后会
+  // 在下次 load 被误当成 modeExplicit=true，导致旧客户端只传 baseUrl 永远切不到在线（#520）。
+  if (!mode || c?.memory?.vector?.modeExplicit !== true) return c
+  return { ...c, memory: { ...c.memory, vector: { ...c.memory.vector, mode } } }
+}
+
 export function saveConfig(cfg, previous = loadConfig()) {
-  const c = normalize(cfg)
+  // 非枚举的 vector.mode 经 spread/structuredClone 会丢；调用方没显式带 mode 时，
+  // 沿用上一份权威配置的 mode，避免一次无关保存把「本地」又推回 baseUrl 推断的 remote（#520 复审）。
+  const input = (() => {
+    const hasMode = cfg?.memory?.vector && Object.hasOwn(cfg.memory.vector, 'mode')
+    const prevMode = previous?.memory?.vector?.mode
+    if (hasMode || !prevMode || previous?.memory?.vector?.modeExplicit !== true) return cfg
+    return { ...(cfg || {}), memory: { ...(cfg?.memory || {}), vector: { ...(cfg?.memory?.vector || {}), mode: prevMode } } }
+  })()
+  const c = normalize(input)
   // Only the previous authoritative configuration can carry an authorization forward.
   if (c.ownerQQ) {
     const revision = c.ownerQQ === previous.ownerQQ ? ownerAuthorizationRevision(previous) : ''
     c.ownerAuthorization = { owner: c.ownerQQ, revision: revision || randomUUID() }
   } else delete c.ownerAuthorization
-  writeJson(FILE(), c)
+  writeJson(FILE(), withVectorMode(c))
   return c
 }
 
@@ -1215,7 +1239,8 @@ export function configRevision() { return configRevisionCounter }
  */
 export function commitConfig(cfg, previous = loadConfig()) {
   const c = saveConfig(cfg, previous)
-  if (previous && JSON.stringify(c) === JSON.stringify(previous)) return previous
+  // JSON.stringify 看不到不可枚举的 vector.mode；比较时要把它带上，否则只切本地/在线会被当成没变化。
+  if (previous && JSON.stringify(withVectorMode(c)) === JSON.stringify(withVectorMode(previous))) return previous
   configRevisionCounter++
   return c
 }
@@ -1223,6 +1248,9 @@ export function commitConfig(cfg, previous = loadConfig()) {
 /** 给面板看的版本：密码 / token 不回传原文，只告诉有没有填。 */
 export function publicConfig(cfg) {
   const c = structuredClone(cfg)
+  // vector.mode 是派生值、在 cfg 上不可枚举；structuredClone 会丢掉它，
+  // 面板切到「在线服务」后重载又回退「本地模型」（#520）。回传时显式补成可枚举字段。
+  if (c.memory?.vector && cfg?.memory?.vector?.mode) c.memory.vector.mode = cfg.memory.vector.mode
   delete c.ownerAuthorization
   // 面板上的「试运行」只表示「试运行但不调试」：调试开着时它显示为关
   c.dryRun = Boolean(c.dryRun && !c.debug)
@@ -1243,6 +1271,13 @@ export function publicConfig(cfg) {
 /** 面板保存时：没改的密码字段（空串）保留原值。 */
 export function mergeFromPanel(current, incoming) {
   const next = deepMerge(current, incoming || {})
+  // deepMerge 的 structuredClone 会丢掉 current.memory.vector.mode（不可枚举）；面板局部保存
+  // 不带 vector 时用上一份 mode 补回，否则 baseUrl 会把用户选中的 local 重新推成 remote（#520）。
+  const incomingMode = incoming?.memory?.vector?.mode
+  const keepMode = incomingMode === 'local' || incomingMode === 'remote'
+    ? incomingMode
+    : (current?.memory?.vector?.modeExplicit === true ? current.memory.vector.mode : '')
+  if (next.memory?.vector && keepMode) next.memory.vector.mode = keepMode
   // 面板明确带了非空 chatEfforts（面板上改过单个聊天的档位）就以面板为准；
   // 没带或带的是空对象（旧版面板 / 面板没动过）时保留当前值——QQ 里 /effort 设过的不被清掉。
   const incomingEfforts = incoming && incoming.chatEfforts
