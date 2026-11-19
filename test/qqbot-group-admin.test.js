@@ -1091,3 +1091,136 @@ test('QQBot group_admin 自动解析 member_openid（@提及 / 成员列表 / �
   assert.equal(lmObserved.ok, true)
   assert.equal(lmObserved.members[0]?.openid, 'MEM_SPEAKER_OID')
 })
+
+test('QQBot group_admin 工具 schema 收窄、@ 过期提示、member_openid 格式与 400 错误区分', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aurabot-qqbot-p2-'))
+  const identity = createIdentity({ dataDir: dir, log: silent })
+  t.after(() => identity.close?.())
+  identity.claimOwner('qqbot', 'OWNER_OPENID')
+
+  let restrictMode = 'ok' // 'ok' | '400' | '11253'
+  const cfg = normalize({
+    enabled: false,
+    dryRun: false,
+    allow: { groups: ['qq:group:555', 'qqbot:group:GRP_SCHEMA'] },
+    platforms: {
+      qq: { enabled: true },
+      qqbot: { enabled: true, appId: 'app1', clientSecret: 'sec1', transport: 'webhook', botSecret: 'f'.repeat(32) },
+    },
+  })
+  cfg.platforms = {
+    qq: { enabled: true },
+    qqbot: { enabled: true, appId: 'app1', clientSecret: 'sec1', transport: 'webhook', botSecret: 'f'.repeat(32) },
+  }
+
+  const gw = createGateway({
+    config: cfg,
+    dataDir: (...p) => join(dir, 'gw', ...p),
+    http: { route: () => () => {} },
+    identity,
+    log: silent,
+  })
+  gw.register(() => createQqbotAdapter({
+    client: makeQqbotClient(async (req) => {
+      if (req.path.endsWith('/bot_state')) return { status: 200, data: { member_role: 'admin' } }
+      if (req.path.endsWith('/restrict_chat_setting')) {
+        if (restrictMode === '400') return { status: 400, data: { code: 304003, message: 'invalid member_openid' } }
+        if (restrictMode === '11253') return { status: 403, data: { code: 11253, message: 'forbidden mute' } }
+        return { status: 200, data: {} }
+      }
+      if (req.path.endsWith('/members')) return { status: 200, data: { members: [] } }
+      return { status: 404, data: null }
+    }),
+  }))
+  await gw.sync()
+  t.after(() => gw.stopAll())
+
+  const fakeOnebot = {
+    connected: () => true,
+    on: () => {},
+    getGroupMemberInfo: async () => ({ role: 'admin', nickname: 'Bot' }),
+  }
+  const groupRoles = createGroupRoles({ onebot: fakeOnebot, getGateway: () => gw, getConfig: () => cfg, dataDir: (...p) => join(dir, ...p), log: silent })
+
+  let toolFactory = null
+  const contexts = []
+  const messageListeners = []
+  groupAdminDef.setup({
+    core: {
+      hub: { turnSendersAllOwner: () => true, groupName: async (g) => String(g) },
+      onebot: fakeOnebot,
+      groupRoles,
+      gateway: gw,
+      identity,
+      http: { body: async (r) => r?.body || {}, query: (r) => r?.query || {} },
+    },
+    config: () => cfg,
+    on: (ev, fn) => { if (ev === 'message') messageListeners.push(fn) },
+    tool: (fn) => { toolFactory = fn },
+    context: (fn) => contexts.push(fn),
+    route: () => {},
+  })
+  assert.ok(toolFactory)
+
+  const pickAdmin = (ctx) => [toolFactory(ctx)].flat().filter(Boolean).find((x) => x.name === 'group_admin')
+  const qqbotGroupTool = pickAdmin({ chat: { chatId: 'qqbot:group:GRP_SCHEMA', kind: 'group', groupId: 'GRP_SCHEMA', platform: 'qqbot' }, level: 'social', sessionId: 's_qb' })
+  const qqGroupTool = pickAdmin({ chat: { chatId: 'qq:group:555', kind: 'group', groupId: '555', platform: 'qq' }, level: 'social', sessionId: 's_qq' })
+  const privTool = pickAdmin({ chat: { chatId: 'qqbot:private:OWNER_OPENID', kind: 'private', userId: 'OWNER_OPENID', platform: 'qqbot' }, level: 'full', sessionId: 's_priv' })
+
+  // 1) QQBot 群只暴露 ban / unban / kick / list_members 且省略 text；QQ 直连群与私聊保留完整 8 动作与 text
+  assert.deepEqual(qqbotGroupTool.parameters.properties.action.enum, ['ban', 'unban', 'kick', 'list_members'])
+  assert.equal('text' in qqbotGroupTool.parameters.properties, false)
+  assert.deepEqual(qqGroupTool.parameters.properties.action.enum, ['ban', 'unban', 'whole_ban', 'whole_unban', 'kick', 'title', 'notice', 'list_members'])
+  assert.ok('text' in qqGroupTool.parameters.properties)
+  assert.deepEqual(privTool.parameters.properties.action.enum, ['ban', 'unban', 'whole_ban', 'whole_unban', 'kick', 'title', 'notice', 'list_members'])
+  assert.ok('text' in privTool.parameters.properties)
+
+  // 2) api.context 提示说「群禁言」时先问清是全体禁言还是单人禁言，明确全体禁言做不了
+  const ctxBeforeRole = contexts.map((fn) => fn({ chat: { chatId: 'qqbot:group:GRP_SCHEMA', kind: 'group', groupId: 'GRP_SCHEMA', platform: 'qqbot' } })).join('\n')
+  assert.match(ctxBeforeRole, /群禁言/)
+  assert.match(ctxBeforeRole, /全体禁言做不了/)
+
+  // 3) >3 分钟的 @ 提及过期后明确提示“超过 3 分钟”
+  let nowMs = 1_700_000_000_000
+  t.mock.method(Date, 'now', () => nowMs)
+  for (const fn of messageListeners) {
+    await fn({
+      kind: 'group',
+      platform: 'qqbot',
+      chatId: 'qqbot:group:GRP_SCHEMA',
+      userId: 'OWNER_OPENID',
+      nickname: '主人',
+      sender: { isOwner: true },
+      parts: [
+        { type: 'text', text: '禁言 ' },
+        { type: 'mention', account: 'MEM_EXP_1', name: '过期友' },
+      ],
+    })
+  }
+  nowMs += 3 * 60_000 + 1
+  const expiredRes = await qqbotGroupTool.execute({ action: 'ban', minutes: 5 })
+  assert.equal(expiredRes.ok, false)
+  assert.match(expiredRes.message, /超过 3 分钟/)
+
+  // 4) 显式传入非法的 member_openid 格式立即拦截
+  const invalidExplicit = await qqbotGroupTool.execute({ action: 'ban', member_openid: '非法 空格 openid', minutes: 5 })
+  assert.equal(invalidExplicit.ok, false)
+  assert.match(invalidExplicit.message, /member_openid 格式不对/)
+
+  // 5) 显式 member_openid 遇非权限 API 错误（400）附带排查提示；11253 权限错误不附带
+  restrictMode = '400'
+  const err400 = await qqbotGroupTool.execute({ action: 'ban', member_openid: 'MEM_BAD_400', minutes: 5 })
+  assert.equal(err400.ok, false)
+  assert.match(err400.message, /可能无效或不在本群/)
+
+  const ctxAfterRole = contexts.map((fn) => fn({ chat: { chatId: 'qqbot:group:GRP_SCHEMA', kind: 'group', groupId: 'GRP_SCHEMA', platform: 'qqbot' } })).join('\n')
+  assert.match(ctxAfterRole, /管理员/)
+  assert.match(ctxAfterRole, /群禁言/)
+  assert.match(ctxAfterRole, /全体禁言做不了/)
+
+  restrictMode = '11253'
+  const err11253 = await qqbotGroupTool.execute({ action: 'ban', member_openid: 'MEM_PERM_11253', minutes: 5 })
+  assert.equal(err11253.ok, false)
+  assert.match(err11253.message, /11253/)
+  assert.doesNotMatch(err11253.message, /可能无效或不在本群/)
+})

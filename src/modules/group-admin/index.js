@@ -111,12 +111,14 @@ export default {
       return out
     }
 
-    const freshOwnerMentions = (chatId) => {
+    const ownerMentionState = (chatId) => {
       const key = normChatKey(chatId)
       const entry = key ? lastOwnerMentions.get(key) : null
-      if (!entry || Date.now() - entry.at > MENTION_TTL_MS) return []
-      return entry.mentions || []
+      if (!entry || !entry.mentions?.length) return { mentions: [], expired: false }
+      if (Date.now() - entry.at > MENTION_TTL_MS) return { mentions: [], expired: true }
+      return { mentions: entry.mentions, expired: false }
     }
+    const freshOwnerMentions = (chatId) => ownerMentionState(chatId).mentions
 
     api.on?.('message', (msg) => {
       if (!msg || msg.kind !== 'group' || !msg.chatId) return false
@@ -216,11 +218,15 @@ export default {
         if (/^\d{5,15}$/.test(explicit)) {
           return { error: 'QQ 官方机器人不能按 QQ 号操作，请在群里 @ 对方、填群成员昵称，或先用 list_members 查出 member_openid' }
         }
+        if (!/^[0-9A-Za-z_-]{4,128}$/.test(explicit)) {
+          return { error: 'member_openid 格式不对，请在群里 @ 对方、填群成员昵称，或先用 list_members 查出 member_openid' }
+        }
         return { openid: explicit, nick: '', via: 'explicit' }
       }
 
       const raw = unwrapMentionToken(rawUserId)
-      const mentions = freshOwnerMentions(chatId)
+      const mentionState = ownerMentionState(chatId)
+      const mentions = mentionState.mentions
       if (!raw) {
         let candidates = mentions
         if (candidates.length > 1 && (action === 'ban' || action === 'kick')) {
@@ -230,6 +236,9 @@ export default {
         if (candidates.length === 1) return { openid: candidates[0].openid, nick: candidates[0].nick, via: 'mention' }
         if (candidates.length > 1) {
           return { error: `这一轮 @ 了多位成员，请明确指定要操作谁：${formatCandidates(candidates)}` }
+        }
+        if (mentionState.expired) {
+          return { error: '上一次 @ 已超过 3 分钟，请重新 @ 对方、提供群昵称，或先用 list_members 查出 member_openid' }
         }
         return { error: '要说清楚对谁操作：可在群里 @ 对方、填对方群昵称，或先用 list_members 查出 member_openid' }
       }
@@ -271,13 +280,19 @@ export default {
       return { error: `群成员列表里没找到「${cleaned}」，请确认昵称或在群里 @ 对方 / 用 list_members 查看 member_openid` }
     }
 
+    const isQqbotOnlyChat = (chat) => {
+      if (chat?.kind !== 'group') return false
+      const info = roleInfoSync(chat)
+      if (info?.backend === 'gateway-admin' && info?.platform !== 'qq') return true
+      return String(chat?.platform || parseChatId(normChatKey(chat?.chatId))?.platform || '') === 'qqbot'
+    }
+
     // 她在这个群的身份：没管理权限或无官方接口权限时直接如实说明
     api.context(({ chat }) => {
       if (chat.kind !== 'group') return ''
       const info = roleInfoSync(chat)
       const role = info?.role || ''
-      const isQqbotGroup = (info?.backend === 'gateway-admin' && info?.platform !== 'qq')
-        || String(chat?.platform || parseChatId(normChatKey(chat?.chatId))?.platform || '') === 'qqbot'
+      const isQqbotGroup = isQqbotOnlyChat(chat)
       const mentions = isQqbotGroup ? freshOwnerMentions(chat.chatId) : []
       const mentionHint = mentions.length
         ? `\n本轮主人刚刚 @ 的群成员：${mentions.map((m) => (m.nick ? `${m.nick}（member_openid=${m.openid}）` : `member_openid=${m.openid}`)).join('、')}。`
@@ -286,8 +301,8 @@ export default {
         if (info?.backend === 'gateway-admin' && info?.platform !== 'qq' && info.reason) {
           return `当前群的 QQ 官方机器人群管理暂不可用（${info.reason}）；主人让你禁言或踢人时，直接如实说明原因。`
         }
-        if (isQqbotGroup && mentions.length) {
-          return `QQ 官方机器人群可用 group_admin 执行单人禁言（ban）/ 解禁（unban）/ 踢人（kick）/ 查成员（list_members），接受对方昵称/@昵称或 member_openid（不支持全体禁言、不能填 QQ 号）。${mentionHint}`
+        if (isQqbotGroup) {
+          return `QQ 官方机器人群可用 group_admin 执行单人禁言（ban）/ 解禁（unban）/ 踢人（kick）/ 查成员（list_members），接受对方昵称/@昵称或 member_openid（不能填 QQ 号）。QQ 官方机器人只支持单人禁言；用户说「群禁言」时先问清是全体禁言还是禁言某个人，全体禁言做不了。${mentionHint}`
         }
         return ''
       }
@@ -295,7 +310,7 @@ export default {
         return '你在这个群只是普通成员，没有管理权限：禁言、踢人这些做不了，主人要求时直接说明。'
       }
       if (info?.backend === 'gateway-admin' && info?.platform !== 'qq') {
-        return `你在这个群是${groupRoles.label(role)}。主人要求时可以用 group_admin 做单人禁言（ban）、解禁（unban）、踢人（kick）或查成员（list_members）；可直接填对方昵称/@昵称或 member_openid，若主人刚在消息里 @ 了对方也可以直接调工具自动识别（不支持全体禁言 whole_ban、改专属头衔和发群公告；不能填 QQ 号；不要写 /ban 等斜杠命令）。${mentionHint}`
+        return `你在这个群是${groupRoles.label(role)}。主人要求时可以用 group_admin 做单人禁言（ban）、解禁（unban）、踢人（kick）或查成员（list_members）；可直接填对方昵称/@昵称或 member_openid，若主人刚在消息里 @ 了对方也可以直接调工具自动识别（不支持全体禁言 whole_ban、改专属头衔和发群公告；不能填 QQ 号；不要写 /ban 等斜杠命令）。QQ 官方机器人只支持单人禁言；用户说「群禁言」时先问清是全体禁言还是禁言某个人，全体禁言做不了。${mentionHint}`
       }
       return `你在这个群是${groupRoles.label(role)}，主人要求时可以用 group_admin 做群管操作（不要写 /ban 等斜杠命令）。`
     })
@@ -303,18 +318,38 @@ export default {
     // 工具层校验：这一轮说话的人必须全是主人
     api.tool(({ chat, level, sessionId }) => {
       if (!(chat.kind === 'group' || level === 'full')) return []
+      const qqbotOnly = isQqbotOnlyChat(chat)
+      const properties = {
+        action: qqbotOnly
+          ? {
+              type: 'string',
+              enum: ['ban', 'unban', 'kick', 'list_members'],
+              description: 'ban 单人禁言，unban 解禁，kick 踢出，list_members 列出群成员及 member_openid（QQ 官方机器人不支持全体禁言/改头衔/发公告）',
+            }
+          : {
+              type: 'string',
+              enum: ['ban', 'unban', 'whole_ban', 'whole_unban', 'kick', 'title', 'notice', 'list_members'],
+              description: 'ban 单人禁言，unban 解禁，whole_ban 全体禁言（仅 QQ 直连），whole_unban 解除全体禁言（仅 QQ 直连），kick 踢出，title 改专属头衔（仅 QQ 直连），notice 发公告（仅 QQ 直连），list_members 列出群成员及 member_openid',
+            },
+        group_id: qqbotOnly
+          ? str('规范群地址（如 qqbot:group:xxx）；在群里用时可省略，默认当前群')
+          : str('群号或规范群地址（如 qqbot:group:xxx）；在群里用时可省略，默认当前群'),
+        user_id: qqbotOnly
+          ? str('操作对象：填对方群昵称 / @昵称 / member_openid，若主人刚 @ 了对方也可省略自动匹配（不可填纯数字 QQ 号）')
+          : str('操作对象：QQ 直连群填对方 QQ 号；QQ 官方机器人群可填对方群昵称 / @昵称 / member_openid，若主人刚 @ 了对方也可省略自动匹配（不可填纯数字 QQ 号）'),
+        member_openid: str('可选，明确指定 QQ 官方机器人群目标成员的 member_openid'),
+        query: str('可选，action=list_members 时按昵称或 ID 筛选成员'),
+        minutes: int('禁言分钟数，默认 10；QQ 官方机器人最长 43200（30 天）'),
+      }
+      if (!qqbotOnly) {
+        properties.text = str('头衔内容或公告内容（QQ 官方机器人不支持）')
+      }
       return defineTool({
         name: 'group_admin',
-        description: '群管理：单人禁言（ban）/ 解禁（unban）/ 踢人（kick）/ 查成员（list_members）；QQ 直连群还支持全体禁言（whole_ban/whole_unban）/ 改头衔（title）/ 发公告（notice）。QQ 官方机器人群可直接填群昵称/@昵称、填 member_openid，或在主人 @ 对方后省略目标自动识别。只有主人单独发话时才能用。',
-        properties: {
-          action: { type: 'string', enum: ['ban', 'unban', 'whole_ban', 'whole_unban', 'kick', 'title', 'notice', 'list_members'], description: 'ban 单人禁言，unban 解禁，whole_ban 全体禁言（仅 QQ 直连），whole_unban 解除全体禁言（仅 QQ 直连），kick 踢出，title 改专属头衔（仅 QQ 直连），notice 发公告（仅 QQ 直连），list_members 列出群成员及 member_openid' },
-          group_id: str('群号或规范群地址（如 qqbot:group:xxx）；在群里用时可省略，默认当前群'),
-          user_id: str('操作对象：QQ 直连群填对方 QQ 号；QQ 官方机器人群可填对方群昵称 / @昵称 / member_openid，若主人刚 @ 了对方也可省略自动匹配（不可填纯数字 QQ 号）'),
-          member_openid: str('可选，明确指定 QQ 官方机器人群目标成员的 member_openid'),
-          query: str('可选，action=list_members 时按昵称或 ID 筛选成员'),
-          minutes: int('禁言分钟数，默认 10；QQ 官方机器人最长 43200（30 天）'),
-          text: str('头衔内容或公告内容（QQ 官方机器人不支持）'),
-        },
+        description: qqbotOnly
+          ? 'QQ 官方机器人群管理：仅支持单人禁言（ban）/ 解禁（unban）/ 踢人（kick）/ 查成员（list_members），不支持全体禁言。可直接填群昵称/@昵称、填 member_openid，或在主人 @ 对方后省略目标自动识别。只有主人单独发话时才能用。'
+          : '群管理：单人禁言（ban）/ 解禁（unban）/ 踢人（kick）/ 查成员（list_members）；QQ 直连群还支持全体禁言（whole_ban/whole_unban）/ 改头衔（title）/ 发公告（notice）。QQ 官方机器人群可直接填群昵称/@昵称、填 member_openid，或在主人 @ 对方后省略目标自动识别。只有主人单独发话时才能用。',
+        properties,
         required: ['action'],
         execute: async ({ action, group_id, user_id, member_openid, query, minutes, text }) => {
           if (!hub.turnSendersAllOwner(sessionId)) return { ok: false, message: '只有主人能让我做群管操作' }
@@ -478,7 +513,12 @@ export default {
                 await ga.kickMember(spec.openid, resolvedOpenid)
               }
             } catch (error) {
-              return { ok: false, message: error?.message || `群管操作失败（${action}）` }
+              const base = error?.message || `群管操作失败（${action}）`
+              const knownStatusError = ['group-admin-forbidden', 'group-admin-not-admin', 'group-admin-rate-limited', 'group-admin-unsupported'].includes(error?.code)
+              if (resolved.via === 'explicit' && !knownStatusError) {
+                return { ok: false, message: `${base}（该 member_openid 可能无效或不在本群，可用 list_members 核对）` }
+              }
+              return { ok: false, message: base }
             }
             if (resolved.via === 'mention' || resolved.via === 'members' || resolved.via === 'observed') {
               return { ok: true, message: `做好了（对象：${resolved.nick ? `${resolved.nick} / ${resolvedOpenid}` : resolvedOpenid}）` }
