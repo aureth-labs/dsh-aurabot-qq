@@ -27,9 +27,6 @@ const ALL_MODS = [...BUILTINS, groupAdminMod]
  * 规则：T1/T2 只许缩短，不许加长；T3 清空删除。
  */
 const MIGRATION_ALLOWLIST = new Set([
-  // T2-4: speakup
-  'qq_set_reminder',
-  'qq_close_reminder',
   // T2-5: bili
   'qq_send_shot',
   'qq_list_shots',
@@ -421,5 +418,9 @@ test('usage.moduleOfTool 覆盖已迁移工具的权威名与旧别名', () => {
   assert.equal(moduleOfTool('qq_generate_video'), '生视频')
   assert.equal(moduleOfTool('song_cover'), '翻唱')
   assert.equal(moduleOfTool('qq_song_cover'), '翻唱')
+  assert.equal(moduleOfTool('set_reminder'), '主动搭话')
+  assert.equal(moduleOfTool('close_reminder'), '主动搭话')
+  assert.equal(moduleOfTool('qq_set_reminder'), '主动搭话')
+  assert.equal(moduleOfTool('qq_close_reminder'), '主动搭话')
   assert.equal(moduleOfTool('qq_send_shot'), '刷 B 站')
 })

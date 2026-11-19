@@ -4,12 +4,18 @@ import { createSpeakUp } from '../../features/companion.js'
 import { isOwner } from '../../chat/access.js'
 import { defineTool, str } from '../../tools/tools.js'
 
+export const toolAliases = Object.freeze({
+  qq_set_reminder: 'set_reminder',
+  qq_close_reminder: 'close_reminder',
+})
+
 export default {
   id: 'speakup',
   name: '主动搭话',
   version: '1.0.0',
   api: 3,
   platforms: ['*'],
+  toolAliases,
   description: '主人一阵子没理她时，在私聊里主动找主人说话',
   tab: 'speakup',
   files: ['features/companion.js'],
@@ -39,7 +45,7 @@ export default {
       if (!ownerChat(chat) || api.config().speakUp?.enabled === false) return []
       return [
         defineTool({
-          name: 'qq_set_reminder',
+          name: 'set_reminder',
           description: '给未来的自己定一个小闹钟。到时间系统会提醒你主动找主人说话。at 必须是 yyyy-mm-dd HH:MM（本地时间），note 是到时要提醒自己的内容/由头。只用于主人私聊；面板里的小闹钟开关关着时不能用。',
           properties: {
             at: str('时间，格式 yyyy-mm-dd HH:MM，例如 2026-11-12 17:30'),
@@ -54,7 +60,7 @@ export default {
           },
         }),
         defineTool({
-          name: 'qq_close_reminder',
+          name: 'close_reminder',
           description: '关闭一个自己设的小闹钟。id 用运行时「她的小闹钟」列表里的编号。',
           properties: { id: str('要关闭的小闹钟 id') },
           required: ['id'],
@@ -67,9 +73,14 @@ export default {
     })
     api.context(({ chat }) => {
       if (!ownerChat(chat) || api.config().speakUp?.reminderEnabled !== true) return ''
+      const lines = [
+        '- 给未来定小闹钟用 set_reminder，关闭小闹钟用 close_reminder；不要写 /remind 或 /reminder 之类的斜杠命令。',
+      ]
       const list = speakUp.reminders()
-      if (!list.length) return ''
-      return '【她的小闹钟】\n' + list.map((r) => `- ${r.id}｜${r.atText}｜${r.note}`).join('\n') + '\n要关闭某条用 qq_close_reminder。'
+      if (list.length) {
+        lines.push('【她的小闹钟】\n' + list.map((r) => `- ${r.id}｜${r.atText}｜${r.note}`).join('\n') + '\n要关闭某条用 close_reminder。')
+      }
+      return lines.join('\n')
     })
     api.route('/speakup/reminder/close', async (req) => {
       const body = await api.core.http.body(req).catch(() => ({}))
