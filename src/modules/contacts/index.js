@@ -95,7 +95,47 @@ export default {
       return `${user} 邀请${invited}加入${group}`
     }
     const groupInFlight = new Set()
-    const ownerInviteAccepted = new Set()
+    const ownerAcceptedFile = () => (typeof api.dataDir === 'function' ? api.dataDir('owner-invite-accepted.json') : '')
+
+    const loadOwnerAccepted = () => {
+      const f = ownerAcceptedFile()
+      if (!f || !existsSync(f)) return new Set()
+      try {
+        const j = JSON.parse(readFileSync(f, 'utf8'))
+        const list = Array.isArray(j) ? j.map((x) => String(x || '')).filter(Boolean) : []
+        return new Set(list.slice(-PENDING_MAX))
+      } catch {
+        return new Set()
+      }
+    }
+
+    const saveOwnerAccepted = () => {
+      const f = ownerAcceptedFile()
+      if (!f) return
+      try {
+        writeFileSync(f, JSON.stringify([...ownerInviteAccepted].slice(-PENDING_MAX)))
+      } catch (error) {
+        api.log.warn('存主人拉群去重记录出错：', error.message)
+      }
+    }
+
+    const autoWhitelistGroup = (groupId) => {
+      const n = cleanId(groupId)
+      if (!n || typeof api.setConfig !== 'function') return false
+      let added = false
+      api.setConfig((cur) => {
+        const list = (cur.allow?.groups || []).map(String)
+        if (list.includes(n) || list.includes(`qq:group:${n}`)) return cur
+        const nextPlan = planWhitelist(cur, { action: 'add', kind: 'group', id: n }, identity)
+        if (!nextPlan.ok || !nextPlan.changed) return cur
+        added = true
+        return { ...cur, allow: { ...cur.allow, groups: nextPlan.next } }
+      })
+      return added
+    }
+
+    const ownerInviteAccepted = loadOwnerAccepted()
+    const ownerInviteInFlight = new Set()
 
     const onGroupRequest = (ev) => {
       if (!ev.flag || !['add', 'invite'].includes(ev.sub_type)) return
@@ -105,20 +145,49 @@ export default {
       const cfg = api.config()
       const botQQ = String(cfg.botQQ || '')
 
-      // 群邀请只处理「邀请机器人」；别人邀请其他人时不打扰主人。
+      // 群邀请只处理「邀请机器人」或未带 invited_id 的事件；明确邀请其他人时不打扰主人。
       if (ev.sub_type === 'invite' && invitedId && invitedId !== botQQ) return
 
-      // 主人自己拉机器人进群：这是主人已经做过的主动操作，直接接受即可，
-      // 不要再把「是否通过邀请」弹回给主人。重复事件按 flag 去重。
-      if (ev.sub_type === 'invite' && invitedId === botQQ && isOwner(identity, userId, 'qq')) {
+      // 主人自己拉机器人进群：这是主人已经做过的主动操作，直接接受并加入群白名单，
+      // 不要再把「是否通过邀请」弹回给主人。失败时记日志、入待处理列表并通知主人。
+      if (ev.sub_type === 'invite' && (!invitedId || invitedId === botQQ) && isOwner(identity, userId, 'qq')) {
         const flag = String(ev.flag)
-        if (ownerInviteAccepted.has(flag)) return
-        ownerInviteAccepted.add(flag)
-        while (ownerInviteAccepted.size > 50) ownerInviteAccepted.delete(ownerInviteAccepted.values().next().value)
+        if (ownerInviteAccepted.has(flag) || ownerInviteInFlight.has(flag)) return
         if (cfg.dryRun) return
-        qqCall('set_group_add_request', { flag, sub_type: 'invite', approve: true }, { timeoutMs: 15000 }).catch((error) => {
-          ownerInviteAccepted.delete(flag)
+        ownerInviteInFlight.add(flag)
+        let reqPromise
+        try {
+          reqPromise = Promise.resolve(qqCall('set_group_add_request', { flag, sub_type: 'invite', approve: true }, { timeoutMs: 15000 }))
+        } catch (error) {
+          reqPromise = Promise.reject(error)
+        }
+        reqPromise.then(() => {
+          ownerInviteInFlight.delete(flag)
+          ownerInviteAccepted.add(flag)
+          while (ownerInviteAccepted.size > PENDING_MAX) {
+            const oldest = ownerInviteAccepted.values().next().value
+            if (oldest === undefined) break
+            ownerInviteAccepted.delete(oldest)
+          }
+          saveOwnerAccepted()
+          const pending = loadGroupPending()
+          if (pending.some((x) => x.flag === flag)) {
+            saveGroupPending(pending.filter((x) => x.flag !== flag))
+          }
+          autoWhitelistGroup(groupId)
+        }).catch((error) => {
+          ownerInviteInFlight.delete(flag)
           api.log.warn(`自动接受主人拉群邀请失败（群 ${groupId}）：${error?.message || error}`)
+          const list = loadGroupPending()
+          if (!list.some((x) => x.flag === flag)) {
+            list.push({ flag, subType: 'invite', userId, groupId, invitedId, comment: String(ev.comment || '').slice(0, 80), at: Date.now() })
+            saveGroupPending(list)
+          }
+          const curCfg = api.config()
+          const to = ownerTarget()
+          if ((curCfg.profilePerms?.qqFriendRequest || 'owner') !== 'off' && to) {
+            api.sendText(to, `你拉我进群 ${groupId || '未知群'} 时自动接受失败（${error?.message || error}），已记入待处理列表，可以让我列出待处理的加群申请后重试。`).catch(() => {})
+          }
         })
         return
       }
@@ -243,6 +312,16 @@ export default {
             try {
               await qqCall('set_group_add_request', { flag: req.flag, sub_type: req.subType, approve, ...(reason && !approve ? { reason: String(reason) } : {}) }, { timeoutMs: 15000 })
               saveGroupPending(loadGroupPending().filter((x) => x.flag !== req.flag))
+              if (req.subType === 'invite' && approve && isOwner(identity, req.userId, 'qq')) {
+                ownerInviteAccepted.add(req.flag)
+                while (ownerInviteAccepted.size > PENDING_MAX) {
+                  const oldest = ownerInviteAccepted.values().next().value
+                  if (oldest === undefined) break
+                  ownerInviteAccepted.delete(oldest)
+                }
+                saveOwnerAccepted()
+                autoWhitelistGroup(req.groupId)
+              }
               return { ok: true, message: `已${verb}「${label}」` }
             } catch (error) {
               if (error?.code === 'unsupported-action') return { ok: false, message: '当前 QQ 网关不支持处理加群申请' }

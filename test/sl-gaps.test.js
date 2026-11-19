@@ -23,29 +23,33 @@ const otherChat = { kind: 'private', userId: OTHER, groupId: '', chatId: `privat
 const groupChat = { kind: 'group', userId: OTHER, groupId: '44444444', chatId: 'group:44444444' }
 const groupEvent = (patch = {}) => ({ post_type: 'request', request_type: 'group', sub_type: 'add', user_id: Number(OTHER), group_id: 44444444, flag: '原样:flag/1', comment: '你好', ...patch })
 
-function setupContacts({ cfg = {}, allOwner = true, callImpl } = {}) {
+function setupContacts({ cfg = {}, allOwner = true, callImpl, dir: customDir } = {}) {
   let config = normalize({ ownerQQ: OWNER, botQQ: BOT, enabled: true, dryRun: false, ...cfg })
   const identity = makeTestIdentity(config.ownerQQ || OWNER, 'qq')
   let owner = allOwner
-  const dir = mkdtempSync(join(tmpdir(), 'aurabot-sl-contacts-'))
-  const sent = [], calls = []
+  const dir = customDir || mkdtempSync(join(tmpdir(), 'aurabot-sl-contacts-'))
+  const sent = [], calls = [], warns = []
   let listener, builder
   contacts.setup({
     core: { identity, routeOwner: identity.routeOwner, hub: { turnSendersAllOwner: () => owner }, onebot: { call: async (action, params) => { calls.push({ action, params }); return callImpl?.(action, params) } } },
     config: () => config,
+    setConfig: (fn) => { config = typeof fn === 'function' ? fn(config) : fn },
     dataDir: (...parts) => join(dir, ...parts),
-    log: { warn() {} },
+    log: { warn: (...args) => warns.push(args.join(' ')) },
     on: (_name, fn) => { listener = fn },
     tool: (fn) => { builder = fn },
     sendText: async (chatId, text) => { sent.push({ chatId, text }) },
   })
   return {
+    dir, cfg: () => config, warns,
     event: (ev) => listener(ev), sent, calls,
     tools: (chat) => Object.fromEntries(builder({ chat, sessionId: 's' }).map((tool) => [tool.name, tool])),
     set: (patch) => { config = normalize({ ...config, ...patch }); if (patch.ownerQQ !== undefined) identity.setOwner(patch.ownerQQ, 'qq') },
     setOwner: (value) => { owner = value },
   }
 }
+
+const flush = () => new Promise((r) => setImmediate(r))
 
 test('加群申请和邀请：通知、去重、列出并原样处理 flag', async () => {
   const s = setupContacts()
@@ -78,7 +82,7 @@ test('加群申请和邀请：通知、去重、列出并原样处理 flag', asy
   assert.doesNotMatch(remaining.message, /invite:2|invite:3|原样:flag/)
 })
 
-test('主人自己拉机器人进群：自动接受邀请，不通知主人；重复事件只接受一次', async () => {
+test('主人自己拉机器人进群：自动接受并加白名单（去重/防重复/dryRun），缺少 invited_id 兼容；失败转待处理并通知且可重试', async () => {
   const s = setupContacts()
   const ownerInvite = groupEvent({
     sub_type: 'invite',
@@ -89,11 +93,19 @@ test('主人自己拉机器人进群：自动接受邀请，不通知主人；�
   })
   s.event(ownerInvite)
   s.event(ownerInvite)
+  await flush()
   assert.equal(s.sent.length, 0, '主人自己拉群不应该再弹待处理通知')
   assert.deepEqual(s.calls, [
     { action: 'set_group_add_request', params: { flag: 'invite:owner', sub_type: 'invite', approve: true } },
   ])
+  assert.ok(s.cfg().allow.groups.includes('66666666'), '自动接受主人拉群后应自动加入群白名单')
   assert.match((await s.tools(ownerChat).qq_list_group_requests.execute({})).message, /没有待处理/)
+
+  // P2-3：重启后读取持久化去重文件，同一 flag 再次推送不重复调用接受接口
+  const sRestarted = setupContacts({ dir: s.dir })
+  sRestarted.event(ownerInvite)
+  await flush()
+  assert.equal(sRestarted.calls.length, 0, '重启后已接受过的 flag 不得重复接受')
 
   // 别人邀请另一个人（不是机器人）也不应该打扰主人
   const otherInvite = groupEvent({
@@ -104,8 +116,82 @@ test('主人自己拉机器人进群：自动接受邀请，不通知主人；�
     invited_id: 60000006,
   })
   s.event(otherInvite)
+  await flush()
   assert.equal(s.sent.length, 0)
   assert.equal(s.calls.length, 1)
+
+  // P2-4：事件缺少 invited_id 时，主人邀请同样自动接受并加白名单
+  s.event({
+    post_type: 'request',
+    request_type: 'group',
+    sub_type: 'invite',
+    user_id: Number(OWNER),
+    group_id: 77778888,
+    flag: 'invite:owner-no-invited-id',
+  })
+  await flush()
+  assert.equal(s.calls.length, 2)
+  assert.equal(s.sent.length, 0)
+  assert.ok(s.cfg().allow.groups.includes('77778888'))
+
+  // P2-1：已在白名单（裸号或 qq:group: 前缀）时不重复追加；dryRun 不接受不改配置
+  const dupCheck = setupContacts({ cfg: { allow: { groups: ['99999999', 'qq:group:88888888'] } } })
+  dupCheck.event(groupEvent({ sub_type: 'invite', flag: 'invite:dup1', user_id: Number(OWNER), group_id: 99999999, invited_id: Number(BOT) }))
+  dupCheck.event(groupEvent({ sub_type: 'invite', flag: 'invite:dup2', user_id: Number(OWNER), group_id: 88888888, invited_id: Number(BOT) }))
+  await flush()
+  assert.deepEqual(dupCheck.cfg().allow.groups, ['99999999', 'qq:group:88888888'])
+  dupCheck.set({ dryRun: true })
+  dupCheck.event(groupEvent({ sub_type: 'invite', flag: 'invite:dry', user_id: Number(OWNER), group_id: 12121212, invited_id: Number(BOT) }))
+  await flush()
+  assert.equal(dupCheck.calls.length, 2)
+  assert.equal(dupCheck.cfg().allow.groups.includes('12121212'), false)
+
+  // P2-2：自动接受失败 → 记日志、入待处理列表、发消息通知主人、不加白名单；重投事件成功后清待处理并加白名单
+  let shouldFail = true
+  const retryable = setupContacts({
+    callImpl: async () => { if (shouldFail) throw new Error('网络超时') },
+  })
+  const failInvite = groupEvent({
+    sub_type: 'invite',
+    flag: 'invite:fail-once',
+    user_id: Number(OWNER),
+    group_id: 91919191,
+    invited_id: Number(BOT),
+  })
+  retryable.event(failInvite)
+  await flush()
+  assert.equal(retryable.warns.length, 1)
+  assert.match(retryable.warns[0], /网络超时/)
+  assert.equal(retryable.sent.length, 1)
+  assert.match(retryable.sent[0].text, /91919191.*网络超时/)
+  assert.equal(retryable.cfg().allow.groups.includes('91919191'), false)
+  assert.match((await retryable.tools(ownerChat).qq_list_group_requests.execute({})).message, /invite:fail-once/)
+
+  shouldFail = false
+  retryable.event(failInvite)
+  await flush()
+  assert.match((await retryable.tools(ownerChat).qq_list_group_requests.execute({})).message, /没有待处理/)
+  assert.ok(retryable.cfg().allow.groups.includes('91919191'))
+
+  // P2-2（手工通过重试路径）：通过 qq_handle_group_request 重试失败的主人邀请后同样清列表并加白名单
+  let manualFail = true
+  const manualRetry = setupContacts({
+    callImpl: async () => { if (manualFail) throw new Error('暂不可用') },
+  })
+  manualRetry.event(groupEvent({
+    sub_type: 'invite',
+    flag: 'invite:manual-retry',
+    user_id: Number(OWNER),
+    group_id: 92929292,
+    invited_id: Number(BOT),
+  }))
+  await flush()
+  assert.equal(manualRetry.cfg().allow.groups.includes('92929292'), false)
+  manualFail = false
+  const handled = await manualRetry.tools(ownerChat).qq_handle_group_request.execute({ flag: 'invite:manual-retry', approve: true })
+  assert.equal(handled.ok, true, handled.message)
+  assert.match((await manualRetry.tools(ownerChat).qq_list_group_requests.execute({})).message, /没有待处理/)
+  assert.ok(manualRetry.cfg().allow.groups.includes('92929292'))
 })
 
 test('加群申请：仅主人、权限变化、试运行和失败重试', async () => {
