@@ -32,13 +32,13 @@ function boot ({ ownerTurn = true, dryRun = false } = {}) {
     },
   }
   groupAdmin.setup(api)
-  const tool = tools.find((t) => t.name === 'qq_group_admin')
+  const tool = tools.find((t) => t.name === 'group_admin')
   return { tool, calls, cfg }
 }
 
 test('群管工具里能选到全体禁言', () => {
   const { tool } = boot()
-  assert.ok(tool, '没有 qq_group_admin 工具')
+  assert.ok(tool, '没有 group_admin 工具')
   const enumList = tool.parameters.properties.action.enum
   assert.ok(enumList.includes('whole_ban'), '枚举里没有 whole_ban')
   assert.ok(enumList.includes('whole_unban'), '枚举里没有 whole_unban')

@@ -8,7 +8,8 @@ export default {
   name: '群管',
   version: '1.0.0',
   api: 1,
-  description: '主人要求时禁言 / 解禁 / 踢人 / 改头衔 / 发公告（qq_group_admin）；告诉她自己在群里有没有管理权限',
+  toolAliases: { qq_group_admin: 'group_admin' },
+  description: '主人要求时禁言 / 解禁 / 踢人 / 改头衔 / 发公告（group_admin）；告诉她自己在群里有没有管理权限',
   setup(api) {
     const { hub, onebot, groupRoles } = api.core
 
@@ -24,7 +25,7 @@ export default {
     api.tool(({ chat, level, sessionId }) => {
       if (!(chat.kind === 'group' || level === 'full')) return []
       return defineTool({
-        name: 'qq_group_admin',
+        name: 'group_admin',
         description: '群管理：禁言 / 解禁 / 全体禁言 / 解除全体禁言 / 踢人 / 改头衔 / 发群公告。只有主人要求时才能用；别人要求会被系统拒绝。',
         properties: {
           action: { type: 'string', enum: ['ban', 'unban', 'whole_ban', 'whole_unban', 'kick', 'title', 'notice'], description: 'ban 禁言某人，unban 解除某人的禁言，whole_ban 全体禁言（整个群都禁言），whole_unban 解除全体禁言，kick 踢出，title 改专属头衔，notice 发公告' },

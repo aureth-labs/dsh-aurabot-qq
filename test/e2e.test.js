@@ -64,7 +64,7 @@ async function brain({ preset, text, images, callTool }) {
   if (text.includes('第一句') && text.includes('第二句')) return '两句我都看到啦'
   if (text.includes('画一只')) { const r = await callTool('draw_image', { prompt: '一只蓝色小鲸鱼' }); return r && r.ok ? '画好啦' : '画不了' }
   if (text.includes('禁言')) {
-    const r = await callTool('qq_group_admin', { action: 'ban', user_id: '999', minutes: 5 })
+    const r = await callTool('group_admin', { action: 'ban', user_id: '999', minutes: 5 })
     return r && r.ok ? '好 禁了' : '你谁啊 我只听主人的'
   }
   if (text.includes('发文件越界')) {
@@ -182,7 +182,7 @@ test('主人私聊「在吗」：建会话（完整权限 preset）、按 ||| �
   // 主人私聊的会话里有完整工具
   const agent = fake.agents.get(ws.sessionIds[0])
   assert.ok(agent.tools.has('qq_send_qzone'))
-  assert.ok(agent.tools.has('qq_group_admin'))
+  assert.ok(agent.tools.has('group_admin'))
 })
 
 test('#7 主人私聊：她这一轮还在跑时再发消息，直接 steer 进去，不等整轮结束', async () => {

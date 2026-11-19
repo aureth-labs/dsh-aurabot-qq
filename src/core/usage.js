@@ -153,6 +153,8 @@ const TOOL_MODULES = {
   close_reminder: 'speakup',
   qq_set_reminder: 'speakup',
   qq_close_reminder: 'speakup',
+  group_admin: 'group-admin',
+  qq_group_admin: 'group-admin',
   send_sticker: 'stickers',
   list_stickers: 'stickers',
   edit_sticker: 'stickers',

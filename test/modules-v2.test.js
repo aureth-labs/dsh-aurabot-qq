@@ -499,7 +499,7 @@ test('QQ 内置模块收到 unsupported-action 时给出清晰失败提示而不
 
   const tools = mods.buildTools({ chat: { chatId: 'qq:group:123456', kind: 'group', groupId: '123456', userId: '10000001' }, level: 'social', sessionId: 's1' })
   const apiCallTool = tools.find((x) => x.name === 'qq_api_call')
-  const adminTool = tools.find((x) => x.name === 'qq_group_admin')
+  const adminTool = tools.find((x) => x.name === 'group_admin')
 
   const r1 = await apiCallTool.execute({ action: 'get_essence_msg_list', param: '{"group_id":123456}' })
   assert.equal(r1.ok, false)

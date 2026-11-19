@@ -26,10 +26,7 @@ const ALL_MODS = [...BUILTINS, groupAdminMod]
  * T0 临时迁移白名单：仅允许正在分阶段迁移的旧工具名暂留。
  * 规则：T1/T2 只许缩短，不许加长；T3 清空删除。
  */
-const MIGRATION_ALLOWLIST = new Set([
-  // T2-6: group-admin
-  'qq_group_admin',
-])
+const MIGRATION_ALLOWLIST = new Set([])
 
 /**
  * 跨平台模块里按平台显式门控的平台专属动作白名单：
@@ -423,4 +420,6 @@ test('usage.moduleOfTool 覆盖已迁移工具的权威名与旧别名', () => {
   assert.equal(moduleOfTool('bili_list_shots'), '刷 B 站')
   assert.equal(moduleOfTool('qq_send_shot'), '刷 B 站')
   assert.equal(moduleOfTool('qq_list_shots'), '刷 B 站')
+  assert.equal(moduleOfTool('group_admin'), '群管')
+  assert.equal(moduleOfTool('qq_group_admin'), '群管')
 })

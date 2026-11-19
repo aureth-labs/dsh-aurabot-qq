@@ -21,6 +21,10 @@ function backendLabelOf(info, spec) {
   return 'QQ 直连'
 }
 
+export const toolAliases = Object.freeze({
+  qq_group_admin: 'group_admin',
+})
+
 export default {
   id: 'group-admin',
   name: '群管',
@@ -30,7 +34,8 @@ export default {
   features: {
     optional: ['chat.member.list'],
   },
-  description: '主人要求时做群管理：QQ 直连支持禁言/解禁/全体禁言/踢人/改头衔/发公告；QQ 官方机器人支持禁言/解禁/踢人（qq_group_admin）',
+  toolAliases,
+  description: '主人要求时做群管理：QQ 直连支持禁言/解禁/全体禁言/踢人/改头衔/发公告；QQ 官方机器人支持禁言/解禁/踢人（group_admin）',
   setup(api) {
     const { hub, onebot, groupRoles, gateway, http } = api.core
     const groupNameCache = new Map() // chatId -> { name, at }
@@ -83,16 +88,16 @@ export default {
         return '你在这个群只是普通成员，没有管理权限：禁言、踢人这些做不了，主人要求时直接说明。'
       }
       if (info?.backend === 'gateway-admin' && info?.platform !== 'qq') {
-        return `你在这个群是${groupRoles.label(role)}。主人要求时可以用 qq_group_admin 禁言、解禁或踢人（QQ 官方机器人不支持全体禁言、改专属头衔和发群公告；操作对象只能填群成员的 member_openid，不能填 QQ 号）。`
+        return `你在这个群是${groupRoles.label(role)}。主人要求时可以用 group_admin 禁言、解禁或踢人（QQ 官方机器人不支持全体禁言、改专属头衔和发群公告；操作对象只能填群成员的 member_openid，不能填 QQ 号；不要写 /ban 等斜杠命令）。`
       }
-      return `你在这个群是${groupRoles.label(role)}，主人要求时可以用群管工具。`
+      return `你在这个群是${groupRoles.label(role)}，主人要求时可以用 group_admin 做群管操作（不要写 /ban 等斜杠命令）。`
     })
 
     // 工具层校验：这一轮说话的人必须全是主人
     api.tool(({ chat, level, sessionId }) => {
       if (!(chat.kind === 'group' || level === 'full')) return []
       return defineTool({
-        name: 'qq_group_admin',
+        name: 'group_admin',
         description: '群管理：禁言（ban）/ 解禁（unban）/ 踢人（kick），QQ 直连群还支持全体禁言（whole_ban/whole_unban）/ 改头衔（title）/ 发公告（notice）。只有主人单独发话时才能用。',
         properties: {
           action: { type: 'string', enum: ['ban', 'unban', 'whole_ban', 'whole_unban', 'kick', 'title', 'notice'], description: 'ban 禁言，unban 解禁，whole_ban 全体禁言，whole_unban 解除全体禁言，kick 踢出，title 改专属头衔，notice 发公告' },

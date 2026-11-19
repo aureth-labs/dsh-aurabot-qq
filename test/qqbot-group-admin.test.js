@@ -277,7 +277,7 @@ test('group-admin：qqbot ban/unban/kick、禁止纯数字 QQ、实时重查角�
     route: (path, handler) => routes.set(path, handler),
   })
 
-  const adminTool = tools.find((x) => x.name === 'qq_group_admin')
+  const adminTool = tools.find((x) => x.name === 'group_admin')
   assert.ok(adminTool)
 
   // 1) ban / unban / kick 走 QQBot 接口；且不允许传纯数字 QQ 号
@@ -543,8 +543,8 @@ test('group-admin 审查加固：P1 拒绝 qq#2 串台退回 onebot；P2-5 /grou
     const res = typeof b === 'function' ? b({ chat: { kind: 'private', chatId: 'qq:private:10000001' }, level: 'full', sessionId: 's1' }) : b
     return Array.isArray(res) ? res : (res ? [res] : [])
   })
-  const adminTool = BuiltTools.find((x) => x?.name === 'qq_group_admin')
-  assert.ok(adminTool, '应注册 qq_group_admin 工具')
+  const adminTool = BuiltTools.find((x) => x?.name === 'group_admin')
+  assert.ok(adminTool, '应注册 group_admin 工具')
   const qq2Exec = await adminTool.execute({ action: 'ban', group_id: 'qq#2:group:777', user_id: '12345' })
   assert.equal(qq2Exec.ok, false)
   assert.equal(obCalls, 0, 'qq#2 执行群管时绝不能回退打到默认 OneBot')
@@ -678,7 +678,7 @@ test('复审 6.3 P2：默认 QQ 网关无 groupAdmin 且无直连 onebot 时直�
     const res = typeof b === 'function' ? b({ chat: { kind: 'private', chatId: 'qq:private:10000001' }, level: 'full', sessionId: 's1' }) : b
     return Array.isArray(res) ? res : (res ? [res] : [])
   })
-  const adminTool = BuiltTools.find((x) => x?.name === 'qq_group_admin')
+  const adminTool = BuiltTools.find((x) => x?.name === 'group_admin')
   const toolRes = await adminTool.execute({ action: 'ban', group_id: 'qq:group:1136292994', user_id: '12345' })
   assert.equal(toolRes.ok, false)
   assert.match(toolRes.message, /默认 QQ 网关未提供群管理能力/)
@@ -801,8 +801,8 @@ test('默认 QQ 网关（无直连 onebot）与 qq#2 多实例经 gateway.groupA
   })
 
   const buildTools = (cid) => toolBuilders.flatMap((b) => [b({ chat: { chatId: cid, kind: 'group', groupId: '777', platform: 'qq' }, level: 'social', sessionId: cid })].flat().filter(Boolean))
-  const q1Tool = buildTools('qq:group:777').find((x) => x.name === 'qq_group_admin')
-  const q2Tool = buildTools('qq#2:group:777').find((x) => x.name === 'qq_group_admin')
+  const q1Tool = buildTools('qq:group:777').find((x) => x.name === 'group_admin')
+  const q2Tool = buildTools('qq#2:group:777').find((x) => x.name === 'group_admin')
 
   // 默认 qq 网关（群主）：支持禁言与全体禁言/发公告/改头衔
   assert.equal((await q1Tool.execute({ action: 'ban', user_id: '556677', minutes: 3 })).ok, true)
