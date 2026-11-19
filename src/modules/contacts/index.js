@@ -95,17 +95,39 @@ export default {
       return `${user} 邀请${invited}加入${group}`
     }
     const groupInFlight = new Set()
+    const ownerInviteAccepted = new Set()
 
     const onGroupRequest = (ev) => {
       if (!ev.flag || !['add', 'invite'].includes(ev.sub_type)) return
       const userId = String(ev.user_id || '')
       const groupId = String(ev.group_id || '')
+      const invitedId = String(ev.invited_id || '')
+      const cfg = api.config()
+      const botQQ = String(cfg.botQQ || '')
+
+      // 群邀请只处理「邀请机器人」；别人邀请其他人时不打扰主人。
+      if (ev.sub_type === 'invite' && invitedId && invitedId !== botQQ) return
+
+      // 主人自己拉机器人进群：这是主人已经做过的主动操作，直接接受即可，
+      // 不要再把「是否通过邀请」弹回给主人。重复事件按 flag 去重。
+      if (ev.sub_type === 'invite' && invitedId === botQQ && isOwner(identity, userId, 'qq')) {
+        const flag = String(ev.flag)
+        if (ownerInviteAccepted.has(flag)) return
+        ownerInviteAccepted.add(flag)
+        while (ownerInviteAccepted.size > 50) ownerInviteAccepted.delete(ownerInviteAccepted.values().next().value)
+        if (cfg.dryRun) return
+        qqCall('set_group_add_request', { flag, sub_type: 'invite', approve: true }, { timeoutMs: 15000 }).catch((error) => {
+          ownerInviteAccepted.delete(flag)
+          api.log.warn(`自动接受主人拉群邀请失败（群 ${groupId}）：${error?.message || error}`)
+        })
+        return
+      }
+
       const list = loadGroupPending()
       if (list.some((x) => x.flag === String(ev.flag))) return
-      const req = { flag: String(ev.flag), subType: ev.sub_type, userId, groupId, invitedId: String(ev.invited_id || ''), comment: String(ev.comment || '').slice(0, 80), at: Date.now() }
+      const req = { flag: String(ev.flag), subType: ev.sub_type, userId, groupId, invitedId, comment: String(ev.comment || '').slice(0, 80), at: Date.now() }
       list.push(req)
       saveGroupPending(list)
-      const cfg = api.config()
       const to = ownerTarget()
       if ((cfg.profilePerms?.qqFriendRequest || 'owner') !== 'off' && to) {
         const note = req.comment ? `，验证消息：「${req.comment}」` : ''

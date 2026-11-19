@@ -58,11 +58,11 @@ test('加群申请和邀请：通知、去重、列出并原样处理 flag', asy
   s.event(c)
   s.event(groupEvent({ flag: '' }))
   s.event(groupEvent({ sub_type: 'unknown', flag: 'ignored' }))
-  assert.equal(s.sent.length, 3)
+  assert.equal(s.sent.length, 2)
   assert.equal(s.sent[0].chatId, `private:${OWNER}`)
   assert.match(s.sent[0].text, /30000003.*申请.*44444444/)
   assert.match(s.sent[1].text, /50000005.*邀请我.*55555555/)
-  assert.match(s.sent[2].text, /60000006/)
+  assert.doesNotMatch(s.sent[1].text, /60000006/)
   const tools = s.tools(ownerChat)
   const list = await tools.qq_list_group_requests.execute({})
   assert.match(list.message, /原样:flag\/1/)
@@ -75,8 +75,37 @@ test('加群申请和邀请：通知、去重、列出并原样处理 flag', asy
     { action: 'set_group_add_request', params: { flag: b.flag, sub_type: 'invite', approve: false, reason: '暂不加入' } },
   ])
   const remaining = await tools.qq_list_group_requests.execute({})
-  assert.doesNotMatch(remaining.message, /invite:2|原样:flag/)
-  assert.match(remaining.message, /invite:3/)
+  assert.doesNotMatch(remaining.message, /invite:2|invite:3|原样:flag/)
+})
+
+test('主人自己拉机器人进群：自动接受邀请，不通知主人；重复事件只接受一次', async () => {
+  const s = setupContacts()
+  const ownerInvite = groupEvent({
+    sub_type: 'invite',
+    flag: 'invite:owner',
+    user_id: Number(OWNER),
+    group_id: 66666666,
+    invited_id: Number(BOT),
+  })
+  s.event(ownerInvite)
+  s.event(ownerInvite)
+  assert.equal(s.sent.length, 0, '主人自己拉群不应该再弹待处理通知')
+  assert.deepEqual(s.calls, [
+    { action: 'set_group_add_request', params: { flag: 'invite:owner', sub_type: 'invite', approve: true } },
+  ])
+  assert.match((await s.tools(ownerChat).qq_list_group_requests.execute({})).message, /没有待处理/)
+
+  // 别人邀请另一个人（不是机器人）也不应该打扰主人
+  const otherInvite = groupEvent({
+    sub_type: 'invite',
+    flag: 'invite:other',
+    user_id: 50000005,
+    group_id: 77777777,
+    invited_id: 60000006,
+  })
+  s.event(otherInvite)
+  assert.equal(s.sent.length, 0)
+  assert.equal(s.calls.length, 1)
 })
 
 test('加群申请：仅主人、权限变化、试运行和失败重试', async () => {
