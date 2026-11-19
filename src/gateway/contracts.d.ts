@@ -224,6 +224,26 @@ export interface SendError extends Error {
 
 // ───────────────────────── 6. 能力表 ─────────────────────────
 
+/**
+ * L2 细粒度功能键（共 14 项）。
+ * 与 L1 Caps 不同：Caps 描述发信载体与基础通道限制，Feature 描述模块可直接查询/门控的功能原语。
+ */
+export type Feature =
+  | 'message.quote.send'
+  | 'message.quote.read'
+  | 'message.history.read'
+  | 'message.forward.expand'
+  | 'message.recall'
+  | 'message.reaction'
+  | 'media.fetch'
+  | 'chat.member.list'
+  | 'chat.member.read'
+  | 'chat.typing'
+  | 'sticker.send.native'
+  | 'sticker.collect'
+  | 'sticker.sync.native'
+  | 'card.send'
+
 export interface Caps {
   image: boolean
   sticker: boolean
@@ -255,6 +275,16 @@ export interface Caps {
   history: boolean
   memberList: boolean
   forwardExpand: boolean
+  /**
+   * L2 细粒度功能表，由网关按不可逆顺序解析：
+   *  1. adapter L1 caps → 推导有 L1 键的 Feature（其中 chat.member.read 先缺省取 memberList）；
+   *  2. 叠加 adapter 显式 features（带 L1 键仅允许 true→false；无 L1 键及独立 chat.member.read 严格取显式值，缺省 false）；
+   *  3. 叠加用户配置 L1 caps（只紧不松）；
+   *  4. 用户关掉 L1 caps 时强制收敛对应带 L1 键 Feature（注意：用户关 memberList 不自动关独立的 chat.member.read）；
+   *  5. 叠加用户配置 caps.features（未知键丢弃 warn，仅允许 true→false）。
+   * 提示：如 message.quote.read=true 仅表示适配器支持调用，不承诺当前租户必然具备平台授权。
+   */
+  features?: Partial<Record<Feature, boolean>>
 }
 
 // ───────────────────────── 7. 平台端 ─────────────────────────
@@ -282,11 +312,54 @@ export interface AdapterContext {
 
 export type FetchRequest =
   | { kind: 'media'; media: MediaRef }
+  | { kind: 'message'; messageId: string; chat?: { kind: ChatKind; id: string } }
   | { kind: 'forward'; id: string }
-  | { kind: 'history'; chat: { kind: ChatKind; id: string }; count: number; before?: string }
+  /** before：继续往前翻页的不透明游标；count 缺省时由适配器按 20 条处理 */
+  | { kind: 'history'; chat: { kind: ChatKind; id: string }; count?: number; before?: string }
   | { kind: 'member'; chat: { kind: ChatKind; id: string }; account: string }
   | { kind: 'members'; chat: { kind: ChatKind; id: string } }
   | { kind: 'chats' }
+
+export interface FetchedMessage {
+  messageId: string
+  /** 发送时间，毫秒时间戳 */
+  at?: number
+  /**
+   * 发送者信息。系统消息或已撤回消息缺少发送者时可整体省略 sender；
+   * 若提供 sender 但确实拿不到账号，account 填空串 ''，严禁伪造账号。
+   */
+  sender?: {
+    account: string
+    name?: string
+    /**
+     * 是否机器人/应用自己发送的消息；缺失时中枢保守按 false 处理。
+     * 飞书 sender_type='app'、QQ user_id === 实例 self 时均应由适配器填 true。
+     */
+    isBot?: boolean
+    /**
+     * 平台侧发送者 ID 类型（多 ID 体系平台如飞书显式标注；单账号平台如 QQ 可省略）。
+     * 仅当省略或为 'open_id' 时，中枢才将其 account 与实例 open_id 做相等比对。
+     */
+    idType?: 'open_id' | 'union_id' | 'user_id'
+  }
+  parts: Part[]
+  /** @internal 仅供适配器或测试调试；中枢、缓存（recentInbound/quoteCache）、模型提示词、聊天流水与日志严禁读取或持久化。 */
+  raw?: unknown
+}
+
+export interface FetchedHistoryPage {
+  /** 归一化后的历史消息列表（约定按时间升序 [旧 → 新]） */
+  messages: FetchedMessage[]
+  /** true 表示在当前返回结果之前仍有更早的历史消息可继续往前翻 */
+  hasMore?: boolean
+  /** 继续往前翻页的不透明字符串游标（如 QQ 为最早一条 message_id，飞书为 page_token），调用方原样回传给 FetchRequest.history.before */
+  before?: string
+}
+
+export interface FetchedForwardResult {
+  /** 统一返回归一化消息数组（Phase 1A 起启用），禁止返回裸嵌套数组或原平台 node */
+  messages: FetchedMessage[]
+}
 
 export interface PlatformAdapter {
   id: Platform
@@ -305,6 +378,9 @@ export interface PlatformAdapter {
    * 失败必须抛 SendError；抛别的错误网关一律当 'unknown' 处理。
    */
   send(message: { chat: { kind: ChatKind; id: string }; parts: Part[]; replyTo?: string; inResponseTo?: string; timeoutMs?: number; ext?: Record<string, unknown> }): Promise<{ messageId: string }>
+  fetch?(request: FetchRequest & { kind: 'message' }): Promise<FetchedMessage>
+  fetch?(request: FetchRequest & { kind: 'forward' }): Promise<FetchedForwardResult>
+  fetch?(request: FetchRequest & { kind: 'history' }): Promise<FetchedHistoryPage>
   fetch?(request: FetchRequest): Promise<any>
   /**
    * 把本平台的原生消息格式转成 parts。QQ 端用它接住旧接口 sendSegments 传进来的 OneBot 消息段，
@@ -313,6 +389,19 @@ export interface PlatformAdapter {
   toParts?(nativeMessage: unknown): Part[]
   /** 平台独有的本事。只有声明了 platforms 含本平台的模块能经 api.native 调到这里 */
   native?(action: string, params?: any, opts?: { timeoutMs?: number }): Promise<any>
+  /** 可选群管理能力（例如 QQ 官方机器人 bot_state / 禁言 / 踢人） */
+  groupAdmin?: GroupAdminCapability
+}
+
+export interface GroupAdminCapability {
+  supportedActions?: { ban?: boolean; unban?: boolean; kick?: boolean; wholeBan?: boolean; title?: boolean; notice?: boolean }
+  getBotState(groupOpenid: string): Promise<{ role: 'owner' | 'admin' | 'member' | ''; groupOpenid: string; memberOpenid?: string }>
+  getGroupInfo?(groupOpenid: string): Promise<{ groupOpenid: string; name?: string; memberCount?: number }>
+  listMembers?(groupOpenid: string, opts?: { startIndex?: number; limit?: number }): Promise<Array<{ openid: string; nick?: string; role?: string }>>
+  muteMember?(groupOpenid: string, memberOpenid: string, durationMs: number): Promise<void>
+  unmuteMember?(groupOpenid: string, memberOpenid: string): Promise<void>
+  kickMember?(groupOpenid: string, memberOpenid: string, opts?: { addBlackList?: boolean }): Promise<void>
+  observedGroups?(): Array<{ openid: string; at: number; preview?: string }>
 }
 
 // ───────────────────────── 8. 网关 ─────────────────────────
@@ -338,7 +427,13 @@ export interface Gateway {
 
   onMessage(fn: (message: InboundMessage) => void): () => void
   onEvent(fn: (event: AdapterEvent & { instance: Instance; platform: Platform; chatId?: ChatId }) => void): () => void
+  /** 只负责实例连接状态变化（unconfigured / connecting / connected / disconnected / stopped）；宿主不得拿它替代 onCapsChanged 驱动会话工具重挂 */
   onState(fn: (status: InstanceStatus) => void): () => void
+  /**
+   * 必选方法（Step 0B 在网关实现）：仅在实例连接状态或解析后的 L2 features 发生实质变化时触发；
+   * 宿主必须通过本回调（而非 onState）去抖重挂会话工具，不反复重启模块。
+   */
+  onCapsChanged(fn: (info: { instance: Instance; platform: Platform; state: ConnState; caps: Caps | null; features: Record<Feature, boolean> }) => void): () => void
 
   /**
    * 唯一的出站口。做的事按顺序：规范化地址 → 查实例是否在线 → 按 caps 降级 → 调平台端 →
@@ -347,8 +442,16 @@ export interface Gateway {
    */
   send(message: OutboundMessage): Promise<SendResult>
   caps(chatIdOrInstance: string): Caps | null
+  /** 必选方法（Step 0B 在网关实现）：返回目标聊天或实例当前 14 项 L2 布尔表；实例未连接、不存在或 caps === null 时全为 false */
+  features(chatIdOrInstance: string): Record<Feature, boolean>
+  /** 拉取约定：message → FetchedMessage；forward → FetchedForwardResult；history → FetchedHistoryPage（Phase 3A 起强制全适配器归一化） */
+  fetch(chatIdOrInstance: string, request: FetchRequest & { kind: 'message' }): Promise<FetchedMessage>
+  fetch(chatIdOrInstance: string, request: FetchRequest & { kind: 'forward' }): Promise<FetchedForwardResult>
+  fetch(chatIdOrInstance: string, request: FetchRequest & { kind: 'history' }): Promise<FetchedHistoryPage>
   fetch(chatIdOrInstance: string, request: FetchRequest): Promise<any>
   native(instance: Instance, action: string, params?: any, opts?: { timeoutMs?: number }): Promise<any>
+  /** 只读暴露实例的群管理能力对象（实例未连接或未实现时返回 null，避免模块直接摸 adapter 对象） */
+  groupAdmin?(chatIdOrInstance: string): GroupAdminCapability | null
   /** 转给该实例平台端的 toParts；平台端没实现时抛错 */
   toParts(chatIdOrInstance: string, nativeMessage: unknown): Part[]
 
@@ -382,7 +485,8 @@ export interface InstanceConfig {
   adapter?: string
   /**
    * 用户手动关掉这个实例的某些能力。只能往「更弱」改：把 true 改成 false、native 改成 file、
-   * free 改成 limited 或 none。想打开平台端没声明的能力无效。网关把它叠在平台端的 caps() 上。
+   * free 改成 limited 或 none。caps.features 同样只允许 true → false，未知 Feature 键忽略。
+   * 想打开平台端没声明的能力无效。网关把它叠在平台端的 caps() 上。
    */
   caps?: Partial<Caps>
   /** 这个实例上她的行为开关，全部可选，不写就用全局设置 */

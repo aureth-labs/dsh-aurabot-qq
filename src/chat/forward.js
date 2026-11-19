@@ -1,6 +1,7 @@
 // 合并转发：把聊天记录展开成文字，顺带收集里面的图片。转发里可以再套转发，所以按层往下拉。
 
 import { parseMessageEvent } from './inbound.js'
+import { renderParts } from '../gateway/render.js'
 
 export const MAX_FORWARD_DEPTH = 5 // 最多展开几层
 export const MAX_FORWARD_LINES = 200 // 一条消息里所有层加起来最多几行
@@ -53,6 +54,76 @@ export function applyForwardBodies(text, bodies) {
     out += parts[i]
   }
   return out
+}
+
+/** 将网关归一化的 FetchedMessage[] 展平为 { lines, images, stickers }（不读 raw）。 */
+export function formatFetchedForward(messages, { limit = MAX_FORWARD_LINES, maxImages = MAX_FORWARD_IMAGES, depth = 1, state = null } = {}) {
+  const st = state || { count: 0, seen: new Set(), lines: [], images: [], stickers: [] }
+  const pad = '  '.repeat(depth)
+  const nestedIds = []
+  for (const m of Array.isArray(messages) ? messages : []) {
+    if (!m || st.count >= limit) break
+    st.count++
+    const who = m.sender?.name || m.sender?.account || '某人'
+    const rendered = renderParts(m.parts).text || '（图片/表情）'
+    st.lines.push(`${pad}${who}：${rendered.slice(0, MAX_LINE)}`)
+    for (const part of Array.isArray(m.parts) ? m.parts : []) {
+      if (part?.type === 'forward' && part.id) nestedIds.push(String(part.id))
+      if (st.images.length + st.stickers.length >= maxImages) continue
+      if (part?.type === 'image') {
+        st.images.push({
+          type: 'image',
+          data: {
+            url: part.media?.url,
+            file: part.media?.id || part.media?.url || '',
+            mediaId: part.media?.id,
+            mime: part.media?.mime,
+            messageId: m.messageId,
+          },
+        })
+      } else if (part?.type === 'sticker') {
+        st.stickers.push({
+          type: 'image',
+          data: {
+            sub_type: 1,
+            summary: part.label,
+            url: part.media?.url,
+            file: part.media?.id || part.media?.url || '',
+            mediaId: part.media?.id,
+            mime: part.media?.mime,
+            messageId: m.messageId,
+          },
+        })
+      }
+    }
+  }
+  return { ...st, nestedIds }
+}
+
+/** 递归展开网关归一化的合并转发（深度上限与传统 readForward 一致，防环且不读 raw）。 */
+export async function readFetchedForward(fetchFn, id, { depth = 1, state, log } = {}) {
+  const st = state || { count: 0, seen: new Set(), lines: [], images: [], stickers: [] }
+  const sid = String(id ?? '')
+  if (!sid || st.seen.has(sid)) return st
+  st.seen.add(sid)
+  let res
+  try {
+    res = await fetchFn(sid)
+  } catch (error) {
+    log?.debug?.('拉合并转发失败（网关）：', error?.message || error)
+    return st
+  }
+  const { nestedIds } = formatFetchedForward(res?.messages, { depth, state: st })
+  if (nestedIds.length) {
+    if (depth < MAX_FORWARD_DEPTH) {
+      for (const childId of nestedIds) {
+        await readFetchedForward(fetchFn, childId, { depth: depth + 1, state: st, log })
+      }
+    } else {
+      st.lines.push(`${'  '.repeat(depth)}  （里面还有一层转发，太深了没展开）`)
+    }
+  }
+  return st
 }
 
 /** 拼成交给她的文字。 */

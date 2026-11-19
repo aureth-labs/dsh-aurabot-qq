@@ -17,14 +17,47 @@ import { registerSecretField } from './config.js'
 import { defineTool } from '../tools/tools.js'
 import { selfName } from '../persona/personas.js'
 import { normalizeChatId, parseChatId } from '../gateway/address.js'
+import { ALL_FEATURES, emptyFeatures, mergeCapsWithFeatures } from '../gateway/features.js'
+import { partsToSegmentsFallback, segmentsToPartsFallback } from '../chat/part-fallback.js'
 import { isOwner as checkOwnerIdentity } from '../chat/access.js'
 
 const platformContext = new AsyncLocalStorage()
 const runWithPlatform = (platform, fn) => (platform ? platformContext.run(platform, fn) : fn())
 
-/** 扩展接口版本：v2 起支持多平台模块（platforms / api.caps / api.native / api.platformOf / api.sendParts），向后兼容 v1。 */
-export const API_VERSION = 2
+/** 扩展接口版本：v3 起在 v2 基础上提供 L2 Feature（api.features / api.can / api.require / FeatureUnavailableError）与会话能力注入，向后兼容 v1/v2。 */
+export const API_VERSION = 3
 export const MIN_API_VERSION = 1
+
+const ALL_FEATURE_SET = new Set(ALL_FEATURES)
+
+const L1_KEY_FOR_FEATURE = Object.freeze({
+  'message.quote.send': 'quoteReply',
+  'message.history.read': 'history',
+  'message.forward.expand': 'forwardExpand',
+  'message.recall': 'recall',
+  'chat.member.list': 'memberList',
+  'chat.typing': 'typing',
+  'sticker.send.native': 'sticker',
+  'card.send': 'card',
+})
+
+/** 当模块主动调用 api.require(feature, chatId) 而能力不可用时抛出。 */
+export class FeatureUnavailableError extends Error {
+  constructor({ feature = '', chatId = '', instance = '', reason = 'unsupported', message } = {}) {
+    const why = reason === 'offline'
+      ? '对应平台实例未连接或未就绪'
+      : reason === 'disabled-by-config'
+        ? '该能力已在配置中被手动禁用'
+        : '当前平台实例不支持该能力'
+    super(message || `能力「${feature}」不可用（${why}${instance ? `，实例：${instance}` : ''}）`)
+    this.name = 'FeatureUnavailableError'
+    this.code = 'FEATURE_UNAVAILABLE'
+    this.reason = reason
+    this.feature = String(feature || '')
+    this.chatId = String(chatId || '')
+    this.instance = String(instance || '')
+  }
+}
 
 const QQ_FALLBACK_CAPS = {
   image: true,
@@ -141,64 +174,32 @@ export function modulePlatforms(def) {
   return out.length ? out : ['qq']
 }
 
-function segmentsToPartsFallback(segs = []) {
-  if (!Array.isArray(segs)) return []
-  const out = []
-  for (const s of segs) {
-    if (!s || typeof s !== 'object') continue
-    const d = s.data || {}
-    if (s.type === 'text') {
-      if (d.text !== undefined) out.push({ type: 'text', text: String(d.text) })
-    } else if (s.type === 'at') {
-      if (String(d.qq) === 'all') out.push({ type: 'mention', all: true })
-      else if (d.qq != null) out.push({ type: 'mention', userId: String(d.qq) })
-    } else if (s.type === 'face') {
-      if (d.id != null) out.push({ type: 'face', id: String(d.id) })
-    } else if (s.type === 'reply') {
-      if (d.id != null) out.push({ type: 'reply', messageId: String(d.id) })
-    } else if (s.type === 'image' || s.type === 'record' || s.type === 'voice' || s.type === 'video' || s.type === 'file') {
-      const type = s.type === 'record' ? 'voice' : s.type
-      const file = String(d.url || d.file || '')
-      if (!file) continue
-      const part = { type }
-      if (file.startsWith('base64://')) part.base64 = file.slice('base64://'.length)
-      else if (/^https?:\/\//i.test(file)) part.url = file
-      else part.file = file
-      if (d.name) part.name = String(d.name)
-      out.push(part)
-    }
-  }
-  return out
+function normalizeFeaturesDecl(decl) {
+  if (!decl || typeof decl !== 'object' || Array.isArray(decl)) return null
+  const filterKnown = (arr) => (Array.isArray(arr)
+    ? arr.filter((f) => typeof f === 'string' && f.trim()).map((f) => f.trim()).filter((f) => ALL_FEATURE_SET.has(f))
+    : [])
+  const required = filterKnown(decl.required)
+  const optional = filterKnown(decl.optional)
+  if (!required.length && !optional.length) return null
+  return { required, optional }
 }
 
-function partsToSegmentsFallback(parts = []) {
-  if (!Array.isArray(parts)) return []
-  const out = []
-  for (const p of parts) {
-    if (!p || typeof p !== 'object') continue
-    if (p.type === 'text') {
-      if (p.text) out.push({ type: 'text', data: { text: String(p.text) } })
-    } else if (p.type === 'mention') {
-      const qq = p.all ? 'all' : String(p.userId || '')
-      if (qq) out.push({ type: 'at', data: { qq } })
-    } else if (p.type === 'face') {
-      if (p.id != null) out.push({ type: 'face', data: { id: String(p.id) } })
-    } else if (p.type === 'reply') {
-      if (p.messageId != null) out.push({ type: 'reply', data: { id: String(p.messageId) } })
-    } else if (p.type === 'image' || p.type === 'voice' || p.type === 'video' || p.type === 'file') {
-      const file = p.url
-        ? String(p.url)
-        : p.file
-          ? (isAbsolute(String(p.file)) ? pathToFileURL(String(p.file)).href : String(p.file))
-          : p.base64
-            ? `base64://${p.base64}`
-            : ''
-      if (!file) continue
-      const segType = p.type === 'voice' ? 'record' : p.type
-      out.push({ type: segType, data: p.type === 'file' && p.name ? { file, name: String(p.name) } : { file } })
+function matchesFilter(spec, { platform, features } = {}) {
+  if (!spec || typeof spec !== 'object') return true
+  if (Array.isArray(spec.platforms) && spec.platforms.length) {
+    if (platform && !spec.platforms.includes('*') && !spec.platforms.includes(platform)) return false
+  }
+  const reqFeatures = Array.isArray(spec.features)
+    ? spec.features
+    : (spec.features && Array.isArray(spec.features.required) ? spec.features.required : null)
+  if (reqFeatures && reqFeatures.length) {
+    if (!features || typeof features !== 'object') return false
+    for (const f of reqFeatures) {
+      if (!features[f]) return false
     }
   }
-  return out
+  return true
 }
 
 /** 检查模块定义，返回出错原因（没问题返回空串）。 */
@@ -213,6 +214,22 @@ export function checkDef(def, id) {
   if (def.platforms !== undefined) {
     if (!Array.isArray(def.platforms) || !def.platforms.length || def.platforms.some((p) => typeof p !== 'string' || !p.trim())) {
       return '模块 platforms 要是非空字符串数组（例如 [\'qq\'] 或 [\'*\']）'
+    }
+  }
+  if (def.features !== undefined) {
+    if (!def.features || typeof def.features !== 'object' || Array.isArray(def.features)) {
+      return '模块 features 要是对象（例如 { required: [], optional: [] }）'
+    }
+    for (const key of ['required', 'optional']) {
+      if (def.features[key] !== undefined) {
+        if (!Array.isArray(def.features[key]) || def.features[key].some((f) => typeof f !== 'string' || !f.trim())) {
+          return `模块 features.${key} 要是字符串数组`
+        }
+        const unknown = def.features[key].map((f) => f.trim()).filter((f) => !ALL_FEATURE_SET.has(f))
+        if (unknown.length) {
+          return `模块 features.${key} 包含未知能力键：${unknown.join('、')}`
+        }
+      }
     }
   }
   return ''
@@ -685,7 +702,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     if (hasPlatMap) {
       for (const [k, v] of Object.entries(plats)) {
         if (!v || v.enabled === false) continue
-        const p = String(v.platform || k.split(':')[0] || '').trim()
+        const p = String(v.platform || k.split(':')[0].split('#')[0] || '').trim()
         if (p) set.add(p)
       }
     }
@@ -728,6 +745,82 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       return { ...QQ_FALLBACK_CAPS }
     }
     return null
+  }
+  const deriveQqFallbackFeatures = (chatIdOrInstance = 'qq') => {
+    const instance = parseChatId(chatIdOrInstance)?.instance || String(chatIdOrInstance || 'qq')
+    const userCaps = getConfig()?.platforms?.[instance]?.caps
+    const merged = mergeCapsWithFeatures({ ...QQ_FALLBACK_CAPS }, userCaps, instance, log)
+    return { ...emptyFeatures(), ...(merged.features || {}) }
+  }
+  const resolveChatTarget = (chatId, modPlatforms = null) => {
+    const raw = chatId !== undefined && chatId !== null ? String(chatId).trim() : ''
+    if (raw) return normalizeChatId(raw) || raw
+    const activePlat = platformContext.getStore() || ''
+    const insts = core.gateway?.instances?.() || []
+    if (activePlat) {
+      const inst = insts.find((st) => st?.platform === activePlat && st.enabled && st.state === 'connected')
+        || insts.find((st) => st?.platform === activePlat && st.enabled)
+      if (inst?.instance) return inst.instance
+      if (activePlat === 'qq' && qqEnabled()) return 'qq:private:0'
+    }
+    if (Array.isArray(modPlatforms) && modPlatforms.length === 1 && modPlatforms[0] !== '*') {
+      const targetPlat = modPlatforms[0]
+      const inst = insts.find((st) => st?.platform === targetPlat && st.enabled && st.state === 'connected')
+        || insts.find((st) => st?.platform === targetPlat && st.enabled)
+      if (inst?.instance) return inst.instance
+      if (targetPlat === 'qq' && qqEnabled()) return 'qq:private:0'
+    }
+    const enabled = insts.filter((st) => st?.enabled)
+    if (enabled.length === 1) return enabled[0].instance
+    if (!insts.length && qqEnabled() && core.onebot?.state === 'connected') return 'qq:private:0'
+    return ''
+  }
+  const featuresFor = (chatId) => {
+    const norm = resolveChatTarget(chatId)
+    if (!norm) return emptyFeatures()
+    const gw = core.gateway
+    const addr = parseChatId(norm)
+    if (gw && typeof gw.features === 'function') {
+      const hasGwCaps = typeof gw.caps === 'function' ? gw.caps(norm) !== null : true
+      if (hasGwCaps) return { ...emptyFeatures(), ...(gw.features(norm) || {}) }
+      if (addr?.platform === 'qq' && qqEnabled() && core.onebot?.state === 'connected') {
+        return deriveQqFallbackFeatures(norm)
+      }
+      return { ...emptyFeatures(), ...(gw.features(norm) || {}) }
+    }
+    if (addr?.platform === 'qq' && qqEnabled() && core.onebot?.state === 'connected') {
+      return deriveQqFallbackFeatures(norm)
+    }
+    return emptyFeatures()
+  }
+  const featureUnavailableReason = (feature, norm) => {
+    if (!ALL_FEATURE_SET.has(feature)) return { instance: '', reason: 'unsupported' }
+    const addr = norm ? parseChatId(norm) : null
+    const cfg = getConfig()
+    const platsCfg = cfg?.platforms && typeof cfg.platforms === 'object' ? cfg.platforms : null
+    const instance = addr?.instance || (platsCfg && norm in platsCfg ? norm : '') || addr?.platform || ''
+    const gw = core.gateway
+    const instList = gw && typeof gw.instances === 'function' ? gw.instances() : null
+    const st = Array.isArray(instList) ? instList.find((x) => x.instance === instance) : null
+    const legacyOnline = addr?.platform === 'qq' && qqEnabled() && core.onebot?.state === 'connected' && (!st || !st.caps)
+    const connected = Boolean((st && st.state === 'connected' && st.caps !== null) || (!gw && legacyOnline) || legacyOnline)
+    if (!connected) return { instance, reason: 'offline' }
+    const userCaps = instance && platsCfg?.[instance]?.caps && typeof platsCfg[instance].caps === 'object'
+      ? platsCfg[instance].caps
+      : null
+    if (userCaps) {
+      if (userCaps.features?.[feature] === false) return { instance, reason: 'disabled-by-config' }
+      const l1Key = L1_KEY_FOR_FEATURE[feature]
+      if (l1Key && userCaps[l1Key] === false) return { instance, reason: 'disabled-by-config' }
+    }
+    return { instance, reason: 'unsupported' }
+  }
+  const requireFeature = (feature, chatId) => {
+    const norm = resolveChatTarget(chatId)
+    const feats = featuresFor(norm)
+    if (Boolean(feats[feature])) return true
+    const { instance, reason } = featureUnavailableReason(feature, norm)
+    throw new FeatureUnavailableError({ feature, chatId: norm || String(chatId || ''), instance, reason })
   }
   const requireQqCompatFor = (rec, id, label, chatId) => {
     if (!qqEnabled()) throw new Error(`QQ 平台未启用，${label} 不可用`)
@@ -924,8 +1017,27 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       // ---- 往插件里加东西 ----
       tool: (builder) => { rec.tools.push(builder); return () => remove(rec.tools, builder) },
       defineTool,
-      context: (fn) => { rec.contexts.push(fn); return () => remove(rec.contexts, fn) },
-      rule: (fn) => { rec.rules.push(fn); return () => remove(rec.rules, fn) },
+      context: (fnOrSpec) => {
+        const entry = typeof fnOrSpec === 'function'
+          ? { fn: fnOrSpec, platforms: fnOrSpec.platforms, features: fnOrSpec.features }
+          : (fnOrSpec && typeof (fnOrSpec.fn || fnOrSpec.render) === 'function')
+            ? { fn: fnOrSpec.fn || fnOrSpec.render, platforms: fnOrSpec.platforms, features: fnOrSpec.features }
+            : null
+        if (!entry) throw new Error('context 需要函数或带 fn/render 的描述对象')
+        rec.contexts.push(entry)
+        return () => remove(rec.contexts, entry)
+      },
+      rule: (fnOrSpec) => {
+        const entry = typeof fnOrSpec === 'object' && fnOrSpec !== null && !Array.isArray(fnOrSpec)
+          ? {
+            fn: fnOrSpec.fn ?? fnOrSpec.rule ?? '',
+            platforms: fnOrSpec.platforms,
+            features: fnOrSpec.features,
+          }
+          : { fn: fnOrSpec }
+        rec.rules.push(entry)
+        return () => remove(rec.rules, entry)
+      },
       command: (c) => {
         if (!c || !c.name || typeof c.run !== 'function') throw new Error('command 要有 name 和 run')
         const item = {
@@ -1036,6 +1148,9 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       sendVoiceFile: writable('sendVoiceFile', (chatId, file, note) => governedSend(core, id, { chatId: String(chatId) }, () => core.hub.sendVoiceFile(String(chatId), file, note || `[${id}] 语音`), obLog)),
       platformOf: (chatId) => platformOf(chatId),
       caps: (chatId) => capsFor(chatId),
+      features: (chatId) => featuresFor(resolveChatTarget(chatId, rec.platforms)),
+      can: (feature, chatId) => Boolean(featuresFor(resolveChatTarget(chatId, rec.platforms))[feature]),
+      require: (feature, chatId) => requireFeature(feature, resolveChatTarget(chatId, rec.platforms)),
       ownerRoute: (opts) => readOwnerRoute(opts),
       ownerChat: () => readOwnerRoute({ purpose: 'proactive' }).chatId,
       native: writable('native', (platform, action, params, opts) => nativeCall(rec, id, platform, action, params, opts)),
@@ -1226,7 +1341,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       const why = checkDef(def, u.id)
       if (why) throw new Error(why)
       plats = modulePlatforms(def)
-      userMeta.set(u.id, { name: def.name || u.id, description: def.description || '', version: def.version || '', platforms: plats })
+      userMeta.set(u.id, { name: def.name || u.id, description: def.description || '', version: def.version || '', platforms: plats, features: normalizeFeaturesDecl(def.features) })
     } catch (error) {
       if (disposed || (revisions.get(u.id) || 0) !== revision) return null
       if (!stillWanted()) { resyncRequested = true; return null }
@@ -1458,19 +1573,31 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     })
   }
 
+  const TOOL_ALIASES = Object.freeze({
+    qq_chat_history: 'chat_history',
+    qq_search_chatlog: 'search_chatlog',
+    qq_send_file: 'send_file',
+    qq_send_message: 'send_message',
+  })
+
   // ---------- 汇总给插件其他部分用 ----------
   function buildTools(where) {
     const out = []
     const names = new Set()
-    const p = where?.chat?.platform || platformOf(where?.chat?.chatId || where?.chatId)
+    const chatId = where?.chat?.chatId || where?.chatId || ''
+    const p = where?.chat?.platform || platformOf(chatId)
+    const features = where?.features || featuresFor(chatId)
+    const toolWhere = where && typeof where === 'object' ? { ...where, features } : { features }
     runWithPlatform(p, () => {
       for (const rec of live.values()) {
         if (p && !recMatchesPlatform(rec, p)) continue
         for (const b of rec.tools) {
+          if (!matchesFilter(b, { platform: p, features })) continue
           let r
-          try { r = typeof b === 'function' ? b(where) : b } catch (error) { note(rec.id, '生成工具', error); continue }
+          try { r = typeof b === 'function' ? b(toolWhere) : b } catch (error) { note(rec.id, '生成工具', error); continue }
           for (const t of [].concat(r || [])) {
             if (!t || !t.name) continue
+            if (!matchesFilter(t, { platform: p, features })) continue
             if (names.has(t.name)) { log.debug(`工具 ${t.name} 重名，模块「${rec.id}」的没挂`); continue }
             names.add(t.name)
             out.push(p && typeof t.execute === 'function' ? { ...t, execute: (...a) => platformContext.run(p, () => t.execute(...a)) } : t)
@@ -1480,29 +1607,97 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     })
     return out
   }
+  /** 解析会话可用工具：先精确匹配权威工具名，未命中时再按旧 qq_* 工具别名回落兼容执行路由。 */
+  function resolveTool(where, name) {
+    const wanted = String(name || '').trim()
+    if (!wanted) return undefined
+    const tools = buildTools(where)
+    const exact = tools.find((t) => t.name === wanted)
+    if (exact) return exact
+    const alias = TOOL_ALIASES[wanted]
+    return alias ? tools.find((t) => t.name === alias) : undefined
+  }
   function contextFor(args) {
     const parts = []
-    const p = args?.chat?.platform || platformOf(args?.chat?.chatId || args?.chatId)
+    const chatId = args?.chat?.chatId || args?.chatId || ''
+    const p = args?.chat?.platform || platformOf(chatId)
+    const features = args?.features || featuresFor(chatId)
+    const ctxArgs = args && typeof args === 'object' ? { ...args, features } : { features }
     runWithPlatform(p, () => {
       for (const rec of live.values()) {
         if (p && !recMatchesPlatform(rec, p)) continue
-        for (const fn of rec.contexts) {
-          try { const t = fn(args); if (t) parts.push(String(t)) } catch (error) {}
+        for (const entry of rec.contexts) {
+          if (!matchesFilter(entry, { platform: p, features })) continue
+          try {
+            const fn = typeof entry === 'function' ? entry : entry.fn
+            const t = typeof fn === 'function' ? fn(ctxArgs) : ''
+            if (t) parts.push(String(t))
+          } catch (error) {}
         }
       }
     })
     return parts.join('\n\n')
   }
-  function rules(kind) {
+  const warnedRuleLeaks = new Set()
+  function rules(kind, opts = {}) {
     const out = []
+    const active = activePlatforms()
+    const targetPlatform = opts?.platform ? String(opts.platform) : ''
+    const coversAllActive = (plats) => {
+      if (!Array.isArray(plats) || !plats.length) return true
+      if (plats.includes('*')) return true
+      if (targetPlatform) return plats.includes(targetPlatform)
+      return active.size > 0 && [...active].every((p) => plats.includes(p))
+    }
     for (const rec of live.values()) {
-      for (const fn of rec.rules) {
-        try { const t = typeof fn === 'function' ? fn(kind, getConfig()) : fn; for (const line of [].concat(t || [])) if (line) out.push(String(line)) } catch (error) {}
+      const modGlobalOk = targetPlatform
+        ? recMatchesPlatform(rec, targetPlatform)
+        : coversAllActive(rec.platforms)
+      if (!modGlobalOk) {
+        if (rec.rules.length && !warnedRuleLeaks.has(rec.id)) {
+          warnedRuleLeaks.add(rec.id)
+          log.warn(`模块「${rec.id}」仅声明平台 ${JSON.stringify(rec.platforms)}，多平台共存下其 api.rule 不会写入全局 preset；请改用 api.context(({ chat, features }) => ...)`)
+        }
+        continue
+      }
+      for (const entry of rec.rules) {
+        const spec = entry && typeof entry === 'object' && ('fn' in entry || 'platforms' in entry || 'features' in entry)
+          ? entry
+          : { fn: entry }
+        if (!coversAllActive(spec.platforms) || (!opts?.features && spec.features) || (opts?.features && !matchesFilter(spec, { platform: targetPlatform, features: opts.features }))) {
+          const warnKey = `${rec.id}:spec`
+          if (!opts?.features && !warnedRuleLeaks.has(warnKey)) {
+            warnedRuleLeaks.add(warnKey)
+            log.warn(`模块「${rec.id}」的全局 api.rule 不得绑定局部平台或 features（无法按会话隔离），已跳过；请迁入 api.context`)
+          }
+          continue
+        }
+        try {
+          const fn = spec.fn
+          const t = typeof fn === 'function' ? fn(kind, getConfig()) : fn
+          for (const line of [].concat(t || [])) if (line) out.push(String(line))
+        } catch (error) {}
       }
     }
     return out
   }
-  const commands = () => [...live.values()].flatMap((r) => r.commands)
+  const commands = (where) => {
+    if (!where || (!where.platform && !where.chatId && !where.features)) {
+      return [...live.values()].flatMap((r) => r.commands)
+    }
+    const chatId = where.chatId ? String(where.chatId) : ''
+    const p = where.platform || (chatId ? platformOf(chatId) : '')
+    const features = where.features || (chatId ? featuresFor(chatId) : null)
+    const out = []
+    for (const rec of live.values()) {
+      if (p && !recMatchesPlatform(rec, p)) continue
+      for (const cmd of rec.commands) {
+        if (!matchesFilter(cmd, { platform: p, features })) continue
+        out.push(cmd)
+      }
+    }
+    return out
+  }
   const dshTools = () => [...live.values()].flatMap((r) => r.dshTools.map((t) => ({ ...t, module: r.id })))
   /** 内置模块里没在跑的（关掉的、被替换的）。 */
   const builtinOff = () => new Set([...builtinDefs.keys()].filter((id) => live.get(id)?.source !== 'builtin'))
@@ -1552,6 +1747,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
         description: def.description || '',
         version: def.version || '',
         platforms: rec?.platforms || um?.platforms || modulePlatforms(b || def),
+        features: normalizeFeaturesDecl(def.features || b?.features || um?.features),
         skipReason: skipped.get(id) || '',
         builtin: Boolean(b),
         builtinVersion: b?.version || '',
@@ -1588,10 +1784,26 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
   }
   function toolNames(rec) {
     const names = []
+    const active = activePlatforms()
+    const modPlats = Array.isArray(rec.platforms) ? rec.platforms : []
+    const firstActive = core.gateway?.instances?.()?.find?.((st) => st?.enabled && (modPlats.includes('*') || modPlats.includes(st.platform)))
+    const probePlat = firstActive?.platform
+      || modPlats.find((p) => p !== '*' && (!active.size || active.has(p)))
+      || (active.size === 1 ? [...active][0] : '')
+    const probeCid = firstActive?.instance || (probePlat ? `${probePlat}:private:0` : '')
+    const probeFeatures = featuresFor(probeCid)
+    const filter = { platform: probePlat, features: probeFeatures }
     for (const b of rec.tools) {
+      if (!matchesFilter(b, filter)) continue
       try {
-        const r = typeof b === 'function' ? b({ chat: { chatId: 'private:0', kind: 'private', userId: '0' }, level: 'full', sessionId: '' }) : b
-        for (const t of [].concat(r || [])) if (t?.name) names.push(t.name)
+        const r = typeof b === 'function'
+          ? b({ chat: { chatId: probeCid || 'private:0', kind: 'private', ...(probePlat ? { platform: probePlat } : {}), userId: '0' }, level: 'full', sessionId: '', features: probeFeatures })
+          : b
+        for (const t of [].concat(r || [])) {
+          if (!t?.name) continue
+          if (!matchesFilter(t, filter)) continue
+          names.push(t.name)
+        }
       } catch (error) {}
     }
     return names
@@ -1688,9 +1900,9 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     boot, sync, reload, stop, dispose, status, create, fork, promptFor, panelSource,
     use: exportsOf, has: (id) => live.has(id), running: (id) => live.get(id)?.source || null, generation: () => generation,
     capabilitiesOf,
-    emit, claim, filter, filterSync, buildTools,
+    emit, claim, filter, filterSync, buildTools, resolveTool,
     // 插件核心自己听事件（不属于任何模块，不会被撤掉）
-    listen: (event, fn) => { const item = { id: '@core', fn }; listeners.set(event, [...(listeners.get(event) || []), item]); return () => listeners.set(event, (listeners.get(event) || []).filter((x) => x !== item)) }, contextFor, rules, commands, dshTools, builtinOff, handle,
+    listen: (event, fn) => { const item = { id: '@core', fn }; listeners.set(event, [...(listeners.get(event) || []), item]); return () => listeners.set(event, (listeners.get(event) || []).filter((x) => x !== item)) }, contextFor, rules, commands, dshTools, builtinOff, activePlatforms: () => [...activePlatforms()], handle,
     hasRoute: (path) => routes.has(path),
     routeAccess: (path) => routes.get(path)?.access || null,
     dir: userDir,

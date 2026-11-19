@@ -101,3 +101,34 @@ test('QQ 消息入口执行已授权重开，拒绝未授权的全局开关和�
   assert.equal(globalThis.__delegatedProbe, 1)
   assert.equal(JSON.parse(readFileSync(join(dir, 'sessions.json'), 'utf8')).chats['group:30000003'].sessionId, 'group-session')
 })
+
+test('P1-2: 规范 ChatId（feishu / qq）与 PersonId 授权可命中使用，且 Feishu /model 持久保存并可重置', async () => {
+  let cfg = normalize({
+    ownerQQ: owner,
+    model: { provider: 'fake', model: 'base', reasoningEffort: '' },
+    allow: { private: ['feishu:private:ou_x', 'qq:private:12345', 'p-guest1'] },
+    commandAllow: {
+      model: ['feishu:private:ou_x', 'qq:private:12345', 'p-guest1'],
+      reset: ['feishu:private:ou_x'],
+    },
+  })
+  const fsMsg = { kind: 'private', platform: 'feishu', chatId: 'feishu:private:ou_x', userId: 'ou_x' }
+  const qqCanonMsg = { kind: 'private', platform: 'qq', chatId: 'qq:private:12345', userId: '12345' }
+  const personMsg = { kind: 'private', platform: 'feishu', chatId: 'feishu:private:ou_other', userId: 'ou_other', sender: { person: 'p-guest1' } }
+  const crossPlatMsg = { kind: 'private', platform: 'qqbot', chatId: 'qqbot:private:ou_x', userId: 'ou_x' }
+
+  assert.equal(canUseDelegatedCommand(cfg, fsMsg, 'model'), true)
+  assert.equal(canUseDelegatedCommand(cfg, fsMsg, 'reset'), true)
+  assert.equal(canUseDelegatedCommand(cfg, fsMsg, 'status'), false)
+  assert.equal(canUseDelegatedCommand(cfg, qqCanonMsg, 'model'), true)
+  assert.equal(canUseDelegatedCommand(cfg, personMsg, 'model'), true)
+  assert.equal(canUseDelegatedCommand(cfg, crossPlatMsg, 'model'), false, '不同平台同 id 不串放行')
+
+  const list = [{ provider: 'fake', model: 'base', name: 'Base' }, { provider: 'fake', model: 'new', name: 'New' }]
+  const deps = { getConfig: () => cfg, setConfig: (next) => { cfg = normalize(next) }, listModels: async () => list, defaultModel: () => cfg.model }
+  assert.match(await runPersonalModelCommand({ name: 'model', arg: '2' }, fsMsg, deps), /New/)
+  assert.deepEqual(cfg.chatModels.privates['feishu:private:ou_x'], { provider: 'fake', model: 'new', reasoningEffort: '' })
+  assert.match(await runPersonalModelCommand({ name: 'model', arg: '' }, fsMsg, deps), /new/)
+  await runPersonalModelCommand({ name: 'model', arg: '默认' }, fsMsg, deps)
+  assert.equal(cfg.chatModels.privates['feishu:private:ou_x'], undefined)
+})

@@ -128,19 +128,21 @@ export function isOwnerChatMuted(identity, isMuted) {
  * 非 QQ 平台的默认值是关闭：只能通过主人、规范 ChatId 或 PersonId 放行。
  * 旧 QQ 白名单仍接受裸 QQ 号，行为不变。
  */
-function allowMatches(list, msg, kind) {
+export function allowMatches(list, msg, kind) {
   const entries = (list || []).map((x) => String(x).trim()).filter(Boolean)
   if (!entries.length) return false
-  const platform = String(msg.platform || parseChatId(msg.chatId)?.platform || '').trim()
+  const parsed = parseChatId(msg.chatId)
+  const platform = String(msg.platform || parsed?.platform || '').trim()
+  const instance = String(msg.instance || parsed?.instance || '').trim()
   const account = String(kind === 'group' ? msg.groupId : msg.userId || '').trim()
   const chatId = normalizeChatId(msg.chatId) || (platform && account ? normalizeChatId(`${platform}:${kind}:${account}`) : '')
   if (chatId && entries.some((entry) => normalizeChatId(entry) === chatId)) return true
   const person = msg.sender?.person || msg.person
   if (person && entries.includes(String(person))) return true
-  // 裸编号只沿用到默认平台（旧 QQ 形态），避免飞书/官方机器人的
-  // ou_xxx / openid 被当成另一个平台的号码串误放行。
+  // 裸编号只沿用到默认平台实例（旧 QQ 形态），避免飞书/官方机器人/多实例的
+  // ou_xxx / openid / qq#2 同号被误放行。
   const legacyPlatform = parseChatId('private:0')?.platform || ''
-  if ((platform && platform !== legacyPlatform) || !account) return false
+  if ((platform && platform !== legacyPlatform) || (instance && instance !== legacyPlatform) || !account) return false
   return entries.includes(account)
 }
 
@@ -175,7 +177,7 @@ export function groupOwnerTools(cfg, chat) {
   const mode = cfg?.group?.ownerTools
   if (mode !== 'owner') return 'off'
   const list = (cfg?.group?.ownerToolsGroups || []).map(String).filter(Boolean)
-  if (list.length && !list.includes(String(chat.groupId || ''))) return 'off'
+  if (list.length && !allowMatches(list, chat, 'group')) return 'off'
   return mode
 }
 
@@ -200,9 +202,53 @@ export function presetFor(level, cfg) {
 /** 授权名单只作用于已获准聊天的私聊对象。 */
 export function privateCapabilityAllowed(cfg, chat, capability) {
   if (chat?.kind !== 'private') return false
-  const userId = String(chat.userId || '')
-  if (!userId || !(cfg.allow?.private || []).map(String).includes(userId)) return false
-  return (cfg.capabilityAllow?.[capability] || []).map(String).includes(userId)
+  return allowMatches(cfg.allow?.private, chat, 'private') && allowMatches(cfg.capabilityAllow?.[capability], chat, 'private')
+}
+
+const legacyPlatform = () => parseChatId('private:0')?.platform || ''
+
+export const safeFriendFileKey = (canon) => String(canon || '')
+  .replace(/:/g, '~')
+  .replace(/[^a-zA-Z0-9._~-]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)
+
+/**
+ * 解析主动搭话 / 朋友白名单条目：兼容旧纯数字编号与规范 ChatId（<platform>:private:<id>）。
+ * 非私聊地址或非法格式返回 null。
+ */
+export function resolveFriendTarget(raw) {
+  const s = String(raw ?? '').trim()
+  if (!s) return null
+  if (/^\d{5,}$/.test(s)) {
+    const plat = legacyPlatform()
+    const canon = normalizeChatId(`${plat}:private:${s}`)
+    if (!canon) return null
+    return {
+      raw: s,
+      legacy: true,
+      canon,
+      sendAs: `private:${s}`,
+      platform: plat,
+      instance: plat,
+      id: s,
+      legacyKey: s,
+      safeFileKey: safeFriendFileKey(canon),
+    }
+  }
+  const parsed = parseChatId(s)
+  if (!parsed || parsed.kind !== 'private' || !parsed.id) return null
+  const canon = normalizeChatId(s)
+  if (!canon) return null
+  return {
+    raw: s,
+    legacy: false,
+    canon,
+    sendAs: canon,
+    platform: parsed.platform,
+    instance: parsed.instance,
+    id: parsed.id,
+    legacyKey: parsed.platform === legacyPlatform() && /^\d{5,}$/.test(parsed.id) ? parsed.id : '',
+    safeFileKey: safeFriendFileKey(canon),
+  }
 }
 
 /** 改资料类操作（改昵称 / 签名 / 头像、改 B 站签名），以及处理好友申请、改白名单的三档权限。 */

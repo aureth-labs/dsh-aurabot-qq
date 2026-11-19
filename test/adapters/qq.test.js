@@ -3,6 +3,9 @@
 // 全部用可注入的假 OneBot client，绝不真连网。
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { runAdapterContract, makeCtx } from '../contract/adapter-kit.js'
 import { createQqAdapter } from '../../src/adapters/qq/index.js'
 import { parseMessageEvent } from '../../src/chat/inbound.js'
@@ -378,5 +381,314 @@ test('native：转发到 OneBot 扩展动作（空间/收藏表情等）', async
     const r = await adapter.native('get_group_list', {})
     assert.ok(r !== undefined, 'native 应把动作转发给 OneBot client')
   }
+  await adapter.stop()
+})
+
+test('Step 1A：fetch(message) 与 fetch(forward) 统一输出归一化 FetchedMessage / FetchedForwardResult', async () => {
+  const h = makeHarness()
+  const adapter = h.makeAdapter()
+  const ctx = makeCtx(adapter)
+  await adapter.start(ctx)
+
+  const origCall = adapter.__fakeClient.call
+  adapter.__fakeClient.call = async (action, params, opts) => {
+    if (action === 'get_msg') {
+      if (String(params.message_id) === '2001') {
+        return {
+          status: 'ok', retcode: 0,
+          data: {
+            message_id: 2001,
+            time: 1700000100,
+            user_id: 10000,
+            sender: { user_id: 10000, nickname: '假机器人' },
+            message: [{ type: 'text', data: { text: '我自己发的话' } }],
+          },
+        }
+      }
+      return {
+        status: 'ok', retcode: 0,
+        data: {
+          message_id: 2002,
+          time: 1700000200,
+          user_id: 20001,
+          sender: { user_id: 20001, card: '群友A' },
+          message: [{ type: 'text', data: { text: '别人发的话' } }],
+        },
+      }
+    }
+    if (action === 'get_forward_msg') {
+      return {
+        status: 'ok', retcode: 0,
+        data: {
+          messages: [
+            { message_id: 'fn1', time: 1700000300, sender: { user_id: 20001, card: '张三' }, message: [{ type: 'text', data: { text: '第一句' } }] },
+            { message_id: 'fn2', time: 1700000301, sender: { user_id: 10000, nickname: '假机器人' }, message: [{ type: 'image', data: { file: 'abc.png', url: 'https://img.example/1.png' } }] },
+          ],
+        },
+      }
+    }
+    return origCall(action, params, opts)
+  }
+
+  const selfMsg = await adapter.fetch({ kind: 'message', messageId: '2001' })
+  assert.equal(selfMsg.messageId, '2001')
+  assert.equal(selfMsg.at, 1700000100000)
+  assert.equal(selfMsg.sender?.account, '10000')
+  assert.equal(selfMsg.sender?.isBot, true)
+  assert.deepEqual(selfMsg.parts, [{ type: 'text', text: '我自己发的话' }])
+
+  const otherMsg = await adapter.fetch({ kind: 'message', messageId: '2002' })
+  assert.equal(otherMsg.sender?.isBot, false)
+  assert.equal(otherMsg.sender?.name, '群友A')
+
+  const fwd = await adapter.fetch({ kind: 'forward', id: 'fwd-42' })
+  assert.equal(fwd.messages.length, 2)
+  assert.equal(fwd.messages[0].messageId, 'fn1')
+  assert.equal(fwd.messages[0].sender?.name, '张三')
+  assert.equal(fwd.messages[0].sender?.isBot, false)
+  assert.deepEqual(fwd.messages[0].parts, [{ type: 'text', text: '第一句' }])
+  assert.equal(fwd.messages[1].sender?.isBot, true)
+  assert.equal(fwd.messages[1].parts[0]?.type, 'image')
+
+  await adapter.stop()
+})
+
+test('Step 1A P1-1 & 复审5.3：fetch(media) 仅放行媒体子目录+合法媒体，拒绝 outbox/config/caps/越界/伪装文件', async () => {
+  const controlledDir = mkdtempSync(join(tmpdir(), 'aurabot-qq-media-'))
+  const outsideDir = mkdtempSync(join(tmpdir(), 'aurabot-qq-outside-'))
+  const dataRoot = mkdtempSync(join(tmpdir(), 'aurabot-qq-datadir-'))
+  const snowlumaDir = mkdtempSync(join(tmpdir(), 'aurabot-qq-snowluma-'))
+  const dataMediaDir = join(dataRoot, 'media')
+  const snowlumaConfigDir = join(snowlumaDir, 'config')
+  const fakeHome = mkdtempSync(join(tmpdir(), 'aurabot-qq-home-'))
+  const tencentPicDir = join(fakeHome, 'Documents', 'Tencent Files', '123456', 'nt_qq', 'nt_data', 'Pic', '2026-11')
+  const tencentDbDir = join(fakeHome, 'Documents', 'Tencent Files', '123456', 'nt_qq', 'nt_db')
+  const qqConfigDir = join(fakeHome, '.config', 'QQ')
+  mkdirSync(dataMediaDir, { recursive: true })
+  mkdirSync(snowlumaConfigDir, { recursive: true })
+  mkdirSync(tencentPicDir, { recursive: true })
+  mkdirSync(tencentDbDir, { recursive: true })
+  mkdirSync(qqConfigDir, { recursive: true })
+
+  const insideFile = join(controlledDir, 'cached.png')
+  const dataMediaPng = join(dataMediaDir, 'in-datadir-media.png')
+  const extensionlessPng = join(controlledDir, 'hash_no_ext')
+  const tencentPicPng = join(tencentPicDir, 'pic.png')
+  const tencentDbFile = join(tencentDbDir, 'nt_msg.db')
+  const qqConfigFile = join(qqConfigDir, 'config.json')
+  const outsideFile = join(outsideDir, 'secret.txt')
+  const outboxFile = join(dataRoot, 'outbox.json')
+  const capsFile = join(dataRoot, 'caps.json')
+  const configFile = join(dataRoot, 'config.json')
+  const snowlumaWebui = join(snowlumaConfigDir, 'webui.json')
+  const disguisedOutbox = join(dataMediaDir, 'outbox.png')
+  const disguisedJsonPng = join(dataMediaDir, 'evil.png')
+  const sqliteFile = join(dataMediaDir, 'msg.db')
+
+  const expected = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x01, 0x02])
+  writeFileSync(insideFile, expected)
+  writeFileSync(dataMediaPng, expected)
+  writeFileSync(extensionlessPng, expected)
+  writeFileSync(tencentPicPng, expected)
+  writeFileSync(tencentDbFile, 'SQLite format 3\0nt')
+  writeFileSync(qqConfigFile, '{"uin":"123"}')
+  writeFileSync(outsideFile, 'do-not-read')
+  writeFileSync(outboxFile, '{"queue":[{"secret":"token"}]}')
+  writeFileSync(capsFile, '{"features":{}}')
+  writeFileSync(configFile, '{"token":"abc"}')
+  writeFileSync(snowlumaWebui, '{"password":"secret"}')
+  writeFileSync(disguisedOutbox, expected)
+  writeFileSync(disguisedJsonPng, '{"secret":"json-disguised-as-png"}')
+  writeFileSync(sqliteFile, 'SQLite format 3\0dummy')
+
+  const client = makeFakeClient()
+  const baseCall = client.call.bind(client)
+  let nextPath = insideFile
+  client.call = async (action, params, opts) => {
+    if (action === 'get_image') return { status: 'ok', retcode: 0, data: { file: nextPath } }
+    return baseCall(action, params, opts)
+  }
+
+  const adapter = createQqAdapter({ client, mediaDirs: [controlledDir], homeDir: fakeHome })
+  const ctx = makeCtx(adapter, { snowlumaDir })
+  ctx.dataDir = (...p) => join(dataRoot, ...p)
+  await adapter.start(ctx)
+  await new Promise((r) => setTimeout(r, 60))
+
+  // 1. 显式 mediaDirs 内的合法 PNG、ctx.dataDir('media') 内的合法 PNG、Tencent Pic 缓存子目录、以及无扩展名真实 PNG magic 放行
+  for (const [label, target] of [
+    ['explicit mediaDir PNG', insideFile],
+    ['ctx.dataDir(media) PNG', dataMediaPng],
+    ['Tencent Pic subdir PNG', tencentPicPng],
+    ['extensionless media magic', extensionlessPng],
+  ]) {
+    nextPath = target
+    const okRes = await adapter.fetch({ kind: 'media', media: { id: label } })
+    assert.deepEqual(okRes.bytes, expected, label)
+    assert.equal('path' in okRes, false, 'QQ fetch(media) 不应再把裸本机 path 透出给中枢')
+  }
+
+  // 2. outbox.json / config.json / caps.json / snowluma config / Tencent nt_db / .config/QQ config / 伪装文件名与伪装内容 / db 全部拒绝
+  for (const denied of [
+    outsideFile, outboxFile, capsFile, configFile, snowlumaWebui,
+    tencentDbFile, qqConfigFile, disguisedOutbox, disguisedJsonPng, sqliteFile,
+  ]) {
+    nextPath = denied
+    await assert.rejects(
+      () => adapter.fetch({ kind: 'media', media: { id: denied } }),
+      (e) => e.certainty === 'not-sent' && e.code === 'unsafe-media-path',
+      `必须拒绝敏感/越界/伪装路径：${denied}`,
+    )
+  }
+
+  await adapter.stop()
+})
+
+test('Phase 3A：QQ fetch(history) 统一输出按时间升序的 FetchedHistoryPage（群/私聊/before游标/hasMore）', async () => {
+  const h = makeHarness()
+  const adapter = h.makeAdapter()
+  const ctx = makeCtx(adapter)
+  await adapter.start(ctx)
+
+  const calls = []
+  const origCall = adapter.__fakeClient.call
+  adapter.__fakeClient.call = async (action, params, opts) => {
+    calls.push({ action, params })
+    if (action === 'get_group_msg_history') {
+      if (!params.message_id) {
+        // 故意倒序（新 → 旧）返回 3 条（请求 count=2 会多要到 3 条用来判定 hasMore）
+        return {
+          status: 'ok', retcode: 0,
+          data: {
+            messages: [
+              { message_id: 103, time: 1700000300, sender: { user_id: 10000, nickname: '假机器人' }, message: [{ type: 'text', data: { text: '第三条' } }] },
+              { message_id: 102, time: 1700000200, sender: { user_id: 20001, card: '群友A' }, message: [{ type: 'text', data: { text: '第二条' } }] },
+              { message_id: 101, time: 1700000100, sender: { user_id: 20002, nickname: '群友B' }, message: [{ type: 'text', data: { text: '第一条' } }] },
+            ],
+          },
+        }
+      }
+      // 带 before='102' 时可能把锚点 102 本身也带回来，且只有 1 条更早消息
+      return {
+        status: 'ok', retcode: 0,
+        data: {
+          messages: [
+            { message_id: 101, time: 1700000100, sender: { user_id: 20002, nickname: '群友B' }, message: [{ type: 'text', data: { text: '第一条' } }] },
+            { message_id: 102, time: 1700000200, sender: { user_id: 20001, card: '群友A' }, message: [{ type: 'text', data: { text: '第二条' } }] },
+          ],
+        },
+      }
+    }
+    if (action === 'get_friend_msg_history') {
+      return {
+        status: 'ok', retcode: 0,
+        data: {
+          messages: [
+            { message_id: 201, time: 1700000400, sender: { user_id: 30001, nickname: '好友C' }, message: [{ type: 'text', data: { text: '私聊历史' } }] },
+          ],
+        },
+      }
+    }
+    return origCall(action, params, opts)
+  }
+
+  const histCalls = () => calls.filter((c) => c.action === 'get_group_msg_history' || c.action === 'get_friend_msg_history')
+
+  const page1 = await adapter.fetch({ kind: 'history', chat: { kind: 'group', id: '999' }, count: 2 })
+  assert.equal(histCalls()[0].action, 'get_group_msg_history')
+  assert.equal(histCalls()[0].params.group_id, 999)
+  assert.equal(histCalls()[0].params.count, 3)
+  assert.equal(page1.hasMore, true)
+  assert.equal(page1.before, '102')
+  assert.deepEqual(page1.messages.map((m) => m.messageId), ['102', '103'])
+  assert.equal(page1.messages[0].sender?.account, '20001')
+  assert.equal(page1.messages[0].sender?.name, '群友A')
+  assert.equal(page1.messages[0].sender?.isBot, false)
+  assert.equal(page1.messages[1].sender?.isBot, true)
+  assert.equal('raw' in page1.messages[0], false)
+
+  const page2 = await adapter.fetch({ kind: 'history', chat: { kind: 'group', id: '999' }, count: 2, before: page1.before })
+  assert.equal(histCalls()[1].params.message_id, 102)
+  assert.equal(histCalls()[1].params.reverse_order, true)
+  assert.equal(histCalls()[1].params.count, 4)
+  assert.equal(page2.hasMore, false)
+  assert.deepEqual(page2.messages.map((m) => m.messageId), ['101'])
+  assert.equal(page2.before, '101')
+
+  const dmPage = await adapter.fetch({ kind: 'history', chat: { kind: 'private', id: '30001' }, count: 5 })
+  assert.equal(histCalls()[2].action, 'get_friend_msg_history')
+  assert.equal(histCalls()[2].params.user_id, 30001)
+  assert.equal(dmPage.hasMore, false)
+  assert.equal(dmPage.messages[0]?.parts?.[0]?.text, '私聊历史')
+
+  await assert.rejects(
+    () => adapter.fetch({ kind: 'history', chat: { kind: 'group', id: 'not-a-number' } }),
+    (e) => e.certainty === 'not-sent' && e.code === 'bad-fetch-request',
+  )
+
+  await adapter.stop()
+})
+
+test('QQ 平台端 groupAdmin：botState / getGroupInfo / listMembers / mute / unmute / kick 及 unsupported 懒降级', async () => {
+  const calls = []
+  let failTitleUnsupported = false
+  const client = makeFakeClient()
+  const origCall = client.call.bind(client)
+  client.call = async (action, params, opts) => {
+    calls.push({ action, params })
+    if (action === 'get_group_member_info') return { status: 'ok', retcode: 0, data: { user_id: params.user_id, role: 'owner' } }
+    if (action === 'get_group_info') return { status: 'ok', retcode: 0, data: { group_id: params.group_id, group_name: '网关QQ测试群', member_count: 18 } }
+    if (action === 'get_group_member_list') {
+      return {
+        status: 'ok', retcode: 0,
+        data: [
+          { user_id: 10000, nickname: '机器人', role: 'owner' },
+          { user_id: 20001, card: '群名片B', nickname: '原昵称', role: 'member' },
+        ],
+      }
+    }
+    if (action === 'set_group_ban' || action === 'set_group_kick') return { status: 'ok', retcode: 0, data: {} }
+    if (action === 'set_group_special_title' && failTitleUnsupported) {
+      throw Object.assign(new Error('不支持的API'), { data: { retcode: 1404, message: 'unsupported' } })
+    }
+    return origCall(action, params, opts)
+  }
+
+  const adapter = createQqAdapter({ client })
+  await adapter.start(makeCtx(adapter))
+
+  const st = await adapter.groupAdmin.getBotState('7001')
+  assert.deepEqual(st, { role: 'owner', groupOpenid: '7001', memberOpenid: '10000' })
+
+  const gInfo = await adapter.groupAdmin.getGroupInfo('7001')
+  assert.deepEqual(gInfo, { groupOpenid: '7001', name: '网关QQ测试群', memberCount: 18 })
+
+  const members = await adapter.groupAdmin.listMembers('7001', { startIndex: 0, limit: 10 })
+  assert.deepEqual(members, [
+    { openid: '10000', nick: '机器人', role: 'owner' },
+    { openid: '20001', nick: '群名片B', role: 'member' },
+  ])
+
+  await adapter.groupAdmin.muteMember('7001', '20001', 120_000)
+  await adapter.groupAdmin.unmuteMember('7001', '20001')
+  const banCalls = calls.filter((c) => c.action === 'set_group_ban')
+  assert.deepEqual(banCalls, [
+    { action: 'set_group_ban', params: { group_id: 7001, user_id: 20001, duration: 120 } },
+    { action: 'set_group_ban', params: { group_id: 7001, user_id: 20001, duration: 0 } },
+  ])
+
+  await adapter.groupAdmin.kickMember('7001', '20001', { addBlackList: true })
+  const kickCalls = calls.filter((c) => c.action === 'set_group_kick')
+  assert.deepEqual(kickCalls, [
+    { action: 'set_group_kick', params: { group_id: 7001, user_id: 20001, reject_add_request: true } },
+  ])
+
+  // native(set_group_special_title) 遇 1404 时懒降级 supportedActions.title
+  assert.equal(adapter.groupAdmin.supportedActions.title, true)
+  failTitleUnsupported = true
+  await assert.rejects(() => adapter.native('set_group_special_title', { group_id: 7001, user_id: 20001, special_title: '测试' }))
+  assert.equal(adapter.groupAdmin.supportedActions.title, false)
+
+  await assert.rejects(() => adapter.groupAdmin.getBotState('not-num'), (e) => e.code === 'bad-fetch-request')
   await adapter.stop()
 })

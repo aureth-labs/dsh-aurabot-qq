@@ -11,12 +11,13 @@ import { toMono16k } from '../../voice/wav.js'
 import { fileOf } from '../../local/local.js'
 import { asrConfigured, transcribeAudio } from '../../voice/asr.js'
 import { mergeFromPanel, normalize } from '../../core/config.js'
+import { formatChatId, normalizeChatId, parseChatId } from '../../gateway/address.js'
 
 export default {
   id: 'voice',
   name: '语音',
   version: '1.0.0',
-  api: 2,
+  api: 3,
   platforms: ['*'],
   description: '发语音条：把她的话念出来（关掉后想发语音时改发文字）',
   tab: 'voice',
@@ -137,30 +138,66 @@ export default {
       s0.prepare(s0.snapshot().selection.providerId)
       return { ok: true, message: '开始下载识别模型（约 200MB，下好后常驻本机）' }
     })
-    // 自检「听语音」（真 QQ）：拿和某人私聊里最近一条语音，走一遍 get_record → 16k → DSH 识别
+    // 自检「听语音」：优先取最近入站语音走网关媒体拉取 + 转 16k + ASR；无缓存时仅 QQ 网关且具历史能力才回退拉私聊记录
     api.route('/voice/asr-last', async (req) => {
-      const b = await http.body(req)
+      const b = await http.body(req).catch(() => ({})) || {}
+      const gw = api.core.gateway
+      const targetChat = b.chatId ? (normalizeChatId(String(b.chatId)) || String(b.chatId)) : ''
+      const recent = hub.lastInboundVoice?.({ chatId: targetChat, userId: b.userId }) || null
+      if (recent?.seg) {
+        const feats = gw?.features?.(recent.chatId)
+        if (feats && feats['media.fetch'] === false) {
+          return { ok: false, degraded: true, reason: 'unsupported-media-fetch', message: '当前平台实例不支持拉取语音媒体（media.fetch 未开启）' }
+        }
+        try {
+          const t = Date.now()
+          const text = await hub.localTranscribe(recent.seg, undefined, { chatId: recent.chatId, platform: recent.platform, messageId: recent.messageId })
+          return { ok: Boolean(text), source: 'inbound-cache', platform: recent.platform || parseChatId(recent.chatId)?.platform || '', heard: text, at: new Date(recent.at).toLocaleString(), ms: Date.now() - t }
+        } catch (error) {
+          return { ok: false, message: error?.message || '语音识别失败' }
+        }
+      }
+
+      const insts = gw?.instances?.() || []
+      const connected = insts.filter((s) => s?.enabled && s.caps !== null && s.state === 'connected')
+      const legacyOb = api.core.onebot
+      const hasLegacyQq = Boolean(legacyOb && legacyOb.state === 'connected' && typeof legacyOb.call === 'function')
+      if ((!gw || !connected.length) && !hasLegacyQq) {
+        return { ok: false, degraded: true, reason: 'offline', message: '当前没有已连接的聊天网关（启用并连上网关后可自检）' }
+      }
+      const qqInst = connected.find((s) => s?.platform === 'qq')
+      if (!qqInst && !hasLegacyQq) {
+        return { ok: false, degraded: true, reason: 'no-history-support', message: '当前平台不支持回溯历史记录，请先发一条语音消息后再点自检' }
+      }
       const ownerPerson = api.core.identity?.owner?.()
       const ownerQq = ownerPerson ? api.core.identity?.accountOn?.(ownerPerson, 'qq') : ''
       const uid = Number(b.userId || ownerQq || 0)
-      const gw = api.core.gateway
-      const qqInst = gw?.instances?.()?.find((s) => s?.platform === 'qq' && s.enabled)
-      if (!gw || !qqInst || qqInst.caps === null) {
-        return { ok: false, message: '仅在启用且连接 QQ 网关时支持此自检' }
+      if (!uid) return { ok: false, message: '请先绑定主人 QQ 账号（或先发一条语音后再点自检）' }
+      const qqChatId = formatChatId({ instance: qqInst?.instance || 'qq', kind: 'private', id: String(uid) }) || `qq:private:${uid}`
+      if (qqInst) {
+        const qqFeats = gw.features?.(qqChatId)
+        if (qqFeats && !qqFeats['message.history.read']) {
+          return { ok: false, degraded: true, reason: 'unsupported-history', message: '当前 QQ 网关未开放历史消息读取，请先发一条语音后再点自检' }
+        }
       }
-      if (!uid) return { ok: false, message: '请先绑定主人 QQ 账号（或指定 userId）' }
       let h
       try {
-        h = await gw.native(qqInst.instance, 'get_friend_msg_history', { user_id: uid, count: 30 })
+        h = qqInst
+          ? await gw.native(qqInst.instance, 'get_friend_msg_history', { user_id: uid, count: 30 })
+          : await legacyOb.call('get_friend_msg_history', { user_id: uid, count: 30 }, { timeoutMs: 15000 })
       } catch (error) {
-        return { ok: false, message: error?.code === 'unsupported-action' ? '当前 QQ 网关不支持读取聊天记录' : (error?.message || '读取 QQ 聊天记录失败') }
+        return { ok: false, message: error?.code === 'unsupported-action' ? '当前 QQ 网关不支持读取聊天记录' : (error?.message || '读取聊天记录失败') }
       }
-      const recs = (h?.messages || []).filter((m) => String(m.user_id) === String(uid)).flatMap((m) => (m.message || []).filter((s) => s.type === 'record').map((s) => ({ seg: s, time: m.time })))
+      const recs = (h?.messages || []).filter((m) => String(m.user_id) === String(uid)).flatMap((m) => (m.message || []).filter((s) => s.type === 'record').map((s) => ({ seg: s, time: m.time, mid: m.message_id })))
       const last = recs.at(-1)
       if (!last) return { ok: false, message: '最近的聊天里没有对方发的语音' }
-      const t = Date.now()
-      const text = await hub.localTranscribe(last.seg)
-      return { ok: Boolean(text), heard: text, at: new Date(last.time * 1000).toLocaleString(), ms: Date.now() - t }
+      try {
+        const t = Date.now()
+        const text = await hub.localTranscribe(last.seg, undefined, { chatId: qqChatId, platform: 'qq', messageId: last.mid ? String(last.mid) : '' })
+        return { ok: Boolean(text), source: qqInst ? 'qq-history' : 'legacy-qq-history', platform: 'qq', heard: text, at: new Date(last.time * 1000).toLocaleString(), ms: Date.now() - t }
+      } catch (error) {
+        return { ok: false, message: error?.message || '语音识别失败' }
+      }
     })
     // 自检「听语音」：Windows 语音念一句 → 转 16k 单声道 → DSH 自带识别 → 看能不能认回来
     api.route('/voice/asr-test', async (req) => {

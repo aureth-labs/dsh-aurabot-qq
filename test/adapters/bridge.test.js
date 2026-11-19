@@ -511,3 +511,35 @@ test('优雅 stop 会把未取走的消息按 not-sent 还给网关，并清空�
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('Step 0B：/hello caps.features 只放行白名单 14 项布尔 Feature，丢弃未知键与非布尔值', async () => {
+  const adapter = createBridgeAdapter({ token: TOKEN, timeoutMs: 100 })
+  const ctx = makeCtx(adapter)
+  await adapter.start(ctx)
+
+  const res = await call(ctx, '/hello', {
+    protocol: 1,
+    caps: {
+      image: true,
+      features: {
+        'media.fetch': true,
+        'sticker.collect': true,
+        'message.reaction': false,
+        'unknown.feature': true,
+        'message.quote.read': 'yes',
+      },
+    },
+  })
+  assert.equal(res.statusCode, 200)
+  const snap = adapter.caps()
+  assert.equal(snap.features['media.fetch'], true)
+  assert.equal(snap.features['sticker.collect'], true)
+  assert.equal(snap.features['message.reaction'], false)
+  assert.equal(Object.hasOwn(snap.features, 'unknown.feature'), false)
+  assert.equal(Object.hasOwn(snap.features, 'message.quote.read'), false)
+
+  // 修改 caps().features 副本不应污染内部 caps
+  snap.features['media.fetch'] = false
+  assert.equal(adapter.caps().features['media.fetch'], true)
+  await adapter.stop()
+})

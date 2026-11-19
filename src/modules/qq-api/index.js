@@ -113,7 +113,7 @@ export default {
   name: 'QQ 接口',
   version: '1.0.0',
   description: '把 SnowLuma 的 QQ 能力交给她：查群公告、精华、荣誉、群文件，主人开口时还能撤回、设精华、改群名片等（qq_api_find / qq_api_call）',
-  api: 2,
+  api: 3,
   platforms: ['qq'],
   setup(api) {
     const { hub, onebot } = api.core
@@ -167,8 +167,12 @@ export default {
         }),
       ]
     })
-    api.rule((kind, cfg) => (cfg.qqApi?.enabled === false ? [] : [kind === 'social'
-      ? '- 群公告、精华、荣誉、群文件这些，用 qq_api_find 查接口再用 qq_api_call 调；别人只能查当前这个群。'
-      : '- QQ 上想做的事（撤回、设精华、改群名片、点赞、表情回应、查群公告等）没有专门工具时，用 qq_api_find 查接口再用 qq_api_call 调。'].filter(Boolean)))
+    api.context?.(({ chat, level }) => {
+      if (!chat || chat.kind === 'system' || api.config().qqApi?.enabled === false) return ''
+      const social = level !== 'full' && level !== 'group-full'
+      return social
+        ? '- 群公告、精华、荣誉、群文件这些，用 qq_api_find 查接口再用 qq_api_call 调；别人只能查当前这个群。'
+        : '- QQ 上想做的事（撤回、设精华、改群名片、点赞、表情回应、查群公告等）没有专门工具时，用 qq_api_find 查接口再用 qq_api_call 调。'
+    })
   },
 }

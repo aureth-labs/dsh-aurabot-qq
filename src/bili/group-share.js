@@ -10,6 +10,7 @@
 import { isOwnerPrivateChat } from '../chat/access.js'
 import { dataDir, readJson, writeJson } from '../core/store.js'
 import { reallySent } from '../chat/hub.js'
+import { normalizeChatId, parseChatId, sameChat } from '../gateway/address.js'
 
 const dayKey = (d = new Date()) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 export const linkOf = (bvid) => (bvid ? `https://www.bilibili.com/video/${bvid}` : '')
@@ -73,11 +74,58 @@ export function createGroupShare({ getConfig, hub, identity = null, routeOwner =
     // 用「主人私聊」那档预设：她本人在跟主人说话，不是群里的样子
     return String(await hub.runSystemTurn('bili-groupshare', title, prompt, { level: 'full', timeoutMs: 60_000, key: kind }))
   })
+  const warnedBad = new Set()
+  function warnBadOnce(context, value) {
+    const key = `${context}:${String(value)}`
+    if (warnedBad.has(key)) return
+    warnedBad.add(key)
+    log.warn?.(`B 站群分享存在无效群地址（${context}），已跳过：${String(value)}`)
+  }
+
+  function resolveGroupEntry(raw, { context = '' } = {}) {
+    const s = String(raw ?? '').trim()
+    if (!s) return null
+    if (/^\d+$/.test(s)) {
+      const canon = normalizeChatId(`qq:group:${s}`)
+      if (canon) return { canon, sendAs: `group:${s}`, id: s }
+    }
+    try {
+      const parsed = parseChatId(s)
+      if (parsed && parsed.kind === 'group' && parsed.id) {
+        const canon = normalizeChatId(s)
+        if (canon) return { canon, sendAs: canon, id: parsed.id }
+      }
+    } catch {}
+    if (context) warnBadOnce(context, s)
+    return null
+  }
+
+  const sameGroup = (a, b) => {
+    const ea = resolveGroupEntry(a)
+    const eb = resolveGroupEntry(b)
+    return Boolean(ea && eb && sameChat(ea.canon, eb.canon))
+  }
+
   const file = () => dataDir('bili-group-share.json')
   const load = () => {
     const s = readJson(file(), () => ({ day: '', sentToday: 0, nextId: 1, items: [] }))
     if (!s || typeof s !== 'object') return { day: dayKey(), sentToday: 0, nextId: 1, items: [] }
-    if (!Array.isArray(s.items)) s.items = []
+    const rawItems = Array.isArray(s.items) ? s.items : []
+    const cleanItems = []
+    for (const it of rawItems) {
+      if (!it || typeof it !== 'object') {
+        warnBadOnce('history.item', String(it))
+        continue
+      }
+      if (it.groupId != null && String(it.groupId).trim() !== '') {
+        const entry = resolveGroupEntry(it.groupId, { context: 'history.groupId' })
+        if (!entry) continue
+        cleanItems.push({ ...it, groupId: entry.canon })
+      } else {
+        cleanItems.push(it)
+      }
+    }
+    s.items = cleanItems
     if (!Number.isFinite(Number(s.nextId))) s.nextId = 1
     if (s.day !== dayKey()) { s.day = dayKey(); s.sentToday = 0 }
     return s
@@ -102,27 +150,43 @@ export function createGroupShare({ getConfig, hub, identity = null, routeOwner =
     return r && !r.blocked ? String(r.chatId || '') : ''
   }
 
-  /** 默认群 + 额外授权群；没配额外群就只认 groupId。 */
+  /** 默认群 + 额外授权群；没配额外群就只认 groupId。兼容旧纯数字 QQ 群号与规范 ChatId。 */
   function allowedGroups() {
     const c = cfg()
-    const list = [String(c.groupId || '').trim(), ...(Array.isArray(c.groups) ? c.groups : [])]
+    const raw = [String(c.groupId || '').trim(), ...(Array.isArray(c.groups) ? c.groups : [])]
       .map((x) => String(x || '').trim()).filter(Boolean)
-    return [...new Set(list)]
+    const out = []
+    const seen = new Set()
+    for (const item of raw) {
+      const entry = resolveGroupEntry(item, { context: 'config.groups' })
+      if (!entry || seen.has(entry.canon)) continue
+      seen.add(entry.canon)
+      out.push(entry)
+    }
+    return out
   }
 
-  async function nameOf(gid) {
+  async function nameOf(entryOrId) {
+    const entry = typeof entryOrId === 'object' && entryOrId?.canon ? entryOrId : resolveGroupEntry(entryOrId)
+    const label = entry?.id || String(entryOrId || '')
     try {
-      if (groupNameOf) return String(await groupNameOf(String(gid))) || String(gid)
+      if (groupNameOf) {
+        const got = await groupNameOf(entry?.canon || label)
+        if (got && got !== entry?.canon && got !== label) return String(got)
+      }
       const m = hub?.groupNames
-      if (m && typeof m.get === 'function') return String(m.get(String(gid)) || gid)
+      if (m && typeof m.get === 'function') return String(m.get(entry?.canon) || m.get(label) || label)
     } catch {}
-    return String(gid)
+    return label
   }
 
   /** 让她用自己的口气写问话；模型挂了或说废话就退回一句朴素模板。 */
   async function askSpeech(list, groups) {
     const names = []
-    for (const gid of groups) names.push(`${await nameOf(gid)}（${gid}）`)
+    for (const g of groups) {
+      const entry = typeof g === 'object' && g?.canon ? g : resolveGroupEntry(g)
+      names.push(`${await nameOf(entry || g)}（${entry?.id || g}）`)
+    }
     const lines = list.map((it, i) => `${i + 1}.《${clip(it.title, 40)}》——我的点评：${clip(it.text, 80)}`)
     const prompt = [
       '【写一句私聊：问主人这批 B 站视频能不能发到群里】',
@@ -178,7 +242,8 @@ export function createGroupShare({ getConfig, hub, identity = null, routeOwner =
   async function submit(items = []) {
     const g = getConfig()
     const c = cfg()
-    if (!c.enabled || !String(c.groupId || '').trim()) return { ok: false, why: '群分享没开（没配群号）' }
+    const defaultTarget = resolveGroupEntry(c.groupId, { context: c.groupId ? 'config.groupId' : '' })
+    if (!c.enabled || !defaultTarget) return { ok: false, why: '群分享没开（没配群号）' }
     if (!g.enabled) return { ok: false, why: '总开关关着' }
     if (g.dryRun) return { ok: false, why: '试运行，不攒待批' }
     const r = ownerRoute()
@@ -193,7 +258,7 @@ export function createGroupShare({ getConfig, hub, identity = null, routeOwner =
     const s = load()
     if (s.sentToday >= Number(c.dailyLimit)) return { ok: false, why: `今天已经发够 ${c.dailyLimit} 条了` }
     const have = pendingOf(s)
-    if (have.some((x) => String(x.groupId) !== String(c.groupId))) return { ok: false, why: '还有别的群的待批没回，先处理完' }
+    if (have.some((x) => !x.groupId || !sameGroup(x.groupId, defaultTarget.canon))) return { ok: false, why: '还有别的群的待批没回，先处理完' }
     const room = Math.max(0, Number(c.queueLimit) - have.length)
     if (!room) return { ok: false, why: '待批的还没回，先不攒新的' }
     const fresh = []
@@ -206,7 +271,7 @@ export function createGroupShare({ getConfig, hub, identity = null, routeOwner =
       if (fresh.some((x) => x.bvid === bvid)) continue
       if (s.items.some((x) => x.bvid === bvid && x.state === 'sent')) continue
       const shotIds = Array.isArray(it.shotIds) ? it.shotIds.filter((x) => typeof x === 'string').slice(0, 2) : []
-      const item = { id: s.nextId++, at: Date.now(), bvid, title: clip(it.title, 80), text: clip(text, 300), shotIds, groupId: String(c.groupId), state: 'pending', decidedAt: 0 }
+      const item = { id: s.nextId++, at: Date.now(), bvid, title: clip(it.title, 80), text: clip(text, 300), shotIds, groupId: defaultTarget.canon, state: 'pending', decidedAt: 0 }
       s.items.push(item)
       fresh.push(item)
     }
@@ -225,7 +290,9 @@ export function createGroupShare({ getConfig, hub, identity = null, routeOwner =
   }
 
   /** 发一条到某个群：先发截图（有就发，失败不影响文字），再发文字+链接。 */
-  async function sendOne(it, gid) {
+  async function sendOne(it, targetOrId) {
+    const target = typeof targetOrId === 'object' && targetOrId?.sendAs ? targetOrId : resolveGroupEntry(targetOrId, { context: 'send' })
+    if (!target) return false
     let shot = ''
     try {
       const name = Array.isArray(it.shotIds) ? it.shotIds[0] : ''
@@ -236,9 +303,9 @@ export function createGroupShare({ getConfig, hub, identity = null, routeOwner =
       log.debug?.('群分享补截图失败：', error.message)
     }
     if (shot) {
-      try { await hub.sendImage(`group:${gid}`, shot, undefined, undefined, { proactive: true, proactiveCause: 'bili-groupshare' }) } catch (error) { log.warn('群分享的截图没发出去：', error.message) }
+      try { await hub.sendImage(target.sendAs, shot, undefined, undefined, { proactive: true, proactiveCause: 'bili-groupshare' }) } catch (error) { log.warn('群分享的截图没发出去：', error.message) }
     }
-    const r = await hub.sendText(`group:${gid}`, `${it.text}\n${linkOf(it.bvid)}`, undefined, undefined, undefined, { proactive: true, proactiveCause: 'bili-groupshare' })
+    const r = await hub.sendText(target.sendAs, `${it.text}\n${linkOf(it.bvid)}`, undefined, undefined, undefined, { proactive: true, proactiveCause: 'bili-groupshare' })
     // 只有网关真给了 message_id 才算发出去：模拟返回（sim-*）和「排队补发」都不占额度
     return reallySent(r)
   }
@@ -273,10 +340,23 @@ export function createGroupShare({ getConfig, hub, identity = null, routeOwner =
     let failed = 0
     const ok = allowedGroups()
     // 默认群总要发；主人额外点名的群排后面（「多发几个群」= 默认 + 点名）
-    const targets = [...new Set([String(cfg().groupId || ''), ...(Array.isArray(groups) ? groups : [])]
+    const rawTargets = [...new Set([String(cfg().groupId || ''), ...(Array.isArray(groups) ? groups : [])]
       .map((x) => String(x || '').trim()).filter(Boolean))]
-    const legal = [...new Set(targets.filter((gid) => ok.includes(gid)))]
-    const illegal = targets.filter((gid) => !ok.includes(gid))
+    const legal = []
+    const legalSeen = new Set()
+    const illegal = []
+    for (const rawTarget of rawTargets) {
+      const entry = resolveGroupEntry(rawTarget)
+      const matched = entry ? ok.find((o) => sameChat(o.canon, entry.canon)) : null
+      if (matched) {
+        if (!legalSeen.has(matched.canon)) {
+          legalSeen.add(matched.canon)
+          legal.push(matched)
+        }
+      } else {
+        illegal.push(rawTarget)
+      }
+    }
     for (const id of ids) {
       const it = s.items.find((x) => x.id === id)
       if (!it || it.state !== 'pending') continue // 已经处理过 / 过期了，跳过，绝不再发一次
@@ -340,7 +420,7 @@ export function createGroupShare({ getConfig, hub, identity = null, routeOwner =
   async function understand(text, list) {
     if (!think) return null
     const names = []
-    for (const gid of allowedGroups()) names.push(`${await nameOf(gid)}（${gid}）`)
+    for (const g of allowedGroups()) names.push(`${await nameOf(g)}（${g.id}）`)
     // 编号必须跟问话时一一对应：过期那格留成空行，别让它后面的编号整体前移
     const lines = list.map((it, i) => (it
       ? `${i + 1}.《${clip(it.title, 40)}》——点评：${clip(it.text, 80)}`

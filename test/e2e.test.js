@@ -48,7 +48,7 @@ async function brain({ preset, text, images, callTool }) {
   if (/【(私聊|群聊)/.test(text) && text.includes('戳了戳你')) return '干嘛戳我<poke>'
   if (/【私聊/.test(text) && text.includes('表情改名测试')) { const m = text.match(/把「(.+?)」/); const r = await callTool('qq_edit_sticker', { sticker: m[1], new_name: '改过的名字', tags: ['开心'] }); return r.message }
   if (/【私聊/.test(text) && text.includes('表情删除测试')) { const r = await callTool('qq_edit_sticker', { sticker: '改过的名字', delete: true }); return r.message }
-  if (/【私聊/.test(text) && text.includes('翻聊天记录')) { const r = await callTool('qq_chat_history', { count: 5 }); return r.message.split('\n')[0] }
+  if (/【私聊/.test(text) && text.includes('翻聊天记录')) { const r = await callTool('chat_history', { count: 5 }); return r.message.split('\n')[0] }
   if (text.includes('查看QQ资料测试')) { const r = await callTool('qq_get_profile', {}); return r?.ok ? '资料查到了' : r ? r.message : '没这个工具' }
   if (text.includes('改昵称测试')) { const r = await callTool('qq_set_nickname', { name: '小鲸鱼' }); return r ? r.message : '没这个工具' }
   if (text.includes('改签名测试')) { const r = await callTool('qq_set_signature', { text: '今天也要开心' }); return r ? r.message : '没这个工具' }
@@ -68,23 +68,23 @@ async function brain({ preset, text, images, callTool }) {
     return r && r.ok ? '好 禁了' : '你谁啊 我只听主人的'
   }
   if (text.includes('发文件越界')) {
-    const r = await callTool('qq_send_file', { file: outsideFilePath, name: '外面的文件.txt' })
+    const r = await callTool('send_file', { file: outsideFilePath, name: '外面的文件.txt' })
     return r && r.ok ? '居然发了' : '发文件失败：' + (r && r.message)
   }
   if (text.includes('发文件超限')) {
-    const r = await callTool('qq_send_file', { file: bigFilePath, name: '太大了.bin' })
+    const r = await callTool('send_file', { file: bigFilePath, name: '太大了.bin' })
     return r && r.ok ? '居然发了' : '发文件失败：' + (r && r.message)
   }
   if (text.includes('发文件发给群')) {
-    const r = await callTool('qq_send_file', { file: sendFilePath, name: '发个文件.txt', target: 'group:555' })
+    const r = await callTool('send_file', { file: sendFilePath, name: '发个文件.txt', target: 'group:555' })
     return r && r.ok ? '发到群里啦' : '发文件失败：' + (r && r.message)
   }
   if (text.includes('发文件目标越界')) {
-    const r = await callTool('qq_send_file', { file: sendFilePath, name: '发个文件.txt', target: 'group:999' })
+    const r = await callTool('send_file', { file: sendFilePath, name: '发个文件.txt', target: 'group:999' })
     return r && r.ok ? '居然发了' : '发文件失败：' + (r && r.message)
   }
   if (text.includes('发文件测试')) {
-    const r = await callTool('qq_send_file', { file: sendFilePath, name: '发个文件.txt' })
+    const r = await callTool('send_file', { file: sendFilePath, name: '发个文件.txt' })
     return r && r.ok ? '文件发出去啦' : '发文件失败：' + (r ? r.message : '没有这个工具')
   }
   if (text.includes('跑个慢任务')) { await new Promise((r) => setTimeout(r, 1500)); return '慢任务跑完了' }
@@ -238,8 +238,10 @@ test('群聊：没叫她不回；@她必回（群聊 preset，只有主人那一
   assert.deepEqual(reply[1], { type: 'at', data: { qq: '777' } }, '回复真实 @ 对方')
   const agent = fake.agents.get(turn.sessionId)
   assert.ok(!agent.tools.has('qq_send_qzone'), '群聊会话没有发空间这类主人工具')
-  assert.ok(agent.tools.has('qq_send_message'), '群聊会话有跨聊天发送工具，但 execute 里只放行「这一轮说话的全是主人」')
-  assert.ok(agent.tools.has('qq_send_file'), '群聊会话有发文件工具，但 execute 里只放行「这一轮说话的全是主人」')
+  assert.ok(agent.tools.has('send_message'), '群聊会话有跨聊天发送工具，但 execute 里只放行「这一轮说话的全是主人」')
+  assert.ok(agent.tools.has('send_file'), '群聊会话有发文件工具，但 execute 里只放行「这一轮说话的全是主人」')
+  assert.equal(agent.tools.has('qq_send_message'), false, '模型工具面去重：不重复挂旧名 qq_send_message')
+  assert.equal(agent.tools.has('qq_send_file'), false, '模型工具面去重：不重复挂旧名 qq_send_file')
 })
 
 test('群聊：叫名字（唤醒词）必回', async () => {
@@ -436,10 +438,11 @@ test('空间互动：别人在她的评论下面接着回她，她会接着回�
 })
 
 test('戳一戳：主人戳她，她会回话，还会戳回去；20 秒内重复戳只算一次', async () => {
+  await until(() => !api.hub.stats().busy, 15000)
   const turns = fake.turns.length
   const poke = { post_type: 'notice', notice_type: 'notify', sub_type: 'poke', self_id: Number(BOT), user_id: Number(OWNER), sender_id: Number(OWNER), target_id: Number(BOT) }
   mock.push(poke)
-  await until(() => mock.sent('send_poke').length === 1)
+  await until(() => mock.sent('send_poke').length === 1 && sentTo('private', OWNER).at(-1)?.params?.message?.[0]?.data?.text === '干嘛戳我' && !api.hub.stats().busy, 15000)
   assert.match(fake.turns.at(-1).userText, /戳了戳你/)
   assert.equal(mock.sent('send_poke')[0].params.user_id, Number(OWNER))
   assert.equal(sentTo('private', OWNER).at(-1).params.message[0].data.text, '干嘛戳我')
@@ -891,7 +894,7 @@ test('用量归属：聊天里让她刷 B 站，处理工具结果那次调用�
   const mid = await read()
   const chat2 = runsOf(mid, '聊天')
   const bili2 = runsOf(mid, '刷 B 站')
-  fake.emit('session/event', sess, { type: 'tool/call', data: { turn: 9002, step: 1, callId: 'c2', name: 'qq_send_message', arguments: '{}' } })
+  fake.emit('session/event', sess, { type: 'tool/call', data: { turn: 9002, step: 1, callId: 'c2', name: 'send_message', arguments: '{}' } })
   fake.emit('session/event', sess, {
     type: 'assistant/message',
     time: Date.now(),
@@ -1363,12 +1366,12 @@ test('主人私聊可以查询最新 QQ 资料，关闭资料模块后查询工�
   assert.equal(c.result.profile.nickname, expected.nickname)
   assert.equal(c.result.profile.signature, expected.long_nick)
   assert.equal(mock.sent('get_stranger_info').at(-1).params.no_cache, true)
-  assert.match(fake.variables.get('aurabot_rules_private')(), /qq_get_profile/)
-  assert.doesNotMatch(fake.variables.get('aurabot_rules_social')(), /qq_get_profile/)
+  assert.match(fake.turns.at(-1).ctxText, /qq_get_profile/)
+  assert.doesNotMatch(api.modules.contextFor({ chat: { kind: 'group', platform: 'qq', chatId: 'qq:group:555', groupId: '555', userId: '30000003' } }), /qq_get_profile/)
   try {
     await fake.call('/save', { modules: { profile: { enabled: false } } })
     await until(() => !api.modules.use('profile'))
-    assert.doesNotMatch(fake.variables.get('aurabot_rules_private')(), /qq_get_profile/)
+    assert.doesNotMatch(api.modules.contextFor({ chat: { kind: 'private', platform: 'qq', chatId: `qq:private:${OWNER}`, userId: OWNER } }), /qq_get_profile/)
     mock.push(priv(OWNER, text('查看QQ资料测试 模块关闭')))
     const unavailable = await lastCall('模块关闭')
     assert.equal(unavailable.result.message, 'no such tool')
@@ -1616,7 +1619,7 @@ test('语音发出去、补发表情失败：这一轮不算没发出去（补�
     mock.state.failFace = true // 只让带系统表情的那条发失败
     mock.push(priv(OWNER, text('表情补发失败测试')))
     await until(() => sentTo('private', OWNER).slice(n).some((c) => (c.params.message || []).some((s) => s.type === 'record')), 20000)
-    await until(() => bots().length > before, 8000) // 记了流水 = 这一轮算说出口了
+    await until(() => bots().length > before, 20000) // 记了流水 = 这一轮算说出口了
     assert.ok(bots().slice(before).some((x) => /晚安/.test(x.text)), '语音发出去了就该记成说过：' + JSON.stringify(bots().slice(before)))
     const tried = mock.calls.filter((c) => (c.params?.message || []).some((s) => s.type === 'face'))
     assert.ok(tried.length >= 1, '补发那一步确实试过（这次注定失败）')

@@ -6,8 +6,8 @@ import { askModel } from '../core/llm.js'
 import { cleanText, clipText } from '../core/text.js'
 import { shouldDeferBackground } from '../core/offpeak.js'
 import { followUpHint } from './memory.js'
-import { isOwner, isOwnerChatMuted } from '../chat/access.js'
-import { parseChatId } from '../gateway/address.js'
+import { isOwner, isOwnerChatMuted, resolveFriendTarget } from '../chat/access.js'
+import { parseChatId, sameChat } from '../gateway/address.js'
 import { moodReason } from './mood-context.js'
 import { selfName } from '../persona/personas.js'
 
@@ -173,9 +173,46 @@ export function createMood({ getConfig, dsh, log }) {
 // ---------------- 主动搭话 ----------------
 
 export function createSpeakUp({ getConfig, hub, log, isMuted, memory, identity, routeOwner, resolveOwnerRoute }) {
+  const warnedBad = new Set()
+  const warnBad = (ctx, val) => {
+    const k = `${ctx}:${String(val)}`
+    if (warnedBad.has(k)) return
+    warnedBad.add(k)
+    log?.warn?.(`主动搭话存在无效条目（${ctx}），已跳过：${String(val)}`)
+  }
+  const normalizeFriendsMap = (raw) => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      if (raw !== undefined && raw !== null) warnBad('friends', String(raw))
+      return {}
+    }
+    const out = {}
+    for (const [k, v] of Object.entries(raw)) {
+      const target = resolveFriendTarget(k)
+      if (!target || !v || typeof v !== 'object' || Array.isArray(v)) {
+        warnBad('friends.entry', k)
+        continue
+      }
+      if (!out[target.canon] || k === target.canon) out[target.canon] = { ...v }
+    }
+    return out
+  }
   const file = () => dataDir('speakup.json')
-  const load = () => readJson(file(), () => ({ day: '', count: 0, nextAt: 0, last: 0 }))
-  const save = (s) => writeJson(file(), s)
+  const load = () => {
+    const raw = readJson(file(), () => ({ day: '', count: 0, nextAt: 0, last: 0 }))
+    const base = raw && typeof raw === 'object' && !Array.isArray(raw)
+      ? { ...raw }
+      : { day: '', count: 0, nextAt: 0, last: 0 }
+    if (raw !== null && (typeof raw !== 'object' || Array.isArray(raw))) warnBad('state', typeof raw)
+    if ('friends' in base) base.friends = normalizeFriendsMap(base.friends)
+    return base
+  }
+  const save = (s) => {
+    const clean = { ...s }
+    if (clean.friends && typeof clean.friends === 'object' && !Array.isArray(clean.friends)) {
+      clean.friends = normalizeFriendsMap(clean.friends)
+    }
+    writeJson(file(), clean)
+  }
   const ownerId = () => identity?.owner?.() || null
   const ownerRoute = () => {
     if (typeof resolveOwnerRoute === 'function') return resolveOwnerRoute({ purpose: 'proactive' })
@@ -397,16 +434,41 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory, identity, 
     await hub.pushToSession({ chatId: targetChat, kind: 'private', platform: addr?.platform || '', instance: addr?.instance || '', userId: addr?.id || '', nickname: owner }, [{ type: 'text', text: [prompt, followUpHint(followUp)].filter(Boolean).join('\n') }], '', followUpReceipt(followUp))
   }
 
+  const friendPersonId = (target) => (target ? (identity?.lookup?.(target.platform, target.id) || '') : '')
+  const friendMuted = (target) => Boolean(target && (isMuted?.(target.canon) || (target.sendAs !== target.canon && isMuted?.(target.sendAs))))
+  const friendDisliked = (target) => {
+    if (!target) return false
+    const mem = memory?.()
+    if (!mem?.dislikes) return false
+    const pid = friendPersonId(target)
+    return Boolean((pid && mem.dislikes(pid)) || mem.dislikes(target.id))
+  }
+  const friendLastAt = (target) => {
+    if (!target) return 0
+    return Math.max(
+      Number(hub.lastPrivateAt?.(target.canon) || 0),
+      target.legacyKey ? Number(hub.lastPrivateAt?.(target.legacyKey) || 0) : 0,
+      Number(hub.lastPrivateAt?.(target.id) || 0),
+    )
+  }
+
   /** 找白名单里的人：不提主人的事，这是她和对方自己的聊天。 */
-  async function fireFriend(qq) {
+  async function fireFriend(raw) {
     const cfg = getConfig()
-    if (!cfg.enabled || !cfg.speakUp.enabled || !(cfg.speakUp.allow || []).map(String).includes(String(qq)) || isMuted?.(`private:${qq}`) || memory?.()?.dislikes?.(qq)) return
-    const followUp = memory?.()?.dueFollowUp?.(qq)
-    const idle = Math.round((Date.now() - (hub.lastPrivateAt?.(qq) || 0)) / 60000)
+    const target = resolveFriendTarget(raw)
+    if (!target) return
+    const allowed = (cfg.speakUp.allow || []).some((entry) => {
+      const parsed = resolveFriendTarget(entry)
+      return Boolean(parsed && sameChat(parsed.canon, target.canon))
+    })
+    if (!cfg.enabled || !cfg.speakUp.enabled || !allowed || friendMuted(target) || friendDisliked(target)) return
+    const pid = friendPersonId(target)
+    const followUp = (pid && memory?.()?.dueFollowUp?.(pid)) || memory?.()?.dueFollowUp?.(target.id) || null
+    const idle = Math.round((Date.now() - friendLastAt(target)) / 60000)
     const angle = ANGLES[Math.floor(Math.random() * ANGLES.length)]
     const prompt = `【系统提醒，不是对方说的话】你已经 ${idle > 600 ? '很久' : idle + ' 分钟'}没和这位朋友私聊了，想主动找对方说点什么。这次的由头：${angle}。只说你和对方之间的事，别提主人或别人的私事。`
-    log.info(`主动搭话（白名单 ${qq}）`)
-    await hub.pushToSession({ chatId: `private:${qq}`, kind: 'private', userId: qq, nickname: qq }, [{ type: 'text', text: [prompt, followUpHint(followUp)].filter(Boolean).join('\n') }], '', followUpReceipt(followUp))
+    log.info(`主动搭话（白名单 ${target.canon}）`)
+    await hub.pushToSession({ chatId: target.sendAs, kind: 'private', platform: target.platform, instance: target.instance, userId: target.id, nickname: target.id }, [{ type: 'text', text: [prompt, followUpHint(followUp)].filter(Boolean).join('\n') }], '', followUpReceipt(followUp))
   }
 
   /** 白名单：每人单独算次数和间隔，一分钟最多找一个人，不一口气群发。 */
@@ -415,18 +477,19 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory, identity, 
     const h = new Date().getHours()
     if (!(h >= c.awakeFrom && h < c.awakeTo)) return false
     const today = new Date().toDateString()
-    s.friends = s.friends || {}
-    for (const qq of c.allow || []) {
-      const addr = parseChatId(qq) || parseChatId(`private:${qq}`)
-      if (isOwner(identity, addr?.id || String(qq), addr?.platform || parseChatId('private:0')?.platform) || isMuted?.(`private:${qq}`) || memory?.()?.dislikes?.(qq)) continue
-      const f = s.friends[qq] || (s.friends[qq] = {})
+    s.friends = normalizeFriendsMap(s.friends)
+    for (const raw of c.allow || []) {
+      const target = resolveFriendTarget(raw)
+      if (!target) { warnBad('speakUp.allow', raw); continue }
+      if (isOwner(identity, { chatId: target.canon, platform: target.platform, kind: 'private', userId: target.id }) || friendMuted(target) || friendDisliked(target)) continue
+      const f = s.friends[target.canon] || (s.friends[target.canon] = {})
       if (f.day !== today) Object.assign(f, { day: today, count: 0 })
       if (!f.nextAt) schedule(f, c)
-      if (Date.now() - (hub.lastPrivateAt?.(qq) || 0) > c.idleMinutes * 60_000 && f.count < c.maxPerDay && Date.now() >= f.nextAt) {
+      if (Date.now() - friendLastAt(target) > c.idleMinutes * 60_000 && f.count < c.maxPerDay && Date.now() >= f.nextAt) {
         f.count++
         schedule(f, c)
         save(s)
-        await fireFriend(qq)
+        await fireFriend(raw)
         return true
       }
     }

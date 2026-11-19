@@ -74,8 +74,9 @@ export default {
   id: 'weather',              // 必填：小写字母开头，小写字母 / 数字 / -，2~40 个字；和文件夹名一样
   name: '查天气',             // 面板上显示的名字
   version: '0.1.0',           // 你自己的版本号，随便写
-  api: 2,                     // 按哪一版扩展接口写的（现在是 {{API}}；v1 仍兼容）
+  api: 3,                     // 按哪一版扩展接口写的（现在是 {{API}}；v1 / v2 仍兼容）
   platforms: ['*'],           // 可选：支持的平台，如 ['*']（平台无关）或 ['qq', 'feishu']；不写默认 ['qq']
+  features: { required: ['message.quote.read'], optional: ['chat.typing'] }, // 可选：能力申报（仅限 14 个标准 Feature 键；方案 A 仅展示提示，不阻断加载）
   description: '一句话说明',
   defaults: { city: '北京' }, // 设置的默认值
   settings: [                 // 面板自动生成设置表单（见「面板」）
@@ -119,9 +120,12 @@ export default {
 | `api.sendImage(chatId, 图片路径或网址)` | 发图 |
 | `api.sendFile(chatId, 文件路径或网址, 文件名?)` | 把文件（文档、压缩包、音频、视频……）当文件发过去。要先在面板「聊天」页打开「发文件」；本机文件给**绝对路径**，而且只能在 QQ 工作区或主人在面板里加的目录里；单个文件有大小上限（默认 50 MB）。网关在别的机器 / 容器里看不到本机路径时，小文件会自动改用 base64 再试一次 |
 | `api.sendVoiceFile(chatId, 音频文件, 日志备注?)` | 把本机一个音频文件当语音条发出去（不走「念文字」） |
-| `api.sendParts(chatId, parts, opts?)` | **推荐**：发跨平台标准化 `Part[]` 消息段（`text`、`image`、`voice`、`video`、`file`、`mention`、`reply`……），自动走网关降级与出站策略 |
+| `api.sendParts(chatId, parts, opts?)` | **推荐**：发跨平台标准化 `Part[]` 消息段（`text`、`image`、`voice`、`video`、`file`、`mention`、`reply`……），自动走网关降级与出站策略；无网关回退通道下 `card` 与 `forward` 会降级为可读纯文本（如 `[合并转发 #id]`），不产生原生合并转发卡片 |
 | `api.platformOf(chatId)` | 从 `chatId` 解析所属平台（如 `'qq'`、`'feishu'`），无法识别返回 `''` |
-| `api.caps(chatId)` | 查询该聊天所在平台实例的当前能力表（`Caps`），未就绪返回 `null` |
+| `api.caps(chatId)` | 查询该聊天所在平台实例的当前 L1 能力表（`Caps`），未就绪返回 `null` |
+| `api.features(chatId?)` | 查询目标聊天的 14 项 L2 能力布尔表；省略 `chatId` 时依次取当前触发平台上下文、模块唯一声明平台或唯一启用实例，若无上下文且存在多个已启用实例则保守返回全 `false`。断线/未配置时全 `false`；无网关传统 QQ 回退路径仅推导带 L1 映射的能力（其余未探测 L2 能力保持 `false`）。**注意能力与权限边界**：`sticker.sync.native = true` 仅表示读探测通过且乐观允许写动作，首次遇到底层 `unsupported` 会运行时降级；`message.quote.read = true` 仅代表协议支持调用，不保证租户已开通平台权限（如飞书 `im:message:readonly`），遇 `230027`/`403` 时会写入长冷却负缓存并引导核对授权（也可用配置 `caps.features` 手动关闭） |
+| `api.can(feature, chatId?)` | 快捷检查单项 L2 能力是否可用（返回 `boolean`） |
+| `api.require(feature, chatId?)` | 若目标聊天不具备该 L2 能力则抛出 `FeatureUnavailableError`（`error.reason` 为 `'offline'` / `'disabled-by-config'` / `'unsupported'`） |
 | `api.ownerRoute({ purpose? })` | 查询主人主账号路由的结构化结果 `{ chatId, blocked, reason, target, fallbackUsed }`；受阻或无路由时 `chatId` 为 `''` 且不会静默回退 QQ |
 | `api.ownerChat()` | `api.ownerRoute().chatId` 的快捷方式：返回主人当前主动消息目标 `chatId`，受阻或无可用通道返回 `''` |
 | `api.proactive.submit({ text, to?, itemId?, cause? })` | **仅支持 `broker` 档**：`broker` 档省略 `to` 时自动解析主人主账号目标，主账号受阻或不可达返回 `{ deliveryId: null, state: 'dropped', reason }`；`pass` / `gate` 档不解析主账号并直接返回 `{ deliveryId: null, state: 'unsupported' }`（非 `broker` 档请改用 `api.ownerChat()` + `api.sendParts` / `api.sendText`） |
@@ -131,7 +135,10 @@ export default {
 
 `chatId` 的格式：`private:QQ号`、`group:群号` 或 `<实例>:<private|group>:<账号/群>`（如 `feishu:group:oc_xxx`；她后台自己想事情用的会话是 `system:名字`，工具生成函数里可能见到，发不了消息）。
 
-> **多平台过滤规则**：插件按模块声明的 `platforms`（缺省 `['qq']`）自动把不匹配的模块跳过（状态说明「未启用对应平台」），也只往匹配该平台聊天的模块派发 `message` / `poke` / `reply` / `reply/items` / `send` / `group/decide` / `prompt` / `model`、`api.tool` 和 `api.context`。
+> **多平台与 L2 能力过滤规则**：
+> - **方案 A 生命周期**：模块仅按 `platforms`（缺省 `['qq']`）决定是否加载（不匹配时跳过，状态标灰显示「未启用对应平台」）；`features: { required, optional }` 仅作面板展示与元数据申报，不阻断模块加载，也不会在断线重连或能力切换时重启模块；网关 L2 能力变化时由宿主 100ms 去抖重挂会话工具，模块通过 `api.can` / `api.require` / `features` 自适应降级。
+> - **全表面按平台与能力过滤**：只往匹配对话平台的模块派发 `message` / `poke` / `reply` / `reply/items` / `send` / `group/decide` / `prompt` / `model`、`api.tool`、`api.context` 与 `api.command`。其中 `api.tool(({ chat, level, sessionId, features }) => ...)` 与 `api.context` 会收到目标会话的 L2 `features` 布尔表，并可按 `{ fn, platforms?, features? }`（或函数属性 `.platforms` / `.features`）声明过滤条件，`api.command` 也可附带 `platforms` / `features`（面板全量命令目录与权限配置列表不受影响）。
+> - **`api.rule` 全局性约束**：内置系统提示词预设只在无指定平台时生成全局共享规则；当多平台同时启用时，仅声明部分平台或绑定 `features` 的全局 `api.rule` 会被跳过以防跨平台泄露，应改为按会话动态注入的 `api.context(({ chat, features }) => ...)`。
 
 判断是不是主人：`api.isOwner(msg.userId)`。
 
@@ -150,8 +157,8 @@ export default {
 |---|---|
 | `api.on(事件, fn)` | 听事件（见下一节） |
 | `api.emit(事件, ...参数)` | 发事件给别的模块 |
-| `api.tool(fn 或 工具)` | 给她加工具（见「工具」） |
-| `api.defineTool({ name, description, properties, required, execute })` | 做一个工具 |
+| `api.tool(fn 或 工具)` | 给她加工具（见「工具」）；支持给函数、工具或数组元素附加 `platforms` / `features` 进行会话级自动过滤 |
+| `api.defineTool({ name, description, properties, required, platforms, features, execute })` | 做一个工具（支持可选 `platforms` / `features` 元数据） |
 | `api.context(({ chat, sessionId }) => '文字')` | 每轮聊天前塞进她上下文的话（比如「现在北京 20 度」）；返回空串就不塞 |
 | `api.rule((kind, cfg) => '一条规则')` | 补一条她的规则（会放进系统提示词；kind 是 `private` 主人私聊 / `social` 群聊和别人）。告诉她「你会查天气，用 xxx 工具」就写在这里。可以直接给字符串、也可以返回多条（数组）；函数**每一轮都会重新调用**，所以里面可以拼当前设置 |
 | `api.command({ name, aliases, desc, delegatable, run(arg, msg) })` | 主人可在 QQ 私聊或白名单群里发送命令。默认仅主人可用。只有显式设置 `delegatable: true` 的命令，主人才能授权给私聊白名单中的 QQ 用户。此时 `run` 会收到实际发送者的消息，模块应自行限制命令的操作范围。返回的文字回到发命令的聊天。名字可以是中文，中文命令后面可以不加空格；`arg` 已去掉首尾空格。和内置命令同名时模块命令优先 |
@@ -344,7 +351,8 @@ return function Panel({ settings, save, toast }) {
 | `voice` | 语音 | `speak(文字) → { file, engine }` |
 | `mood` | 心情 | `state()` `label()` `nudge(变化量, 原因)` `effects()` `contextLine()` |
 | `memory` | 记忆 | `add({ text, about, aboutName, importance, tags, source })` `addEvent({ text, about, tags, importance, kind, meta })` `recall(查询, { about, limit })` `vectorHits(查询)` `vectorStatus()` `vectorTest(文字)` `vectorReset()` `vectorSync()` `rerankStatus()` `rerankTest(文字)` `list(查询)` `remove(id)` `update(id, 改动)` `contextFor(chat, sessionId)` `noteVia({ via, qq, who, text, at })` `contextVia({ qq, query })` `topicScore(文字)` `profiles()` `consolidate()` …… |
-| `qq-tools` | 基础 QQ 工具 | （只有工具：`qq_chat_history`、`qq_send_message`、`qq_send_file`） |
+| `chat-tools` | 通用聊天工具 | （只有工具：`chat_history`、`search_chatlog`、`send_message`、`send_file`，支持 `qq_*` 执行路由兼容） |
+| `qq-tools` | 基础 QQ 工具 | （只有工具：`qq_send_card`、`qq_read_file`） |
 | `imagegen` | 生图 | `enabled()` `generate(描述) → Buffer` |
 | `diary` | 空间日记 | `writeDiary()` `post(正文, { images, visibility })` `remove(tid)` `history()` `nextTime()` |
 | `qzone-social` | 空间互动 | `run({ force })` `state()` |
@@ -437,7 +445,7 @@ return function Panel({ settings, save, toast }) {
 ## 升级会不会坏
 
 - **你的文件**：`modules/` 里的东西插件升级不碰
-- **`api.*` 和内置模块导出表**：v1 扩展接口（只支持 QQ）**只加不改**；v2 起新增了多平台字段与方法（`platforms`、`api.sendParts`、`api.caps`、`api.native`、`api.platformOf`、`platform/state`），同时向后兼容 v1 模块（缺省视为 `platforms: ['qq']`）。插件会拒绝加载高于当前支持版本的模块并在面板里说明原因。
+- **`api.*` 和内置模块导出表**：v1 扩展接口（只支持 QQ）**只加不改**；v2 起新增了多平台字段与方法（`platforms`、`api.sendParts`、`api.caps`、`api.native`、`api.platformOf`、`platform/state`），同时向后兼容 v1 模块（缺省视为 `platforms: ['qq']`）；v3 起新增 L2 能力查询与过滤（`features`、`api.features`、`api.can`、`api.require`、`FeatureUnavailableError`、按平台/能力过滤 `api.tool` / `api.context` / `api.command`，以及多平台全局 `api.rule` 防泄露），v1 / v2 模块保持完全兼容。插件会拒绝加载高于当前支持版本的模块并在面板里说明原因。
 - **`api.core`、`api.lib`、`api.dsh`**：插件内部和 DSH 的东西，全开放但可能随版本变。用了它们的模块，升级后留意面板「已安装」页的报错
 - **复制出来改的内置模块**：是你的分叉。内置的版本更新了，面板会提示「内置版本更新了」，你可以对照着把新改动合进去，或者删掉文件夹用回内置的
 

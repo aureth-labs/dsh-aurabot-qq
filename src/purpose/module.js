@@ -9,10 +9,11 @@
 // 现有的「主动搭话」模块（speakup，src/features/companion.js）保持默认实现不变，
 // 想换引擎的主人自己开关，迁移说明见 docs/PURPOSE_MODULE_API.md。
 
+import { existsSync, unlinkSync } from 'node:fs'
 import { dataDir, readJson, writeJson } from '../core/store.js'
 import { cleanOutboundText } from '../chat/reply.js'
-import { isOwner, isOwnerChatMuted, isOwnerPrivateChat } from '../chat/access.js'
-import { parseChatId } from '../gateway/address.js'
+import { isOwner, isOwnerChatMuted, isOwnerPrivateChat, resolveFriendTarget } from '../chat/access.js'
+import { normalizeChatId, parseChatId, sameChat } from '../gateway/address.js'
 import { isSessionBackoff } from '../chat/session-backoff.js'
 import { followUpHint } from '../features/memory.js'
 import { selfName, selfNames } from '../persona/personas.js'
@@ -100,6 +101,13 @@ export function cleanReply(raw, options, cfg) {
 export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, memory, personaText, pet: petOf, use, identity, routeOwner, resolveOwnerRoute }) {
   const moodOf = () => { try { return mood?.() || null } catch { return null } }
   const memoryOf = () => { try { return memory?.() || null } catch { return null } }
+  const warnedBad = new Set()
+  const warnBad = (ctx, val) => {
+    const k = `${ctx}:${String(val)}`
+    if (warnedBad.has(k)) return
+    warnedBad.add(k)
+    log?.warn?.(`目的：存在无效地址/状态（${ctx}），已跳过：${String(val)}`)
+  }
   const ownerId = () => identity?.owner?.() || null
   const ownerRoute = () => {
     if (typeof resolveOwnerRoute === 'function') return resolveOwnerRoute({ purpose: 'proactive' })
@@ -111,15 +119,52 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     return r && !r.blocked ? String(r.chatId || '') : ''
   }
   const ownerMuted = () => isOwnerChatMuted(identity, isMuted)
+  const friendPersonId = (target) => (target ? (identity?.lookup?.(target.platform, target.id) || '') : '')
   // 下面的 friend 是主动搭话白名单里的对象，不传就是主人。朋友各有各的状态，素材只看和这个人的私聊、关于这个人的记忆。
-  const chatIdOf = (cfg, friend) => (friend ? `private:${friend}` : resolveOwnerChat())
-  const lastPrivateAt = (cfg, friend) => friend ? (hub?.lastPrivateAt?.(friend) || 0) : Math.max(hub?.lastOwnerChatAt || 0, hub?.lastBotToOwner?.at || 0)
-  const stateFile = (friend) => dataDir('purpose', ...(friend ? ['friends', `${friend}.json`] : ['purpose-state.json']))
+  const chatIdOf = (cfg, friend) => (friend ? (resolveFriendTarget(friend)?.sendAs || '') : resolveOwnerChat())
+  const lastPrivateAt = (cfg, friend) => {
+    if (!friend) return Math.max(hub?.lastOwnerChatAt || 0, hub?.lastBotToOwner?.at || 0)
+    const target = resolveFriendTarget(friend)
+    if (!target) return 0
+    return Math.max(
+      Number(hub?.lastPrivateAt?.(target.canon) || 0),
+      target.legacyKey ? Number(hub?.lastPrivateAt?.(target.legacyKey) || 0) : 0,
+      Number(hub?.lastPrivateAt?.(target.id) || 0),
+    )
+  }
+  const friendStatePaths = (friend) => {
+    if (!friend) {
+      const main = dataDir('purpose', 'purpose-state.json')
+      return { canonical: main, legacy: '', preferCanonical: true }
+    }
+    const target = resolveFriendTarget(friend)
+    if (!target) return null
+    return {
+      canonical: dataDir('purpose', 'friends', `${target.safeFileKey}.json`),
+      legacy: target.legacyKey ? dataDir('purpose', 'friends', `${target.legacyKey}.json`) : '',
+      preferCanonical: !target.legacy,
+    }
+  }
+  const stateFile = (friend) => {
+    const p = friendStatePaths(friend)
+    return p ? (p.preferCanonical || !p.legacy ? p.canonical : p.legacy) : ''
+  }
   const nudgeFile = () => dataDir('purpose', 'nudge.json')
 
   // ---------- 状态 ----------
   function loadState(config, now = Date.now(), friend = '') {
-    const raw = readJson(stateFile(friend), null)
+    const paths = friendStatePaths(friend)
+    let raw = null
+    if (paths) {
+      const readFrom = existsSync(paths.canonical)
+        ? paths.canonical
+        : (paths.legacy && existsSync(paths.legacy) ? paths.legacy : '')
+      if (readFrom) {
+        const parsed = readJson(readFrom, undefined)
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) raw = parsed
+        else warnBad('state.json', readFrom)
+      }
+    }
     const state = normalizePurposeState(raw, now)
     if (!raw && !friend) {
       // 旧 speakup.json 只读迁移当日次数，之后弃用
@@ -135,14 +180,27 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     ensurePurposeSchedule(state, { now, config })
     return state
   }
-  const saveState = (state, friend = '') => writeJson(stateFile(friend), state)
+  const saveState = (state, friend = '') => {
+    const paths = friendStatePaths(friend)
+    if (!paths) return
+    const useCanonical = paths.preferCanonical || !paths.legacy || existsSync(paths.canonical)
+    const dest = useCanonical ? paths.canonical : paths.legacy
+    writeJson(dest, state)
+    if (useCanonical && paths.legacy && paths.legacy !== dest && existsSync(paths.legacy)) {
+      try { unlinkSync(paths.legacy) } catch {}
+    }
+  }
 
   // ---------- 素材（记忆 importance 0~1 → 引擎 0~100） ----------
   function memoryRecords(friend = '') {
+    const target = friend ? resolveFriendTarget(friend) : null
+    if (friend && !target) return []
+    const pid = friendPersonId(target)
+    const aboutIds = target ? new Set([String(friend), target.canon, target.id, ...(pid ? [pid] : [])]) : null
     try {
       const items = memoryOf()?.list?.('') || []
       return items
-        .filter((m) => m && !m.invalidAt && !m.followUp && m.text && !['hearsay', 'guess'].includes(m.status) && (!friend || (m.scope !== 'group' && String(m.about) === friend)))
+        .filter((m) => m && !m.invalidAt && !m.followUp && m.text && !['hearsay', 'guess'].includes(m.status) && (!aboutIds || (m.scope !== 'group' && aboutIds.has(String(m.about)))))
         .map((m) => {
           // 自驱引擎的沉淀（反思/做梦，带「自驱」标签）加权：那是她自己想明白的事，
           // 比聊天流水里的一句闲话更值得成为搭话话题（autotelic 联动，2026-11-05）
@@ -166,7 +224,8 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
 
   // 聊天流水（hub.chatLogOf）→ 引擎的 conversations 结构：只看主人私聊 + 最近群；朋友只看 TA 自己的私聊
   function conversations(cfg, now = Date.now(), friend = '') {
-    const friendKey = friend ? `private:${friend}` : ''
+    const friendTarget = friend ? resolveFriendTarget(friend) : null
+    if (friend && !friendTarget) return []
     const per = new Map()
     const pick = (chatId, isOwnerConv) => {
       let c = per.get(chatId)
@@ -180,7 +239,7 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
         for (const e of hub.chatLogOf?.(day) || []) {
           if (!e?.chatId || e.forgottenAt) continue
           const isGroup = parseChatId(e.chatId)?.kind === 'group'
-          const isOwnPriv = friend ? e.chatId === friendKey : isOwnerPrivateChat(identity, e.chatId)
+          const isOwnPriv = friendTarget ? sameChat(e.chatId, friendTarget.canon) : isOwnerPrivateChat(identity, e.chatId)
           if (!isOwnPriv && (friend || !isGroup)) continue
           pick(e.chatId, isOwnPriv && !friend).recentMessages.push({
             text: String(e.text || ''),
@@ -276,8 +335,13 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
 
   // ①~④ 收素材 → 驱动 → 目标假设 → 候选（不落盘；打分配了模型才有一次额外回合）
   async function prepare(cfg, config, state, now = Date.now(), friend = '') {
-    const targetPerson = friend || ownerId() || ''
-    const followUp = targetPerson ? (memoryOf()?.dueFollowUp?.(targetPerson, now) || null) : null
+    const friendTarget = friend ? resolveFriendTarget(friend) : null
+    const friendPid = friendPersonId(friendTarget)
+    const targetPerson = friendTarget ? (friendPid || friendTarget.id) : (ownerId() || '')
+    const mem = memoryOf()
+    const followUp = targetPerson
+      ? (mem?.dueFollowUp?.(targetPerson, now) || (friendTarget && friendTarget.id !== targetPerson ? mem?.dueFollowUp?.(friendTarget.id, now) : null) || null)
+      : null
     const materials = collectMaterials({
       now, config,
       ownerUin: chatIdOf(cfg, friend) || targetPerson,
@@ -312,14 +376,24 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
   }
 
   const friendName = (friend) => {
-    try { return memoryOf()?.profiles?.().find((p) => p.qq === friend)?.name || '这位朋友' } catch { return '这位朋友' }
+    const target = friend ? resolveFriendTarget(friend) : null
+    const pid = friendPersonId(target)
+    try {
+      const hit = memoryOf()?.profiles?.().find((p) => (
+        (pid && (p.personId === pid || p.id === pid))
+        || (target && (p.qq === target.id || p.id === target.id || p.qq === target.canon))
+        || p.qq === friend
+      ))
+      return hit?.name || '这位朋友'
+    } catch { return '这位朋友' }
   }
 
   function promptFor(cfg, config, selected, ctx, state, now = Date.now(), friend = '') {
     const name = friend ? friendName(friend) : cfg.ownerName || '主人'
+    const friendTarget = friend ? resolveFriendTarget(friend) : null
     const prompt = buildPurposePrompt({
       now, config, mode: 'auto', // 模型直接输出那句话（Aurabot 没有发送工具）
-      ownerUin: friend || ownerId() || '',
+      ownerUin: friendTarget?.id || ownerId() || '',
       ownerName: name,
       contextBlocks: [],
       materials: ctx.materials.items,
@@ -536,7 +610,8 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     const target = String(to || '')
     const ownerKey = chatIdOf(cfg)
     // 只对发往主人私聊的内容过目；别的接收人（白名单朋友等）各有各的额度，宿主直发
-    if (target !== ownerKey) return { ok: true, send: true, text, reviewed: false }
+    const isOwnerTarget = target && ((ownerKey && sameChat(target, ownerKey)) || isOwnerPrivateChat(identity, target))
+    if (!isOwnerTarget) return { ok: true, send: true, text, reviewed: false }
     const srcModule = String(moduleId || '模块')
     const ownerName = cfg.ownerName || '主人'
     // ---- 审查上下文：人格 + 心情 + 相关记忆 + 人物档案 + 最近来往 ----
@@ -622,7 +697,9 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     const profileLine = (() => {
       try {
         const mem = memoryOf()
-        const p = mem?.personaPerson?.(ownerKey.slice('private:'.length))
+        const targetAddr = parseChatId(target) || parseChatId(ownerKey)
+        const pid = (targetAddr?.platform && targetAddr?.id ? identity?.lookup?.(targetAddr.platform, targetAddr.id) : null) || ownerId() || ''
+        const p = (pid && mem?.personaPerson?.(pid)) || (targetAddr?.id && targetAddr.id !== pid ? mem?.personaPerson?.(targetAddr.id) : null)
         if (!p) return ''
         const parts = []
         if (p.alias) parts.push(`你平时叫 TA「${p.alias}」`)
@@ -638,7 +715,7 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
         for (const day of days.slice(-1)) {
           for (const e of hub.chatLogOf?.(day) || []) {
             if (!e || e.forgottenAt) continue
-            if (String(e.chatId) !== ownerKey) continue
+            if (!sameChat(e.chatId, target) && (!ownerKey || !sameChat(e.chatId, ownerKey))) continue
             rows.push(e)
           }
         }
@@ -809,10 +886,14 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     const ownerConfig = applyPersonaOverrides(config, personaOf(cfg))
     const ownerCheck = ownerRoute()
     if (ownerCheck && !ownerCheck.blocked && ownerCheck.chatId && !ownerMuted() && !memoryOf()?.dislikes?.(ownId) && await tickOne(cfg, ownerConfig)) return
-    for (const qq of cfg.speakUp?.allow || []) {
-      const addr = parseChatId(qq) || parseChatId(`private:${qq}`)
-      if (isOwner(identity, addr?.id || String(qq), addr?.platform || 'qq') || isMuted?.(chatIdOf(cfg, qq)) || memoryOf()?.dislikes?.(qq)) continue
-      if (await tickOne(cfg, config, String(qq))) return
+    for (const raw of cfg.speakUp?.allow || []) {
+      const target = resolveFriendTarget(raw)
+      if (!target) { warnBad('speakUp.allow', raw); continue }
+      const pid = friendPersonId(target)
+      const muted = Boolean(isMuted?.(target.canon) || (target.sendAs !== target.canon && isMuted?.(target.sendAs)))
+      const disliked = Boolean((pid && memoryOf()?.dislikes?.(pid)) || memoryOf()?.dislikes?.(target.id))
+      if (isOwner(identity, { chatId: target.canon, platform: target.platform, kind: 'private', userId: target.id }) || muted || disliked) continue
+      if (await tickOne(cfg, config, String(raw))) return
     }
   }
 

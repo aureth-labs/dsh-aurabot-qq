@@ -39,6 +39,7 @@
 import { readFileSync, writeFileSync, renameSync } from 'node:fs'
 import { dirname, isAbsolute, join } from 'node:path'
 import { ensureDir } from '../../core/store.js'
+import { sanitizeFeaturesInput } from '../../gateway/features.js'
 
 /** 协议版本。不一致一律拒绝（宁可连不上，也不猜字段含义）。 */
 const PROTOCOL = 1
@@ -80,6 +81,7 @@ const CONSERVATIVE_CAPS = {
   history: false,
   memberList: false,
   forwardExpand: false,
+  features: Object.freeze({}),
 }
 
 /**
@@ -87,10 +89,10 @@ const CONSERVATIVE_CAPS = {
  * 为什么要白名单：caps 决定网关怎么降级，外部程序乱塞键或塞错类型会让降级表算错。
  */
 function sanitizeCaps(input) {
-  const caps = { ...CONSERVATIVE_CAPS }
+  const caps = { ...CONSERVATIVE_CAPS, features: {} }
   if (!input || typeof input !== 'object') return caps
   for (const key of Object.keys(CONSERVATIVE_CAPS)) {
-    if (!(key in input)) continue
+    if (key === 'features' || !(key in input)) continue
     const value = input[key]
     if (key === 'voice') {
       if (value === 'native' || value === 'file' || value === false) caps.voice = value
@@ -103,6 +105,8 @@ function sanitizeCaps(input) {
       caps[key] = Boolean(value)
     }
   }
+  const features = sanitizeFeaturesInput(input.features, { source: 'bridge./hello caps.features' })
+  if (features) caps.features = features
   return caps
 }
 
@@ -174,7 +178,7 @@ export function createBridgeAdapter(options = {}) {
   let ctx = null
   let running = false
   let connected = false
-  let caps = { ...CONSERVATIVE_CAPS }
+  let caps = { ...CONSERVATIVE_CAPS, features: {} }
   let announced = false // 外部程序是否已经 /hello 声明过 caps
   const offs = []
   let seq = 0
@@ -457,7 +461,7 @@ export function createBridgeAdapter(options = {}) {
     name,
     contract: 1,
 
-    caps: () => ({ ...caps }),
+    caps: () => ({ ...caps, features: { ...(caps.features || {}) } }),
 
     settings: [
       { key: 'token', label: '接入令牌', type: 'password', hint: '必填。外部程序每个请求都要带 x-bridge-token 等于它；不填则拒绝连接（不给空口令开绿灯）' },
@@ -478,7 +482,7 @@ export function createBridgeAdapter(options = {}) {
 
       // 进程内重启（同一实例再 start）沿用内存里已声明的能力；跨进程重启一律退回最保守，
       // 等外部程序重新 /hello（CONTRACTS §八.1：探测前按最保守报）。
-      caps = announced ? caps : { ...CONSERVATIVE_CAPS }
+      caps = announced ? caps : { ...CONSERVATIVE_CAPS, features: {} }
 
       offs.push(gatewayCtx.route('/hello', handleHello))
       offs.push(gatewayCtx.route('/inbound', handleInbound))
@@ -647,10 +651,13 @@ export function createBridgeAdapter(options = {}) {
     injectFail(why) { failSend = why },
     /** 等价于外部程序重新 /hello 只改 caps（测试用，不必造 HTTP 请求） */
     injectCaps(partial) {
-      caps = sanitizeCaps({ ...caps, ...(partial || {}) })
+      const mergedFeatures = partial?.features && typeof partial.features === 'object'
+        ? { ...(caps.features || {}), ...partial.features }
+        : caps.features
+      caps = sanitizeCaps({ ...caps, ...(partial || {}), ...(mergedFeatures ? { features: mergedFeatures } : {}) })
       announced = true
       ctx?.capsChanged?.()
-      return { ...caps }
+      return { ...caps, features: { ...(caps.features || {}) } }
     },
     queueLength: () => queue.length,
     inflightCount: () => inflight.size,

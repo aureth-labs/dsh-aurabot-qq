@@ -19,10 +19,11 @@ const step = { desc: '只读了解「查竖屏转法」', level: 'L0' }
 
 // ---------- exec ----------
 
-test('做事提示词：边界写死（不发消息、不碰 onebot、不跑 shell）', () => {
+test('做事提示词：边界写死（不发消息、不调网关、不跑 shell）', () => {
   const p = buildActPrompt(task, step, { quiet: true })
-  assert.match(p, /不许发 QQ 消息/)
-  assert.match(p, /不许碰 onebot/)
+  assert.match(p, /不许发聊天消息/)
+  assert.match(p, /不许调网关原生接口/)
+  assert.doesNotMatch(p, /onebot/i)
   assert.match(p, /不许跑 shell/)
   assert.match(p, /只读为主/)
   assert.ok(p.includes(task.title), '提示词带上任务')

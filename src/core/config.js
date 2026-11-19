@@ -4,9 +4,9 @@ import { randomUUID } from 'node:crypto'
 import { normalizeChatEfforts } from '../chat/effort-command.js'
 import { dataDir, readJson, writeJson } from './store.js'
 import { DEFAULT_GROUP_POLICY } from '../chat/group-policy.js'
-import { LEVELS, PROFILE_PERM_KEYS, PROFILE_PERM_LEVELS, profilePermDefault } from '../chat/access.js'
+import { LEVELS, PROFILE_PERM_KEYS, PROFILE_PERM_LEVELS, profilePermDefault, resolveFriendTarget } from '../chat/access.js'
 import { normalizeChatModels } from '../chat/chat-model.js'
-import { normalizeChatId } from '../gateway/address.js'
+import { normalizeChatId, parseChatId } from '../gateway/address.js'
 import { DELEGATED_COMMANDS, isDelegatedCommandKey } from '../chat/delegated-commands.js'
 import { DIARY_AUDIENCES } from '../features/qzone-audience.js'
 import { DEFAULT_TIER_DAYS } from '../features/memory-rules.js'
@@ -468,6 +468,34 @@ const allowList = (v) => {
   }
   return [...new Set(out)]
 }
+// B站群分享目标：兼容旧数字 QQ 群号与规范平台群地址（feishu:group:oc_x / qq:group:123）。
+const groupShareTarget = (v) => {
+  const s = String(v ?? '').trim()
+  if (!s) return ''
+  if (/^\d+$/.test(s)) return s
+  try {
+    const parsed = parseChatId(s)
+    if (parsed?.kind === 'group' && parsed.id) return normalizeChatId(s) || ''
+  } catch {}
+  return ''
+}
+const privateGrantList = (v) => {
+  const raw = Array.isArray(v) ? v : []
+  const out = []
+  for (const item of raw) {
+    const s = String(item ?? '').trim()
+    if (!s) continue
+    if (/^\d{5,}$/.test(s) || /^p-[0-9a-z]+$/.test(s)) { out.push(s); continue }
+    try {
+      const parsed = parseChatId(s)
+      if (parsed?.kind === 'private') {
+        const canon = normalizeChatId(s)
+        if (canon) out.push(canon)
+      }
+    } catch {}
+  }
+  return [...new Set(out)]
+}
 const hhmm = (v, d) => (/^\d{1,2}:\d{2}$/.test(String(v)) ? String(v) : d)
 // 严格校验 'YYYY-MM-DD'（面板手填/配置文件手改都可能乱），非法日期当没填。
 const dateKey = (v) => {
@@ -596,15 +624,9 @@ export function normalize(raw) {  const c = deepMerge(DEFAULTS, raw)
   c.chatModels = normalizeChatModels(c.chatModels)
   c.chatEfforts = normalizeChatEfforts(c.chatEfforts)
   c.profilePerms = Object.fromEntries(PROFILE_PERM_KEYS.map((k) => [k, PROFILE_PERM_LEVELS.includes(c.profilePerms?.[k]) ? c.profilePerms[k] : profilePermDefault(k)]))
-  c.capabilityAllow = Object.fromEntries(['image', 'song', 'video'].map((key) => {
-    const ids = Array.isArray(c.capabilityAllow?.[key]) ? c.capabilityAllow[key] : []
-    return [key, [...new Set(ids.map(String).map((id) => id.trim()).filter((id) => /^\d{5,}$/.test(id)))]]
-  }))
+  c.capabilityAllow = Object.fromEntries(['image', 'song', 'video'].map((key) => [key, privateGrantList(c.capabilityAllow?.[key])]))
   const commandKeys = [...new Set([...DELEGATED_COMMANDS, ...Object.keys(c.commandAllow || {}).filter(isDelegatedCommandKey)])]
-  c.commandAllow = Object.fromEntries(commandKeys.map((key) => {
-    const ids = Array.isArray(c.commandAllow?.[key]) ? c.commandAllow[key] : []
-    return [key, [...new Set(ids.map(String).map((id) => id.trim()).filter((id) => /^\d{5,}$/.test(id)))]]
-  }))
+  c.commandAllow = Object.fromEntries(commandKeys.map((key) => [key, privateGrantList(c.commandAllow?.[key])]))
   // 旧版 douyinDm 是「回别人私信」的权限，含义已不同（现在是主动发私信），老配置一律回到默认「仅主人」
   if (isObj(raw?.profilePerms) && 'douyinDm' in raw.profilePerms) c.profilePerms.douyinDm = profilePermDefault('douyinDm')
   c.allow = { private: allowList(c.allow.private), groups: allowList(c.allow.groups) }
@@ -646,10 +668,10 @@ export function normalize(raw) {  const c = deepMerge(DEFAULTS, raw)
   if (!isObj(g.ownerBrief)) g.ownerBrief = { enabled: true, lines: 24, groups: [] }
   g.ownerBrief.enabled = bool(g.ownerBrief.enabled, true)
   g.ownerBrief.lines = num(g.ownerBrief.lines, 24, 1, 30)
-  g.ownerBrief.groups = qqList(g.ownerBrief.groups)
+  g.ownerBrief.groups = allowList(g.ownerBrief.groups)
   // 群聊里的本机工具：默认关；只有明确写了 owner 才开（all 已移除，写 all 也按 off 处理）
   g.ownerTools = g.ownerTools === 'owner' ? 'owner' : 'off'
-  g.ownerToolsGroups = qqList(g.ownerToolsGroups)
+  g.ownerToolsGroups = allowList(g.ownerToolsGroups)
   c.voice.autoChance = num(c.voice.autoChance, 0.15, 0, 1)
   c.voice.autoMaxChars = num(c.voice.autoMaxChars, 80, 1, BIG)
   c.voice.emojiSeparate = c.voice.emojiSeparate !== false
@@ -753,7 +775,12 @@ export function normalize(raw) {  const c = deepMerge(DEFAULTS, raw)
   c.speakUp.reminderEnabled = bool(c.speakUp.reminderEnabled, false)
   c.speakUp.reminderLimit = Math.min(10, Math.max(1, Math.round(num(c.speakUp.reminderLimit, 5, 1, 10))))
   c.speakUp.reminderRetry = bool(c.speakUp.reminderRetry, true)
-  c.speakUp.allow = [...new Set((Array.isArray(c.speakUp.allow) ? c.speakUp.allow : []).map((q) => String(q).trim()).filter((q) => /^\d{5,}$/.test(q)))]
+  c.speakUp.allow = [...new Set((Array.isArray(c.speakUp.allow) ? c.speakUp.allow : [])
+    .map((q) => {
+      const t = resolveFriendTarget(q)
+      return t ? (t.legacy ? t.raw : t.canon) : ''
+    })
+    .filter(Boolean))]
   const q = c.qzoneSocial
   q.enabled = bool(q.enabled, true)
   q.replyOwn = bool(q.replyOwn, true)
@@ -785,8 +812,8 @@ export function normalize(raw) {  const c = deepMerge(DEFAULTS, raw)
   b.shotLibrary = Math.round(num(b.shotLibrary, 300, 1, BIG))
   if (!isObj(b.groupShare)) b.groupShare = {}
   b.groupShare.enabled = bool(b.groupShare.enabled, false)
-  b.groupShare.groupId = qq(b.groupShare.groupId)
-  b.groupShare.groups = [...new Set((Array.isArray(b.groupShare.groups) ? b.groupShare.groups : []).map(qq).filter(Boolean))].slice(0, 20)
+  b.groupShare.groupId = groupShareTarget(b.groupShare.groupId)
+  b.groupShare.groups = [...new Set((Array.isArray(b.groupShare.groups) ? b.groupShare.groups : []).map(groupShareTarget).filter(Boolean))].slice(0, 20)
   b.groupShare.dailyLimit = Math.round(num(b.groupShare.dailyLimit, 3, 0, BIG))
   b.groupShare.pendingTtlHours = Math.round(num(b.groupShare.pendingTtlHours, 24, 1, 24 * 30))
   b.groupShare.queueLimit = Math.round(num(b.groupShare.queueLimit, 1, 1, 20))

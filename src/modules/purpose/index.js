@@ -14,7 +14,7 @@ export default {
   id: 'purpose',
   name: '目的引擎（实验）',
   version: '1.0.0',
-  api: 2,
+  api: 3,
   platforms: ['*'],
   description: '像人一样主动找主人搭话：攒素材 → 记观察 → 立目标假设 → 挑一个候选，到点了才来找你。默认关闭；开启前建议先关掉「主动搭话」总开关，两套别同时开。',
   tab: 'speakup',

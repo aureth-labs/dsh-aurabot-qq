@@ -72,7 +72,7 @@ export function buildParts(parts, { voiceMode = 'native', faceIdOf, log } = {}) 
         }
         const file = mediaSource(part.media)
         if (!file) { degraded.push('sticker dropped (没有可发的内容)'); break }
-        segments.push({ type: 'image', data: { file, ...(part.label ? { summary: String(part.label) } : {}) } })
+        segments.push({ type: 'image', data: { file, sub_type: 1, ...(part.label ? { summary: String(part.label) } : {}) } })
         break
       }
       case 'voice': {

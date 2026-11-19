@@ -68,7 +68,12 @@ test('P0-1：gateway.routeTo() 返回 ChatId 字符串时，hub.ownerChat()（�
     dsh: fake2.ctx,
     getConfig: () => cfg,
     log: noopLog,
-    gateway: { routeTo: () => 'feishu:private:ou_owner' },
+    gateway: {
+      routeTo: () => 'feishu:private:ou_owner',
+      caps: () => null,
+      features: () => ({}),
+      onCapsChanged: () => () => {},
+    },
     identity,
     routeOwner: () => 'feishu:private:ou_owner',
   })
@@ -90,6 +95,8 @@ test('P0-2：旧版直连 OneBot 私聊入站补记 gateway.noteSeen；网关入
     noteSeen: (person, chatId, at) => seenCalls.push({ person, chatId, at }),
     routeTo: () => null,
     caps: () => null,
+    features: () => ({}),
+    onCapsChanged: () => () => {},
   }
   const cfg = normalize({
     enabled: true, dryRun: true, setupDone: true, botQQ: '20000002', ownerQQ: '10001',

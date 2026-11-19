@@ -8,7 +8,7 @@ export default {
   id: 'speakup',
   name: '主动搭话',
   version: '1.0.0',
-  api: 2,
+  api: 3,
   platforms: ['*'],
   description: '主人一阵子没理她时，在私聊里主动找主人说话',
   tab: 'speakup',

@@ -26,7 +26,8 @@
 import { normalizeChatId, parseChatId, formatChatId } from './address.js'
 import { makeSendError, isNotSent, toSendError } from './errors.js'
 import { renderParts } from './render.js'
-import { degrade, VOICE_RANK, PROACTIVE_RANK } from './degrade.js'
+import { degrade } from './degrade.js'
+import { cloneCaps, effectiveFeaturesFor, featuresSignature, mergeCapsWithFeatures } from './features.js'
 import { createOutbox } from './outbox.js'
 import { createRouter } from './router.js'
 import { createDedupe } from './dedupe.js'
@@ -40,34 +41,12 @@ const ARRIVAL_TTL = 60 * 60_000 // 入站到达时间最多记一小时（被动
 const prefixOf = (instance) => String(instance).split('#')[0]
 
 /**
- * 能力叠加：配置 caps 叠在平台端 caps() 上，只能往弱改，往强改忽略并记警告。
+ * 能力叠加：按 5 步不可逆顺序把配置 caps（含 features）叠在平台端 caps() 上，
+ * 只能往弱改，往强改忽略并记警告；同时解析完整 14 项 L2 Feature 表。
  * @returns {import('./contracts.d.ts').Caps}
  */
 export function mergeCaps(adapterCaps, userCaps, instance, log = noopLog) {
-  const merged = { ...adapterCaps }
-  if (!userCaps || typeof userCaps !== 'object') return merged
-  for (const [key, value] of Object.entries(userCaps)) {
-    if (!(key in adapterCaps)) { merged[key] = value; continue }
-    const base = adapterCaps[key]
-    let ignored = false
-    if (typeof base === 'boolean' && key !== 'maxFileBytes') {
-      // true→false 允许（往弱）；false→true 忽略
-      if (base === false && value === true) ignored = true
-    } else if (key === 'voice') {
-      if ((VOICE_RANK[value] ?? 0) > (VOICE_RANK[base] ?? 0)) ignored = true
-    } else if (key === 'proactive') {
-      if ((PROACTIVE_RANK[value] ?? 0) > (PROACTIVE_RANK[base] ?? 0)) ignored = true
-    } else if (key === 'maxFileBytes') {
-      // 上限只能调小；平台报 0（不能发文件）时任何正数都是往强
-      if (Number(value) > Number(base)) ignored = true
-    }
-    if (ignored) {
-      log.warn(`实例 ${instance} 的配置 caps 想把 '${key}' 往强改（${JSON.stringify(base)} → ${JSON.stringify(value)}），已忽略（只能往弱改）`)
-      continue
-    }
-    merged[key] = value
-  }
-  return merged
+  return mergeCapsWithFeatures(adapterCaps, userCaps, instance, log)
 }
 
 /**
@@ -97,6 +76,8 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
   const msgSubs = new Set()
   const evtSubs = new Set()
   const stateSubs = new Set()
+  const capsChangedSubs = new Set()
+  const capsSnapshots = new Map() // 实例名 → last snapshot signature (state + 14 features)
   const flushedSubs = new Set()
 
   const dedupe = createDedupe({ max: 2000, log: logger })
@@ -126,7 +107,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
       state: run.state,
       detail: run.detail,
       self: run.self,
-      caps: run.caps,
+      caps: cloneCaps(run.caps),
       settings: run.adapter?.settings || [],
     }
   }
@@ -190,10 +171,31 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
     }
   }
 
+  function emitCapsChanged(instanceName, { platform, state, caps }) {
+    const features = effectiveFeaturesFor(state, caps)
+    const sig = featuresSignature(state, features)
+    if (capsSnapshots.get(instanceName) === sig) return
+    capsSnapshots.set(instanceName, sig)
+    for (const fn of capsChangedSubs) {
+      try {
+        fn({
+          instance: instanceName,
+          platform,
+          state,
+          caps: cloneCaps(caps),
+          features: { ...features },
+        })
+      } catch (error) {
+        logger.warn('onCapsChanged 订阅者出错：', error?.message || error)
+      }
+    }
+  }
+
   function handleState(run, state, detail) {
     run.state = state
     run.detail = detail
     notifyState(run)
+    emitCapsChanged(run.instance, { platform: run.platform, state: run.state, caps: run.caps })
     if (state === 'connected') void postConnect(run)
   }
 
@@ -224,6 +226,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
       run.state = 'disconnected'
       run.detail = `whoami 失败：${error?.message || error}`
       notifyState(run)
+      emitCapsChanged(run.instance, { platform: run.platform, state: run.state, caps: run.caps })
       return false
     }
     run.self = me
@@ -238,6 +241,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
       // 直接抛 not-sent 且不入队（否则队列会在每次重连时空转一轮，还可能发错人）。
       run.dead = true
       notifyState(run)
+      emitCapsChanged(run.instance, { platform: run.platform, state: run.state, caps: run.caps })
       return false
     }
     return true
@@ -299,6 +303,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
       state: (state, detail) => handleState(run, state, detail),
       capsChanged: () => {
         run.caps = mergeCaps(run.adapter.caps(), rawConfig?.caps, run.instance, logger)
+        emitCapsChanged(run.instance, { platform: run.platform, state: run.state, caps: run.caps })
       },
       log: logger,
       dataDir: (...parts) => dir('instances', run.instance, ...parts),
@@ -351,6 +356,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
       unregisterRoutes(run)
       runs.delete(instanceName)
       idle.set(instanceName, { state: 'stopped', detail: `启动失败：${error?.message || error}` })
+      emitCapsChanged(instanceName, { platform: run.platform, state: 'stopped', caps: null })
       logger.warn(`实例 ${instanceName} 启动失败：`, error?.message || error)
     }
   }
@@ -379,6 +385,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
     }
     runs.delete(instanceName)
     idle.set(instanceName, { state: 'stopped', detail: reason || '实例已停止' })
+    emitCapsChanged(instanceName, { platform: run.platform, state: 'stopped', caps: null })
   }
 
   /** 按 config.platforms 启停实例；只动有变化的实例 */
@@ -692,6 +699,23 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
       stateSubs.add(fn)
       return () => stateSubs.delete(fn)
     },
+    onCapsChanged(fn) {
+      capsChangedSubs.add(fn)
+      for (const run of runs.values()) {
+        try {
+          fn({
+            instance: run.instance,
+            platform: run.platform,
+            state: run.state,
+            caps: cloneCaps(run.caps),
+            features: effectiveFeaturesFor(run.state, run.caps),
+          })
+        } catch (error) {
+          logger.warn('onCapsChanged 订阅者出错：', error?.message || error)
+        }
+      }
+      return () => capsChangedSubs.delete(fn)
+    },
     /** 补发成功回调：onFlushed(message: OutboundMessage, result: SendResult)。G3 用它留痕。 */
     onFlushed(fn) {
       flushedSubs.add(fn)
@@ -702,14 +726,33 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
 
     caps(chatIdOrInstance) {
       const { run } = resolveTarget(chatIdOrInstance)
-      return run ? run.caps : null
+      return run ? cloneCaps(run.caps) : null
+    },
+
+    features(chatIdOrInstance) {
+      const { run } = resolveTarget(chatIdOrInstance)
+      return effectiveFeaturesFor(run?.state, run?.caps)
     },
 
     async fetch(chatIdOrInstance, request) {
-      const { run } = resolveTarget(chatIdOrInstance)
+      const { run, addr } = resolveTarget(chatIdOrInstance)
       if (!run || run.state !== 'connected') throw makeSendError('not-sent', 'offline', String(chatIdOrInstance), '实例未连接')
       if (typeof run.adapter.fetch !== 'function') throw new Error(`平台端 ${run.platform} 没有实现 fetch`)
-      return run.adapter.fetch(request)
+      let req = request
+      if (req?.kind === 'message') {
+        if (!String(req.messageId || '').trim()) {
+          throw makeSendError('not-sent', 'bad-fetch-request', run.instance, 'fetch(message) 缺少 messageId')
+        }
+        if (!req.chat && addr) req = { ...req, chat: { kind: addr.kind, id: addr.id } }
+      } else if (req?.kind === 'history' || req?.kind === 'members') {
+        if (!req.chat && addr && (addr.kind === 'private' || addr.kind === 'group')) {
+          req = { ...req, chat: { kind: addr.kind, id: addr.id } }
+        }
+        if (!String(req.chat?.id || '').trim()) {
+          throw makeSendError('not-sent', 'bad-fetch-request', run.instance, `fetch(${req.kind}) 缺少 chat.id`)
+        }
+      }
+      return run.adapter.fetch(req)
     },
 
     async native(instance, action, params, opts) {
@@ -717,6 +760,12 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
       if (!run || !platformsConfig()[instance]?.enabled) throw new Error(`实例 ${instance} 未启用，native 不可用`)
       if (typeof run.adapter.native !== 'function') throw new Error(`平台端 ${run.platform} 没有实现 native`)
       return run.adapter.native(action, params, opts)
+    },
+
+    groupAdmin(chatIdOrInstance) {
+      const { run } = resolveTarget(chatIdOrInstance)
+      if (!run || !platformsConfig()[run.instance]?.enabled || run.state !== 'connected') return null
+      return run.adapter?.groupAdmin || null
     },
 
     toParts(chatIdOrInstance, nativeMessage) {

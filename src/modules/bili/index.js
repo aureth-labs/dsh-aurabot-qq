@@ -11,12 +11,13 @@ import { segmentBytes } from '../../core/net.js'
 import { createDanmaku, danmakuPanelRequest } from './danmaku.js'
 import { createQrLogin } from '../../bili/qr-login.js'
 import { dataDir } from '../../core/store.js'
+import { normalizeChatId } from '../../gateway/address.js'
 
 export default {
   id: 'bili',
   name: 'B站',
   version: '1.1.0',
-  api: 2,
+  api: 3,
   platforms: ['*'],
   description: '看别人发的 B 站视频；定时自己刷、评论、回评论；可选发弹幕；抽帧看画面、发截图；按权限改自己的头像 / 签名（bili_watch / bili_comment / bili_danmaku / qq_send_shot / bili_set_avatar / bili_set_sign）',
   tab: 'bili',
@@ -30,12 +31,16 @@ export default {
       // 截图库和「补一张」都在 createBili 里：用闭包延迟取，建完之后才真的被调用
       shotPathOf: (name) => bili.shotFileOf(name),
       captureShot: (bvid) => bili.captureShot(bvid),
-      // 群名：缓存命中直接用，没命中由 hub 走一次 get_group_info（拿不到就退回群号）
+      // 群名：缓存命中直接用，QQ 走 get_group_info（非 QQ 或拿不到退回群号）
       groupNameOf: (gid) => hub.groupName(gid),
     })
     api.on('message', (msg) => {
-      const url = (msg.images || []).slice(-1)[0]?.data?.url
-      if (url && /^https?:\/\//i.test(url)) lastImage.set(msg.chatId, url)
+      const partUrl = (msg.parts || []).filter((p) => p?.type === 'image').map((p) => p.media?.url).filter(Boolean).at(-1)
+      const url = partUrl || (msg.images || []).slice(-1)[0]?.data?.url
+      if (url && /^https?:\/\//i.test(url)) {
+        const key = normalizeChatId(msg.chatId) || msg.chatId
+        if (key) lastImage.set(key, url)
+      }
       return groupShare.handleReply(msg.chatId, msg.userId, msg.text)
     })
     const danmaku = createDanmaku(api)
@@ -132,17 +137,19 @@ export default {
             }
             return bili.setAvatar(buf)
           }
-          // ② 刚才那张图：优先取图片字节，拿不到再退回记下的网址
+          // ② 刚才那张图：优先走中枢取图字节（网关 / QQ 均兼容），拿不到再退回记下的网址
           if (!raw || /^(last|刚才|上一张|最近)/i.test(raw)) {
             const media = hub.recentMedia?.(chatId) || []
             const pick = media.filter((x) => !x.sticker).at(-1) || media.at(-1)
             if (pick) {
               try {
-                const buf = await segmentBytes(pick.seg, null, { maxBytes: 10 * 1024 * 1024 })
+                const buf = typeof hub.mediaBytes === 'function'
+                  ? await hub.mediaBytes(chatId, pick.seg, { maxBytes: 10 * 1024 * 1024 })
+                  : await segmentBytes(pick.seg, null, { maxBytes: 10 * 1024 * 1024 })
                 if (buf && buf.length) return bili.setAvatar(buf)
               } catch (error) { /* 退回网址 */ }
             }
-            const previous = lastImage.get(chatId)
+            const previous = lastImage.get(normalizeChatId(chatId) || chatId) ?? lastImage.get(chatId)
             if (!previous) return { ok: false, message: '最近半小时这个聊天里没人发过图片，先把图发过来' }
             return bili.setAvatar(previous)
           }

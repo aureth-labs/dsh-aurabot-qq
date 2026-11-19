@@ -1,6 +1,7 @@
 // 内置模块：生视频。走「本地接口」的 video 脚本（ComfyUI 等），做完自动发回聊天。
 // 生视频要十几分钟，不能让这一轮一直等：工具马上返回，后台做完再发。
 
+import { basename } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { privateCapabilityAllowed } from '../../chat/access.js'
 import { defineTool, str } from '../../tools/tools.js'
@@ -12,7 +13,7 @@ export default {
   id: 'video',
   name: '生视频',
   version: '1.0.0',
-  api: 2,
+  api: 3,
   platforms: ['*'],
   description: '用本地脚本生成视频并发到聊天（qq_generate_video）',
   setup(api) {
@@ -25,16 +26,43 @@ export default {
       return '当前私聊对象已经获得主人的视频生成授权。对方请求生成视频时可以使用 qq_generate_video，以当前授权为准。'
     })
 
-    async function deliver(chatId, file) {
-      try {
-        if (typeof api.sendParts === 'function') {
-          await api.sendParts(chatId, [{ type: 'video', file: pathToFileURL(file).href }], { note: '[视频]', throwOnError: true, timeoutMs: 120_000 })
-        } else {
-          await hub.sendSegments(chatId, [{ type: 'video', data: { file: pathToFileURL(file).href } }], '[视频]', { throwOnError: true, timeoutMs: 120_000 })
+    async function sendPart(chatId, file, part, note) {
+      if (typeof api.sendParts === 'function') {
+        const res = await api.sendParts(chatId, [part], { note, throwOnError: true, timeoutMs: 120_000 })
+        if (res?.degraded?.some((d) => String(d).startsWith(`${part.type} dropped`))) {
+          throw new Error(`${part.type} 能力不可用（${res.degraded.join('; ')}）`)
         }
+        return res
+      }
+      if (part.type === 'video') {
+        return await hub.sendSegments(chatId, [{ type: 'video', data: { file: pathToFileURL(file).href } }], note, { throwOnError: true, timeoutMs: 120_000 })
+      }
+      return await hub.sendFile(chatId, file)
+    }
+
+    async function deliver(chatId, file) {
+      const name = basename(String(file || '')) || 'video.mp4'
+      const caps = typeof api.caps === 'function' ? api.caps(chatId) : null
+      const videoPart = { type: 'video', media: { path: file, name } }
+      const filePart = { type: 'file', media: { path: file, name } }
+      if (caps && !caps.video) {
+        if (!caps.file) throw new Error('当前平台不支持发送视频或文件')
+        api.log.warn('当前平台不支持按视频发送，改发文件')
+        await sendPart(chatId, file, filePart, '[视频文件]')
+        return
+      }
+      try {
+        await sendPart(chatId, file, videoPart, '[视频]')
       } catch (error) {
+        if (caps && !caps.file) throw error
         api.log.warn('按视频发送失败，改发文件：', error.message)
-        await hub.sendFile(chatId, file)
+        if (caps) {
+          await sendPart(chatId, file, filePart, '[视频文件]')
+        } else if (typeof hub?.sendFile === 'function' && (typeof api.platformOf !== 'function' || !api.platformOf(chatId) || api.platformOf(chatId) === 'qq')) {
+          await hub.sendFile(chatId, file)
+        } else {
+          await sendPart(chatId, file, filePart, '[视频文件]')
+        }
       }
     }
 
@@ -63,6 +91,8 @@ export default {
       required: ['prompt'],
       execute: async ({ prompt, seconds }) => {
         if (!hub.turnSendersAllOwner(sessionId) && !privateCapabilityAllowed(api.config(), chat, 'video')) return { ok: false, message: '你还没有获得视频生成权限' }
+        const caps = typeof api.caps === 'function' ? api.caps(chat.chatId) : null
+        if (caps && !caps.video && !caps.file) return { ok: false, message: '当前平台不支持发送视频或文件' }
         const text = String(prompt || '').trim()
         if (!text) return { ok: false, message: '要生成什么内容？' }
         if (running) return { ok: false, message: '上一段视频还在生成，等它好了再说' }

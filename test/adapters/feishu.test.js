@@ -4,6 +4,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createCipheriv, createHash } from 'node:crypto'
+import { mkdtempSync, existsSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { runAdapterContract, makeCtx } from '../contract/adapter-kit.js'
 import {
   createFeishuAdapter,
@@ -21,6 +24,12 @@ import {
   MAX_FILE_BYTES,
   MAX_IMAGE_BYTES,
 } from '../../src/adapters/feishu/index.js'
+import { mergeCapsWithFeatures } from '../../src/gateway/features.js'
+import { createGateway } from '../../src/gateway/index.js'
+import { createHub } from '../../src/chat/hub.js'
+import { normalize } from '../../src/core/config.js'
+import { makeIdentity } from '../gateway/helpers.js'
+import { createFakeDsh } from '../helpers/fake-dsh.js'
 
 const APP_ID = 'cli_test'
 const APP_SECRET = 'secret'
@@ -908,4 +917,673 @@ test('stop 之后再推事件不 emit，且状态是 stopped', async () => {
   const result = adapter.__feishu.injectAfterStop(inboundEvent())
   assert.equal(result.ok, false)
   assert.equal(ctx.emitted.length, 0)
+})
+
+test('Step 0B：CAPS_FEISHU.features 与 fetch(media) 的 4xx/5xx 检查及 401 刷新重试', async () => {
+  const client = makeFakeClient()
+  const baseRequest = client.request.bind(client)
+  let resourceMode = '403'
+  client.request = async (req) => {
+    if (req.url.includes('/resources/')) {
+      client.calls.push({ ...req })
+      if (resourceMode === '403') return { status: 403, json: { code: 230027, msg: 'no permission' }, bytes: Buffer.alloc(0) }
+      if (resourceMode === '500') return { status: 500, json: { code: 500, msg: 'internal' }, bytes: Buffer.alloc(0) }
+      if (resourceMode === '401-then-ok') {
+        resourceMode = 'ok'
+        return { status: 401, json: { code: 99991663, msg: 'token expired' }, bytes: Buffer.alloc(0) }
+      }
+      return { status: 200, json: { raw: '' }, bytes: Buffer.from([1, 2, 3]) }
+    }
+    return baseRequest(req)
+  }
+
+  const adapter = createFeishuAdapter({ client })
+  adapter.__feishu.setConfig(CFG)
+  const ctx = makeCtx(adapter)
+  await adapter.start(ctx)
+
+  const caps = adapter.caps()
+  assert.equal(caps.features['media.fetch'], true)
+  assert.equal(caps.features['sticker.collect'], true)
+  assert.equal(caps.features['message.quote.read'], true, 'Step 1A 开启 message.quote.read')
+
+  await assert.rejects(
+    () => adapter.fetch({ kind: 'media', media: { id: 'img_1', messageId: 'om_1' } }),
+    (e) => e.certainty === 'not-sent' && e.code === '230027',
+  )
+
+  resourceMode = '500'
+  await assert.rejects(
+    () => adapter.fetch({ kind: 'media', media: { id: 'img_1', messageId: 'om_1' } }),
+    (e) => e.certainty === 'unknown' && /500/.test(e.message),
+  )
+
+  resourceMode = '401-then-ok'
+  const ok = await adapter.fetch({ kind: 'media', media: { id: 'img_1', messageId: 'om_1' } })
+  assert.deepEqual(ok.bytes, Buffer.from([1, 2, 3]))
+  await adapter.stop()
+})
+
+test('Step 1A：fetch(message) 解析文本/图片/app机器人/deleted/230027/403 与非 open_id 边界', async () => {
+  const client = makeFakeClient()
+  const baseRequest = client.request.bind(client)
+  let msgMode = 'user-text'
+  client.request = async (req) => {
+    if (req.url.includes('/open-apis/im/v1/messages/')) {
+      client.calls.push({ ...req })
+      if (msgMode === 'user-text') {
+        return {
+          status: 200,
+          json: {
+            code: 0,
+            data: {
+              items: [{
+                message_id: 'om_u1',
+                create_time: '1700000000000',
+                msg_type: 'text',
+                body: { content: JSON.stringify({ text: 'quoted hello' }) },
+                sender: { id: 'ou_sender1', id_type: 'open_id', sender_type: 'user' },
+              }],
+            },
+          },
+        }
+      }
+      if (msgMode === 'app-image') {
+        return {
+          status: 200,
+          json: {
+            code: 0,
+            data: {
+              items: [{
+                message_id: 'om_bot1',
+                create_time: '1700000005000',
+                msg_type: 'image',
+                body: { content: JSON.stringify({ image_key: 'img_q1' }) },
+                sender: { id: 'cli_app_x', id_type: 'app_id', sender_type: 'app' },
+              }],
+            },
+          },
+        }
+      }
+      if (msgMode === 'union-same-id') {
+        return {
+          status: 200,
+          json: {
+            code: 0,
+            data: {
+              items: [{
+                message_id: 'om_u2',
+                create_time: '1700000006000',
+                msg_type: 'text',
+                body: { content: JSON.stringify({ text: 'same union id' }) },
+                sender: { id: 'ou_bot_1', id_type: 'union_id', sender_type: 'user' },
+              }],
+            },
+          },
+        }
+      }
+      if (msgMode === 'deleted') {
+        return {
+          status: 200,
+          json: {
+            code: 0,
+            data: {
+              items: [{
+                message_id: 'om_del',
+                deleted: true,
+                create_time: '1700000007000',
+                msg_type: 'text',
+                body: { content: JSON.stringify({ text: 'This message was recalled' }) },
+                sender: { id: 'ou_sender1', id_type: 'open_id', sender_type: 'user' },
+              }],
+            },
+          },
+        }
+      }
+      if (msgMode === '230027') return { status: 403, json: { code: 230027, msg: 'no permission im:message:readonly' } }
+      return { status: 403, json: { msg: 'forbidden' } }
+    }
+    return baseRequest(req)
+  }
+
+  const adapter = createFeishuAdapter({ client })
+  adapter.__feishu.setConfig(CFG)
+  const ctx = makeCtx(adapter)
+  await adapter.start(ctx)
+  adapter.__feishu.setSelf({ account: 'ou_bot_1', name: '飞书测试Bot' })
+
+  const m1 = await adapter.fetch({ kind: 'message', messageId: 'om_u1' })
+  assert.equal(m1.messageId, 'om_u1')
+  assert.equal(m1.at, 1700000000000)
+  assert.equal(m1.sender?.account, 'ou_sender1')
+  assert.equal(m1.sender?.idType, 'open_id')
+  assert.equal(m1.sender?.isBot, false)
+  assert.deepEqual(m1.parts, [{ type: 'text', text: 'quoted hello' }])
+  assert.equal('raw' in m1, false, 'FetchedMessage 不回传 raw')
+
+  msgMode = 'app-image'
+  const m2 = await adapter.fetch({ kind: 'message', messageId: 'om_bot1' })
+  assert.equal(m2.sender?.isBot, true)
+  assert.equal(m2.parts[0]?.type, 'image')
+  assert.equal(m2.parts[0]?.media?.id, 'img_q1')
+  assert.equal(m2.parts[0]?.media?.messageId, 'om_bot1')
+
+  msgMode = 'union-same-id'
+  const m3 = await adapter.fetch({ kind: 'message', messageId: 'om_u2' })
+  assert.equal(m3.sender?.idType, 'union_id')
+  assert.equal(m3.sender?.isBot, false, '非 open_id 不得与实例 self.account 相等比对')
+
+  msgMode = 'deleted'
+  const m4 = await adapter.fetch({ kind: 'message', messageId: 'om_del' })
+  assert.equal(m4.deleted, true)
+  assert.match(m4.parts[0]?.text || '', /撤回/)
+
+  msgMode = '230027'
+  await assert.rejects(
+    () => adapter.fetch({ kind: 'message', messageId: 'om_perm' }),
+    (e) => e.certainty === 'not-sent' && e.code === '230027',
+  )
+
+  msgMode = '403'
+  await assert.rejects(
+    () => adapter.fetch({ kind: 'message', messageId: 'om_403' }),
+    (e) => e.certainty === 'not-sent' && e.code === '403',
+  )
+
+  await adapter.stop()
+})
+
+test('Phase 3A：飞书 history 开关默认关闭、开启后 fetch(history) 输出 FetchedHistoryPage（群聊/单聊/分页/230027）', async () => {
+  const defaultAdapter = createFeishuAdapter({ client: makeFakeClient() })
+  defaultAdapter.__feishu.setConfig(CFG)
+  const defaultCtx = makeCtx(defaultAdapter)
+  await defaultAdapter.start(defaultCtx)
+  assert.equal(defaultAdapter.caps().history, false, '未开启 history 设置前默认宣称 false')
+  assert.equal(mergeCapsWithFeatures(defaultAdapter.caps(), null).features['message.history.read'], false)
+  await defaultAdapter.stop()
+
+  const client = makeFakeClient()
+  const baseRequest = client.request.bind(client)
+  let histMode = 'page1'
+  client.request = async (req) => {
+    if (req.method === 'GET' && req.url.includes('/open-apis/im/v1/messages?')) {
+      client.calls.push({ ...req })
+      if (histMode === '230027') return { status: 403, json: { code: 230027, msg: 'no permission im:message:readonly' } }
+      if (histMode === 'page1') {
+        return {
+          status: 200,
+          json: {
+            code: 0,
+            data: {
+              has_more: true,
+              page_token: 'pt_page2',
+              items: [
+                {
+                  message_id: 'om_2',
+                  create_time: '1700000200000',
+                  msg_type: 'text',
+                  body: { content: JSON.stringify({ text: '较新一条' }) },
+                  sender: { id: 'ou_bot', id_type: 'open_id', sender_type: 'app' },
+                },
+                {
+                  message_id: 'om_1',
+                  create_time: '1700000100000',
+                  msg_type: 'text',
+                  body: { content: JSON.stringify({ text: '较早一条' }) },
+                  sender: { id: 'ou_u1', id_type: 'open_id', sender_type: 'user' },
+                },
+              ],
+            },
+          },
+        }
+      }
+      if (histMode === 'page2') {
+        return {
+          status: 200,
+          json: {
+            code: 0,
+            data: {
+              has_more: false,
+              items: [
+                {
+                  message_id: 'om_0',
+                  create_time: '1700000050000',
+                  msg_type: 'text',
+                  body: { content: JSON.stringify({ text: '最老一条' }) },
+                  sender: { id: 'ou_u1', id_type: 'open_id', sender_type: 'user' },
+                },
+              ],
+            },
+          },
+        }
+      }
+      return {
+        status: 200,
+        json: {
+          code: 0,
+          data: {
+            has_more: false,
+            items: [
+              {
+                message_id: 'om_p2p_1',
+                create_time: '1700000300000',
+                msg_type: 'text',
+                body: { content: JSON.stringify({ text: '单聊历史消息' }) },
+                sender: { id: 'ou_p2p_user', id_type: 'open_id', sender_type: 'user' },
+              },
+            ],
+          },
+        },
+      }
+    }
+    if (req.method === 'POST' && req.url.includes('/open-apis/im/v1/messages')) {
+      client.calls.push({ ...req })
+      return { status: 200, json: { code: 0, data: { message_id: 'om_sent_p2p', chat_id: 'oc_p2p_from_send' } } }
+    }
+    return baseRequest(req)
+  }
+
+  const adapter = createFeishuAdapter({ client })
+  adapter.__feishu.setConfig({ ...CFG, history: true })
+  const ctx = makeCtx(adapter)
+  await adapter.start(ctx)
+  assert.equal(adapter.caps().history, true)
+  assert.equal(mergeCapsWithFeatures(adapter.caps(), null).features['message.history.read'], true)
+
+  const page1 = await adapter.fetch({ kind: 'history', chat: { kind: 'group', id: 'oc_g1' }, count: 2 })
+  const req1Url = new URL(client.calls.find((c) => c.url.includes('container_id=oc_g1')).url)
+  assert.equal(req1Url.searchParams.get('container_id_type'), 'chat')
+  assert.equal(req1Url.searchParams.get('sort_type'), 'ByCreateTimeDesc')
+  assert.equal(req1Url.searchParams.get('page_size'), '2')
+  assert.equal(page1.hasMore, true)
+  assert.equal(page1.before, 'pt_page2')
+  assert.deepEqual(page1.messages.map((m) => m.messageId), ['om_1', 'om_2'])
+  assert.equal(page1.messages[0].sender?.isBot, false)
+  assert.equal(page1.messages[1].sender?.isBot, true)
+  assert.equal('raw' in page1.messages[0], false)
+
+  histMode = 'page2'
+  const page2 = await adapter.fetch({ kind: 'history', chat: { kind: 'group', id: 'oc_g1' }, count: 2, before: page1.before })
+  const req2Url = new URL(client.calls.at(-1).url)
+  assert.equal(req2Url.searchParams.get('page_token'), 'pt_page2')
+  assert.equal(page2.hasMore, false)
+  assert.equal('before' in page2, false)
+  assert.deepEqual(page2.messages.map((m) => m.messageId), ['om_0'])
+
+  // 单聊未记录 chat_id 时诚实报错；通过 send 返回 chat_id（或入站消息）记录后即可翻单聊历史
+  await assert.rejects(
+    () => adapter.fetch({ kind: 'history', chat: { kind: 'private', id: 'ou_p2p_user' }, count: 5 }),
+    (e) => e.certainty === 'not-sent' && e.code === 'no-chat-id',
+  )
+  await adapter.send({ chat: { kind: 'private', id: 'ou_p2p_user' }, parts: [{ type: 'text', text: 'hi' }] })
+  histMode = 'p2p'
+  const p2pPage = await adapter.fetch({ kind: 'history', chat: { kind: 'private', id: 'ou_p2p_user' }, count: 5 })
+  const reqP2pUrl = new URL(client.calls.at(-1).url)
+  assert.equal(reqP2pUrl.searchParams.get('container_id'), 'oc_p2p_from_send')
+  assert.equal(p2pPage.messages[0]?.parts?.[0]?.text, '单聊历史消息')
+
+  histMode = '230027'
+  await assert.rejects(
+    () => adapter.fetch({ kind: 'history', chat: { kind: 'group', id: 'oc_g1' } }),
+    (e) => e.certainty === 'not-sent' && e.code === '230027',
+  )
+
+  await adapter.stop()
+})
+
+test('Phase 3 P2-1 & P2-4：飞书 fetch(chats) 分页群列表与 p2pChatIds 跨重启持久化', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'aurabot-feishu-p2p-'))
+  const makeChatsClient = () => {
+    const base = makeFakeClient()
+    return {
+      calls: base.calls,
+      async request(req) {
+        if (req.method === 'GET' && req.url.includes('/open-apis/im/v1/chats?')) {
+          base.calls.push({ ...req })
+          const u = new URL(req.url)
+          if (!u.searchParams.get('page_token')) {
+            return { status: 200, json: { code: 0, data: { has_more: true, page_token: 'c_p2', items: [{ chat_id: 'oc_a', name: '项目一组', description: 'desc-a' }] } } }
+          }
+          return { status: 200, json: { code: 0, data: { has_more: false, items: [{ chat_id: 'oc_b', name: '设计二组' }] } } }
+        }
+        if (req.method === 'POST' && req.url.includes('/open-apis/im/v1/messages')) {
+          base.calls.push({ ...req })
+          return { status: 200, json: { code: 0, data: { message_id: 'om_sent_p2p', chat_id: 'oc_p2p_persisted' } } }
+        }
+        if (req.method === 'GET' && req.url.includes('/open-apis/im/v1/messages?')) {
+          base.calls.push({ ...req })
+          return {
+            status: 200,
+            json: {
+              code: 0,
+              data: {
+                has_more: false,
+                items: [{
+                  message_id: 'om_after_restart',
+                  create_time: '1700000100000',
+                  msg_type: 'text',
+                  body: { content: JSON.stringify({ text: '重启后仍能查到单聊历史' }) },
+                  sender: { id: 'ou_persist', id_type: 'open_id', sender_type: 'user' },
+                }],
+              },
+            },
+          }
+        }
+        return base.request(req)
+      },
+    }
+  }
+
+  const client1 = makeChatsClient()
+  const a1 = createFeishuAdapter({ client: client1 })
+  a1.__feishu.setConfig({ ...CFG, history: true })
+  const ctx1 = makeCtx(a1)
+  ctx1.dataDir = (...parts) => join(dir, ...parts)
+  await a1.start(ctx1)
+
+  const chats = await a1.fetch({ kind: 'chats' })
+  assert.deepEqual(chats, {
+    groups: [
+      { id: 'oc_a', name: '项目一组', description: 'desc-a' },
+      { id: 'oc_b', name: '设计二组' },
+    ],
+    friends: [],
+  })
+
+  await a1.send({ chat: { kind: 'private', id: 'ou_persist' }, parts: [{ type: 'text', text: '记录 p2p' }] })
+  assert.equal(existsSync(join(dir, 'p2p-chats.json')), true)
+  await a1.stop()
+
+  // 创建全新实例模拟进程重启，仅靠数据目录即可直接查该用户单聊历史
+  const client2 = makeChatsClient()
+  const a2 = createFeishuAdapter({ client: client2 })
+  a2.__feishu.setConfig({ ...CFG, history: true })
+  const ctx2 = makeCtx(a2)
+  ctx2.dataDir = (...parts) => join(dir, ...parts)
+  await a2.start(ctx2)
+
+  const page = await a2.fetch({ kind: 'history', chat: { kind: 'private', id: 'ou_persist' }, count: 5 })
+  const histUrl = new URL(client2.calls.find((c) => c.url.includes('/open-apis/im/v1/messages?')).url)
+  assert.equal(histUrl.searchParams.get('container_id'), 'oc_p2p_persisted')
+  assert.equal(page.messages[0]?.parts?.[0]?.text, '重启后仍能查到单聊历史')
+  await a2.stop()
+})
+
+test('飞书扩展能力：merge_forward 展开（fetch(forward)）与群成员列表（fetch(members)）', async () => {
+  const client = makeFakeClient()
+  const baseRequest = client.request.bind(client)
+  client.request = async (req) => {
+    if (req.method === 'GET' && req.url.includes('/open-apis/im/v1/messages/om_mf_1')) {
+      client.calls.push({ ...req })
+      return {
+        status: 200,
+        json: {
+          code: 0,
+          data: {
+            items: [
+              {
+                message_id: 'om_mf_1',
+                msg_type: 'merge_forward',
+                create_time: '1700000000000',
+                body: { content: 'Merged and Forwarded Message' },
+              },
+              {
+                message_id: 'om_sub_2',
+                upper_message_id: 'om_mf_1',
+                msg_type: 'text',
+                create_time: '1700000000200',
+                body: { content: JSON.stringify({ text: '第二条子消息' }) },
+                sender: { id: 'ou_b', id_type: 'open_id', sender_type: 'user' },
+              },
+              {
+                message_id: 'om_sub_1',
+                upper_message_id: 'om_mf_1',
+                msg_type: 'text',
+                create_time: '1700000000100',
+                body: { content: JSON.stringify({ text: '第一条子消息' }) },
+                sender: { id: 'ou_a', id_type: 'open_id', sender_type: 'user' },
+              },
+            ],
+          },
+        },
+      }
+    }
+    if (req.method === 'GET' && req.url.includes('/open-apis/im/v1/chats/oc_g_members/members')) {
+      client.calls.push({ ...req })
+      const u = new URL(req.url)
+      if (!u.searchParams.get('page_token')) {
+        return {
+          status: 200,
+          json: {
+            code: 0,
+            data: {
+              has_more: true,
+              page_token: 'mp2',
+              items: [{ member_id: 'ou_m1', member_id_type: 'open_id', name: '张三' }],
+            },
+          },
+        }
+      }
+      return {
+        status: 200,
+        json: {
+          code: 0,
+          data: {
+            has_more: false,
+            items: [{ member_id: 'ou_m2', member_id_type: 'open_id', name: '李四' }],
+          },
+        },
+      }
+    }
+    return baseRequest(req)
+  }
+
+  const adapter = createFeishuAdapter({ client })
+  adapter.__feishu.setConfig(CFG)
+  const ctx = makeCtx(adapter)
+  await adapter.start(ctx)
+
+  const caps = adapter.caps()
+  assert.equal(caps.memberList, true)
+  assert.equal(caps.forwardExpand, true)
+  const feat = mergeCapsWithFeatures(caps, null).features
+  assert.equal(feat['message.forward.expand'], true)
+  assert.equal(feat['chat.member.list'], true)
+  assert.equal(feat['chat.member.read'], false, 'members 接口不含角色，chat.member.read 保持诚实 false')
+
+  // 带 messageId 的 merge_forward 转成可展开的 forward Part
+  const mfParts = toParts('merge_forward', JSON.stringify({ content: 'Merged and Forwarded Message' }), [], { messageId: 'om_mf_1' })
+  assert.deepEqual(mfParts, [{ type: 'forward', id: 'om_mf_1', summary: '[合并转发]' }])
+
+  const fwd = await adapter.fetch({ kind: 'forward', id: 'om_mf_1' })
+  assert.deepEqual(fwd.messages.map((m) => m.messageId), ['om_sub_1', 'om_sub_2'], '应排除外层并按时间升序排列')
+  assert.equal(fwd.messages[0].parts[0].text, '第一条子消息')
+
+  const members = await adapter.fetch({ kind: 'members', chat: { kind: 'group', id: 'oc_g_members' } })
+  assert.deepEqual(members, [
+    { account: 'ou_m1', name: '张三', idType: 'open_id' },
+    { account: 'ou_m2', name: '李四', idType: 'open_id' },
+  ])
+
+  await assert.rejects(
+    () => adapter.fetch({ kind: 'members', chat: { kind: 'private', id: 'ou_m1' } }),
+    (e) => e.certainty === 'not-sent' && e.code === 'no-member',
+  )
+
+  await adapter.stop()
+})
+
+test('feishu 审查加固：P2-4 多层嵌套 merge_forward（inline 树与多跳 HTTP 拉取）+ P2-3 面板能力说明', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'aurabot-feishu-p24-'))
+  const prevDir = process.env.AURABOT_DATA_DIR
+  process.env.AURABOT_DATA_DIR = root
+
+  const silentLog = { debug() {}, info() {}, warn() {}, error() {}, child() { return this } }
+  let inlineHttpCount = 0
+  const hopHttpCalls = []
+
+  const fakeClient = {
+    async request(req) {
+      if (req.url.includes('/tenant_access_token/')) return { status: 200, json: { code: 0, tenant_access_token: 't-nest', expire: 7200 } }
+      if (req.url.includes('/open-apis/bot/v3/info')) return { status: 200, json: { code: 0, bot: { open_id: 'ou_bot_nest', app_name: '飞书测试' } } }
+
+      // 场景 1：单次响应通过 upper_message_id 带出多层内联 merge_forward
+      if (req.url.includes('/open-apis/im/v1/messages/om_nest_inline')) {
+        inlineHttpCount++
+        return {
+          status: 200,
+          json: {
+            code: 0,
+            data: {
+              items: [
+                {
+                  message_id: 'om_nest_inline',
+                  create_time: '1700000000000',
+                  msg_type: 'merge_forward',
+                  body: { content: '合并转发消息' },
+                  sender: { id: 'ou_outer', id_type: 'open_id', sender_type: 'user' },
+                },
+                {
+                  message_id: 'om_inline_txt_1',
+                  upper_message_id: 'om_nest_inline',
+                  create_time: '1700000001000',
+                  msg_type: 'text',
+                  body: { content: JSON.stringify({ text: '第1层外层消息' }) },
+                  sender: { id: 'ou_u1', id_type: 'open_id', sender_type: 'user' },
+                },
+                {
+                  message_id: 'om_nest_inner',
+                  upper_message_id: 'om_nest_inline',
+                  create_time: '1700000002000',
+                  msg_type: 'merge_forward',
+                  body: { content: '合并转发消息' },
+                  sender: { id: 'ou_u2', id_type: 'open_id', sender_type: 'user' },
+                },
+                {
+                  message_id: 'om_inline_txt_2',
+                  upper_message_id: 'om_nest_inner',
+                  create_time: '1700000003000',
+                  msg_type: 'text',
+                  body: { content: JSON.stringify({ text: '第2层内联嵌套' }) },
+                  sender: { id: 'ou_u2', id_type: 'open_id', sender_type: 'user' },
+                },
+                {
+                  message_id: 'om_nest_deep',
+                  upper_message_id: 'om_nest_inner',
+                  create_time: '1700000004000',
+                  msg_type: 'merge_forward',
+                  body: { content: '合并转发消息' },
+                  sender: { id: 'ou_u3', id_type: 'open_id', sender_type: 'user' },
+                },
+                {
+                  message_id: 'om_inline_txt_3',
+                  upper_message_id: 'om_nest_deep',
+                  create_time: '1700000005000',
+                  msg_type: 'text',
+                  body: { content: JSON.stringify({ text: '第3层深处消息' }) },
+                  sender: { id: 'ou_u3', id_type: 'open_id', sender_type: 'user' },
+                },
+              ],
+            },
+          },
+        }
+      }
+
+      // 场景 2：多跳分次 HTTP 拉取 om_hop_1 -> om_hop_2 -> ... -> om_hop_7（验证 MAX_FORWARD_DEPTH = 5）
+      const hopMatch = req.url.match(/\/open-apis\/im\/v1\/messages\/(om_hop_(\d+))/)
+      if (hopMatch) {
+        const msgId = hopMatch[1]
+        const level = Number(hopMatch[2])
+        hopHttpCalls.push(msgId)
+        const items = [
+          {
+            message_id: msgId,
+            create_time: String(1700001000000 + level * 1000),
+            msg_type: 'merge_forward',
+            body: { content: '合并转发消息' },
+            sender: { id: 'ou_h0', id_type: 'open_id', sender_type: 'user' },
+          },
+          {
+            message_id: `${msgId}_txt`,
+            upper_message_id: msgId,
+            create_time: String(1700001000100 + level * 1000),
+            msg_type: 'text',
+            body: { content: JSON.stringify({ text: `多跳层级-${level}` }) },
+            sender: { id: `ou_h${level}`, id_type: 'open_id', sender_type: 'user' },
+          },
+        ]
+        if (level < 7) {
+          items.push({
+            message_id: `om_hop_${level + 1}`,
+            upper_message_id: msgId,
+            create_time: String(1700001000200 + level * 1000),
+            msg_type: 'merge_forward',
+            body: { content: '合并转发消息' },
+            sender: { id: `ou_h${level}`, id_type: 'open_id', sender_type: 'user' },
+          })
+        }
+        return { status: 200, json: { code: 0, data: { items } } }
+      }
+
+      return { status: 200, json: { code: 0, data: {} } }
+    },
+  }
+
+  let adapterRef = null
+  const gw = createGateway({
+    config: {
+      platforms: {
+        feishu: { enabled: true, transport: 'webhook', encryptKey: '', verificationToken: VERIFY_TOKEN, appId: APP_ID, appSecret: APP_SECRET },
+      },
+    },
+    dataDir: (...p) => join(root, 'gw', ...p),
+    http: { route: () => () => {} },
+    identity: makeIdentity(),
+    log: silentLog,
+    replyHoldMs: 10,
+  })
+  gw.register(() => (adapterRef = createFeishuAdapter({ client: fakeClient })))
+  await gw.sync()
+
+  const cfg = normalize({
+    enabled: true,
+    dryRun: false,
+    allow: { groups: ['feishu:group:oc_nest'] },
+    platforms: { feishu: { enabled: true, transport: 'webhook', appId: APP_ID, appSecret: APP_SECRET } },
+  })
+  const dsh = createFakeDsh({ brain: async () => 'ok' })
+  const hub = createHub({ dsh: dsh.ctx, getConfig: () => cfg, log: silentLog, gateway: gw, isMuted: () => false })
+  t.after(async () => {
+    hub.dispose()
+    await gw.stopAll()
+    if (prevDir === undefined) delete process.env.AURABOT_DATA_DIR
+    else process.env.AURABOT_DATA_DIR = prevDir
+  })
+
+  // 1) adapter.fetch 直接保留内联 child merge_forward 引用并缓存子转发消息
+  const outerInline = await adapterRef.fetch({ kind: 'forward', id: 'om_nest_inline' })
+  assert.equal(inlineHttpCount, 1)
+  assert.ok(Array.isArray(outerInline?.messages) && outerInline.messages.some((m) => m.parts.some((p) => p.type === 'forward' && p.id === 'om_nest_inner')), '外层应保留 nested merge_forward 的 forward part')
+  const innerCached = await adapterRef.fetch({ kind: 'forward', id: 'om_nest_inner' })
+  assert.equal(inlineHttpCount, 1, '内联 upper_message_id 子转发应命中 inlineForwardCache 不重复打 HTTP')
+  assert.ok(Array.isArray(innerCached?.messages) && innerCached.messages.some((m) => m.parts.some((p) => p.type === 'text' && p.text.includes('第2层内联嵌套'))))
+
+  // 2) hub.expandForwards 完整递归展开 inline 3 层嵌套（只打 1 次 outer HTTP，子嵌套全部命中缓存）
+  inlineHttpCount = 0
+  const expandedInline = await hub.expandForwards({ chatId: 'feishu:group:oc_nest', forwards: ['om_nest_inline'], images: [], stickers: [] }, '[合并转发]')
+  assert.match(expandedInline, /第1层外层消息/)
+  assert.match(expandedInline, /第2层内联嵌套/)
+  assert.match(expandedInline, /第3层深处消息/)
+  assert.equal(inlineHttpCount, 1)
+
+  // 3) hub.expandForwards 多跳 HTTP 拉取受 MAX_FORWARD_DEPTH = 5 约束且深层不无限展开
+  const expandedHops = await hub.expandForwards({ chatId: 'feishu:group:oc_nest', forwards: ['om_hop_1'], images: [], stickers: [] }, '[合并转发]')
+  assert.match(expandedHops, /多跳层级-1/)
+  assert.match(expandedHops, /多跳层级-5/)
+  assert.ok(!expandedHops.includes('多跳层级-7'), '超过 MAX_FORWARD_DEPTH=5 的层级应停止继续递归展开')
+  assert.ok(!hopHttpCalls.includes('om_hop_7'))
+
+  // P2-3: 面板对 memberList=true 但 chat.member.read=false 的明确提示文案
+  const clientSrc = readFileSync(new URL('../../client/client.js', import.meta.url), 'utf8')
+  assert.ok(clientSrc.includes('成员列表可用；跨群身份校验不可用，非主人跨群默认拒绝'))
 })

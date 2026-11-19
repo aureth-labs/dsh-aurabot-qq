@@ -1,3 +1,5 @@
+import { allowMatches } from './access.js'
+import { normalizeChatId, parseChatId } from '../gateway/address.js'
 import { resolveChatModel } from './chat-model.js'
 
 const COMMAND_GRANTS = {
@@ -39,16 +41,24 @@ export function isDelegatedCommandKey(key) {
 
 export function canUseDelegatedCommand(cfg, msg, key) {
   if (msg?.kind !== 'private' || !isDelegatedCommandKey(key)) return false
-  const userId = String(msg.userId || '')
-  return Boolean(userId && (cfg.allow?.private || []).map(String).includes(userId)
-    && (cfg.commandAllow?.[key] || []).map(String).includes(userId))
+  return allowMatches(cfg.allow?.private, msg, 'private')
+    && allowMatches(cfg.commandAllow?.[key], msg, 'private')
 }
 
 export async function runPersonalModelCommand(cmd, msg, deps) {
   const list = await deps.listModels()
   const cfg = deps.getConfig()
   if (!canUseDelegatedCommand(cfg, msg, cmd.name)) return '这个命令的授权已撤销'
-  const chat = { kind: 'private', userId: String(msg.userId) }
+  const normChat = msg.chatId ? normalizeChatId(msg.chatId) : ''
+  const defPlat = parseChatId('private:0')?.platform || ''
+  const plat = String(msg.platform || parseChatId(normChat)?.platform || defPlat)
+  const rawUserId = String(msg.userId || '')
+  const chat = {
+    kind: 'private',
+    ...(normChat ? { chatId: normChat } : {}),
+    ...(plat ? { platform: plat } : {}),
+    userId: rawUserId,
+  }
   const selected = resolveChatModel(cfg, chat, list)
   const effective = selected || deps.defaultModel()
   const label = (m) => m.name && m.name !== m.model ? `${m.name}（${m.model}）` : m.model
@@ -59,9 +69,11 @@ export async function runPersonalModelCommand(cmd, msg, deps) {
 
   const current = cfg
   const privates = { ...current.chatModels.privates }
-  const userId = String(msg.userId)
+  const modelKey = plat && plat !== defPlat
+    ? (normChat || (rawUserId ? normalizeChatId(`${plat}:private:${rawUserId}`) : '') || rawUserId)
+    : (rawUserId || normChat)
   if (/^(默认|default|auto|跟随)$/i.test(cmd.arg)) {
-    delete privates[userId]
+    for (const k of new Set([modelKey, normChat, rawUserId].filter(Boolean))) delete privates[k]
     deps.setConfig({ ...current, chatModels: { ...current.chatModels, privates } })
     return '已恢复跟随默认模型和思考强度，下一句起生效'
   }
@@ -71,7 +83,7 @@ export async function runPersonalModelCommand(cmd, msg, deps) {
     : list.find((m) => m.model.toLowerCase() === q || String(m.name || '').toLowerCase() === q)
       || list.find((m) => m.model.toLowerCase().includes(q) || String(m.name || '').toLowerCase().includes(q))
   if (!hit) return `没找到「${cmd.arg}」这个模型，发 /model 看列表`
-  privates[userId] = { provider: hit.provider, model: hit.model, reasoningEffort: privates[userId]?.reasoningEffort || '' }
+  privates[modelKey] = { provider: hit.provider, model: hit.model, reasoningEffort: privates[modelKey]?.reasoningEffort || '' }
   deps.setConfig({ ...current, chatModels: { ...current.chatModels, privates } })
   return `当前私聊已切换到 ${label(hit)}，下一句起生效`
 }

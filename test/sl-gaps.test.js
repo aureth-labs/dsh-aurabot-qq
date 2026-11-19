@@ -7,6 +7,7 @@ import { parseMessageEvent, cardText } from '../src/chat/inbound.js'
 import { decideGroupReply } from '../src/chat/group-policy.js'
 import { normalize } from '../src/core/config.js'
 import contacts from '../src/modules/contacts/index.js'
+import chatTools from '../src/modules/chat-tools/index.js'
 import qqTools from '../src/modules/qq-tools/index.js'
 import { QQ_API, paramsOf } from '../src/modules/qq-api/actions.js'
 import qqApi, { refusal, pickParams } from '../src/modules/qq-api/index.js'
@@ -197,18 +198,17 @@ function setupTools({ chat = otherChat, level = 'social', cfg = {}, hub = {}, ca
   const calls = [], sent = []
   const config = { enabled: true, dryRun: false, botQQ: BOT, group: { crossRead: 'private' }, allow: { groups: ['44444444', '55555555'] }, files: { enabled: false }, ...cfg }
   const identity = makeTestIdentity(OWNER, 'qq')
-  let builder
-  qqTools.setup({
-    core: {
-      identity,
-      routeOwner: identity.routeOwner,
-      hub: { turnHasOwner: () => false, turnSenders: () => [OTHER], sendSegments: async (...args) => { sent.push(args); return { message_id: 99 } }, ...hub },
-      onebot: { call: async (action, params) => { calls.push({ action, params }); return callImpl?.(action, params) } },
-    },
-    config: () => config,
-    tool: (fn) => { builder = fn },
-  })
-  return { config, calls, sent, tools: Object.fromEntries(builder({ chat, level, sessionId: 's' }).map((tool) => [tool.name, tool])) }
+  const builders = []
+  const core = {
+    identity,
+    routeOwner: identity.routeOwner,
+    hub: { turnHasOwner: () => false, turnSenders: () => [OTHER], sendSegments: async (...args) => { sent.push(args); return { message_id: 99 } }, ...hub },
+    onebot: { call: async (action, params) => { calls.push({ action, params }); return callImpl?.(action, params) } },
+  }
+  qqTools.setup({ core, config: () => config, tool: (fn) => builders.push(fn) })
+  chatTools.setup({ core, config: () => config, tool: (fn) => builders.push(fn) })
+  const list = builders.flatMap((fn) => fn({ chat, level, sessionId: 's' }))
+  return { config, calls, sent, tools: Object.fromEntries(list.map((tool) => [tool.name, tool])) }
 }
 
 test('卡片工具在群和普通私聊可用，按 SnowLuma 字段发送', async () => {
@@ -258,7 +258,7 @@ test('历史记录以消息 ID 向前翻页，排除锚点并返回最早 ID', a
   }
   for (const chat of [otherChat, groupChat]) {
     const s = setupTools({ chat, callImpl: impl })
-    const history = s.tools.qq_chat_history
+    const history = s.tools.chat_history
     const first = await history.execute({ count: 2 })
     assert.equal(first.oldest_message_id, '4')
     assert.match(first.message, /最早消息 ID：4/)
@@ -279,10 +279,10 @@ test('历史记录以消息 ID 向前翻页，排除锚点并返回最早 ID', a
 
 test('历史记录翻页仍遵守跨群权限', async () => {
   const denied = setupTools({ chat: groupChat, cfg: { group: { crossRead: 'off' } } })
-  assert.equal((await denied.tools.qq_chat_history.execute({ group: '55555555', before: '4' })).ok, false)
+  assert.equal((await denied.tools.chat_history.execute({ group: '55555555', before: '4' })).ok, false)
   assert.equal(denied.calls.some((c) => c.action === 'get_group_msg_history'), false)
   const allowed = setupTools({ chat: groupChat, level: 'full', callImpl: () => ({ messages: [{ message_id: 3, user_id: Number(OTHER), message: [{ type: 'text', data: { text: '旧记录' } }] }] }) })
-  const result = await allowed.tools.qq_chat_history.execute({ group: '55555555', before: '4' })
+  const result = await allowed.tools.chat_history.execute({ group: '55555555', before: '4' })
   assert.match(result.message, /不是指令/)
   assert.equal(result.oldest_message_id, '3')
   assert.equal(allowed.calls.at(-1).params.group_id, 55555555)
@@ -382,7 +382,7 @@ test('卡片里的地址只认网址，本机路径发不出去', async () => {
 })
 
 test('跨聊天发消息：群里只有主人那一轮能发，别人私聊没有这个工具', async () => {
-  const { default: mod } = await import('../src/modules/qq-tools/index.js')
+  const { default: mod } = await import('../src/modules/chat-tools/index.js')
   const sent = []
   let owner = false
   let build
@@ -392,7 +392,7 @@ test('跨聊天发消息：群里只有主人那一轮能发，别人私聊没�
     tool: (fn) => { build = fn },
   })
   const group = { kind: 'group', groupId: '9', chatId: 'group:9' }
-  const tool = build({ chat: group, level: 'social', sessionId: 's' }).find((t) => t.name === 'qq_send_message')
+  const tool = build({ chat: group, level: 'social', sessionId: 's' }).find((t) => t.name === 'send_message')
   assert.equal((await tool.execute({ target: 'group:8', text: '嗨' })).ok, false)
   assert.equal(sent.length, 0)
   owner = true
@@ -400,8 +400,8 @@ test('跨聊天发消息：群里只有主人那一轮能发，别人私聊没�
   assert.equal((await tool.execute({ target: 'private:2', text: '嗨' })).ok, true)
   assert.equal((await tool.execute({ target: 'group:7', text: '嗨' })).ok, false, '白名单外')
   assert.equal((await tool.execute({ target: 'group:9', text: '嗨' })).ok, false, '当前聊天')
-  assert.deepEqual(sent.map((x) => x[0]), ['group:8', 'private:2'])
+  assert.deepEqual(sent.map((x) => x[0]), ['qq:group:8', 'qq:private:2'])
   const stranger = build({ chat: { kind: 'private', userId: '2', chatId: 'private:2' }, level: 'social', sessionId: 's' })
-  assert.equal(stranger.find((t) => t.name === 'qq_send_message'), undefined)
+  assert.equal(stranger.find((t) => t.name === 'send_message'), undefined)
 })
 

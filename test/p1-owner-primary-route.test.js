@@ -387,7 +387,12 @@ test('P1-4：hub.ownerChat() 注入 resolveOwnerRoute 后在 blocked 与 no-rout
     dsh: fake.ctx,
     getConfig: () => cfg,
     log: noopLog,
-    gateway: { routeTo: () => 'feishu:private:ou_owner' },
+    gateway: {
+      routeTo: () => 'feishu:private:ou_owner',
+      caps: () => null,
+      features: () => ({}),
+      onCapsChanged: () => () => {},
+    },
     identity,
     resolveOwnerRoute: () => currentRoute,
     routeOwner: () => (currentRoute.blocked ? '' : currentRoute.chatId),

@@ -5,7 +5,7 @@
  * 和 @deepseek-ai/dsh-tools 的 defineTool 产物同形：parameters / output.schema 是 JSON Schema。
  * render 可选：默认只回一行文字；工具要把图片之类的内容块放进结果时自己传（见 imagegen 的 qq_draw_image）。
  */
-export function defineTool({ name, description, properties = {}, required = [], execute, render, slow }) {
+export function defineTool({ name, description, properties = {}, required = [], execute, render, slow, platforms, features }) {
   const parameters = { type: 'object', properties, required, additionalProperties: false }
   return {
     name,
@@ -13,6 +13,8 @@ export function defineTool({ name, description, properties = {}, required = [], 
     // 慢工具（生图、翻唱……）：卡住超过 1.5 秒就先往 QQ 发一条「正在做」的提示（issue #74），
     // 不让主人干等一整轮；具体提示语就写在这里。快工具不用标。
     ...(slow ? { slow } : {}),
+    ...(Array.isArray(platforms) && platforms.length ? { platforms } : {}),
+    ...(Array.isArray(features) && features.length ? { features } : {}),
     parameters,
     output: {
       schema: { type: 'object', additionalProperties: true, properties: {} },

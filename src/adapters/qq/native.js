@@ -11,6 +11,8 @@
 //      transport → not-sent，其余（超时/业务错/读不懂）→ unknown（CONTRACTS §七.3）。
 //      模块拿到的错误和平台端 send 拿到的是同一套语义，写代码的人不用记两套。
 
+import { classifyProbeError } from './probe.js'
+
 /** 现行 OneBot 里「发消息」这一类动作用到的参数形状（只用来判断必填参数，不做严格校验）。 */
 const MESSAGE_ACTIONS = new Set(['send_private_msg', 'send_group_msg', 'send_msg'])
 
@@ -36,7 +38,7 @@ function nativeError(certainty, code, instance, message) {
  * @param {() => string} o.instance 实例名（填进 SendError）
  * @param {object} [o.log]
  */
-export function createNative({ probeState, call, instance, log }) {
+export function createNative({ probeState, call, instance, log, onUnsupported }) {
   /**
    * @param {string} action OneBot 动作名
    * @param {any} params 原样透传
@@ -58,6 +60,11 @@ export function createNative({ probeState, call, instance, log }) {
     try {
       return await call(name, params || {}, { timeoutMs })
     } catch (error) {
+      if (classifyProbeError(error) === 'unsupported') {
+        state?.supported?.delete(name)
+        try { onUnsupported?.(name, error) } catch {}
+        throw nativeError('not-sent', 'unsupported-action', instance(), `当前网关不支持 ${name}`)
+      }
       // 保留客户端的原始判定：transport → 确定没发出去；其余一律 unknown（绝不重发）
       const transport = Boolean(error?.transport)
       const code = transport ? 'transport' : String(error?.data?.retcode ?? error?.code ?? 'native-failed')

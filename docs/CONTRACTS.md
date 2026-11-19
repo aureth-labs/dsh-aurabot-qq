@@ -104,6 +104,32 @@
    - 这类失败不进补发队列（过了时限补发也没用）。**谁守：G1。**
    - 中枢要主动找人之前查 `gateway.routeTo(person)`，它已经排除了 `proactive='none'` 的平台；`limited` 的平台额度由平台端自己记，超了抛 `'not-sent'`。**谁守：G3。**
 5. 靠回调地址收事件的平台用 `ctx.route()` 挂路径。验签在平台端，验不过不 `emit`。**谁守：各平台端。**
+6. **L2 细粒度功能表（`Feature`，共 14 项）**：
+   - 未连接或 `caps === null` 时，`gateway.features(chatIdOrInstance)` 一律返回全 `false`。
+   - 合并顺序不可逆：`adapter L1 → deriveFeatures` → `adapter 显式 features`（带 L1 键仅允许收敛为 false） → `用户 L1 caps`（只紧不松） → `合并后 L1 联动强制收缩带 L1 键项`（`chat.member.read` 独立于 `memberList`，不因用户关 `memberList` 自动关闭） → `用户 caps.features`（只允许 `true → false`，未知键丢弃并告警）。
+   - 无对应 L1 键的 Feature（`message.quote.read`、`message.reaction`、`media.fetch`、`sticker.collect`、`sticker.sync.native`）严格显式，adapter 未声明即 `false`。
+   - `message.quote.read = true` 仅代表适配器支持协议调用，不承诺租户必然具备平台权限。
+   - 完整 14 项 `Feature` 清单与来源约定：
+
+     | `Feature` | 来源 / 推导依据 | 用户 L1 置 `false` 时 |
+     |---|---|---|
+     | `message.quote.send` | `Caps.quoteReply` | 联动置 `false` |
+     | `message.quote.read` | adapter 显式（无 L1 键，缺省 `false`） | 无联动 |
+     | `message.history.read` | `Caps.history` | 联动置 `false` |
+     | `message.forward.expand` | `Caps.forwardExpand` | 联动置 `false` |
+     | `message.recall` | `Caps.recall` | 联动置 `false` |
+     | `message.reaction` | adapter 显式（无 L1 键，缺省 `false`） | 无联动 |
+     | `media.fetch` | adapter 显式（无 L1 键，缺省 `false`） | 无联动 |
+     | `chat.member.list` | `Caps.memberList` | 联动置 `false` |
+     | `chat.member.read` | `adapter.features['chat.member.read'] ?? Caps.memberList` | **独立**（不随 `memberList` 关闭） |
+     | `chat.typing` | `Caps.typing` | 联动置 `false` |
+     | `sticker.send.native` | `Caps.sticker` | 联动置 `false` |
+     | `sticker.collect` | adapter 显式（无 L1 键，缺省 `false`） | 无联动 |
+     | `sticker.sync.native` | adapter 显式（无 L1 键，缺省 `false`） | 无联动 |
+     | `card.send` | `Caps.card` | 联动置 `false` |
+
+   - `FetchedMessage.raw` 为 `@internal` 调试字段，中枢、缓存（`recentInbound` / `quoteCache`）、提示词、流水与常规日志严禁读取或持久化；`sender` 缺失时可整体省略或 `account` 填空串（严禁伪造账号），`sender.idType` 限定 `'open_id' | 'union_id' | 'user_id'`；`FetchRequest.history.count` 缺省由适配器按 20 处理；`forward` 统一返回 `FetchedForwardResult`（其中 `messages` 为 `FetchedMessage[]`，禁止直接返回裸数组），`history` 经 Phase 3A 统一归一化为 `FetchedHistoryPage`（`hasMore` 表示 `before` 游标之前是否还有更早消息）。
+   - `onState` 只负责连接生命周期状态，宿主不得用 `onState` 替代 `onCapsChanged` 驱动工具重挂；`onCapsChanged` 在实例 `state` 或解析后 `features` 实质变化时触发（Gateway 必选，Step 0B 实现），模块本身仅按 `platforms` 启停、不反复重启。**谁守：G1、U1、各平台端。**
 
 ## 八之二、可配置
 

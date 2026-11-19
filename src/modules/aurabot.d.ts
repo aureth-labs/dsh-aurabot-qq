@@ -12,18 +12,67 @@ export type ChatId =
   | `${string}:private:${string}`
   | `${string}:group:${string}`
 
+export interface MediaRef {
+  url?: string
+  path?: string
+  bytes?: Uint8Array
+  id?: string
+  mime?: string
+  md5?: string
+  size?: number
+  width?: number
+  height?: number
+  name?: string
+}
+
 export type Part =
   | { type: 'text'; text: string }
-  | { type: 'image'; file?: string; url?: string; base64?: string; width?: number; height?: number }
-  | { type: 'sticker'; id?: string; file?: string; url?: string; name?: string }
-  | { type: 'voice'; file?: string; url?: string; base64?: string; durationMs?: number }
-  | { type: 'video'; file?: string; url?: string; durationMs?: number }
-  | { type: 'file'; file?: string; url?: string; name?: string; size?: number }
-  | { type: 'mention'; userId?: string; name?: string; all?: boolean }
-  | { type: 'face'; id: string; name?: string }
+  | { type: 'image'; media?: MediaRef; file?: string; url?: string; base64?: string; width?: number; height?: number }
+  | { type: 'sticker'; media?: MediaRef; label?: string; native?: unknown; id?: string; file?: string; url?: string; name?: string }
+  | { type: 'voice'; media?: MediaRef; file?: string; url?: string; base64?: string; durationMs?: number }
+  | { type: 'video'; media?: MediaRef; file?: string; url?: string; durationMs?: number }
+  | { type: 'file'; media?: MediaRef; file?: string; url?: string; name?: string; size?: number }
+  | { type: 'mention'; account?: string; userId?: string; name?: string; all?: boolean }
+  | { type: 'face'; name?: string; value?: string; id?: string }
   | { type: 'reply'; messageId: string }
-  | { type: 'card'; title: string; summary?: string; url?: string; image?: string }
+  | { type: 'card'; text?: string; title?: string; summary?: string; url?: string; from?: string; image?: string }
+  | { type: 'forward'; id: string }
+  | { type: 'poke' }
+  | { type: 'other'; text: string; native?: unknown }
   | { type: 'raw'; platform: string; data: unknown }
+
+export type Feature =
+  | 'message.quote.send'
+  | 'message.quote.read'
+  | 'message.history.read'
+  | 'message.forward.expand'
+  | 'message.recall'
+  | 'message.reaction'
+  | 'media.fetch'
+  | 'chat.member.list'
+  | 'chat.member.read'
+  | 'chat.typing'
+  | 'sticker.send.native'
+  | 'sticker.collect'
+  | 'sticker.sync.native'
+  | 'card.send'
+
+export type FeatureMap = Record<Feature, boolean>
+
+export interface FeatureRequirements {
+  required?: Feature[]
+  optional?: Feature[]
+}
+
+export type FeatureUnavailableReason = 'offline' | 'disabled-by-config' | 'unsupported'
+
+export declare class FeatureUnavailableError extends Error {
+  code: 'FEATURE_UNAVAILABLE'
+  reason: FeatureUnavailableReason
+  feature: Feature | string
+  chatId: string
+  instance: string
+}
 
 export interface Caps {
   image: boolean
@@ -46,6 +95,7 @@ export interface Caps {
   history: boolean
   memberList: boolean
   forwardExpand: boolean
+  features?: Partial<Record<Feature, boolean>>
 }
 
 export interface InstanceStatus {
@@ -135,6 +185,30 @@ export interface Where {
   /** full 主人私聊 / social 群聊和别人 */
   level: 'full' | 'social' | 'chat'
   sessionId: string
+  /** 当前会话所属平台实例的 14 项 L2 能力布尔表 */
+  features: FeatureMap
+}
+
+export interface ContextArgs {
+  chat: Chat
+  sessionId: string
+  features: FeatureMap
+}
+
+export interface ContextSpec {
+  platforms?: (Platform | '*')[]
+  features?: Feature[]
+  fn?: (args: ContextArgs) => string | void
+  render?: (args: ContextArgs) => string | void
+}
+
+export type RuleFn = string | string[] | ((kind: 'private' | 'social', cfg: any) => string | string[] | void)
+
+export interface RuleSpec {
+  platforms?: (Platform | '*')[]
+  features?: Feature[]
+  fn?: RuleFn
+  rule?: RuleFn
 }
 
 export interface Tool {
@@ -142,6 +216,8 @@ export interface Tool {
   description: string
   parameters: any
   output: any
+  platforms?: (Platform | '*')[]
+  features?: Feature[]
   execute(args: any, exec?: any): Promise<any>
 }
 
@@ -151,6 +227,10 @@ export interface ToolSpec {
   /** 参数（JSON Schema 的 properties） */
   properties?: Record<string, any>
   required?: string[]
+  /** 可选：限制该工具仅在匹配平台挂载 */
+  platforms?: (Platform | '*')[]
+  /** 可选：限制该工具仅在目标聊天具备全部指定 L2 能力时挂载 */
+  features?: Feature[]
   /** 返回 { ok, message }：message 是给她看的结果 */
   execute(args: any, exec?: any): any | Promise<any>
 }
@@ -159,8 +239,13 @@ export interface Command {
   name: string
   aliases?: string[]
   desc?: string
+  delegatable?: boolean
   /** 日志只记录命令名，发送失败时结束本次回执。 */
   sensitive?: boolean
+  /** 可选：限制该命令仅在匹配平台可用 */
+  platforms?: (Platform | '*')[]
+  /** 可选：限制该命令仅在目标聊天具备全部指定 L2 能力时可用 */
+  features?: Feature[]
   /** 返回的文字直接回给主人 */
   run(arg: string, msg: Message): string | void | Promise<string | void>
 }
@@ -335,6 +420,14 @@ export interface Api {
   platformOf(chatId: ChatId | string): Platform | ''
   /** 查询当前聊天所属平台实例的能力表，实例未启动或不支持返回 null */
   caps(chatId: ChatId | string): Caps | null
+  /** 查询目标聊天的 14 项 L2 能力布尔表；省略 chatId 时优先取当前平台上下文，其次取模块唯一平台/唯一启用实例；若无上下文且存在多个启用实例或断线时全为 false */
+  features(chatId?: ChatId | string): FeatureMap
+  /** 便捷判断某项 L2 能力在目标聊天是否可用 */
+  can(feature: Feature, chatId?: ChatId | string): boolean
+  /** 若目标聊天不具备某项 L2 能力则抛出带 reason 的 FeatureUnavailableError */
+  require(feature: Feature, chatId?: ChatId | string): void
+  ownerRoute(opts?: { purpose?: string }): { chatId: string; blocked: boolean; reason: string; target: any; fallbackUsed: boolean }
+  ownerChat(): string
   /** 调用指定平台专有原生动作（必须在模块 platforms 里显式声明该平台） */
   native(platform: Platform, action: string, params?: any, opts?: { timeoutMs?: number; [key: string]: any }): Promise<any>
   /** @deprecated 仅 QQ 兼容；请改用 api.sendParts */
@@ -351,8 +444,8 @@ export interface Api {
   emit(event: string, ...args: any[]): void
   tool(builder: Tool | Tool[] | ((where: Where) => Tool | Tool[] | null | undefined)): Off
   defineTool(spec: ToolSpec): Tool
-  context(fn: (args: { chat: Chat; sessionId: string }) => string | void): Off
-  rule(fn: string | ((kind: 'private' | 'social', cfg: any) => string | string[] | void)): Off
+  context(fn: ((args: ContextArgs) => string | void) | ContextSpec): Off
+  rule(fn: RuleFn | RuleSpec): Off
   command(c: Command): Off
   every(ms: number, fn: () => any, label?: string): Off
   later(ms: number, fn: () => any): Off
@@ -411,9 +504,11 @@ export interface AurabotModule {
   name?: string
   version?: string
   /** 按哪一版扩展接口写的 */
-  api?: 1 | 2 | number
+  api?: 1 | 2 | 3 | number
   /** 声明支持的平台（例如 ['qq']、['qq', 'feishu'] 或 ['*'] 平台无关）；缺省为 ['qq'] */
   platforms?: (Platform | '*')[]
+  /** 仅作元信息申报（方案 A：不阻断模块加载），模块内部通过 api.can / api.require 运行时降级 */
+  features?: FeatureRequirements
   description?: string
   defaults?: Record<string, any>
   settings?: Setting[]

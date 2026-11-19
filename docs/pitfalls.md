@@ -26,7 +26,7 @@ ode --test "test/replay/**/*.test.js"。
 ## 2026-11-13 · `npx tsc` 拉到同名假包，校验假通过
 - 现象：`npx tsc --noEmit ...` 输出「This is not the tsc command you are looking for」还 exit 0，contracts.d.ts 的语法校验等于没跑。
 - 原因：npm 上有个叫 `tsc` 的摆烂恶搞包，npx 找不到本地 typescript 时按名字拉到了它。
-- 解决：显式指定包名：`npx -y -p typescript tsc --noEmit --strict ...`（P0 校验 contracts.d.ts 用这个，实测 exit 0 才算数）。
+- 解决：显式指定锁版本的包名：`npx -y -p typescript@5 tsc --noEmit --strict ...`（或直接运行 `npm run test:types` 校验 `contracts-l2.typecheck.ts`）。
 - 涉及文件/命令：src/gateway/contracts.d.ts；命令 `npx -y -p typescript tsc`。
 
 ## 2026-11-13 I1 身份库：SQLite 错误包装不能罩住业务错误

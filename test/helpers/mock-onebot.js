@@ -83,13 +83,22 @@ export async function startMockOneBot({ selfId = '20000002', token = 'mock-token
         return { messages: state.history || [] }
       }
       case 'add_custom_face': {
+        if (!params?.file || params.file === 'base64://') throw new Error('图片数据无效')
         const id = 'emoji-' + (faces.size + 1)
         faces.set(id, '')
         return { emoji_id: id }
       }
       case 'fetch_custom_face': return state.favorites.slice(0, params.count || 48)
-      case 'modify_custom_face': faces.set(params.emoji_id, params.desc); return null
-      case 'delete_custom_face': faces.delete(params.emoji_id); return null
+      case 'modify_custom_face': {
+        if (!params?.emoji_id) throw new Error('缺少 emoji_id')
+        faces.set(params.emoji_id, params.desc)
+        return null
+      }
+      case 'delete_custom_face': {
+        if (!params?.emoji_id) throw new Error('缺少 emoji_id')
+        faces.delete(params.emoji_id)
+        return null
+      }
       case 'send_qzone_msg': {
         // 模拟空间不认配图（图太大 / 格式不对）：带图发说说直接失败，用来测「退回只发文字」
         if (state.failQzoneImage && params.images && params.images.length) throw new Error('第 1 张图片上传失败: 上传图片失败:响应缺少必要字段')

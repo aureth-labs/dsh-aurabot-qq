@@ -68,13 +68,12 @@
 3. **`ClientConfig` 里除 `PingInterval` 外的字段**（如 `ReconnectInterval`、`ReconnectNonce`）
    存在但语义未核实，本端只用了 `PingInterval`（默认 120 秒），重连用自家指数退避。
 4. **群身份 `sender.role` 拿不到真实值。** 接收消息事件里**没有**群主/管理员字段，本端群聊一律报
-   `'member'`、私聊报 `''`。要做真正的权限判定得另外调群成员接口（本端未实现，`caps.memberList=false`）。
+   `'member'`、私聊报 `''`。已接群成员列表接口（`caps.memberList=true` / `fetch({ kind: 'members' })`），但该接口仅返回 `open_id` 与昵称而不返回群管理角色，因此 `features['chat.member.read']` 仍诚实保持 `false`——即飞书成员列表可用，但跨群身份校验仍不可用，非主人跨群默认拒绝。
 5. **发送者昵称拿不到。** 接收消息事件里没有发送者姓名（只有 `mentions[].name`），本端 `sender.name`
    一律空串，不编造。
-6. **`merge_forward` 只拿到占位。** 官方说 content 固定是 `"Merged and Forwarded Message"`，
-   子消息要调「获取指定消息的内容」展开；本端没实现（`caps.forwardExpand=false`）。
+6. **`merge_forward` 已支持多层递归展开。** 入站收到带 `message_id` 的 `merge_forward` 时发出 `forward` Part，由 `fetch({ kind: 'forward' })` 调 `GET /open-apis/im/v1/messages/:message_id` 取回子消息（含嵌套 `merge_forward`，由中枢递归展开至 `MAX_FORWARD_DEPTH=5`）并按时间升序归一化为 `FetchedForwardResult`（`caps.forwardExpand=true`）。
 7. **撤回（recall）没实现。** 官方有 `DELETE /open-apis/im/v1/messages/:message_id`，本次没做，
-   所以 `caps.recall=false`。同理 `history` / `memberList` 都是 false——有接口但没实现，就不声明。
+   所以 `caps.recall=false`。`history` 默认仍为 `false`（权限开通后可在配置中启用）。
 8. **长连接在多副本部署下会「只有一个副本收到消息」**（官方原文：集群模式，不广播）。
    如果用户跑多实例，需要自己做转发，本端不管。
 9. **`msg_type=audio` 之外的音频时长**：上传文件时 `duration` 是可选的，本端有 `durationMs` 就传，
@@ -154,7 +153,8 @@
 | `proactive` | `'free'` | 飞书**没有**被动回复窗口（不像 QQ 官方机器人有 5 分钟限制），可用范围内可随时发；真实限制是「可用范围」与「用户屏蔽」，由错误分类兜住 |
 | `replyWindowMs` | `0` | 没有窗口 |
 | `repliesPerMessage` | `0` | 没有「一条消息只能回 N 条」的限制 |
-| `history` / `memberList` / `forwardExpand` | `false` | 官方都有对应接口，本端未实现，**不撒谎** |
+| `history` | `false` | 需 `im:message:readonly`（群全量记录还需 `im:message.group_msg`；跨群按群名定位群时还需 `im:chat:readonly` 调 `/im/v1/chats`）；默认关，开通权限后可在实例设置中打开（`fetch({ kind: 'history' })` 输出归一化 `FetchedHistoryPage`；单聊 `p2p` 会将 `open_id → chat_id` 持久化在实例数据目录） |
+| `memberList` / `forwardExpand` | `true` / `true` | `memberList` 走 `GET /im/v1/chats/:chat_id/members`（分页；`chat.member.read` 因无角色字段仍保持 `false`）；`forwardExpand` 走 `GET /im/v1/messages/:message_id` 展开 `merge_forward` 子消息 |
 
 ## 五、身份：open_id 与 union_id
 

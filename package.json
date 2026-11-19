@@ -13,7 +13,8 @@
     "./package.json": "./package.json"
   },
   "scripts": {
-    "test": "node --test \"test/**/*.test.js\""
+    "test": "node --test \"test/**/*.test.js\"",
+    "test:types": "npx -y -p typescript@5 tsc --noEmit --strict --target esnext --module nodenext --moduleResolution nodenext test/contract/contracts-l2.typecheck.ts"
   },
   "dsh": {
     "bundle": {

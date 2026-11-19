@@ -395,7 +395,7 @@
 | **表情包** | 无表情包消息类型 | **大**。表情包是她性格的重要载体（仓库里有整套 sticker 系统） |
 | **引用回复** | `message_reference` **暂未支持** | **大**。对话里「她在回哪一句」的连续性会断 |
 | **知道对方是谁** | 只有 openid，**拿不到 QQ 号**；`union_openid` 要邮件申请且限同主体 | **中-大**。跨平台认人靠 `identity.link` 手工做；和 QQ 版的人对不上 |
-| **群管理 / 群记忆** | 有群成员/黑名单/禁言接口（本包未实现）；全量消息要看群主 | **中** |
+| **群管理 / 群记忆** | 已接入 `groupAdmin`：`bot_state`（角色探测）、`info`、单人禁言/解禁（`restrict_chat_setting`）、踢人（`batch_remove_members`）、成员列表（内邀）；需群绑定 `group_openid` 且仅支持 `member_openid`，黑名单/全员禁言写/公告/头衔/入群审批未接 | **中** |
 | **富媒体大文件** | 200MB 硬限制，URL 上传要公网可达，分片上传未实现 | **小-中** |
 | **稳定长连接** | WebSocket 支持 Resume 补发；Webhook 只需公网 HTTPS + 限定端口 | **小** |
 
@@ -429,10 +429,10 @@
 
 ## 五、已知缺口（本包未做，后续可补）
 
-1. **WebSocket 会话恢复未实现**：已内置连接、Identify、心跳和断线重连；`op=6 Resume` 尚未使用。
+1. **WebSocket 会话恢复（已接入）**：已内置连接、`Identify`、`READY` 保存 `session_id` 与 `s` 序号、心跳上报 `seq`、`op=7 Reconnect`/断线后发 `op=6 Resume` 续接会话，以及 `op=9 Invalid Session` 清空状态回退 `op=2 Identify`。
 2. **富媒体分片上传未实现**：URL 和内联 Base64（≤10MB）可用；更大的本地文件需要 `upload_prepare` 三步分片。
 3. **语音条（silk）未实现**：`voice: 'file'`，只有音频文件形态。
-4. **群管理接口未接**：成员列表、黑名单、禁言、入群审批（官方已有接口）。
+4. **群管理能力边界（部分已接）**：已接 `getBotState`（`/bot_state`）、`getGroupInfo`（`/info`）、`listMembers`（`/members`）、`muteMember`/`unmuteMember`（`/restrict_chat_setting`）、`kickMember`（`/batch_remove_members`），`group-admin` 模块已声明 `platforms: ['qq', 'qqbot']` 并持久化 `qqbot-groups.json` 群绑定（群管动作禁 403 重试，映射 `11253` 为 `group-admin-forbidden`）；群黑名单（`member_blacklist`）、入群审批（`join_requests`）、全员禁言写设置、群公告与专属头衔暂未接入。
 5. **ark / markdown / keyboard 出站未实现**：`card: false`。
 6. **入站 ark 卡片解析较简**：只取 `title` / `desc` / `jump_url` / `source`。
 7. **`msg_idx` 去重未用**：官方建议结合 `msg_seq` / `msg_idx` 去重，本包只依赖网关的

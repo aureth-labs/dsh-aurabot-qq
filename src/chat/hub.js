@@ -15,13 +15,15 @@ import { dataDir, readJson, writeJson } from '../core/store.js'
 import { isDefiniteFailure } from '../onebot/client.js'
 import { parseMessageEvent, gifFrames, segmentsOf } from './inbound.js'
 import { parseReply, bubbleDelay, wantsVoice, itemsToLine, cleanOutboundText, cleanOutboundSegments, clockLabel } from './reply.js'
+import { partsToSegmentsFallback } from './part-fallback.js'
 import { decideGroupReply, engagedHint, pickAutoReply, pickDirectRequester, policyFor, sameNameNote, topicRelevance } from './group-policy.js'
 import { checkAllowed, levelFor, presetFor, isOwner, isOwnerPrivateChat, isOwnerChatMuted, groupOwnerTools } from './access.js'
 import { fetchImage, segmentBytes } from '../core/net.js'
 import { toMono16k } from '../voice/wav.js'
 import { asrConfigured, transcribeAudio } from '../voice/asr.js'
 import { mimeOf } from './inbound.js'
-import { applyForwardBodies, forwardBody, readForward } from './forward.js'
+import { applyForwardBodies, forwardBody, readFetchedForward, readForward } from './forward.js'
+import { renderParts } from '../gateway/render.js'
 import { findFfmpeg, findFfmpegForConfig, findSharp, shrinkImage, shrinkWithSharp } from '../core/img.js'
 import { redact } from '../core/redact.js'
 import { defaultModel, pickReasoningEffort, canSeeImages, modelVision } from '../core/llm.js'
@@ -49,6 +51,7 @@ import { normalizeChatId, parseChatId, sameChat, formatChatId } from '../gateway
 // 没填就用环境变量 AURABOT_WORKSPACE，再没有：老安装沿用 C:\Aurabot\qq-chats，新安装放在用户目录下（不用往 C 盘根目录写）
 const LEGACY_WORKSPACE = 'C:\\Aurabot\\qq-chats'
 const MAX_IMAGE_BYTES = 1024 * 1024 * 1024 // 图片大小不设实际限制，只防把内存撑爆
+const MAX_AUDIO_BYTES = 30 * 1024 * 1024 // 语音拉取与转码上限（独立于图片上限）
 const MODEL_IMAGE_BYTES = 8 * 1024 * 1024 // 超过这个大小先缩小再给模型
 const MAX_MESSAGE_IMAGES = 8 // 一条消息最多给她看几张，合并转发里的图算在内
 const QUOTE_FORWARD_MAX_CHARS = 1200 // 引用里套的合并转发：正文本身就是那条消息，比普通引用的 300 字放宽；普通引用仍走 300
@@ -98,7 +101,9 @@ export function assistantReplyText (message) {
  * 主动分享记账、群分享额度都按这个判，别各写一份。
  */
 export function reallySent (r) {
-  return Boolean(r) && r.message_id !== undefined && !String(r.message_id).startsWith('sim-')
+  if (!r || r.queued) return false
+  const id = r.message_id ?? r.messageId
+  return id !== undefined && id !== null && id !== '' && !String(id).startsWith('sim-')
 }
 
 export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, buildTools, contextProviders, onActivity, memoryScore, onMemoryCommand, onCommand, isMuted, dislikes, random = Math.random, moodEffects, localApi, hooks, availableModels, toolsGeneration, capabilitiesOf, gateway: initialGateway = null, identity = null, handover = null, platformLabel: platformLabelInjected = null, routeOwner: routeOwnerInjected = null, resolveOwnerRoute: resolveOwnerRouteInjected = null, onOwnerAccountLinked = null }) {
@@ -106,6 +111,17 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   const ownerRef = () => identity
   const ownerId = () => identity?.owner?.() || null
   const defaultPlatform = () => parseChatId('private:0')?.platform || ''
+  /** 判断会话是否归属默认协议实例（非默认平台与同平台多实例如 qq#2 均走各自网关，不得落回默认通道）。 */
+  const isDefaultInstanceChat = (chatId, explicitPlatform = '') => {
+    const def = defaultPlatform()
+    if (explicitPlatform && explicitPlatform !== def) return false
+    const raw = String(chatId || '').trim()
+    if (!raw) return !explicitPlatform
+    const norm = normalizeChatId(raw) || raw
+    const addr = parseChatId(norm)
+    if (!addr || addr.platform !== def) return false
+    return !addr.instance || addr.instance === def
+  }
   const platformLabelOf = (platform) => {
     if (typeof platformLabelInjected === 'function') {
       try { const label = platformLabelInjected(platform); if (label) return String(label) } catch (error) {}
@@ -181,8 +197,12 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   const memoryCutoffs = map().memoryCutoffs || {}
   const memoryResetAt = (qq) => Number(memoryCutoffs[qq]) || 0
   function chatMemoryCutoff(chatId, uid) {
-    const qq = chatId.startsWith('private:') ? chatId.slice(8) : chatId.startsWith('group:') ? uid : ''
-    return memoryResetAt(qq)
+    const raw = String(chatId || '')
+    const addr = parseChatId(raw)
+    const key = addr
+      ? (addr.kind === 'private' ? addr.id : addr.kind === 'group' ? uid : '')
+      : (raw.startsWith('private:') ? raw.slice(8) : raw.startsWith('group:') ? uid : '')
+    return memoryResetAt(key)
   }
   function isBeforeMemoryReset(chatId, uid, at) {
     const cutoff = chatMemoryCutoff(chatId, uid)
@@ -193,7 +213,12 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     return !isBeforeMemoryReset(chatId, uid, at < 1e12 ? at * 1000 : at)
   }
   function filterHistory(chatId, messages) {
-    return messages.filter((message) => message && historyVisible(chatId, message.sender?.user_id ?? message.user_id, message.time))
+    return (Array.isArray(messages) ? messages : []).filter((message) => {
+      if (!message || typeof message !== 'object') return false
+      const uid = message.sender?.account ?? message.sender?.user_id ?? message.user_id
+      const time = message.at ?? message.time
+      return historyVisible(chatId, uid, time)
+    })
   }
 
   const mounted = new Map() // sessionKey → { agent, offs, chatId, toolsKey }  按会话记，agent 对象换了也能清掉旧工具（#90）
@@ -265,10 +290,14 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   const groupEngagedRun = new Map() // groupId → 没人叫她、连着接了几次话
   const ENGAGE_MS = 3 * 60_000
   const groupNames = new Map()
+  const chatsFetchedAt = new Map() // instance -> last gateway.fetch('chats') ms
+  const groupInfoFetchedAt = new Map() // chatId -> last gateway.groupAdmin.getGroupInfo ms
+  const GROUP_NAMES_TTL_MS = 10 * 60_000
   const friendIds = new Set()
   let friendsAt = 0
   let friendsPending = null
   function refreshFriends() {
+    if (typeof onebot?.call !== 'function') return Promise.resolve()
     if (friendsPending) return friendsPending
     if (Date.now() - friendsAt < 300_000) return Promise.resolve()
     friendsAt = Date.now()
@@ -282,6 +311,42 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       } catch (error) { log.debug?.('暂时取不到 QQ 好友列表：', error.message) }
     })().finally(() => { friendsPending = null })
     return friendsPending
+  }
+  const VOICE_TTL = 30 * 60_000
+  const recentVoices = new Map() // chatId → 最近收到的入站语音
+  function rememberInboundVoice(msg) {
+    if (!msg?.records?.length) return
+    const cid = normalizeChatId(msg.chatId) || String(msg.chatId || '')
+    if (!cid) return
+    const now = Date.now()
+    const plat = msg.platform || parseChatId(cid)?.platform || defaultPlatform()
+    const fresh = (recentVoices.get(cid) || []).filter((item) => now - item.at <= VOICE_TTL).slice(-7)
+    fresh.push({
+      chatId: cid,
+      platform: plat,
+      userId: String(msg.userId || ''),
+      messageId: String(msg.messageId || ''),
+      seg: msg.records[msg.records.length - 1],
+      at: now,
+    })
+    recentVoices.set(cid, fresh)
+  }
+  function lastInboundVoice({ chatId = '', userId = '' } = {}) {
+    const cutoff = Date.now() - VOICE_TTL
+    const norm = chatId ? (normalizeChatId(chatId) || String(chatId)) : ''
+    const uid = String(userId || '').trim()
+    const keys = norm ? (recentVoices.has(norm) ? [norm] : []) : [...recentVoices.keys()]
+    let best = null
+    for (const key of keys) {
+      const fresh = (recentVoices.get(key) || []).filter((item) => item.at >= cutoff)
+      if (!fresh.length) { recentVoices.delete(key); continue }
+      recentVoices.set(key, fresh)
+      for (const item of fresh) {
+        if (uid && item.userId !== uid) continue
+        if (!best || item.at >= best.at) best = item
+      }
+    }
+    return best
   }
   const privateSources = new Map() // 私聊 QQ 号 → 最近一次临时会话的来源群
   const recentMedia = createRecentMedia({ log }) // 最近发来的图片和表情，短期落盘恢复
@@ -383,6 +448,17 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         return
       }
       if (cfg.stickers?.enabled === false || cfg.stickers?.react === false) return
+      const reactCid = msg?.chatId ? (normalizeChatId(msg.chatId) || String(msg.chatId)) : ''
+      const reactAddr = reactCid ? parseChatId(reactCid) : null
+      const reactPlat = msg?.platform || reactAddr?.platform || defaultPlatform()
+      const isDefInst = isDefaultInstanceChat(reactCid, reactPlat)
+      const useGwReact = Boolean(gateway && (!isDefInst || gateway.caps?.(reactCid) !== null || !onebot))
+      if (!useGwReact && !isDefInst) return
+      if (useGwReact && !gateway.features?.(reactCid)?.['message.reaction']) return
+      // 注意：此处不是通用 message.reaction 实现，Phase 1A 仅保留 QQ/OneBot 专有动作 set_msg_emoji_like；
+      // 其他平台的通用 reaction 能力将在后续适配补充统一契约后再放行。
+      if (reactPlat !== defaultPlatform()) return
+      if (!useGwReact && !onebot) return
       const chance = cfg.stickers?.reactChance ?? 0
       if (!(chance > 0) || !msg.messageId || msg.messageId === '0') return
       if (Math.random() >= chance * mood().sticker) return
@@ -399,7 +475,11 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         log.debug?.(`跳过「${name}」（${id}）：编号超过三位，贴出去会是空白`)
         return
       }
-      await onebot.call('set_msg_emoji_like', { message_id: String(msg.messageId), emoji_id: String(id), set: true }, { timeoutMs: 10000 })
+      if (useGwReact) {
+        await gateway.native(reactAddr?.instance || defaultPlatform(), 'set_msg_emoji_like', { message_id: String(msg.messageId), emoji_id: String(id), set: true }, { timeoutMs: 10000 })
+      } else {
+        await onebot.call('set_msg_emoji_like', { message_id: String(msg.messageId), emoji_id: String(id), set: true }, { timeoutMs: 10000 })
+      }
       recent.push(ts)
       reactStamps.set(msg.chatId, recent)
       log.info(`${msg.chatId}：给这条消息贴了个「${name}」（${id}）`)
@@ -511,26 +591,218 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     }
   }
 
-  async function membersOf(groupId) {
-    const hit = groupMembers.get(groupId)
+  async function membersOf(target) {
+    const raw = String(target ?? '').trim()
+    if (!raw) return []
+    const parsed = raw.includes(':') ? parseChatId(raw) : null
+    const norm = parsed ? (normalizeChatId(raw) || raw) : (normalizeChatId(`group:${raw}`) || `group:${raw}`)
+    const qid = parsed ? parsed.id : raw
+    const cacheKey = norm || raw
+    const hit = groupMembers.get(cacheKey)
     if (hit && Date.now() - hit.at < 10 * 60_000) return hit.list
+    const isDefInst = parsed ? isDefaultInstanceChat(norm || raw, parsed.platform) : true
+    const gwCaps = gateway?.caps?.(norm || raw) ?? null
+    const useGw = Boolean(gateway && typeof gateway.fetch === 'function' && (!isDefInst || gwCaps !== null || !onebot))
+    if (useGw) {
+      if (!gwCaps?.memberList && !gateway?.features?.(norm || raw)?.['chat.member.list']) return hit?.list || []
+      try {
+        const r = await gateway.fetch(norm || raw, { kind: 'members', chat: { kind: 'group', id: qid } })
+        const rawList = Array.isArray(r) ? r : (Array.isArray(r?.items) ? r.items : [])
+        const list = rawList.map((m) => ({
+          ...m,
+          user_id: m?.user_id ?? m?.account ?? m?.id ?? '',
+          nickname: m?.nickname ?? m?.name ?? '',
+        }))
+        groupMembers.set(cacheKey, { at: Date.now(), list })
+        return list
+      } catch (error) {
+        log.debug('拉群成员失败，@ 按文字发：', error.message)
+        return hit?.list || []
+      }
+    }
+    if (!isDefInst || !/^\d+$/.test(qid) || !onebot) return []
     try {
-      const r = await onebot.call('get_group_member_list', { group_id: Number(groupId) }, { timeoutMs: 15000 })
+      const r = await onebot.call('get_group_member_list', { group_id: Number(qid) }, { timeoutMs: 15000 })
       const list = Array.isArray(r) ? r : r?.data || []
-      groupMembers.set(groupId, { at: Date.now(), list })
+      groupMembers.set(cacheKey, { at: Date.now(), list })
       return list
     } catch (error) {
       log.debug('拉群成员失败，@ 按文字发：', error.message)
       return hit?.list || []
     }
   }
-  const sentIds = new Set()
+  const SENT_IDS_PER_SCOPE = 500
+  const sentIdsByScope = new Map() // instance -> Set<messageId>
+  const RECENT_INBOUND_MAX = 500
+  const RECENT_INBOUND_TTL_MS = 24 * 60 * 60 * 1000
+  const RECENT_MAX_PARTS = 20
+  const RECENT_MAX_TEXT = 2000
+  const recentInbound = new Map() // `${normChatId}\0${messageId}` -> normalized FetchedMessage-like record (no raw / bytes)
   const stats = { received: 0, sent: 0, voice: 0, stickers: 0, errors: 0, day: new Date().toDateString() }
   let selfId = ''
+
+  function sentScopeOf(target) {
+    const raw = String(target || '').trim()
+    if (!raw) return defaultPlatform()
+    const norm = normalizeChatId(raw) || raw
+    const addr = parseChatId(norm)
+    if (addr?.instance) return addr.instance
+    if (!raw.includes(':')) return raw
+    return defaultPlatform()
+  }
+  function addSentId(target, id) {
+    const sid = String(id ?? '').trim()
+    if (!sid || sid === '0') return
+    const scope = sentScopeOf(target)
+    let set = sentIdsByScope.get(scope)
+    if (!set) {
+      set = new Set()
+      sentIdsByScope.set(scope, set)
+    }
+    if (set.has(sid)) set.delete(sid)
+    set.add(sid)
+    while (set.size > SENT_IDS_PER_SCOPE) set.delete(set.values().next().value)
+  }
+  function hasSentId(target, id) {
+    const sid = String(id ?? '').trim()
+    if (!sid) return false
+    const set = sentIdsByScope.get(sentScopeOf(target))
+    return Boolean(set && set.has(sid))
+  }
+  function selfAccountFor(chatIdOrInstance) {
+    const raw = String(chatIdOrInstance || '').trim()
+    const norm = raw ? (normalizeChatId(raw) || raw) : ''
+    const addr = norm ? parseChatId(norm) : null
+    const instance = addr?.instance || (!raw.includes(':') && raw ? raw : '')
+    const platform = addr?.platform || (instance ? instance.split('#')[0] : '') || defaultPlatform()
+    if (gateway && typeof gateway.instances === 'function' && instance) {
+      const hit = gateway.instances().find((x) => x && x.instance === instance)
+      if (hit?.self?.account) return String(hit.self.account)
+    }
+    if (platform === defaultPlatform()) return String(selfId || getConfig().botQQ || '')
+    return ''
+  }
+  function sanitizePartsForCache(parts) {
+    if (!Array.isArray(parts)) return []
+    const out = []
+    let remainingText = RECENT_MAX_TEXT
+    for (const part of parts.slice(0, RECENT_MAX_PARTS)) {
+      if (!part || typeof part !== 'object') continue
+      const clean = { type: String(part.type || 'other') }
+      if (part.text !== undefined) {
+        if (remainingText <= 0) continue
+        const s = String(part.text).slice(0, remainingText)
+        remainingText -= s.length
+        clean.text = s
+      }
+      if (part.account !== undefined) clean.account = String(part.account)
+      if (part.name !== undefined) clean.name = String(part.name)
+      if (part.value !== undefined) clean.value = String(part.value)
+      if (part.title !== undefined) clean.title = String(part.title).slice(0, 200)
+      if (part.url !== undefined) clean.url = String(part.url)
+      if (part.label !== undefined) clean.label = String(part.label).slice(0, 100)
+      if (part.id !== undefined) clean.id = String(part.id)
+      if (part.media && typeof part.media === 'object') {
+        const m = {}
+        if (part.media.id) m.id = String(part.media.id)
+        if (part.media.url) m.url = String(part.media.url)
+        if (part.media.mime) m.mime = String(part.media.mime)
+        if (part.media.name) m.name = String(part.media.name)
+        if (part.media.messageId) m.messageId = String(part.media.messageId)
+        if (part.media.width > 0) m.width = part.media.width
+        if (part.media.height > 0) m.height = part.media.height
+        clean.media = m
+      }
+      out.push(clean)
+    }
+    return out
+  }
+  function rememberRecentMessage({ chatId, messageId, at, sender, parts }) {
+    if (disposed || simulationStore.getStore()) return
+    const sid = String(messageId ?? '').trim()
+    if (!sid || sid === '0') return
+    const norm = chatId ? (normalizeChatId(String(chatId)) || String(chatId)) : ''
+    if (!norm) return
+    const key = `${norm}\u0000${sid}`
+    const now = Date.now()
+    const msgAt = Number(at) > 0 ? (Number(at) < 1e12 ? Number(at) * 1000 : Number(at)) : now
+    const safeSender = sender && typeof sender === 'object'
+      ? {
+        account: String(sender.account ?? ''),
+        ...(sender.name ? { name: String(sender.name) } : {}),
+        isBot: Boolean(sender.isBot),
+        ...(sender.idType ? { idType: String(sender.idType) } : {}),
+      }
+      : { account: '', isBot: false }
+    const entry = {
+      chatId: norm,
+      messageId: sid,
+      at: msgAt,
+      cachedAt: now,
+      sender: safeSender,
+      parts: sanitizePartsForCache(parts),
+    }
+    if (recentInbound.has(key)) recentInbound.delete(key)
+    recentInbound.set(key, entry)
+    while (recentInbound.size > RECENT_INBOUND_MAX) {
+      recentInbound.delete(recentInbound.keys().next().value)
+    }
+  }
+  function lookupRecentMessage(chatId, messageId) {
+    const sid = String(messageId ?? '').trim()
+    if (!sid) return null
+    const norm = chatId ? (normalizeChatId(String(chatId)) || String(chatId)) : ''
+    if (!norm) return null
+    const key = `${norm}\u0000${sid}`
+    const item = recentInbound.get(key)
+    if (!item) return null
+    if (Date.now() - (item.cachedAt || item.at || 0) > RECENT_INBOUND_TTL_MS) {
+      recentInbound.delete(key)
+      return null
+    }
+    if (!historyVisible(norm, item.sender?.account || '', item.at)) {
+      recentInbound.delete(key)
+      return null
+    }
+    recentInbound.delete(key)
+    recentInbound.set(key, item)
+    return item
+  }
+  function evictMessageCaches(chatIdOrHint, messageId) {
+    const sid = String(messageId ?? '').trim()
+    if (!sid) return
+    const norm = chatIdOrHint ? (normalizeChatId(String(chatIdOrHint)) || String(chatIdOrHint)) : ''
+    if (norm) {
+      recentInbound.delete(`${norm}\u0000${sid}`)
+      quoteCache.delete(`${norm}|${sid}`)
+      quoteCache.delete(`${chatIdOrHint}|${sid}`)
+      return
+    }
+    for (const k of [...recentInbound.keys()]) {
+      if (k.endsWith(`\u0000${sid}`)) recentInbound.delete(k)
+    }
+    for (const k of [...quoteCache.keys()]) {
+      if (k.endsWith(`|${sid}`)) quoteCache.delete(k)
+    }
+  }
   let lastChatAt = 0
   let lastOwnerChatAt = 0
   let lastOwnerChatId = ''
-  const lastPrivateAt = new Map() // 账号 id → 最后一次和这个人私聊的时间（主动搭话白名单用）
+  const lastPrivateAt = new Map() // ChatId / 旧账号 id → 最后一次和这个人私聊的时间（主动搭话白名单用）
+  const touchPrivateAt = (target, at = Date.now()) => {
+    const raw = String(target || '').trim()
+    if (!raw) return
+    const norm = normalizeChatId(raw)
+    if (norm) {
+      const parsed = parseChatId(norm)
+      if (parsed?.kind === 'private' && parsed.id) {
+        lastPrivateAt.set(norm, at)
+        if (parsed.platform === defaultPlatform()) lastPrivateAt.set(parsed.id, at)
+        return
+      }
+    }
+    lastPrivateAt.set(raw, at)
+  }
   const lastInbound = new Map() // chatId → { id, at }，被动回复平台用它填 inResponseTo
   const passivePending = new Map() // chatId → 已过回复窗口、等下一句带出的结果
   let lastBotToOwner = { at: 0, text: '' } // 她在主人私聊里最后说的话
@@ -563,7 +835,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
       const dir = dataDir('chatlog')
       mkdirSync(dir, { recursive: true })
-      const forgotten = String(chatId).startsWith('private:') && getConfig().memory?.enabled && getConfig().memory?.instantCommands !== false && parseMemoryCommand(text)?.action === 'forget'
+      const forgotten = parseChatId(chatId)?.kind === 'private' && getConfig().memory?.enabled && getConfig().memory?.instantCommands !== false && parseMemoryCommand(text)?.action === 'forget'
       const row = { t: timestamp, chatId, who, ...(uid ? { uid: String(uid) } : {}), text: redact(String(text).slice(0, 500)), ...(via ? { via } : {}), ...(proactive ? { proactive } : {}), ...(interaction?.length ? { interaction: [...new Set(interaction.map(String))] } : {}), ...(forgotten ? { forgottenAt: Date.now() } : {}) }
       appendFileSync(join(dir, `${day}.jsonl`), JSON.stringify(row) + '\n', 'utf8')
       chatLogRevision++
@@ -618,7 +890,10 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       } catch (error) { names.set(String(qq), `QQ 用户(${qq})`) }
     }
     if (disposed) return
-    const note = noticeText(ev, { botQQ: cfg.botQQ, name: (qq) => names.get(String(qq)) || String(qq), ownMessage: (id) => sentIds.has(String(id)), faceName: faces.nameOf })
+    if (ev.notice_type === 'group_recall' || ev.notice_type === 'friend_recall') {
+      evictMessageCaches(ev.group_id ? `qq:group:${ev.group_id}` : `qq:private:${ev.user_id || ''}`, ev.message_id)
+    }
+    const note = noticeText(ev, { botQQ: cfg.botQQ, name: (qq) => names.get(String(qq)) || String(qq), ownMessage: (id) => hasSentId(defaultPlatform(), id), faceName: faces.nameOf })
     if (!note) return
     logChat(note.chatId, '系统', `【系统】${note.text}`)
     noticesFor.set(note.chatId, [...(noticesFor.get(note.chatId) || []), note.text].slice(-8))
@@ -692,7 +967,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
           if (!raw) return raw
           let l
           try { l = JSON.parse(raw) } catch (error) { return raw }
-          const own = l.chatId === `private:${qq}` || (String(l.chatId).startsWith('group:') && String(l.uid || '') === String(qq))
+          const own = sameChat(l.chatId, String(qq)) || sameChat(l.chatId, `private:${qq}`) || (parseChatId(l.chatId)?.kind === 'group' && String(l.uid || '') === String(qq))
           if (!own || l.forgottenAt || (query && !matchesMemoryKeyword(l.text, query))) return raw
           l.forgottenAt = Date.now()
           changed = true
@@ -764,7 +1039,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       const t = cleanLegacyTitle(String(chat.title || '后台'), plat)
       return t.startsWith(systemPrefix) ? t : systemPrefix + t
     }
-    if (chat.kind === 'group') return `${label} 群 · ${groupNames.get(chat.groupId) || chat.groupId}`
+    if (chat.kind === 'group') return `${label} 群 · ${groupNames.get(chat.chatId) || groupNames.get(chat.groupId) || chat.groupId}`
     return isOwnerPrivateChat(ownerRef(), chat) ? `${label} · ${owner}私聊` : `${label} 私聊 · ${chat.nickname || chat.userId}`
   }
 
@@ -1231,11 +1506,12 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
           try {
             if (getConfig().chat?.replyMarker?.enabled === true) parts.push(markerInstruction())
             // 贴代码要加围栏：guard 对 ``` 整段豁免，模型得知道包起来才不会被当成超长思考。
-            if (getConfig().chat?.thinkingGuard?.enabled !== false) parts.push(codeFenceInstruction())
+            const canPoke = isDefaultInstanceChat(chat.chatId, chatPlatform(chat)) && gateway?.caps?.(chat.chatId)?.poke !== false
+            if (getConfig().chat?.thinkingGuard?.enabled !== false) parts.push(codeFenceInstruction({ poke: canPoke }))
           } catch (error) {}
           for (const p of contextProviders || []) {
             try {
-              const t = p({ chat, sessionId: sid })
+              const t = p({ chat, level, sessionId: sid })
               if (t) parts.push(t)
             } catch (error) {}
           }
@@ -1374,9 +1650,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
           inResponseTo: responseTo,
           timeoutMs,
         })
-        if (sent?.messageId) {
-          sentIds.add(String(sent.messageId))
-          if (sentIds.size > 500) sentIds.delete(sentIds.values().next().value)
+        if (sent?.messageId && !sent?.queued) {
+          addSentId(normSegId, sent.messageId)
+          rememberRecentMessage({ chatId: normSegId, messageId: sent.messageId, at: Date.now(), sender: { account: selfAccountFor(normSegId), isBot: true }, parts })
         }
         bump('sent')
         if (outputScope.getStore()?.chatId === chatId) outputScope.getStore().sent++
@@ -1398,8 +1674,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     try {
       const r = await onebot.call(action, params, timeoutMs ? { timeoutMs } : undefined)
       if (r && r.message_id !== undefined) {
-        sentIds.add(String(r.message_id))
-        if (sentIds.size > 500) sentIds.delete(sentIds.values().next().value)
+        addSentId(normSegId || chatId, r.message_id)
+        const { parts: sentParts } = segmentsToGatewayParts(message)
+        rememberRecentMessage({ chatId: normSegId || chatId, messageId: r.message_id, at: Date.now(), sender: { account: selfAccountFor(normSegId || chatId), isBot: true }, parts: sentParts })
       }
       bump('sent')
       if (outputScope.getStore()?.chatId === chatId) outputScope.getStore().sent++
@@ -1534,35 +1811,6 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     return { parts, replyTo }
   }
 
-  function partsToSegmentsFallback(parts = []) {
-    const out = []
-    for (const p of parts) {
-      if (!p || typeof p !== 'object') continue
-      if (p.type === 'text') {
-        if (p.text) out.push({ type: 'text', data: { text: String(p.text) } })
-      } else if (p.type === 'mention') {
-        const qq = p.all ? 'all' : String(p.userId || '')
-        if (qq) out.push({ type: 'at', data: { qq } })
-      } else if (p.type === 'face') {
-        if (p.id != null) out.push({ type: 'face', data: { id: String(p.id) } })
-      } else if (p.type === 'reply') {
-        if (p.messageId != null) out.push({ type: 'reply', data: { id: String(p.messageId) } })
-      } else if (p.type === 'image' || p.type === 'voice' || p.type === 'video' || p.type === 'file') {
-        const file = p.url
-          ? String(p.url)
-          : p.file
-            ? (isAbsolute(String(p.file)) ? pathToFileURL(String(p.file)).href : String(p.file))
-            : p.base64
-              ? `base64://${p.base64}`
-              : ''
-        if (!file) continue
-        const segType = p.type === 'voice' ? 'record' : p.type
-        out.push({ type: segType, data: p.type === 'file' && p.name ? { file, name: String(p.name) } : { file } })
-      }
-    }
-    return out
-  }
-
   /**
    * 统一多平台出站发送：接收平台无关的 Part[]，经清洗与门闸后经 gateway.send（无网关时对默认平台退回 sendSegments）。
    */
@@ -1596,7 +1844,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const defaultPlatform = parseChatId('private:0')?.platform
     const useGateway = Boolean(gateway && (addr.platform !== defaultPlatform || gateway.caps?.(normId) !== null || !onebot))
     if (!useGateway) {
-      const segs = partsToSegmentsFallback(cleaned)
+      const segs = partsToSegmentsFallback(cleaned, { faceIdOf: faces?.idOf })
       if (!segs.length) return settleOutboundFailed(verdict)
       const head = replyTo ?? replyId ? [{ type: 'reply', data: { id: String(replyTo ?? replyId) } }] : []
       const r = await sendSegments(chatId, [...head, ...segs], note, { ...opts, force, isCurrent, throwOnError, timeoutMs, quiet, queueKind, queueTtlMs, sensitive, outboundVerdict: verdict })
@@ -1605,7 +1853,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const cfg = getConfig()
     const cap = captureStore.getStore()
     if (cap) {
-      cap.push({ chatId: normId, note, parts: cleaned, message: partsToSegmentsFallback(cleaned) })
+      cap.push({ chatId: normId, note, parts: cleaned, message: partsToSegmentsFallback(cleaned, { faceIdOf: faces?.idOf }) })
       if (outputScope.getStore()?.chatId === chatId || outputScope.getStore()?.chatId === normId) outputScope.getStore().sent++
       settleOutbound(verdict, 'sent')
       return { messageId: 'sim-' + cap.length, message_id: 'sim-' + cap.length }
@@ -1631,9 +1879,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         sensitive: Boolean(sensitive),
         timeoutMs,
       })
-      if (sent?.messageId) {
-        sentIds.add(String(sent.messageId))
-        if (sentIds.size > 500) sentIds.delete(sentIds.values().next().value)
+      if (sent?.messageId && !sent?.queued) {
+        addSentId(normId, sent.messageId)
+        rememberRecentMessage({ chatId: normId, messageId: sent.messageId, at: Date.now(), sender: { account: selfAccountFor(normId), isBot: true }, parts: cleaned })
       }
       bump('sent')
       if (outputScope.getStore()?.chatId === chatId || outputScope.getStore()?.chatId === normId) outputScope.getStore().sent++
@@ -1682,8 +1930,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (!text.trim()) return settleOutboundFailed(verdict)
     // 文字里的 <face:名字> 换成 QQ 系统表情，和文字在同一条消息里；系统表情关着就去掉标签
     let segs = getConfig().stickers.faces ? textToSegments(text, faces.idOf) : [{ type: 'text', data: { text: stripFaceTags(text) } }]
-    // 群里的 @名字 / <at:QQ号> 换成真 @（对方会收到提醒）
-    if (chatId.startsWith('group:') && hasMention(text)) segs = expandMentions(segs, await membersOf(chatId.slice(6)), missed)
+    // 群里的 @名字 / <at:账号> 换成真 @（对方会收到提醒）
+    if (parseChatId(chatId)?.kind === 'group' && hasMention(text)) segs = expandMentions(segs, await membersOf(chatId), missed)
     if (!segs.length || (segs.length === 1 && segs[0].type === 'text' && !segs[0].data.text.trim())) return settleOutboundFailed(verdict)
     // 真正出去的是 sendSegments：把 verdict 交下去让它按真实结果结算（sent / failed / uncertain）
     return sendSegments(chatId, [...quote(replyId), ...mention(userId, segs), ...segs], (replyId ? '[引用] ' : '') + text.slice(0, 60), verdict ? { ...opts, outboundVerdict: verdict } : opts)
@@ -1750,9 +1998,18 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
    */
   async function pokeBack(chatId) {
     const cfg = getConfig()
-    const group = chatId.startsWith('group:') ? chatId.slice(6) : ''
-    const target = group ? lastPoker.get(chatId) || lastSpeaker.get(chatId) : chatId.slice(8)
-    if (!target) return
+    const norm = normalizeChatId(chatId) || String(chatId || '')
+    const addr = parseChatId(norm)
+    if (!addr || !isDefaultInstanceChat(norm)) return
+    const caps = gateway?.caps?.(norm)
+    if (caps && caps.poke === false) return
+    if (typeof onebot?.call !== 'function') return
+    const group = addr.kind === 'group' ? addr.id : ''
+    const legacyKey = group ? `group:${group}` : ''
+    const target = group
+      ? (lastPoker.get(chatId) || lastPoker.get(norm) || lastPoker.get(legacyKey) || lastSpeaker.get(chatId) || lastSpeaker.get(norm) || lastSpeaker.get(legacyKey))
+      : addr.id
+    if (!target || !/^\d+$/.test(String(target)) || (group && !/^\d+$/.test(group))) return
     if (!cfg.enabled || cfg.dryRun) return log.info(`试运行（没真戳）→ ${chatId}：戳了戳 ${target}`)
     try {
       await onebot.call('send_poke', { user_id: Number(target), ...(group ? { group_id: Number(group) } : {}) }, { timeoutMs: 10000 })
@@ -1813,11 +2070,13 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     return { src, external, size, maxBytes }
   }
 
-  /** 把一个文件当文件发到 QQ（OneBot upload_private_file / upload_group_file）。file 可以是本机绝对路径、网址或 base64://。 */
+  /** 发送文件：走网关统一 file Part（多平台）或默认协议原生上传。file 可以是本机绝对路径、网址或 base64://。 */
   async function sendFile(chatId, file, name) {
     if (disposed) return null
     const cfg = getConfig()
-    const tgt = targetOf(chatId)
+    const normId = normalizeChatId(chatId) || String(chatId || '')
+    const addr = parseChatId(normId)
+    const tgt = addr && (addr.kind === 'private' || addr.kind === 'group') ? { kind: addr.kind, id: addr.id } : null
     if (!tgt) return null
     if (!cfg.files?.enabled) throw new Error('发文件没打开（面板「聊天」页 → 发文件），打开后才能发')
     const { src, external, size, maxBytes } = checkSendableFile(cfg, file)
@@ -1831,6 +2090,26 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     }
     if (!cfg.enabled) { log.info(`总开关关着，没发 → ${chatId}：[文件] ${label}`); return null }
     if (cfg.dryRun) { log.info(`试运行（没真发）→ ${chatId}：[文件] ${label}`); return null }
+    const isDefInst = isDefaultInstanceChat(normId)
+    const useGateway = Boolean(gateway && (!isDefInst || gateway.caps?.(normId) !== null || !onebot))
+    if (useGateway) {
+      const caps = gateway.caps?.(normId)
+      if (caps && caps.file === false) {
+        throw new Error(`当前平台实例（${addr.platform}）不支持发送文件`)
+      }
+      let media
+      if (src.startsWith('base64://')) {
+        media = { bytes: Buffer.from(src.slice(9), 'base64'), name: label }
+      } else if (/^https?:\/\//i.test(src)) {
+        media = { url: src, name: label }
+      } else {
+        media = { path: src, name: label }
+      }
+      return await sendParts(normId, [{ type: 'file', media }], `[文件] ${label}`, { timeoutMs: FILE_TIMEOUT_MS, throwOnError: true })
+    }
+    if (!isDefInst || !/^\d+$/.test(tgt.id) || typeof onebot?.call !== 'function') {
+      throw new Error(`当前会话（${normId}）没有可用的文件发送通道`)
+    }
     const action = tgt.kind === 'group' ? 'upload_group_file' : 'upload_private_file'
     const params = tgt.kind === 'group'
       ? { group_id: Number(tgt.id), file: src, name: label }
@@ -1867,7 +2146,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     }
   }
 
-  async function sendSticker(chatId, query, replyId, userId) {
+  async function sendSticker(chatId, query, replyId, userId, opts = {}) {
     // 面板里把表情包关了：回复里的 <sticker:…>、工具、扩展模块要发的一律不发（#31）
     if (!getConfig().stickers.enabled) {
       log.debug(`表情包关着，「${typeof query === 'object' ? query?.name || '' : query}」不发`)
@@ -1878,12 +2157,41 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       log.debug(`没找到「${query}」这张表情，跳过`)
       return false
     }
-    const seg = stickers.segmentFor(item)
-    if (!seg) return false
-    await sendSegments(chatId, [...quote(replyId), ...mention(userId), seg], `[表情] ${item.name || item.md5.slice(0, 8)}`)
-    stickers.markUsed?.(item.md5)
-    bump('stickers')
-    return true
+    let part = typeof stickers.partFor === 'function' ? stickers.partFor(item) : null
+    if (!part && typeof stickers.segmentFor === 'function') {
+      const seg = stickers.segmentFor(item)
+      if (seg) {
+        const m = mediaFromSeg(seg.data || {})
+        part = {
+          type: 'sticker',
+          ...(Object.keys(m).length ? { media: m } : {}),
+          ...(seg.data?.summary ? { label: String(seg.data.summary) } : {}),
+          native: seg,
+        }
+      }
+    }
+    if (!part) return false
+    const parts = [
+      ...(userId ? [{ type: 'mention', account: String(userId) }] : []),
+      part,
+    ]
+    try {
+      const r = await sendParts(chatId, parts, {
+        replyTo: replyId,
+        replyId,
+        note: `[表情] ${item.name || item.md5.slice(0, 8)}`,
+        throwOnError: Boolean(opts.throwOnError),
+        quiet: Boolean(opts.quiet),
+      })
+      if (!r || (Array.isArray(r.degraded) && r.degraded.includes('sticker dropped'))) return false
+      stickers.markUsed?.(item.md5)
+      bump('stickers')
+      return true
+    } catch (error) {
+      if (opts.throwOnError) throw error
+      if (!opts.quiet) failStore.getStore()?.push(error?.message || String(error))
+      return false
+    }
   }
 
   /** 她回复里写的本机图片：主人私聊之外只认工作区、允许目录和插件数据目录，防止被人诱导发出电脑上的图。 */
@@ -1939,8 +2247,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
 
   function silenceTurn(chatId) {
     log.info(`${chatId}：她选择不说话`)
-    if (chatId.startsWith('group:')) {
-      const gid = chatId.slice(6)
+    const addr = parseChatId(chatId)
+    if (addr?.kind === 'group') {
+      const gid = addr.id
       groupEngaged.delete(gid)
       groupEngagedRun.delete(gid)
       groupInterjects.set(gid, [...(groupInterjects.get(gid) || []), Date.now()].slice(-60))
@@ -2070,7 +2379,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       const all = texts.map((t) => t.value).join('，')
       if (all.length <= cfg.voice.autoMaxChars && Math.random() < cfg.voice.autoChance * mood().voice) items = [{ kind: 'voice', value: all }]
     }
-    const inGroup = chatId.startsWith('group:')
+    const chatAddr = parseChatId(chatId)
+    const inGroup = chatAddr?.kind === 'group'
+    const chatGid = chatAddr?.id || ''
     // 群里别刷屏：一段最多 3 条
     if (inGroup && items.length > 3) items = items.slice(0, 3)
     // 按概率补一张表情（群里已经有两条以上就不补了）
@@ -2096,7 +2407,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (!items.length) return silenceTurn(chatId)
     // 一段只有一个人明确 @ / 引用她时，第一条回复引用并 @ 那个人；多人同时叫她不猜。
     // 模型明确选了引用编号时尊重它，不再自动引用另一条。
-    const refs = inGroup ? groupRefs.get(chatId.slice(6)) || {} : {}
+    const refs = inGroup ? groupRefs.get(chatGid) || {} : {}
     const explicit = items.some((item) => item.replyTo)
     const firstSendable = items.findIndex((item) => item.kind === 'text' || item.kind === 'voice' || item.kind === 'image' || (item.kind === 'sticker' && cfg.stickers.enabled && Boolean(item.value && typeof item.value === 'object' ? item.value : stickers.match(item.value))))
     const missedAt = [] // 写了 @ 却没对上群里人的名字
@@ -2138,7 +2449,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     // 一条都没发出去：不记流水，她没说出口的话不能算说过
     if (failures.length && failures.length >= items.filter((i) => i.kind !== 'poke').length) return { missedAt, failed: failures.length, errors: failures, sent: sentTexts.join(' ') }
     if (inGroup) {
-      const gid = chatId.slice(6)
+      const gid = chatGid
       const said = (groupSaid.get(gid) || []).filter((t) => Date.now() - t < 3600_000)
       said.push(Date.now())
       groupSaid.set(gid, said)
@@ -2153,7 +2464,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     // 只记实际发出去的文本（sentTexts），且试运行（dryRun）没真发也不记——她没说出口的话不能算说过（#211 review）。
     if (!opts.own && sentTexts.length && !cfg.dryRun) saidElsewhere.set(chatId, [...(saidElsewhere.get(chatId) || []), { at: Date.now(), text: sentTexts.join(' ').slice(0, 300) }].slice(-5))
     lastChatAt = Date.now()
-    if (chatId.startsWith('private:')) lastPrivateAt.set(chatId.slice(8), Date.now())
+    if (parseChatId(chatId)?.kind === 'private') touchPrivateAt(chatId, lastChatAt)
     if (isOwnerPrivateChat(ownerRef(), chatId)) lastBotToOwner = { at: Date.now(), text: items.filter((i) => i.kind === 'text' || i.kind === 'voice').map((i) => i.value).join('\n') }
     onActivity?.({ kind: 'out', chatId, reply: text, userText: opts.userText || '' })
     return { missedAt, failed: failures.length, errors: failures, sent: sentTexts.join(' ') }
@@ -2387,13 +2698,68 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
 
   // ---------- 收 QQ ----------
   async function groupName(gid) {
-    if (groupNames.has(gid)) return groupNames.get(gid)
+    const raw = String(gid ?? '').trim()
+    if (!raw) return ''
+    if (groupNames.has(raw)) return groupNames.get(raw)
+    const parsed = raw.includes(':') ? parseChatId(raw) : null
+    const norm = parsed ? (normalizeChatId(raw) || raw) : (normalizeChatId(`group:${raw}`) || '')
+    if (norm && groupNames.has(norm)) return groupNames.get(norm)
+    const defPlat = defaultPlatform()
+    if (parsed && groupNames.has(parsed.id) && isDefaultInstanceChat(norm || raw, parsed.platform)) {
+      return groupNames.get(parsed.id)
+    }
+    const qid = parsed ? parsed.id : raw
+    const isDefInst = parsed ? isDefaultInstanceChat(norm || raw, parsed.platform) : true
+    const useGw = Boolean(gateway && typeof gateway.fetch === 'function' && (!isDefInst || (norm && gateway.caps?.(norm) !== null) || !onebot))
+    if (useGw) {
+      const inst = parsed?.instance || defPlat
+      const instPlat = parsed?.platform || defPlat
+      const last = chatsFetchedAt.get(inst) || 0
+      if (!last || Date.now() - last >= GROUP_NAMES_TTL_MS) {
+        chatsFetchedAt.set(inst, Date.now())
+        try {
+          const groups = await chatGroups(norm || inst)
+          for (const g of groups) {
+            const gId = String(g?.group_id ?? g?.id ?? '').trim()
+            const gName = String(g?.group_name ?? g?.name ?? '').trim()
+            if (!gId || !gName) continue
+            const gNorm = formatChatId({ instance: inst, platform: instPlat, kind: 'group', id: gId }) || `${inst}:group:${gId}`
+            groupNames.set(gNorm, gName)
+            if (isDefaultInstanceChat(gNorm, instPlat)) groupNames.set(gId, gName)
+          }
+        } catch {}
+      }
+      const hit = (norm && groupNames.get(norm)) || groupNames.get(raw)
+      if (hit) return hit
+      const ga = typeof gateway?.groupAdmin === 'function' ? gateway.groupAdmin(norm || inst) : null
+      const infoKey = norm || `${inst}:group:${qid}`
+      const lastInfo = groupInfoFetchedAt.get(infoKey) || 0
+      if (ga && typeof ga.getGroupInfo === 'function' && (!lastInfo || Date.now() - lastInfo >= GROUP_NAMES_TTL_MS)) {
+        groupInfoFetchedAt.set(infoKey, Date.now())
+        try {
+          const info = await ga.getGroupInfo(qid)
+          const gName = String(info?.name || '').trim()
+          if (gName) {
+            groupNames.set(infoKey, gName)
+            if (isDefaultInstanceChat(infoKey, instPlat)) groupNames.set(qid, gName)
+            return gName
+          }
+        } catch {}
+      }
+      return (norm && groupNames.get(norm)) || groupNames.get(raw) || (parsed?.platform === defPlat ? parsed.id : raw)
+    }
+    if (!/^\d+$/.test(qid) || !onebot || !isDefInst) {
+      return parsed?.platform === defPlat ? parsed.id : (qid || raw)
+    }
     try {
       // 查群名是锦上添花：失败就退回群号，别在网关抖动时白等重试
-      const info = await onebot.call('get_group_info', { group_id: Number(gid) }, { retries: 0 })
-      if (info?.group_name) groupNames.set(gid, info.group_name)
+      const info = await onebot.call('get_group_info', { group_id: Number(qid) }, { retries: 0 })
+      if (info?.group_name) {
+        groupNames.set(qid, info.group_name)
+        if (norm) groupNames.set(norm, info.group_name)
+      }
     } catch (error) {}
-    return groupNames.get(gid) || gid
+    return groupNames.get(qid) || (norm && groupNames.get(norm)) || groupNames.get(raw) || raw
   }
 
   // ---------- 引用消息 ----------
@@ -2408,11 +2774,62 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   }
   const quoteNeedsHistory = (parsed) => [...(parsed.images || []), ...(parsed.stickers || [])].some((seg) => !quoteSegUsable(seg))
   /**
+   * 网关归一化引用消息里若缺可直接下载的媒体 URL（如 QQ get_msg 只给了裸文件名），
+   * 且当前实例开启了 message.history.read 时，尝试从历史记录页补全。
+   * 对已有媒体下载能力且原生仅带 id+messageId（如飞书）的平台不额外发历史请求。
+   */
+  const fetchedQuoteNeedsHistory = (fetched, feats, isDefaultPlat) => {
+    if (!feats?.['message.history.read']) return false
+    const parts = Array.isArray(fetched?.parts) ? fetched.parts : []
+    return parts.some((p) => {
+      if (!p || (p.type !== 'image' && p.type !== 'sticker')) return false
+      const m = p.media || {}
+      if (m.url || m.bytes || m.path) return false
+      return Boolean(isDefaultPlat || !feats?.['media.fetch'] || !m.id)
+    })
+  }
+  const hasUsableMedia = (fetched) => (Array.isArray(fetched?.parts) ? fetched.parts : [])
+    .some((p) => (p?.type === 'image' || p?.type === 'sticker') && Boolean(p.media?.url || p.media?.bytes || p.media?.path))
+
+  /** 从网关归一化历史分页（FetchedHistoryPage）中按 messageId 捞回目标消息。 */
+  async function quoteFromGatewayHistory(id, normChatId) {
+    const addr = normChatId ? parseChatId(normChatId) : null
+    if (!addr || (addr.kind !== 'group' && addr.kind !== 'private') || !addr.id) return null
+    if (!gateway || typeof gateway.fetch !== 'function' || !gateway.features?.(normChatId)?.['message.history.read']) return null
+    let before
+    for (let pageNo = 0; pageNo < 2; pageNo++) {
+      try {
+        const page = await gateway.fetch(normChatId, {
+          kind: 'history',
+          chat: { kind: addr.kind, id: addr.id },
+          count: 30,
+          ...(before ? { before } : {}),
+        })
+        const msgs = Array.isArray(page?.messages) ? page.messages : []
+        const hit = msgs.find((m) => String(m?.messageId ?? '') === id)
+        if (hit) return hit
+        if (!page?.hasMore || !page?.before || page.before === before) break
+        before = String(page.before)
+      } catch (error) {
+        log.debug(`引用消息网关历史也拉不到（${id}）：`, error?.message || error)
+        break
+      }
+    }
+    return null
+  }
+
+  /**
    * get_msg 对「她发出的表情包/图片」可能只回空 url + 裸文件名（下载不了）。
-   * 这时退回消息历史（get_friend_msg_history / get_group_msg_history），里面带可用 url。
+   * 这时退回消息历史（网关侧 FetchedHistoryPage 或传统 OneBot），里面带可用 url。
    */
   async function quoteFromHistory(id, ctx) {
-    if (!ctx || (!ctx.userId && !ctx.groupId)) return null
+    if (!ctx) return null
+    const rawChatId = ctx.chatId || (ctx.groupId ? `group:${ctx.groupId}` : ctx.userId ? `private:${ctx.userId}` : '')
+    const normChatId = rawChatId ? (normalizeChatId(rawChatId) || String(rawChatId)) : ''
+    const addr = normChatId ? parseChatId(normChatId) : null
+    const useGw = Boolean(gateway && normChatId && (addr?.platform !== defaultPlatform() || gateway.caps?.(normChatId) !== null || !onebot))
+    if (useGw) return quoteFromGatewayHistory(id, normChatId)
+    if ((!ctx.userId && !ctx.groupId) || typeof onebot?.call !== 'function') return null
     const group = Boolean(ctx.groupId)
     const action = group ? 'get_group_msg_history' : 'get_friend_msg_history'
     const base = group ? { group_id: Number(ctx.groupId) } : { user_id: Number(ctx.userId) }
@@ -2432,20 +2849,179 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     }
     return null
   }
+  const NEG_TTL_LONG_MS = 8 * 60_000
+  const NEG_TTL_SHORT_MS = 20_000
+  function classifyQuoteError(error) {
+    const code = String(error?.code || '')
+    const msg = String(error?.message || '')
+    if (code === 'deleted' || /recalled|deleted|已撤回/i.test(msg)) return 'deleted'
+    if (code === '230027' || code === '403' || code === '404' || code === 'message-not-found' || /\b(?:403|404|230027)\b|permission|denied|unauthorized|forbidden|not found/i.test(msg)) {
+      return 'permission'
+    }
+    return 'network'
+  }
+  async function buildQuotedFromFetched(fetched, normChatId, selfAcc) {
+    const sender = fetched?.sender
+    const idType = sender?.idType
+    const canCompareAccount = !idType || idType === 'open_id'
+    const uid = String(sender?.account ?? '')
+    const time = Number(fetched?.at) || 0
+    if (time && !historyVisible(normChatId, uid, time)) return 'hidden'
+    if (fetched?.deleted === true) {
+      evictMessageCaches(normChatId, fetched.messageId)
+      return {
+        ok: false, deleted: true, failKind: 'deleted',
+        expiresAt: Date.now() + NEG_TTL_LONG_MS,
+        who: '', uid, text: '', images: [], stickers: [], records: 0,
+        isBot: false, at: Date.now(), chatId: normChatId, time,
+      }
+    }
+    const parts = Array.isArray(fetched?.parts) ? fetched.parts : []
+    const images = []
+    const stickers = []
+    const forwards = []
+    let records = 0
+    const msgId = String(fetched?.messageId || '')
+    for (const p of parts) {
+      if (!p || typeof p !== 'object') continue
+      if (p.type === 'image') {
+        images.push({ type: 'image', data: { url: p.media?.url, file: p.media?.id || p.media?.url || '', mediaId: p.media?.id, mime: p.media?.mime, messageId: p.media?.messageId || msgId } })
+      } else if (p.type === 'sticker') {
+        stickers.push({ type: 'image', data: { sub_type: 1, summary: p.label, url: p.media?.url, file: p.media?.id || p.media?.url || '', mediaId: p.media?.id, mime: p.media?.mime, messageId: p.media?.messageId || msgId } })
+      } else if (p.type === 'voice') {
+        records++
+      } else if (p.type === 'forward' && p.id) {
+        forwards.push(p.id)
+      }
+    }
+    let text = String(renderParts(parts).text || '').trim().slice(0, 300)
+    if (forwards.length && getConfig().forward?.expandEarly) {
+      const tmp = { chatId: normChatId, forwards, images, stickers }
+      const full = await expandForwards(tmp, text, { timeoutMs: 5000 })
+      if (full) text = full.trim().slice(0, QUOTE_FORWARD_MAX_CHARS)
+    }
+    const isBot = Boolean(sender?.isBot === true || (canCompareAccount && selfAcc && uid && uid === selfAcc))
+    const who = String(sender?.name || uid || (isBot ? '你' : '某人'))
+    return {
+      ok: true,
+      who,
+      uid,
+      text,
+      images: images.slice(0, 4),
+      stickers: stickers.slice(0, 4),
+      records,
+      isBot,
+      at: Date.now(),
+      chatId: normChatId,
+      time,
+    }
+  }
   async function quotedInfo(replyId, ctx = null) {
-    const id = String(replyId || '')
+    const id = String(replyId || '').trim()
     if (!id) return null
-    const chatId = ctx?.chatId || (ctx?.groupId ? `group:${ctx.groupId}` : ctx?.userId ? `private:${ctx.userId}` : '')
-    const key = `${chatId}|${id}`
+    const rawChatId = ctx?.chatId || (ctx?.groupId ? `group:${ctx.groupId}` : ctx?.userId ? `private:${ctx.userId}` : '')
+    const normChatId = rawChatId ? (normalizeChatId(rawChatId) || String(rawChatId)) : ''
+    const key = `${normChatId}|${id}`
     if (quoteCache.has(key)) {
       const cached = quoteCache.get(key)
-      if (!historyVisible(chatId, cached.uid, cached.time)) return null
-      cached.at = Date.now()
-      quoteCache.delete(key)
-      quoteCache.set(key, cached)
-      return cached
+      if (!historyVisible(normChatId, cached.uid, cached.time)) {
+        quoteCache.delete(key)
+        return null
+      }
+      if (!cached.ok && cached.expiresAt && Date.now() >= cached.expiresAt) {
+        quoteCache.delete(key)
+      } else {
+        cached.at = Date.now()
+        quoteCache.delete(key)
+        quoteCache.set(key, cached)
+        return cached
+      }
     }
-    const out = { ok: false, who: '', uid: '', text: '', images: [], stickers: [], records: 0, isBot: false, at: 0, chatId, time: 0 }
+    const addr = normChatId ? parseChatId(normChatId) : null
+    const selfAcc = selfAccountFor(normChatId)
+    const useGatewayQuote = Boolean(gateway && (addr?.platform !== defaultPlatform() || gateway.caps?.(normChatId) !== null || !onebot))
+    const saveCache = (entry) => {
+      if (!entry || entry === 'hidden') return null
+      if (entry.uid && entry.time && !historyVisible(normChatId, entry.uid, entry.time)) {
+        quoteCache.delete(key)
+        return null
+      }
+      if (quoteCache.size >= QUOTE_CACHE_MAX) quoteCache.delete(quoteCache.keys().next().value)
+      quoteCache.set(key, entry)
+      return entry
+    }
+
+    if (useGatewayQuote) {
+      const feats = gateway.features?.(normChatId) || {}
+      if (feats['message.quote.read']) {
+        try {
+          let fetched = await gateway.fetch(normChatId, { kind: 'message', messageId: id })
+          if (fetchedQuoteNeedsHistory(fetched, feats, addr?.platform === defaultPlatform())) {
+            const fromHist = await quoteFromGatewayHistory(id, normChatId)
+            if (fromHist && hasUsableMedia(fromHist)) fetched = fromHist
+          }
+          const built = await buildQuotedFromFetched(fetched, normChatId, selfAcc)
+          return saveCache(built)
+        } catch (error) {
+          const failKind = classifyQuoteError(error)
+          log.debug(`引用消息没拉到（${id}）：`, error.message)
+          if (failKind !== 'deleted') {
+            const recent = lookupRecentMessage(normChatId, id)
+            if (recent) {
+              const built = await buildQuotedFromFetched(recent, normChatId, selfAcc)
+              if (built && built !== 'hidden') return saveCache(built)
+            }
+            if (failKind !== 'permission' && feats['message.history.read']) {
+              const fromHist = await quoteFromGatewayHistory(id, normChatId)
+              if (fromHist) {
+                const built = await buildQuotedFromFetched(fromHist, normChatId, selfAcc)
+                if (built && built !== 'hidden') return saveCache(built)
+              }
+            }
+          }
+          const ttl = failKind === 'network' ? NEG_TTL_SHORT_MS : NEG_TTL_LONG_MS
+          return saveCache({
+            ok: false, deleted: failKind === 'deleted', failKind,
+            expiresAt: Date.now() + ttl,
+            who: '', uid: '', text: '', images: [], stickers: [], records: 0,
+            isBot: false, at: Date.now(), chatId: normChatId, time: 0,
+          })
+        }
+      }
+      const recent = lookupRecentMessage(normChatId, id)
+      if (recent) {
+        const built = await buildQuotedFromFetched(recent, normChatId, selfAcc)
+        if (built && built !== 'hidden') return saveCache(built)
+      }
+      if (feats['message.history.read']) {
+        const fromHist = await quoteFromGatewayHistory(id, normChatId)
+        if (fromHist) {
+          const built = await buildQuotedFromFetched(fromHist, normChatId, selfAcc)
+          if (built && built !== 'hidden') return saveCache(built)
+        }
+      }
+      const instCfg = getConfig()?.platforms?.[addr?.instance || defaultPlatform()]?.caps
+      // quoteReply 控制出站是否引用回复，不应连带禁用入站读取被引用消息；这里只看 message.quote.read
+      const quoteDisabledByCfg = instCfg?.features?.['message.quote.read'] === false
+      if (quoteDisabledByCfg || addr?.platform !== defaultPlatform() || !onebot?.call) {
+        return saveCache({
+          ok: false, failKind: quoteDisabledByCfg ? 'permission' : 'unsupported',
+          expiresAt: Date.now() + NEG_TTL_SHORT_MS,
+          who: '', uid: '', text: '', images: [], stickers: [], records: 0,
+          isBot: false, at: Date.now(), chatId: normChatId, time: 0,
+        })
+      }
+    }
+
+    if (!onebot?.call) {
+      return saveCache({
+        ok: false, failKind: 'unsupported',
+        expiresAt: Date.now() + NEG_TTL_SHORT_MS,
+        who: '', uid: '', text: '', images: [], stickers: [], records: 0,
+        isBot: false, at: Date.now(), chatId: normChatId, time: 0,
+      })
+    }
+    const out = { ok: false, who: '', uid: '', text: '', images: [], stickers: [], records: 0, isBot: false, at: 0, chatId: normChatId, time: 0 }
     try {
       const m = await onebot.call('get_msg', { message_id: Number(id) || id }, { timeoutMs: 5000, retries: 0 })
       // 被引用那条消息的发生时间（QQ 给的是秒）。引用里要标出来，否则模型拿「今晚/昨天」
@@ -2453,15 +3029,15 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       out.time = Number(m?.time) || 0
       const sender = m?.sender || {}
       out.uid = String(sender.user_id ?? m?.user_id ?? '')
-      if (out.time && !historyVisible(chatId, out.uid, out.time)) return null
+      if (out.time && !historyVisible(normChatId, out.uid, out.time)) return null
       out.who = String(sender.card || sender.nickname || out.uid || '某人')
       const kind = ctx?.groupId ? 'group' : 'private'
-      let parsed = parseMessageEvent({ message_type: kind, group_id: ctx?.groupId, user_id: out.uid, sender, message: m?.message ?? m?.raw_message ?? '' }, selfId, { faceName: faces.nameOf })
+      let parsed = parseMessageEvent({ message_type: kind, group_id: ctx?.groupId, user_id: out.uid, sender, message: m?.message ?? m?.raw_message ?? '' }, selfAcc, { faceName: faces.nameOf })
       if (quoteNeedsHistory(parsed)) {
         const hit = await quoteFromHistory(id, ctx)
         if (hit) {
           out.time ||= Number(hit?.time) || 0
-          const again = parseMessageEvent({ message_type: kind, group_id: ctx?.groupId, user_id: out.uid, sender: hit.sender || sender, message: hit.message ?? '' }, selfId, { faceName: faces.nameOf })
+          const again = parseMessageEvent({ message_type: kind, group_id: ctx?.groupId, user_id: out.uid, sender: hit.sender || sender, message: hit.message ?? '' }, selfAcc, { faceName: faces.nameOf })
           if (!quoteNeedsHistory(again)) parsed = again
           else { parsed.images = [...(parsed.images || []), ...(again.images || [])]; parsed.stickers = [...(parsed.stickers || []), ...(again.stickers || [])] }
         }
@@ -2473,22 +3049,28 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       // 引用的是一条合并转发：把里面的内容也拉出来。默认跟 forward.expandEarly 一起开——
       // 她引用别人消息时能看到正文，但被引用消息里套的转发只是占位符，等于没看到。
       if (parsed.forwards?.length && getConfig().forward?.expandEarly) {
-        const tmp = { forwards: parsed.forwards, images: [], stickers: [] }
+        const tmp = { chatId: normChatId, forwards: parsed.forwards, images: [], stickers: [] }
         const full = await expandForwards(tmp, String(parsed.text || ''), { timeoutMs: 5000 })
         if (full) out.text = full.trim().slice(0, QUOTE_FORWARD_MAX_CHARS)
         out.images = [...(out.images || []), ...tmp.images].slice(0, 4)
         out.stickers = [...(out.stickers || []), ...tmp.stickers].slice(0, 4)
       }
-      out.isBot = out.uid === String(selfId || getConfig().botQQ)
+      out.isBot = Boolean(out.uid && selfAcc && out.uid === selfAcc)
       out.ok = true
       out.at = Date.now()
     } catch (error) {
       log.debug(`引用消息没拉到（${id}）：`, error.message)
+      const recent = lookupRecentMessage(normChatId, id)
+      if (recent) {
+        const built = await buildQuotedFromFetched(recent, normChatId, selfAcc)
+        if (built && built !== 'hidden') return saveCache(built)
+      }
+      out.failKind = classifyQuoteError(error)
+      out.deleted = out.failKind === 'deleted'
+      out.expiresAt = Date.now() + (out.failKind === 'network' ? NEG_TTL_SHORT_MS : NEG_TTL_LONG_MS)
     }
-    if (!historyVisible(chatId, out.uid, out.time)) return null
-    if (quoteCache.size >= QUOTE_CACHE_MAX) quoteCache.delete(quoteCache.keys().next().value)
-    quoteCache.set(key, out)
-    return out
+    if (!historyVisible(normChatId, out.uid, out.time)) return null
+    return saveCache(out)
   }
 
   const quoteWho = (q) => (q.isBot ? '你' : `${q.who || q.uid || '某人'}${q.uid ? `(${q.uid})` : ''}`)
@@ -2513,6 +3095,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   /** 引用说明：群聊接在某条消息后面，私聊单独一行。失败时明说没读到，让她可以如实讲。 */
   const quoteInline = (q) => {
     if (!q) return ''
+    if (q.deleted) return '（引用的消息已撤回）'
+    if (!q.ok && q.failKind === 'permission') return '（引用了某条消息，但缺少读取权限或消息不可访问，内容没读到）'
     if (!q.ok) return '（引用了某条消息，但内容没读到；如果影响理解，可以如实说没看到，让对方重发或说一下是哪条）'
     const pics = q.images.length && q.stickers.length
       ? `，另有 ${q.images.length} 张图、${q.stickers.length} 个表情包`
@@ -2527,8 +3111,39 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (!q?.ok || take <= 0) return []
     const segs = [...q.images, ...q.stickers].slice(0, take)
     if (!segs.length) return []
-    const got = await imagesOf({ stickers: [], images: segs })
+    const addr = q.chatId ? parseChatId(q.chatId) : null
+    const got = await imagesOf({ chatId: q.chatId, platform: addr?.platform || defaultPlatform(), stickers: [], images: segs })
     return got.map((x, i) => ({ type: 'image', data: x.data, mediaType: x.mediaType, name: `quote-${q.uid || 'x'}-${i + 1}` }))
+  }
+
+  /** 多平台/传统 OneBot 统一取媒体字节：优先内联 base64，网关会话走 gatewayMediaBytes，纯 URL 走安全 fetchImage，无网关或 G3 回退直连 onebot 允许本机路径。 */
+  async function mediaBytesForSegment(chatId, seg, { maxBytes = MAX_IMAGE_BYTES, timeoutMs = 20000, allowLocal } = {}) {
+    const d = seg?.data || {}
+    const limit = Math.min(Math.max(1, Number(maxBytes) || MAX_IMAGE_BYTES), MAX_IMAGE_BYTES)
+    if (typeof d.file === 'string' && d.file.startsWith('base64://')) {
+      const buf = Buffer.from(d.file.slice('base64://'.length), 'base64')
+      if (!buf.length) throw new Error('内联媒体为空')
+      if (buf.length > limit) throw new Error(`媒体太大（超过 ${Math.round(limit / 1048576)}MB）`)
+      return buf
+    }
+    const normCid = chatId ? (normalizeChatId(String(chatId)) || String(chatId)) : ''
+    const addr = normCid ? parseChatId(normCid) : null
+    const useGatewayRef = Boolean(gateway && normCid && (addr?.platform !== defaultPlatform() || gateway.caps?.(normCid) !== null || !onebot))
+    if (useGatewayRef && (d.mediaId || (d.file && !d.url))) {
+      try {
+        return await gatewayMediaBytes(normCid, d, d.messageId, { maxBytes: limit, timeoutMs })
+      } catch (error) {
+        if (!d.url) throw error
+        return fetchImage(d.url, { maxBytes: limit, allowLocal: false, timeoutMs })
+      }
+    }
+    if (useGatewayRef && d.url) {
+      return fetchImage(d.url, { maxBytes: limit, allowLocal: false, timeoutMs })
+    }
+    const legacyAllowLocal = allowLocal !== undefined
+      ? Boolean(allowLocal)
+      : (Boolean(addr) && (!gateway || gateway.caps?.(normCid) === null)) && Boolean(onebot)
+    return segmentBytes(seg, onebot, { maxBytes: limit, allowLocal: legacyAllowLocal, timeoutMs })
   }
 
   /** 生图复用收到的媒体段和引用缓存，不接受工具传来的路径、URL 或任意消息 ID。 */
@@ -2537,28 +3152,66 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     let seg
     if (source === 'quote') {
       const now = Date.now()
-      const q = [...quoteCache.values()].findLast((item) => item.chatId === chat.chatId && item.ok && item.at <= now && now - item.at < 30 * 60_000)
+      const q = [...quoteCache.values()].findLast((item) => sameChat(item.chatId, chat.chatId) && item.ok && item.at <= now && now - item.at < 30 * 60_000)
       seg = q?.images.at(-1) || q?.stickers.at(-1)
     } else {
       seg = recentMediaOf(chat.chatId).at(-1)?.seg
     }
     if (!seg) throw new Error(source === 'quote' ? '当前聊天没有可用的引用图片，请引用带图的消息再试' : '当前聊天最近半小时没有收到图片，请先发一张图')
-    return segmentBytes(seg, onebot, { maxBytes: MAX_IMAGE_BYTES, allowLocal: false })
+    return mediaBytesForSegment(chat.chatId, seg, { allowLocal: false })
   }
 
   async function repliedToBot(replyId, msg) {
     if (!replyId) return false
-    if (sentIds.has(replyId)) return true
+    if (hasSentId(msg?.chatId || msg, replyId)) return true
     const q = await quotedInfo(replyId, msg)
     return Boolean(q && q.ok && q.isBot)
   }
 
-  /** QQ 语音是 silk：让网关转成 wav，再统一成 16kHz 单声道 PCM16。 */
-  async function recordWav(rec, suppliedWav) {
-    if (suppliedWav) return toMono16k(suppliedWav)
-    const info = await onebot.call('get_record', { file: rec.data?.file, out_format: 'wav' }, { timeoutMs: 30000 })
-    const raw = info?.base64 ? Buffer.from(info.base64, 'base64') : await fetchImage(info?.file || info?.url, { maxBytes: 30 * 1024 * 1024 })
-    return toMono16k(raw)
+  /** 把任意音频字节统一转成 16kHz 单声道 PCM16 WAV；非 WAV 格式依赖本机 ffmpeg 转码。 */
+  async function audioToMono16k(raw) {
+    try {
+      return toMono16k(raw)
+    } catch (wavErr) {
+      const cfg = getConfig()
+      const ffmpeg = findFfmpeg(String(cfg.tools?.ffmpeg?.path || cfg.bili?.ffmpegPath || ''))
+      if (!ffmpeg) throw new Error(`音频不是 WAV 且未找到 ffmpeg，无法转码识别（${wavErr?.message || wavErr}）`)
+      const dir = mkdtempSync(join(tmpdir(), 'aurabot-asr-'))
+      const src = join(dir, 'in.audio')
+      const dst = join(dir, 'out.wav')
+      try {
+        writeFileSync(src, raw)
+        await runFfmpeg(ffmpeg, ['-y', '-hide_banner', '-loglevel', 'error', '-i', src, '-vn', '-f', 'wav', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', dst])
+        const out = readFileSync(dst)
+        if (!out.length) throw new Error('ffmpeg 转码结果为空')
+        return out
+      } finally {
+        rmSync(dir, { recursive: true, force: true })
+      }
+    }
+  }
+
+  /** 拉取语音并转成 16kHz 单声道 PCM16 WAV：网关渠道走 gatewayMediaBytes，默认平台回退协议取音频。 */
+  async function recordWav(rec, suppliedWav, msg = null) {
+    if (suppliedWav) return await audioToMono16k(suppliedWav)
+    const rawCid = msg?.chatId || ''
+    const normCid = rawCid ? (normalizeChatId(rawCid) || String(rawCid)) : ''
+    const isDefInst = isDefaultInstanceChat(normCid, msg?.platform)
+    const useGw = Boolean(gateway && normCid && (!isDefInst || gateway.caps?.(normCid) !== null || !onebot))
+    if (useGw) {
+      const feats = gateway.features?.(normCid)
+      if (feats && feats['media.fetch'] === false) {
+        throw new Error('当前平台实例不支持拉取语音媒体')
+      }
+      const raw = await gatewayMediaBytes(normCid, rec?.data || {}, msg?.messageId, { maxBytes: MAX_AUDIO_BYTES, timeoutMs: 30000 })
+      return await audioToMono16k(raw)
+    }
+    if (!isDefInst || typeof onebot?.call !== 'function') {
+      throw new Error('当前平台没有可用的语音拉取通道')
+    }
+    const info = await onebot.call('get_record', { file: rec?.data?.file, out_format: 'wav' }, { timeoutMs: 30000 })
+    const raw = info?.base64 ? Buffer.from(info.base64, 'base64') : await fetchImage(info?.file || info?.url, { maxBytes: MAX_AUDIO_BYTES })
+    return await audioToMono16k(raw)
   }
 
   async function transcribe(msg, suppliedWav) {
@@ -2566,7 +3219,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       // 本地接口接管：用用户自己的识别服务（最先试）
       if (localApi?.active('asr')) {
         try {
-          const wav = await recordWav(rec, suppliedWav)
+          const wav = await recordWav(rec, suppliedWav, msg)
           const { writeFileSync, mkdirSync } = await import('node:fs')
           const { join } = await import('node:path')
           const dir = localApi.dir() + '/out'
@@ -2583,13 +3236,16 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       const voiceCfg = getConfig().voice
       const viaCloud = async () => {
         if (!asrConfigured(voiceCfg)) return ''
-        try { return await transcribeAudio(await recordWav(rec, suppliedWav), voiceCfg, log) } catch (error) {
+        try { return await transcribeAudio(await recordWav(rec, suppliedWav, msg), voiceCfg, log) } catch (error) {
           log.debug('云端语音识别失败：', error.message)
           return ''
         }
       }
       const viaQq = async () => {
         if (suppliedWav) return '' // 外部输入没有 QQ 消息编号，复用本地/云端/DSH 识别。
+        const normCid = msg?.chatId ? (normalizeChatId(msg.chatId) || String(msg.chatId)) : ''
+        if (!isDefaultInstanceChat(normCid, msg?.platform) || typeof onebot?.call !== 'function') return ''
+        if (!msg?.messageId) return ''
         try {
           const r = await onebot.call('fetch_ptt_text', { message_id: Number(msg.messageId) || msg.messageId }, { timeoutMs: 20000 })
           return String(r?.text || '').trim()
@@ -2613,7 +3269,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         if (text) return `[语音] ${text}`
       }
       try {
-        const text = await localTranscribe(rec, suppliedWav)
+        const text = await localTranscribe(rec, suppliedWav, msg)
         if (text) return `[语音] ${text}`
       } catch (error) {
         log.debug('本地语音识别失败：', error.message)
@@ -2627,7 +3283,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
    * DSH 自带识别（SenseVoice）：resolve({audio}) → transcribe(spec, signal)，音频必须是 16kHz 单声道 PCM16 WAV。
    * QQ 语音是 silk：先让网关 get_record 转成 wav，再重采样。
    */
-  async function localTranscribe(rec, suppliedWav) {
+  async function localTranscribe(rec, suppliedWav, msg = null) {
     const stt = dsh.get('speechToText')
     if (!stt || typeof stt.resolve !== 'function' || typeof stt.transcribe !== 'function') throw new Error('DSH 没开启语音输入')
     // 模型还没下载好：顺手开始准备（下载一次，之后常驻），这一条先算没听清
@@ -2638,7 +3294,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       try { stt.prepare(pid) } catch (error) {}
       throw new Error(`识别模型还在准备（${prov.preparation.phase}）`)
     }
-    const spec = stt.resolve({ audio: new Uint8Array(await recordWav(rec, suppliedWav)) })
+    const spec = stt.resolve({ audio: new Uint8Array(await recordWav(rec, suppliedWav, msg)) })
     const r = await stt.transcribe(spec, AbortSignal.timeout(60000))
     const text = typeof r === 'string' ? r : r?.text || r?.transcript
     return text ? String(text).trim() : ''
@@ -2659,32 +3315,87 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     return small
   }
 
-  async function gatewayMediaBytes(chatId, data, fallbackMessageId) {
+  const MAX_GATEWAY_MEDIA_BYTES = 50 * 1024 * 1024
+  const MAX_MEDIA_BYTES = Math.max(MAX_IMAGE_BYTES, MAX_AUDIO_BYTES)
+  async function gatewayMediaBytes(chatId, data = {}, fallbackMessageId = '', { maxBytes = MAX_GATEWAY_MEDIA_BYTES, timeoutMs = 20000 } = {}) {
+    if (!gateway || typeof gateway.fetch !== 'function') throw new Error('网关未就绪，无法拉取媒体')
+    const limit = Math.min(Math.max(1, Number(maxBytes) || MAX_GATEWAY_MEDIA_BYTES), MAX_MEDIA_BYTES)
     const media = {
-      id: String(data.mediaId || data.file || ''),
-      messageId: String(data.messageId || fallbackMessageId || ''),
-      mime: data.mime,
+      id: String(data?.mediaId || data?.file || ''),
+      messageId: String(data?.messageId || fallbackMessageId || ''),
+      mime: data?.mime,
     }
     const r = await gateway.fetch(chatId, { kind: 'media', media })
-    if (Buffer.isBuffer(r)) return r
-    if (r?.bytes) return Buffer.from(r.bytes)
-    if (r?.buffer) return Buffer.from(r.buffer)
-    if (r?.arrayBuffer) return Buffer.from(await r.arrayBuffer())
+    if (Buffer.isBuffer(r) || r instanceof Uint8Array || r instanceof ArrayBuffer) {
+      const len = r.byteLength ?? r.length ?? 0
+      if (!len) throw new Error('平台端返回了空媒体')
+      if (len > limit) throw new Error(`媒体太大（超过 ${Math.round(limit / 1048576)}MB）`)
+      return Buffer.from(r)
+    }
+    if (!r || typeof r !== 'object') throw new Error('平台端没有返回有效的媒体数据')
+    const status = Number(r.status)
+    const apiCode = r.json && r.json.code !== undefined ? Number(r.json.code) : 0
+    if ((Number.isFinite(status) && status >= 400) || (Number.isFinite(apiCode) && apiCode > 0)) {
+      const code = Number.isFinite(apiCode) && apiCode > 0 ? apiCode : status
+      const msg = r.json?.msg || r.json?.message || ''
+      throw new Error(`平台端拉取媒体失败（${code}）${msg ? '：' + msg : ''}`)
+    }
+    if (r.bytes != null || r.buffer != null) {
+      const raw = r.bytes ?? r.buffer
+      const len = raw?.byteLength ?? raw?.length ?? 0
+      if (!len) throw new Error('平台端返回了空媒体')
+      if (len > limit) throw new Error(`媒体太大（超过 ${Math.round(limit / 1048576)}MB）`)
+      return Buffer.from(raw)
+    }
+    if (typeof r.base64 === 'string' && r.base64.trim()) {
+      const cleanB64 = r.base64.trim().replace(/^base64:\/\//, '')
+      if (Math.ceil(cleanB64.length * 3 / 4) > limit + 4) {
+        const probe = Buffer.from(cleanB64, 'base64')
+        if (probe.length > limit) throw new Error(`媒体太大（超过 ${Math.round(limit / 1048576)}MB）`)
+        return probe
+      }
+      const buf = Buffer.from(cleanB64, 'base64')
+      if (!buf.length) throw new Error('平台端返回的 base64 媒体为空')
+      if (buf.length > limit) throw new Error(`媒体太大（超过 ${Math.round(limit / 1048576)}MB）`)
+      return buf
+    }
+    if (typeof r.url === 'string' && r.url.trim()) {
+      return await fetchImage(r.url.trim(), { allowLocal: false, maxBytes: limit, timeoutMs })
+    }
+    if (typeof r.arrayBuffer === 'function') {
+      const ab = await r.arrayBuffer()
+      if (!ab || !ab.byteLength) throw new Error('平台端返回了空媒体')
+      if (ab.byteLength > limit) throw new Error(`媒体太大（超过 ${Math.round(limit / 1048576)}MB）`)
+      return Buffer.from(ab)
+    }
+    if (r.path !== undefined && r.path !== null && String(r.path).trim()) {
+      throw new Error('安全策略拒绝读取平台端返回的本机路径')
+    }
     throw new Error('平台端没有返回图片字节')
   }
 
   async function imagesOf(msg) {
     const out = []
+    const normCid = msg?.chatId ? (normalizeChatId(msg.chatId) || String(msg.chatId)) : ''
     const nonDefault = Boolean(msg.platform && msg.platform !== defaultPlatform())
+    const useGatewayMedia = Boolean(gateway && (nonDefault || (normCid && gateway.caps?.(normCid) !== null && gateway.features?.(normCid)?.['media.fetch'])))
     for (const seg of [...msg.stickers, ...msg.images].slice(0, MAX_MESSAGE_IMAGES)) {
       try {
         let raw
-        if (nonDefault && gateway && (seg.data?.mediaId || seg.data?.file)) {
+        if (useGatewayMedia && (seg.data?.mediaId || seg.data?.file)) {
           try {
-            raw = await gatewayMediaBytes(msg.chatId, seg.data, msg.messageId)
+            raw = await gatewayMediaBytes(normCid || msg.chatId, seg.data, msg.messageId)
           } catch (error) {
             if (!seg.data?.url) throw error
-            raw = await fetchImage(seg.data.url, { maxBytes: MAX_IMAGE_BYTES })
+            raw = await fetchImage(seg.data.url, { maxBytes: MAX_IMAGE_BYTES, allowLocal: false })
+          }
+        } else if (gateway && !onebot) {
+          if (seg.data?.url) {
+            raw = await fetchImage(seg.data.url, { maxBytes: MAX_IMAGE_BYTES, allowLocal: false })
+          } else if (seg.data?.mediaId || seg.data?.file) {
+            raw = await gatewayMediaBytes(normCid || msg.chatId, seg.data, msg.messageId)
+          } else {
+            continue
           }
         } else {
           raw = await segmentBytes(seg, onebot, { maxBytes: MAX_IMAGE_BYTES })
@@ -2711,7 +3422,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
    *   · parts 里 QQ 表达不了的东西（card / other）用 text 兜底，不丢内容
    */
   function inboundToOneBotEvent(m) {
-    const self = String(selfId || getConfig().botQQ || '')
+    const self = selfAccountFor(m.instance || m.chatId)
     const segments = []
     for (const part of Array.isArray(m.parts) ? m.parts : []) {
       switch (part.type) {
@@ -2723,7 +3434,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         case 'image': segments.push({ type: 'image', data: { file: part.media?.id || part.media?.url || '', url: part.media?.url, sub_type: 0, mediaId: part.media?.id, mime: part.media?.mime, messageId: m.messageId } }); break
         case 'sticker': segments.push({ type: 'image', data: { file: part.media?.id || part.media?.url || '', url: part.media?.url, sub_type: 1, summary: part.label, mediaId: part.media?.id, mime: part.media?.mime, messageId: m.messageId } }); break
         case 'face': segments.push({ type: 'face', data: { raw: part.value, id: part.name } }); break
-        case 'voice': segments.push({ type: 'record', data: { file: part.media?.id || part.media?.url || '', url: part.media?.url } }); break
+        case 'voice': segments.push({ type: 'record', data: { file: part.media?.id || part.media?.url || '', url: part.media?.url, mediaId: part.media?.id, mime: part.media?.mime, messageId: m.messageId } }); break
         case 'video': segments.push({ type: 'video', data: { file: part.media?.id || part.media?.url || '', url: part.media?.url } }); break
         case 'file': segments.push({ type: 'file', data: { file: part.media?.id || part.media?.url || '', name: part.media?.name, url: part.media?.url } }); break
         case 'forward': segments.push({ type: 'forward', data: { id: part.id } }); break
@@ -2847,6 +3558,25 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   async function onGatewayMessage(m) {
     if (disposed || !m) return
     try { gateway?.noteSeen?.(m.sender.person, m.chatId, Number(m.at) || Date.now()) } catch {}
+    if (m.chat?.kind === 'group' && m.chat?.title && m.chatId) {
+      const title = String(m.chat.title).trim()
+      if (title) {
+        groupNames.set(String(m.chatId), title)
+        if (isDefaultInstanceChat(m.chatId, m.platform) && m.chat.id) groupNames.set(String(m.chat.id), title)
+      }
+    }
+    const instSelf = selfAccountFor(m.instance || m.chatId)
+    const senderAcc = String(m.sender?.account || '')
+    const isEcho = Boolean(instSelf && senderAcc && senderAcc === instSelf)
+    if (!isEcho && m.messageId) {
+      rememberRecentMessage({
+        chatId: m.chatId,
+        messageId: m.messageId,
+        at: Number(m.at) || Date.now(),
+        sender: { account: senderAcc, name: String(m.sender?.name || ''), isBot: false },
+        parts: m.parts,
+      })
+    }
     const event = inboundToOneBotEvent(m)
     // F2：新平台第一次私聊，带一段从别处来的交接摘要（只对主人、只做一次）。
     if (handover && m.chat?.kind === 'private' && m.platform && m.platform !== defaultPlatform()) {
@@ -2860,11 +3590,21 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
 
   async function onMessage(event) {
     if (disposed) return
-    selfId = String(event.self_id || selfId || getConfig().botQQ)
-    const cfg = getConfig()
-    const msg = parseMessageEvent(event, selfId, { faceName: faces.nameOf })
     const gw = event.__gateway
-    msg.platform = gw?.platform || defaultPlatform()
+    const msgPlatform = gw?.platform || defaultPlatform()
+    const rawCid = gw?.chatId || (event.message_type === 'group' ? `group:${event.group_id}` : `private:${event.user_id}`)
+    const scopedSelf = selfAccountFor(gw?.instance || rawCid)
+    const isDefaultInstance = !gw || gw.instance === defaultPlatform()
+    if (isDefaultInstance) {
+      if (!gw) selfId = String(event.self_id || selfId || getConfig().botQQ)
+      else if (event.self_id) selfId = String(event.self_id)
+    }
+    const parseSelf = isDefaultInstance
+      ? String(event.self_id || scopedSelf || selfId || getConfig().botQQ || '')
+      : scopedSelf
+    const cfg = getConfig()
+    const msg = parseMessageEvent(event, parseSelf, { faceName: faces.nameOf })
+    msg.platform = msgPlatform
     if (gw?.chatId) msg.chatId = gw.chatId
     if (gw?.mentionedMe) {
       msg.mentioned = true
@@ -2875,7 +3615,17 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     }
     // F2：收不到群里非 @ 消息的平台，只处理被叫到的消息，不建立群缓冲和群记忆。
     if (msg.kind === 'group' && gateway?.caps?.(msg.chatId)?.listenAllInGroup === false && !msg.mentionedMe) return
-    if (msg.userId === selfId) return
+    if (parseSelf && msg.userId === parseSelf) return
+    if (!gw && msg.messageId && msg.messageId !== '0') {
+      const { parts: inParts } = segmentsToGatewayParts(segmentsOf(event))
+      rememberRecentMessage({
+        chatId: msg.chatId,
+        messageId: msg.messageId,
+        at: Date.now(),
+        sender: { account: msg.userId, name: msg.nickname, isBot: false },
+        parts: inParts,
+      })
+    }
     if (msg.messageId) lastInbound.set(msg.chatId, { id: String(msg.messageId), at: Date.now() })
     if (passivePending.has(msg.chatId)) await flushPassive(msg.chatId, String(msg.messageId))
     const now = Date.now()
@@ -2915,7 +3665,11 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     //           真正能不能收由工具那边再按「这一轮说话的全是主人」把关
     let stickerPick = 0
     const collectMode = cfg.stickers.collectMode || 'auto'
-    if (allowed.allowed && msg.stickers.length && cfg.stickers.collect) {
+    const normInbCid = normalizeChatId(msg.chatId) || String(msg.chatId || '')
+    const inbAddr = parseChatId(normInbCid)
+    const useGatewayInb = Boolean(gateway && (inbAddr?.platform !== defaultPlatform() || gateway.caps?.(normInbCid) !== null || !onebot))
+    const canCollectSticker = !useGatewayInb || Boolean(gateway.features?.(normInbCid)?.['sticker.collect'])
+    if (allowed.allowed && msg.stickers.length && cfg.stickers.collect && canCollectSticker) {
       const okSrc = msg.kind === 'group' ? cfg.stickers.fromGroups : cfg.stickers.fromPrivate
       if (okSrc) {
         if (collectMode === 'auto') {
@@ -2931,7 +3685,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       log.debug(`忽略 ${msg.chatId}（${allowed.reason}）`)
       return
     }
-    await refreshFriends()
+    if (isDefaultInstanceChat(msg.chatId, msg.platform) && (!gateway || gateway.caps?.(msg.chatId) === null)) {
+      await refreshFriends()
+    }
     if (disposed) return
     // 静默分支也保存直接互动证据，引用识别沿用现有缓存。
     const quotedBot = msg.kind === 'group' && msg.replyId ? await repliedToBot(msg.replyId, msg) : false
@@ -2950,6 +3706,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         groupEntry.forwardExpanded = true
       }
     }
+    if (msg.records?.length) rememberInboundVoice(msg)
     // 文件先记着，她要读的时候用 qq_read_file 取
     if (msg.files.length) {
       const list = (recentFiles.get(msg.chatId) || []).concat(msg.files.map((f) => ({ ...f, userId: msg.userId, at: now })))
@@ -3167,7 +3924,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         try { gateway?.noteSeen?.(msg.sender?.person || ownerId(), msg.chatId, now) } catch {}
       }
     }
-    if (msg.kind === 'private') lastPrivateAt.set(msg.userId, now)
+    if (msg.kind === 'private') touchPrivateAt(msg.chatId || (msg.platform ? `${msg.platform}:private:${msg.userId}` : `private:${msg.userId}`), now)
     onActivity?.({ kind: 'in', chatId: msg.chatId, userId: msg.userId, nickname: msg.nickname, text, direct: msg.kind === 'private' || msg.mentioned || mode === 'must', owner: msgIsOwner })
 
     enqueue({ chatId: msg.chatId, platform: msg.platform, kind: msg.kind, userId: msg.userId, groupId: msg.groupId, nickname: msg.nickname, sender: msg.sender }, content, msg.userId, wantsVoice(msg.text), mode, { stickerPick })
@@ -3175,9 +3932,24 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
 
   /** 把消息里的「[合并转发]」换成里面的聊天记录，里面的图片并进这条消息一起给她看。 */
   async function expandForwards(msg, text, { timeoutMs = 15000 } = {}) {
+    const cid = msg?.chatId ? (normalizeChatId(msg.chatId) || String(msg.chatId)) : ''
+    const addr = cid ? parseChatId(cid) : null
+    const useGatewayFwd = Boolean(gateway && (addr?.platform !== defaultPlatform() || gateway.caps?.(cid) !== null || !onebot))
+    if (useGatewayFwd) {
+      if (!gateway.features?.(cid)?.['message.forward.expand']) return String(text ?? '')
+      const bodies = []
+      for (const id of msg.forwards.slice(0, 5)) {
+        const r = await readFetchedForward((fid) => gateway.fetch(cid, { kind: 'forward', id: fid }), id, { log })
+        msg.images.push(...r.images)
+        msg.stickers.push(...r.stickers)
+        bodies.push(forwardBody(r))
+      }
+      return applyForwardBodies(text, bodies)
+    }
+    if (!onebot?.call) return String(text ?? '')
     const bodies = []
     for (const id of msg.forwards.slice(0, 5)) {
-      const r = await readForward(onebot, id, { selfId, faceName: faces.nameOf, log, timeoutMs })
+      const r = await readForward(onebot, id, { selfId: selfAccountFor(cid), faceName: faces.nameOf, log, timeoutMs })
       msg.images.push(...r.images)
       msg.stickers.push(...r.stickers)
       bodies.push(forwardBody(r))
@@ -3207,26 +3979,37 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
 
   async function onPoke(ev) {
     if (disposed) return
+    const rawCid = ev?.chatId ? String(ev.chatId) : ''
+    const evAddr = rawCid ? parseChatId(normalizeChatId(rawCid) || rawCid) : null
+    const evInst = ev?.instance || ev?.__gateway?.instance || evAddr?.instance || ''
+    const evPlat = ev?.platform || evAddr?.platform || defaultPlatform()
+    if (evPlat !== defaultPlatform() || (evInst && evInst !== defaultPlatform())) return
     const self = String(ev.self_id || selfId || getConfig().botQQ)
     if (String(ev.target_id) !== self) return
     if (hooks?.poke) {
       try { if (await hooks.poke(ev)) return } catch (error) {}
     }
     if (disposed) return
-    const group = ev.group_id ? String(ev.group_id) : ''
-    const poker = String(group ? ev.user_id : ev.sender_id ?? ev.user_id)
+    const group = ev.group_id ? String(ev.group_id) : (evAddr?.kind === 'group' ? evAddr.id : '')
+    const poker = String(group ? ev.user_id : ev.sender_id ?? ev.user_id ?? (evAddr?.kind === 'private' ? evAddr.id : ''))
     if (!poker || poker === self) return
-    if (group && await titleFilter.shouldIgnore({ group_id: group, user_id: poker })) return
+    if ((group && !/^\d+$/.test(group)) || !/^\d+$/.test(poker)) return
+    const chatId = rawCid ? (normalizeChatId(rawCid) || rawCid) : (group ? `group:${group}` : `private:${poker}`)
+    if (!isDefaultInstanceChat(chatId, evPlat)) return
+    const caps = gateway?.caps?.(chatId)
+    if (caps && caps.poke === false) return
+    if (group && await titleFilter.shouldIgnore({ ...ev, group_id: group, user_id: poker })) return
     if (disposed) return
-    const chatId = group ? `group:${group}` : `private:${poker}`
     lastPoker.set(chatId, poker)
     if (Date.now() - (pokeAt.get(chatId) || 0) < 20_000) return
     pokeAt.set(chatId, Date.now())
     let nickname = poker
-    try {
-      const info = group ? await onebot.call('get_group_member_info', { group_id: Number(group), user_id: Number(poker) }, { timeoutMs: 5000 }) : await onebot.call('get_stranger_info', { user_id: Number(poker) }, { timeoutMs: 5000 })
-      nickname = info?.card || info?.nickname || poker
-    } catch (error) {}
+    if (typeof onebot?.call === 'function') {
+      try {
+        const info = group ? await onebot.call('get_group_member_info', { group_id: Number(group), user_id: Number(poker) }, { timeoutMs: 5000 }) : await onebot.call('get_stranger_info', { user_id: Number(poker) }, { timeoutMs: 5000 })
+        nickname = info?.card || info?.nickname || poker
+      } catch (error) {}
+    }
     if (disposed) return
     log.info(`${chatId}：${nickname} 戳了戳她`)
     await onMessage({
@@ -3280,7 +4063,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
 
   /** 群聊这一段的提示词：之前的几句当背景，上次交给她之后群里新说的话全部列出来，让她看完整段再回。 */
   async function groupPrompt(chat, mode, imageRoom = 0, refOffset = 0) {
-    const name = await groupName(chat.groupId)
+    const name = await groupName(chat.chatId || chat.groupId)
     const buf = groupBuf.get(chat.groupId) || []
     // 时间戳可能同一毫秒：直接取上一轮之后的消息，避免紧接着到达的消息丢失。
     const fresh = buf.filter((x) => !x.fed).slice(-20)
@@ -3608,10 +4391,16 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (disposed) return
     const cfg = getConfig()
     if (chat.kind !== 'private' || !cfg.enabled || cfg.dryRun || typing.has(key)) return
-    const caps = gateway?.caps?.(chat.chatId)
+    const cid = normalizeChatId(chat.chatId) || String(chat.chatId || '')
+    const addr = cid ? parseChatId(cid) : null
+    if (!isDefaultInstanceChat(cid, chat.platform)) return
+    const caps = gateway?.caps?.(cid)
     if (caps && caps.typing === false) return
-    if (typeof onebot?.call !== 'function') return
-    const ping = () => { if (!disposed) onebot.call('set_input_status', { user_id: Number(chat.userId), event_type: 1 }, { timeoutMs: 5000 }).catch(() => {}) }
+    const feats = caps !== null ? gateway?.features?.(cid) : null
+    if (feats && !feats['chat.typing']) return
+    const uid = String(chat.userId || addr?.id || '')
+    if (!/^\d+$/.test(uid) || typeof onebot?.call !== 'function') return
+    const ping = () => { if (!disposed) onebot.call('set_input_status', { user_id: Number(uid), event_type: 1 }, { timeoutMs: 5000 }).catch(() => {}) }
     ping()
     const started = Date.now()
     const t = setInterval(() => {
@@ -3649,6 +4438,139 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     return out
   }
 
+  /** 把网关归一化的 FetchedMessage 历史列表拍平成「谁：内容」。 */
+  function flatFetchedHistory(list) {
+    const out = []
+    for (const m of Array.isArray(list) ? list : []) {
+      if (!m || typeof m !== 'object') continue
+      const who = m.sender?.isBot ? '你' : String(m.sender?.name || m.sender?.account || '')
+      const text = String(renderParts(m.parts || []).text || '').replace(/\s+/g, ' ').trim().slice(0, 120)
+      if (!who && !text) continue
+      const rawAt = Number(m.at) || 0
+      const at = rawAt > 0 ? (rawAt < 1e12 ? rawAt * 1000 : rawAt) : 0
+      out.push(`${at ? clockLabel(at) + ' ' : ''}${who}：${text}`)
+    }
+    return out
+  }
+
+  /** 供跨平台模块调用的统一历史分页查询（网关历史或默认实例遗留 OneBot 历史，均返回归一化 FetchedHistoryPage）。 */
+  async function fetchHistory(chatId, { count = 20, before } = {}) {
+    const cid = normalizeChatId(chatId) || String(chatId || '')
+    const addr = parseChatId(cid)
+    if (!addr || (addr.kind !== 'group' && addr.kind !== 'private') || !addr.id) return { messages: [], hasMore: false }
+    const n = Math.max(1, Math.min(100, Number(count) || 20))
+    const anchor = before !== undefined && before !== null ? String(before).trim() : ''
+    const isDefInst = isDefaultInstanceChat(cid, addr.platform)
+    const gwCaps = gateway?.caps?.(cid)
+    const useGw = Boolean(gateway && typeof gateway.fetch === 'function' && (!isDefInst || gwCaps !== null || !onebot))
+    if (useGw) {
+      const feats = gateway?.features?.(cid)
+      if (!feats?.['message.history.read'] || gwCaps?.history === false) {
+        throw Object.assign(new Error('当前平台网关不支持读取聊天记录'), { code: 'unsupported-action' })
+      }
+      return await gateway.fetch(cid, {
+        kind: 'history',
+        chat: { kind: addr.kind, id: addr.id },
+        count: n,
+        ...(anchor ? { before: anchor } : {}),
+      })
+    }
+    if (!isDefInst || typeof onebot?.call !== 'function' || !/^\d+$/.test(addr.id)) {
+      throw Object.assign(new Error('当前网关不支持读取聊天记录'), { code: 'unsupported-action' })
+    }
+    const base = addr.kind === 'group' ? { group_id: Number(addr.id) } : { user_id: Number(addr.id) }
+    const anchorParam = anchor && /^-?\d+$/.test(anchor) && !/^-?0+$/.test(anchor)
+      ? (Number.isSafeInteger(Number(anchor)) ? Number(anchor) : anchor)
+      : ''
+    const req = anchorParam ? { ...base, count: n + 1, message_id: anchorParam, reverse_order: true } : { ...base, count: n }
+    const r = await onebot.call(addr.kind === 'group' ? 'get_group_msg_history' : 'get_friend_msg_history', req, { timeoutMs: 15000 })
+    const rawList = Array.isArray(r) ? r : (r?.messages || [])
+    const selfAcc = selfAccountFor(cid)
+    const mapped = rawList.map((m, idx) => {
+      const uid = m?.sender?.user_id ?? m?.user_id
+      const hasUid = uid !== undefined && uid !== null && String(uid) !== ''
+      const account = hasUid ? String(uid) : ''
+      const name = String(m?.sender?.card || m?.sender?.nickname || m?.nickname || account || '')
+      const rawTime = Number(m?.time)
+      const at = Number.isFinite(rawTime) && rawTime > 0 ? (rawTime < 1e12 ? rawTime * 1000 : rawTime) : undefined
+      const parsed = parseMessageEvent({ ...m, message_type: m?.message_type || addr.kind }, selfAcc, { faceName: faces.nameOf })
+      const parts = parsed.text ? [{ type: 'text', text: parsed.text }] : []
+      return {
+        messageId: String(m?.message_id ?? m?.id ?? `legacy-${idx}`),
+        ...(at ? { at } : {}),
+        ...(hasUid ? { sender: { account, ...(name ? { name } : {}), isBot: Boolean(selfAcc && account === selfAcc) } } : {}),
+        parts,
+      }
+    })
+    if (mapped.length >= 2) {
+      const firstAt = Number(mapped[0]?.at) || 0
+      const lastAt = Number(mapped[mapped.length - 1]?.at) || 0
+      if (firstAt > 0 && lastAt > 0 && firstAt > lastAt) mapped.reverse()
+    }
+    let filtered = mapped
+    if (anchor) {
+      const anchorIdx = mapped.findIndex((m) => String(m.messageId) === anchor)
+      filtered = anchorIdx >= 0
+        ? mapped.slice(0, anchorIdx)
+        : mapped.filter((m) => String(m.messageId) !== anchor)
+    }
+    const messages = filtered.slice(-n)
+    const beforeOut = messages.length > 0 && messages[0].messageId ? String(messages[0].messageId) : undefined
+    return {
+      messages,
+      hasMore: filtered.length > n,
+      ...(beforeOut ? { before: beforeOut } : {}),
+    }
+  }
+
+  /** 供跨平台模块查询当前实例可见的群列表。 */
+  async function chatGroups(chatIdOrInstance) {
+    const raw = String(chatIdOrInstance || '')
+    const norm = normalizeChatId(raw) || raw
+    const addr = parseChatId(norm)
+    const inst = addr?.instance || (!raw.includes(':') && raw ? raw : defaultPlatform())
+    const isDefInst = isDefaultInstanceChat(norm, addr?.platform)
+    const useGw = Boolean(gateway && typeof gateway.fetch === 'function' && (!isDefInst || gateway.caps?.(norm) !== null || !onebot))
+    if (useGw) {
+      const r = await gateway.fetch(inst, { kind: 'chats' }).catch(() => null)
+      return Array.isArray(r?.groups) ? r.groups : []
+    }
+    if (isDefInst && typeof onebot?.call === 'function') {
+      const r = await onebot.call('get_group_list', {}, { timeoutMs: 15000 }).catch(() => [])
+      return Array.isArray(r) ? r : []
+    }
+    return []
+  }
+
+  /** 供跨平台模块验证某用户是否真实在指定群内（未支持 member.read 时 fail-closed 返回 false）。 */
+  async function isGroupMember(targetChatId, userId) {
+    const norm = normalizeChatId(targetChatId) || String(targetChatId || '')
+    const addr = parseChatId(norm)
+    if (!addr || addr.kind !== 'group' || !addr.id) return false
+    const isDefInst = isDefaultInstanceChat(norm, addr.platform)
+    const useGw = Boolean(gateway && typeof gateway.fetch === 'function' && (!isDefInst || gateway.caps?.(norm) !== null || !onebot))
+    if (useGw) {
+      if (!gateway.features?.(norm)?.['chat.member.read']) return false
+      try {
+        const m = await gateway.fetch(norm, { kind: 'member', chat: { kind: 'group', id: addr.id }, account: String(userId) })
+        const mid = String(m?.user_id ?? m?.account ?? '')
+        if (mid !== String(userId)) return false
+        return m?.join_time !== undefined ? Number(m.join_time) > 0 : true
+      } catch {
+        return false
+      }
+    }
+    if (isDefInst && typeof onebot?.call === 'function' && /^\d+$/.test(addr.id) && /^\d+$/.test(String(userId))) {
+      try {
+        const m = await onebot.call('get_group_member_info', { group_id: Number(addr.id), user_id: Number(userId), no_cache: true }, { timeoutMs: 10000 })
+        return String(m?.user_id) === String(userId) && Number(m?.join_time) > 0
+      } catch {
+        return false
+      }
+    }
+    return false
+  }
+
   /** 只在这个会话第一次说话时，把最近的历史补给她的上下文。 */
   async function seedHistoryOnce(sessionId, chat, content) {
     const key = sessionKey(sessionId)
@@ -3658,14 +4580,29 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       const cfg = getConfig()
       if (!cfg.enabled || cfg.dryRun) return content
       if (!cfg.chat?.seedHistory) return content
-      const count = Math.min(50, Math.max(1, Number(cfg.chat?.seedHistoryCount) || 20))
+      const cid = normalizeChatId(chat.chatId) || String(chat.chatId || '')
       const tgt = targetOf(chat.chatId)
       if (!tgt) return content
-      const r = tgt.kind === 'group'
-        ? await onebot.call('get_group_msg_history', { group_id: Number(tgt.id), count }, { timeoutMs: 8000 })
-        : await onebot.call('get_friend_msg_history', { user_id: Number(tgt.id), count }, { timeoutMs: 8000 })
-      const list = Array.isArray(r) ? r : (r?.messages || [])
-      const lines = flatHistory(filterHistory(chat.chatId, list)).slice(-count)
+      const count = Math.min(50, Math.max(1, Number(cfg.chat?.seedHistoryCount) || 20))
+      const isDefInst = isDefaultInstanceChat(cid, chat.platform)
+      const gwCaps = gateway?.caps?.(cid)
+      const useGw = Boolean(gateway && (!isDefInst || gwCaps !== null || !onebot))
+      let lines = []
+      if (useGw) {
+        const feats = gateway?.features?.(cid)
+        if (!feats?.['message.history.read'] || gwCaps?.history === false) return content
+        if (typeof gateway.fetch !== 'function') return content
+        const page = await gateway.fetch(cid, { kind: 'history', chat: { kind: tgt.kind, id: tgt.id }, count })
+        const list = Array.isArray(page?.messages) ? page.messages : []
+        lines = flatFetchedHistory(filterHistory(chat.chatId, list)).slice(-count)
+      } else {
+        if (!isDefInst || typeof onebot?.call !== 'function' || !/^\d+$/.test(tgt.id)) return content
+        const r = tgt.kind === 'group'
+          ? await onebot.call('get_group_msg_history', { group_id: Number(tgt.id), count }, { timeoutMs: 8000 })
+          : await onebot.call('get_friend_msg_history', { user_id: Number(tgt.id), count }, { timeoutMs: 8000 })
+        const list = Array.isArray(r) ? r : (r?.messages || [])
+        lines = flatHistory(filterHistory(chat.chatId, list)).slice(-count)
+      }
       if (!lines.length) return content
       log.info(`${chat.chatId}：新会话，补看最近 ${lines.length} 条历史`)
       const block = `【你刚上线，先补看最近 ${lines.length} 条${tgt.kind === 'group' ? '群' : '私聊'}记录】\n${lines.join('\n')}\n【补看结束，接着回下面这条】`
@@ -3869,7 +4806,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     }
     logChat(chatId, chat.nickname, text || '[图片]', senderAcc, { via: source, originId })
     lastChatAt = Date.now()
-    if (isOwnerPrivateChat(ownerRef(), chatId)) { lastOwnerChatAt = lastChatAt; lastOwnerChatId = chatId; lastPrivateAt.set(senderAcc, lastChatAt) }
+    if (isOwnerPrivateChat(ownerRef(), chatId)) { lastOwnerChatAt = lastChatAt; lastOwnerChatId = chatId; touchPrivateAt(chatId, lastChatAt) }
     onActivity?.({ kind: 'in', chatId, userId: senderAcc, nickname: chat.nickname, text, direct: true, owner: true })
     await pushToSession(chat, content, senderAcc, { queryText: text || '[图片]', steer: running.has(chatId), assertAuthorized: validate })
     return { ok: true }
@@ -4142,7 +5079,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const m = map()
     const entry = m.chats[chatId]
     if (!entry && !cutoff) return false
-    const qq = chatId.slice(8)
+    const resetAddr = parseChatId(String(chatId || ''))
+    const qq = resetAddr?.kind === 'private' ? resetAddr.id : String(chatId || '').slice(8)
     if (cutoff) m.memoryCutoffs = { ...memoryCutoffs, [qq]: cutoff }
     delete m.chats[chatId]
     saveMap(m)
@@ -4190,7 +5128,13 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     saidElsewhere.delete(chatId)
     recentFiles.delete(chatId)
     recentMedia.clear(chatId)
-    for (const key of quoteCache.keys()) if (key.startsWith(chatId + "|")) quoteCache.delete(key)
+    const normClear = normalizeChatId(chatId) || chatId
+    for (const key of [...quoteCache.keys()]) {
+      if (key.startsWith(chatId + '|') || key.startsWith(normClear + '|')) quoteCache.delete(key)
+    }
+    for (const key of [...recentInbound.keys()]) {
+      if (key.startsWith(chatId + '\u0000') || key.startsWith(normClear + '\u0000')) recentInbound.delete(key)
+    }
     for (const [groupId, entries] of groupBuf) {
       groupBuf.set(groupId, entries.filter((entry) => entry.uid !== qq || entry.t > cutoff))
     }
@@ -4238,8 +5182,13 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     return { result, sent }
   }
   /** 模拟测试：假装这个会话这一轮是谁在说话（工具里的「主人才能用」靠它判断）。 */
-  function simulateTurn(sessionId, senders) {
-    turnState.set(sessionKey(sessionId), { lastTurn: -1, text: '', senders: new Set(senders.map(String)) })
+  function simulateTurn(sessionId, senders, platform = '') {
+    turnState.set(sessionKey(sessionId), {
+      lastTurn: -1,
+      text: '',
+      senders: new Set(senders.map(String)),
+      ...(platform ? { platform: String(platform) } : {}),
+    })
   }
 
   /** 工具清单可能变了：把已挂载的会话重新挂一遍（DSH 会话窗口直接打字时也能用上新工具）。 */
@@ -4405,8 +5354,11 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     sessionCreating.clear()
     privateSources.clear()
     quoteCache.clear()
+    recentInbound.clear()
+    sentIdsByScope.clear()
     busy.clear()
     running.clear()
+    recentVoices.clear()
     recentMedia.dispose()
   }
 
@@ -4430,16 +5382,24 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     onMessage,
     /** G3：网关入站入口。收到 InboundMessage 走这条；未装网关时等价于不接线，行为不变。 */
     onGatewayMessage,
+    onGatewayRecall: (chatIdOrHint, messageId) => evictMessageCaches(chatIdOrHint, messageId),
+    selfAccountFor,
+    gatewayMediaBytes,
+    mediaBytes: mediaBytesForSegment,
+    imagesOf,
+    quotedInfo,
+    repliedToBot,
+    expandForwards,
     /** G3：补发成功后留痕（G1 的 onFlushed 回调接这里，#327） */
     onGatewayFlushed(message, result) {
       try {
         const mid = String(result?.messageId || '')
+        const chatId = message?.chatId
         if (mid) {
-          sentIds.add(mid)
-          if (sentIds.size > 500) sentIds.delete(sentIds.values().next().value)
+          addSentId(chatId, mid)
+          rememberRecentMessage({ chatId, messageId: mid, at: Date.now(), sender: { account: selfAccountFor(chatId), isBot: true }, parts: message?.parts || [] })
         }
         bump('sent')
-        const chatId = message?.chatId
         if (chatId && Array.isArray(message?.parts)) {
           const text = message.parts.filter((p) => p?.type === 'text').map((p) => p.text).join('')
           if (text) logChat(chatId, 'bot', text, '', { via: message?.note ? '补发' : '' })
@@ -4484,6 +5444,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     resetPersonChat,
     memoryResetAt,
     filterHistory,
+    fetchHistory,
+    chatGroups,
+    isGroupMember,
     joinTopic: (gid) => groupEngaged.set(String(gid), Date.now() + ENGAGE_MS),
     leaveTopic: (gid) => {
       groupEngaged.delete(String(gid))
@@ -4501,6 +5464,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     speakersOf: (sessionId) => turnState.get(sessionKey(sessionId))?.speakers || [],
     logChat, chatLogRevision: () => chatLogRevision, refreshFriends, isFriend: (qq) => friendIds.has(String(qq)),
     localTranscribe,
+    lastInboundVoice,
     ensureWorkspace,
     chatLogOf,
     forgetChatLog,
@@ -4515,7 +5479,16 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     get lastOwnerChatAt() { return lastOwnerChatAt },
     ownerChat: resolveOwnerChat,
     isOwnerMuted: () => isOwnerChatMuted(ownerRef(), isMuted),
-    lastPrivateAt: (qq) => lastPrivateAt.get(String(qq)) || 0,
+    lastPrivateAt: (id) => {
+      const direct = lastPrivateAt.get(String(id))
+      if (direct) return direct
+      const norm = normalizeChatId(String(id))
+      if (!norm) return 0
+      const hit = lastPrivateAt.get(norm)
+      if (hit) return hit
+      const parsed = parseChatId(norm)
+      return parsed?.kind === 'private' && parsed.platform === defaultPlatform() ? (lastPrivateAt.get(parsed.id) || 0) : 0
+    },
     // 「别处说过」桥接的只读快照（测试/诊断用）：这个聊天待补进上下文的原话列表
     saidElsewhereOf: (chatId) => (saidElsewhere.get(String(chatId)) || []).map((x) => x.text),
     // 重启兜底的只读快照：从聊天流水里回捞「主动发出过」的最近几条（同进程内补过一次就空）

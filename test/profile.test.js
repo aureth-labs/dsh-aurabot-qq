@@ -15,7 +15,7 @@ const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a
 function setup(overrides = {}) {
   let cfg = normalize({ botQQ: BOT, ownerQQ: OWNER, model: { vision: 'on' }, ...overrides.cfg })
   const identity = makeTestIdentity(cfg.ownerQQ || OWNER, 'qq')
-  const calls = [], rules = [], disposers = [], sends = [], downloads = [], asks = [], attachments = []
+  const calls = [], contexts = [], disposers = [], sends = [], downloads = [], asks = [], attachments = []
   let allOwner = true, builder
   const state = { nickname: '大肥鱼', long_nick: '爱吃白米饭' }
   const api = {
@@ -44,14 +44,14 @@ function setup(overrides = {}) {
     },
     on() {},
     onDispose: (fn) => disposers.push(fn),
-    rule: (fn) => rules.push(fn),
+    context: (fn) => contexts.push(fn),
     tool: (fn) => { builder = fn },
   }
   profileModule.setup(api, {
     async fetchAvatar(url, options) { downloads.push({ url, options }); return overrides.fetchAvatar ? overrides.fetchAvatar(url, options) : png },
     async ask(_dsh, options) { asks.push(options); return '蓝色的小鲸鱼。' },
   })
-  return { calls, state, rules, sends, downloads, asks, attachments,
+  return { calls, state, contexts, sends, downloads, asks, attachments,
     tools: (chat = ownerChat) => Object.fromEntries(builder({ chat, sessionId: 's1' }).map((tool) => [tool.name, tool])),
     set: (patch) => { cfg = normalize({ ...cfg, ...patch }); if (patch.ownerQQ !== undefined) identity.setOwner(patch.ownerQQ, 'qq') },
     mixed: () => { allOwner = false },
@@ -249,15 +249,17 @@ test('查询等待期间卸载，不会继续获取头像或返回陈旧结果',
   assert.equal(s.images.length, 0)
 })
 
-test('主动查询规则只在主人私聊规则中出现，要求依据实时结果回答', () => {
+test('主动查询规则只在主人私聊上下文中出现，要求依据实时结果回答', () => {
   const s = setup()
-  const privateRules = s.rules.map((fn) => fn('private')).join('\n')
-  assert.match(privateRules, /qq_get_profile/)
-  assert.match(privateRules, /主动/)
-  assert.match(privateRules, /view_avatar=true/)
-  assert.match(privateRules, /qq_send_avatar/)
-  assert.match(privateRules, /不要.*重复发图/)
-  assert.equal(s.rules.map((fn) => fn('social')).join(''), '')
+  const ownerCtx = s.contexts.map((fn) => fn({ chat: ownerChat })).join('\n')
+  assert.match(ownerCtx, /qq_get_profile/)
+  assert.match(ownerCtx, /主动/)
+  assert.match(ownerCtx, /view_avatar=true/)
+  assert.match(ownerCtx, /qq_send_avatar/)
+  assert.match(ownerCtx, /不要.*重复发图/)
+  assert.equal(s.contexts.map((fn) => fn({ chat: { kind: 'private', userId: '30000003' } })).join(''), '')
+  assert.equal(s.contexts.map((fn) => fn({ chat: { kind: 'group', userId: OWNER, groupId: '777' } })).join(''), '')
+  assert.equal(s.contexts.map((fn) => fn({ chat: { kind: 'system' } })).join(''), '')
 })
 
 test('查询头像工具返回同一张图的登记附件，render 把图片交给聊天模型且不发送 QQ 消息', async () => {

@@ -12,6 +12,7 @@ import { createShotStore, shotPath, clockOf } from './shots.js'
 const PAUSE_CODES = { '-101': 'B 站没登录或 Cookie 过期了', '-111': 'Cookie 里的 bili_jct 不对', '-352': '被 B 站风控了', '-509': '发得太频繁', '12015': 'B 站要求验证码' }
 import { isSilence, cleanOutboundText } from '../chat/reply.js'
 import { reallySent } from '../chat/hub.js'
+import { normalizeChatId, parseChatId } from '../gateway/address.js'
 
 const FACE_MAX = 2 * 1024 * 1024 // B 站头像上限（api.js 里也有一份，这里给缩图判断用）
 const dayKey = (d = new Date()) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
@@ -178,7 +179,12 @@ export function createBili({ getConfig, hub, memory, log, dsh, api: injected, vi
   async function sendShot({ chatId, query = '' } = {}) {
     const g = getConfig()
     if (!g.enabled || !g.bili.enabled) return { ok: false, sent: false, message: '插件或 B 站没打开' }
-    if (!/^(private|group):\d+$/.test(String(chatId || ''))) return { ok: false, sent: false, message: '没有可发送的 QQ 会话' }
+    const rawChat = String(chatId || '').trim()
+    const addr = rawChat ? parseChatId(rawChat) : null
+    if (!addr || (addr.kind !== 'private' && addr.kind !== 'group') || !addr.id) {
+      return { ok: false, sent: false, message: '没有可发送的聊天会话' }
+    }
+    const targetChatId = normalizeChatId(rawChat) || rawChat
     const it = shots.pick(query)
     if (!it) {
       return {
@@ -189,15 +195,16 @@ export function createBili({ getConfig, hub, memory, log, dsh, api: injected, vi
     if (!shots.exists(it)) return { ok: false, message: '那张截图的文件已经没有了' }
     if (g.dryRun) return { ok: true, sent: false, simulated: true, message: `试运行：准备发送《${it.title}》${clockOf(it.sec)} 的截图，未实际发送` }
     let r
-    try { r = await hub.sendImage(chatId, shotPath(it)) } catch (error) {
+    try { r = await hub.sendImage(rawChat, shotPath(it)) } catch (error) {
       return { ok: false, sent: false, message: '图没发出去：' + error.message }
     }
-    if (String(r?.message_id || '').startsWith('sim-')) return { ok: true, sent: false, simulated: true, message: '模拟发送：未实际发到 QQ' }
-    if (r?.message_id === undefined) return { ok: false, sent: false, message: '图没发出去或未收到消息回执，看日志' }
+    const mid = r?.message_id ?? r?.messageId
+    if (String(mid || '').startsWith('sim-')) return { ok: true, sent: false, simulated: true, message: '模拟发送：未实际发送' }
+    if (!reallySent(r)) return { ok: false, sent: false, message: '图没发出去或未收到消息回执，看日志' }
     const st = load()
     record(st, { kind: 'shot', title: it.title, bvid: it.bvid, text: `第 ${clockOf(it.sec)} 的截图` })
     save(st)
-    log.info(`发了一张截图《${it.title}》${clockOf(it.sec)} → ${chatId}`)
+    log.info(`发了一张截图《${it.title}》${clockOf(it.sec)} → ${targetChatId}`)
     return { ok: true, sent: true, message: `发了《${it.title}》${clockOf(it.sec)} 那一帧`, shot: { title: it.title, bvid: it.bvid, sec: it.sec } }
   }
 

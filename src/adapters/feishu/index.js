@@ -53,6 +53,8 @@
 //      机器人不在群里 → 230002。这些都按 not-sent 分类，绝不谎报成功。
 
 import { createDecipheriv, createHash, timingSafeEqual } from 'node:crypto'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { dirname, isAbsolute } from 'node:path'
 
 // ───────────────────────── 平台常量（全部来自官方文档，见 ADAPTER-FEISHU.md） ─────────────────────────
 
@@ -63,6 +65,8 @@ export const DEFAULT_BASE_URL = 'https://open.feishu.cn'
 export const PATH_TENANT_TOKEN = '/open-apis/auth/v3/tenant_access_token/internal'
 /** 发送消息（POST，query receive_id_type）—— /open-apis/im/v1/messages */
 export const PATH_SEND_MESSAGE = '/open-apis/im/v1/messages'
+/** 获取机器人所在群列表（GET，page_size/page_token） */
+export const PATH_CHATS = '/open-apis/im/v1/chats'
 /** 上传图片（multipart，image_type=message|avatar）→ image_key */
 export const PATH_UPLOAD_IMAGE = '/open-apis/im/v1/images'
 /** 上传文件（multipart，file_type + file_name + file）→ file_key */
@@ -154,6 +158,14 @@ export const CAPS_CONSERVATIVE = {
   quoteReply: false, mention: false, mentionAll: false, poke: false, typing: false,
   recall: false, card: false, listenAllInGroup: false, proactive: 'none',
   replyWindowMs: 0, repliesPerMessage: 0, history: false, memberList: false, forwardExpand: false,
+  features: {
+    'message.quote.read': false,
+    'message.reaction': false,
+    'media.fetch': false,
+    'chat.member.read': false,
+    'sticker.collect': false,
+    'sticker.sync.native': false,
+  },
 }
 
 /**
@@ -183,9 +195,17 @@ export const CAPS_FEISHU = {
   proactive: 'free',
   replyWindowMs: REPLY_WINDOW_MS,
   repliesPerMessage: REPLIES_PER_MESSAGE,
-  history: false,     // 有历史消息接口，本端没实现
-  memberList: false,  // 有群成员接口，本端没实现
-  forwardExpand: false, // 合并转发要用「获取指定消息的内容」展开，未实现
+  history: false,     // 读历史需 im:message:readonly（群全量还需 im:message.group_msg），默认关，开通权限后在设置打开
+  memberList: true,   // GET /open-apis/im/v1/chats/:chat_id/members（返回 open_id 与名字，不含群管理身份）
+  forwardExpand: true, // GET /open-apis/im/v1/messages/:message_id 展开 merge_forward 子消息
+  features: {
+    'media.fetch': true,
+    'sticker.collect': true,
+    'message.quote.read': true, // Step 1A：已实现 GET /open-apis/im/v1/messages/:id
+    'message.reaction': false,
+    'chat.member.read': false,
+    'sticker.sync.native': false,
+  },
 }
 
 // ───────────────────────── 加解密 / 验签 ─────────────────────────
@@ -570,8 +590,9 @@ export function toParts(messageType, contentRaw, mentions, options = {}) {
     }
 
     case 'merge_forward':
-      // 官方：content 固定为 "Merged and Forwarded Message"，子消息要调「获取指定消息的内容」展开
-      parts.push({ type: 'other', text: '[合并转发]', native: content })
+      // 有 message_id 时输出标准化 forward Part，供网关 fetch(forward) 调用 /im/v1/messages/:id 展开子消息
+      if (messageId) parts.push({ type: 'forward', id: messageId, summary: '[合并转发]' })
+      else parts.push({ type: 'other', text: '[合并转发]', native: content })
       break
 
     case 'share_chat': parts.push({ type: 'other', text: '[群名片]', native: content }); break
@@ -810,6 +831,58 @@ export function createFeishuAdapter(options = {}) {
   let wsReconnectTimer = null
   let wsRetry = 0
   const sentFrames = [] // 测试断言应答/心跳帧用
+  const p2pChatIds = new Map() // open_id → p2p chat_id (oc_xxx)，供 GET /im/v1/messages 查私聊历史
+  const P2P_CHATS_MAX = 2000
+  const inlineForwardCache = new Map() // nested merge_forward id → sub-items（当接口一次返回多层子消息时复用）
+
+  function p2pCachePath() {
+    try {
+      const p = typeof ctx?.dataDir === 'function' ? String(ctx.dataDir('p2p-chats.json') || '') : ''
+      return p && isAbsolute(p) ? p : ''
+    } catch {
+      return ''
+    }
+  }
+
+  function saveP2pChats() {
+    const file = p2pCachePath()
+    if (!file) return
+    try {
+      mkdirSync(dirname(file), { recursive: true })
+      writeFileSync(file, JSON.stringify(Object.fromEntries(p2pChatIds)), 'utf8')
+    } catch (error) {
+      log().debug?.('保存飞书单聊 chat_id 映射失败：', error?.message || error)
+    }
+  }
+
+  function loadP2pChats() {
+    const file = p2pCachePath()
+    if (!file || !existsSync(file)) return
+    try {
+      const parsed = JSON.parse(readFileSync(file, 'utf8'))
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return
+      for (const [openId, chatId] of Object.entries(parsed)) {
+        const oid = String(openId || '').trim()
+        const cid = String(chatId || '').trim()
+        if (!oid || !cid || p2pChatIds.has(oid)) continue
+        if (p2pChatIds.size >= P2P_CHATS_MAX) p2pChatIds.delete(p2pChatIds.keys().next().value)
+        p2pChatIds.set(oid, cid)
+      }
+    } catch (error) {
+      log().debug?.('读取飞书单聊 chat_id 映射失败：', error?.message || error)
+    }
+  }
+
+  function rememberP2pChat(openId, chatId) {
+    const oid = String(openId || '').trim()
+    const cid = String(chatId || '').trim()
+    if (!oid || !cid) return
+    const changed = p2pChatIds.get(oid) !== cid
+    p2pChatIds.delete(oid)
+    while (p2pChatIds.size >= P2P_CHATS_MAX) p2pChatIds.delete(p2pChatIds.keys().next().value)
+    p2pChatIds.set(oid, cid)
+    if (changed) saveP2pChats()
+  }
 
   // 测试故障注入
   let failSend = null
@@ -911,6 +984,7 @@ export function createFeishuAdapter(options = {}) {
     // 群聊/话题群：chat.id 用 chat_id（oc_ 开头）
     const chatId = isPrivate ? openId : String(msg.chat_id || '')
     if (!chatId) return null
+    if (isPrivate && openId && msg.chat_id) rememberP2pChat(openId, String(msg.chat_id))
 
     return {
       chat: { kind: isPrivate ? 'private' : 'group', id: chatId, title: msg.chat_name },
@@ -1349,6 +1423,33 @@ export function createFeishuAdapter(options = {}) {
     return sendError('unknown', errCode || code, instance, `飞书请求失败：${message}`)
   }
 
+  async function requestAuthedGet(url, failLabel) {
+    const requestOnce = async (forceToken = false) => {
+      const token = await tenantToken({ force: forceToken })
+      return httpClient.request({
+        method: 'GET',
+        url,
+        headers: { authorization: `Bearer ${token}` },
+        timeoutMs: timeoutMsOf(),
+      })
+    }
+    let r = await requestOnce(false)
+    let apiCode = r?.json && r.json.code !== undefined ? Number(r.json.code) : 0
+    if (r?.status === 401 || TOKEN_INVALID_CODES.has(String(apiCode))) {
+      tokenCache = { token: '', expiresAt: 0 }
+      r = await requestOnce(true)
+      apiCode = r?.json && r.json.code !== undefined ? Number(r.json.code) : 0
+    }
+    const status = Number(r?.status) || 200
+    if (status >= 400 || (Number.isFinite(apiCode) && apiCode > 0)) {
+      const codeStr = Number.isFinite(apiCode) && apiCode > 0 ? String(apiCode) : String(status)
+      const certainty = (status >= 400 && status < 500) || NOT_SENT_CODES.has(codeStr) ? 'not-sent' : 'unknown'
+      const msg = r?.json?.msg || r?.json?.message || ''
+      throw sendError(certainty, codeStr, instance, `${failLabel}（HTTP ${status}${apiCode > 0 ? ` / ${apiCode}` : ''}）${msg ? '：' + msg : ''}`)
+    }
+    return r
+  }
+
   // ───────────────────────── 平台端契约 ─────────────────────────
 
   const adapter = {
@@ -1356,7 +1457,11 @@ export function createFeishuAdapter(options = {}) {
     name,
     contract: 1,
 
-    caps: () => ({ ...capsState, ...(capsOverride || {}) }),
+    caps: () => ({
+      ...capsState,
+      ...(capsOverride || {}),
+      features: { ...(capsState.features || {}), ...(capsOverride?.features || {}) },
+    }),
 
     settings: [
       { key: 'appId', label: 'App ID', type: 'text', hint: '开发者后台 → 应用详情 → 凭证与基础信息（cli_ 开头）' },
@@ -1370,6 +1475,10 @@ export function createFeishuAdapter(options = {}) {
       {
         key: 'listenAllInGroup', label: '接收群内全部消息', type: 'boolean', default: false,
         hint: '需要敏感权限 im:message.group_msg（或含机器人的 im:message.group_msg.include_bot:read）；没批下来就只能收到 @ 她的消息',
+      },
+      {
+        key: 'history', label: '读取会话历史记录', type: 'boolean', default: false,
+        hint: '需要 im:message:readonly（读群全量历史还需 im:message.group_msg）；确认在飞书开放平台开通后打开',
       },
       {
         key: 'maxTextChars', label: '单条文本上限（字符）', type: 'number', default: DEFAULT_TEXT_CHARS,
@@ -1386,11 +1495,13 @@ export function createFeishuAdapter(options = {}) {
       instance = String(ctx.instance || id)
       running = true
       stopped = false
+      loadP2pChats()
       const cfg = config()
 
-      // 用户配置只能把能力改小
+      // 用户配置只能把能力改小（listenAllInGroup / history 为需确认应用权限后再开启的扩展门控）
       capsOverride = { ...(capsOverride || {}) }
       if (cfg.listenAllInGroup != null) capsOverride.listenAllInGroup = cfg.listenAllInGroup === true || cfg.listenAllInGroup === 'true'
+      if (cfg.history != null) capsOverride.history = cfg.history === true || cfg.history === 'true'
       if (cfg.proactive === 'none' || cfg.proactive === 'limited') capsOverride.proactive = cfg.proactive
 
       transport = String(cfg.transport || 'websocket') === 'webhook' ? 'webhook' : 'websocket'
@@ -1448,6 +1559,7 @@ export function createFeishuAdapter(options = {}) {
       for (const off of offs.splice(0)) { try { off() } catch {} }
       closeWebsocket()
       tokenCache = { token: '', expiresAt: 0 }
+      inlineForwardCache.clear()
       ctx?.state('stopped')
     },
 
@@ -1553,13 +1665,197 @@ export function createFeishuAdapter(options = {}) {
         }
         if (r.code !== 0) throw classifyResponse(r)
         lastMessageId = String(r.json?.data?.message_id || '')
+        if (!isGroup && chat?.id && r.json?.data?.chat_id) {
+          rememberP2pChat(String(chat.id), String(r.json.data.chat_id))
+        }
       }
       if (!lastMessageId) throw sendError('unknown', 'no-message-id', instance, '飞书没返回 message_id（拿不准）')
       return { messageId: lastMessageId }
     },
 
-    /** 取媒体字节：官方 GET /im/v1/messages/:message_id/resources/:file_key?type=image|file */
+    /** 取媒体字节、单条消息或会话历史记录 */
     async fetch(request) {
+      const toFetched = (item, fallbackId = '') => {
+        const selfOpenId = String(self?.account || '')
+        const rawTime = Number(item?.create_time)
+        const at = Number.isFinite(rawTime) && rawTime > 0 ? (rawTime < 1e12 ? rawTime * 1000 : rawTime) : undefined
+        let sender
+        if (item?.sender && typeof item.sender === 'object') {
+          const idTypeRaw = String(item.sender.id_type || '').trim()
+          const idType = idTypeRaw === 'open_id' || idTypeRaw === 'union_id' || idTypeRaw === 'user_id' ? idTypeRaw : undefined
+          const account = String(item.sender.id ?? '')
+          const senderType = String(item.sender.sender_type || '')
+          const isBot = senderType === 'app' || senderType === 'bot' || ((!idType || idType === 'open_id') && Boolean(selfOpenId && account === selfOpenId))
+          sender = {
+            account,
+            isBot,
+            ...(idType ? { idType } : {}),
+          }
+        }
+        const resolvedId = String(item?.message_id || fallbackId)
+        if (item?.deleted === true) {
+          return {
+            messageId: resolvedId,
+            ...(at ? { at } : {}),
+            ...(sender ? { sender } : {}),
+            parts: [{ type: 'other', text: '[该消息已撤回]' }],
+            deleted: true,
+          }
+        }
+        const parts = toParts(item?.msg_type, item?.body?.content, item?.mentions, {
+          selfOpenId,
+          messageId: resolvedId,
+        })
+        return {
+          messageId: resolvedId,
+          ...(at ? { at } : {}),
+          ...(sender ? { sender } : {}),
+          parts: parts.length ? parts : [{ type: 'other', text: '[空消息]' }],
+        }
+      }
+
+      if (request?.kind === 'message') {
+        const messageId = String(request.messageId || '').trim()
+        if (!messageId) throw sendError('not-sent', 'bad-fetch-request', instance, '飞书取消息需要 messageId')
+        const url = `${baseUrl()}${PATH_SEND_MESSAGE}/${encodeURIComponent(messageId)}`
+        const r = await requestAuthedGet(url, '飞书读取消息失败')
+        const item = r?.json?.data?.items?.[0]
+        if (!item || typeof item !== 'object') {
+          throw sendError('not-sent', 'message-not-found', instance, `飞书未返回消息内容（${messageId}）`)
+        }
+        if (item.chat_id && request.chat?.kind === 'private' && request.chat?.id) {
+          rememberP2pChat(String(request.chat.id), String(item.chat_id))
+        }
+        return toFetched(item, messageId)
+      }
+      if (request?.kind === 'forward') {
+        const messageId = String(request.id || '').trim()
+        if (!messageId) throw sendError('not-sent', 'bad-fetch-request', instance, '飞书展开合并转发需要 id（message_id）')
+        let rawItems = inlineForwardCache.get(messageId)
+        if (rawItems) {
+          inlineForwardCache.delete(messageId)
+        } else {
+          const url = `${baseUrl()}${PATH_SEND_MESSAGE}/${encodeURIComponent(messageId)}`
+          const r = await requestAuthedGet(url, '飞书展开合并转发失败')
+          rawItems = Array.isArray(r?.json?.data?.items) ? r.json.data.items : []
+        }
+        if (!rawItems.length) {
+          throw sendError('not-sent', 'message-not-found', instance, `飞书未返回合并转发内容（${messageId}）`)
+        }
+        const nonSelf = rawItems.filter((it) => it && String(it.message_id || '') !== messageId)
+        const hasUpperIds = nonSelf.some((it) => it.upper_message_id)
+        const directChildren = hasUpperIds ? nonSelf.filter((it) => it.upper_message_id === messageId) : []
+        const list = directChildren.length ? directChildren : nonSelf
+        if (hasUpperIds && directChildren.length && nonSelf.length > directChildren.length) {
+          // 若响应一次性内联了多层嵌套子消息，缓存每条子合并转发对应的后代列表，供 readFetchedForward 逐层递归至 MAX_FORWARD_DEPTH
+          for (const child of directChildren) {
+            if (child?.msg_type !== 'merge_forward' || !child?.message_id) continue
+            const cid = String(child.message_id)
+            const nested = nonSelf.filter((it) => it !== child)
+            const hasNested = nested.some((it) => it.upper_message_id === cid)
+            if (hasNested) {
+              if (inlineForwardCache.size >= 100) inlineForwardCache.delete(inlineForwardCache.keys().next().value)
+              inlineForwardCache.set(cid, nested)
+            }
+          }
+        }
+        const messages = list.map((it, idx) => toFetched(it, `fwd-${idx}`))
+        if (messages.length >= 2) {
+          const firstAt = Number(messages[0]?.at) || 0
+          const lastAt = Number(messages[messages.length - 1]?.at) || 0
+          if (firstAt > 0 && lastAt > 0 && firstAt > lastAt) messages.reverse()
+        }
+        return { messages }
+      }
+      if (request?.kind === 'members') {
+        const chat = request.chat || {}
+        if (chat.kind !== 'group') throw sendError('not-sent', 'no-member', instance, '飞书私聊没有群成员列表')
+        const chatId = String(chat.id || '').trim()
+        if (!chatId) throw sendError('not-sent', 'bad-fetch-request', instance, '飞书获取群成员缺少 chat.id')
+        const members = []
+        let pageToken = ''
+        for (let pageNo = 0; pageNo < 5; pageNo++) {
+          const params = new URLSearchParams({ member_id_type: 'open_id', page_size: '100' })
+          if (pageToken) params.set('page_token', pageToken)
+          const url = `${baseUrl()}${PATH_CHATS}/${encodeURIComponent(chatId)}/members?${params.toString()}`
+          const r = await requestAuthedGet(url, '飞书获取群成员列表失败')
+          const data = r?.json?.data || {}
+          for (const item of Array.isArray(data.items) ? data.items : []) {
+            const acc = String(item?.member_id || '').trim()
+            if (!acc) continue
+            const idType = String(item?.member_id_type || '').trim()
+            members.push({
+              account: acc,
+              name: String(item?.name || ''),
+              ...(idType ? { idType } : {}),
+            })
+          }
+          if (!data.has_more || !data.page_token) break
+          pageToken = String(data.page_token)
+        }
+        return members
+      }
+      if (request?.kind === 'chats') {
+        const groups = []
+        let pageToken = ''
+        for (let pageNo = 0; pageNo < 5; pageNo++) {
+          const params = new URLSearchParams({ page_size: '100' })
+          if (pageToken) params.set('page_token', pageToken)
+          const url = `${baseUrl()}${PATH_CHATS}?${params.toString()}`
+          const r = await requestAuthedGet(url, '飞书获取群列表失败')
+          const data = r?.json?.data || {}
+          for (const item of Array.isArray(data.items) ? data.items : []) {
+            const cid = String(item?.chat_id || '').trim()
+            if (!cid) continue
+            groups.push({
+              id: cid,
+              name: String(item?.name || ''),
+              ...(item?.description ? { description: String(item.description) } : {}),
+            })
+          }
+          if (!data.has_more || !data.page_token) break
+          pageToken = String(data.page_token)
+        }
+        return { groups, friends: [] }
+      }
+      if (request?.kind === 'history') {
+        const chat = request.chat || {}
+        const rawId = String(chat.id || '').trim()
+        if (!rawId) throw sendError('not-sent', 'bad-fetch-request', instance, '飞书取历史记录缺少 chat.id')
+        const containerId = rawId.startsWith('oc_')
+          ? rawId
+          : (chat.kind === 'private' ? (p2pChatIds.get(rawId) || '') : rawId)
+        if (!containerId) {
+          throw sendError('not-sent', 'no-chat-id', instance, '飞书单聊暂未记录会话 chat_id（oc_ 开头）；先收到或发出一条该单聊消息后才能翻历史')
+        }
+        const pageSize = Math.max(1, Math.min(50, Number(request.count) || 20))
+        const params = new URLSearchParams({
+          container_id_type: 'chat',
+          container_id: containerId,
+          sort_type: 'ByCreateTimeDesc',
+          page_size: String(pageSize),
+        })
+        const beforeToken = request.before !== undefined && request.before !== null ? String(request.before).trim() : ''
+        if (beforeToken) params.set('page_token', beforeToken)
+        const url = `${baseUrl()}${PATH_SEND_MESSAGE}?${params.toString()}`
+        const r = await requestAuthedGet(url, '飞书读取历史消息失败')
+        const data = r?.json?.data || {}
+        const rawItems = Array.isArray(data.items) ? data.items : []
+        const messages = rawItems.map((it, idx) => toFetched(it, `hist-${idx}`))
+        // ByCreateTimeDesc 返回新 → 旧；除明确已按 [旧 → 新] 返回的情况外，统一转为 [旧 → 新]
+        if (messages.length >= 2) {
+          const firstAt = Number(messages[0]?.at) || 0
+          const lastAt = Number(messages[messages.length - 1]?.at) || 0
+          if (!(firstAt > 0 && lastAt > 0 && firstAt < lastAt)) messages.reverse()
+        }
+        const hasMore = Boolean(data.has_more && data.page_token)
+        const before = hasMore ? String(data.page_token) : undefined
+        return {
+          messages,
+          hasMore,
+          ...(before ? { before } : {}),
+        }
+      }
       if (request?.kind !== 'media') throw new Error(`飞书平台端不支持这种 fetch：${request?.kind}`)
       const media = request.media || {}
       const key = String(media.id || '')
@@ -1567,13 +1863,8 @@ export function createFeishuAdapter(options = {}) {
       const messageId = String(media.messageId || '')
       if (!messageId) throw new Error('飞书取媒体需要 media.messageId（官方接口要消息 ID 才能定位资源）')
       const type = /^img_/.test(key) || String(media.mime || '').startsWith('image/') ? 'image' : 'file'
-      const token = await tenantToken()
-      return httpClient.request({
-        method: 'GET',
-        url: `${baseUrl()}/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/resources/${encodeURIComponent(key)}?type=${type}`,
-        headers: { authorization: `Bearer ${token}` },
-        timeoutMs: timeoutMsOf(),
-      })
+      const url = `${baseUrl()}/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/resources/${encodeURIComponent(key)}?type=${type}`
+      return requestAuthedGet(url, '飞书拉取媒体失败')
     },
 
     /** 上传媒体换 key（外部拿到字节后让平台端上传；本端不主动下载） */
@@ -1599,7 +1890,22 @@ export function createFeishuAdapter(options = {}) {
 
   adapter.__feishu = {
     setSelf(value) { self = value },
-    setCaps(partial) { capsState = { ...capsState, ...(partial || {}) }; ctx?.capsChanged?.() },
+    setCaps(partial) {
+      capsState = {
+        ...capsState,
+        ...(partial || {}),
+        ...(partial?.features ? { features: { ...(capsState.features || {}), ...partial.features } } : {}),
+      }
+      if (capsOverride && partial && typeof partial === 'object') {
+        const { features, ...rest } = partial
+        capsOverride = {
+          ...capsOverride,
+          ...rest,
+          ...(features ? { features: { ...(capsOverride.features || {}), ...features } } : {}),
+        }
+      }
+      ctx?.capsChanged?.()
+    },
     setConfig(cfg) { injectedConfig = cfg },
     tokenCache: () => ({ ...tokenCache }),
     handleCallback,

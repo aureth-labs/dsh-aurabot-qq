@@ -118,6 +118,9 @@ function respond(action, params, gateway = {}) {
     case 'set_self_longnick': throw Object.assign(new Error('签名太长'), { data: { retcode: 100, message: '签名太长' } })
     case 'get_qzone_msg_list': return envelope({ total: 0, msglist: [] })
     case 'fetch_custom_face': return envelope([])
+    case 'add_custom_face': throw Object.assign(new Error('图片数据无效'), { data: { retcode: 100, message: '图片数据无效' } })
+    case 'modify_custom_face': throw Object.assign(new Error('表情 ID 为空或备注过长'), { data: { retcode: 100, message: '表情 ID 为空或备注过长' } })
+    case 'delete_custom_face': throw Object.assign(new Error('缺少有效的 emoji_id'), { data: { retcode: 100, message: '缺少有效的 emoji_id' } })
     case 'fetch_ptt_text': throw Object.assign(new Error('消息不存在'), { data: { retcode: 100, message: '消息不存在' } })
     case 'fetch_sys_faces': return envelope({ packs: [] })
     case 'get_image':
@@ -805,4 +808,89 @@ test('Probe 表本身健全：每个探针都有名字、动作（或由参数�
   }
   const names = PROBE_TABLE.map((p) => p.name)
   assert.equal(new Set(names).size, names.length, '探针名不能重复（缓存和日志按名字索引）')
+})
+
+test('Step 0B：QQ 适配器 L2 features（只读探测 sticker.collect / sticker.sync.native + 运行期写动作懒降级）', async () => {
+  const conservative = makeAdapter()
+  assert.equal(conservative.adapter.caps().features['sticker.collect'], false)
+  assert.equal(conservative.adapter.caps().features['sticker.sync.native'], false)
+
+  // 修改返回副本不应影响内部 caps.features
+  const snap = conservative.adapter.caps()
+  snap.features['sticker.collect'] = true
+  assert.equal(conservative.adapter.caps().features['sticker.collect'], false)
+
+  // get_image 存在即 sticker.collect=true & media.fetch=true；只读 fetch_custom_face 存在即 sticker.sync.native=true
+  const { adapter: full, client: fullClient } = makeAdapter()
+  const ctxFull = makeCtx(full)
+  await full.start(ctxFull)
+  await waitProbed(full)
+  const fFull = full.caps().features
+  assert.equal(fFull['media.fetch'], true)
+  assert.equal(fFull['sticker.collect'], true)
+  assert.equal(fFull['sticker.sync.native'], true)
+  assert.equal(fFull['message.quote.read'], true)
+  assert.equal(fFull['message.reaction'], true)
+  assert.equal(fFull['chat.member.read'], true)
+
+  // 运行期懒降级：真实网关只支持 fetch_custom_face、但第一次实际调用 add_custom_face 返回 1404 不支持 →
+  // 立刻将 sticker.sync.native 懒降级为 false、触发 capsChanged 并从后续允许动作剔除
+  const baseCall = fullClient.call.bind(fullClient)
+  fullClient.call = async (action, params) => {
+    if (action === 'add_custom_face') {
+      fullClient.calls.push({ action, params })
+      throw Object.assign(new Error('不支持的API：add_custom_face'), { data: { retcode: 1404, message: '不支持的API：add_custom_face' } })
+    }
+    return baseCall(action, params)
+  }
+  const changesBeforeDowngrade = ctxFull.capsChanges
+  await assert.rejects(
+    () => full.native('add_custom_face', { file: 'base64://valid' }),
+    (e) => e.certainty === 'not-sent' && e.code === 'unsupported-action',
+  )
+  assert.equal(full.caps().features['sticker.sync.native'], false, '首次遇到 1404 后 sticker.sync.native 应立刻降为 false')
+  assert.ok(ctxFull.capsChanges > changesBeforeDowngrade, '懒降级后必须通知网关重读 caps')
+  const callsBeforeSecondTry = fullClient.calls.length
+  await assert.rejects(
+    () => full.native('add_custom_face', { file: 'base64://valid' }),
+    (e) => e.certainty === 'not-sent' && e.code === 'unsupported-action',
+  )
+  assert.equal(fullClient.calls.length, callsBeforeSecondTry, '再次调用已降级动作应本地直接拦截，不再发请求')
+  await full.stop()
+
+  // 缺失 fetch_custom_face 与 get_image / get_record → sticker.sync.native=false 且 sticker.collect=false
+  const { adapter: partial } = makeAdapter({
+    gateway: { missing: ['fetch_custom_face', 'get_image', 'get_record'] },
+  })
+  const ctxPartial = makeCtx(partial)
+  await partial.start(ctxPartial)
+  await waitProbed(partial)
+  const fPartial = partial.caps().features
+  assert.equal(fPartial['media.fetch'], false)
+  assert.equal(fPartial['sticker.collect'], false, '无媒体下载能力时 sticker.collect 必须显式为 false')
+  assert.equal(fPartial['sticker.sync.native'], false, '缺失只读 fetch_custom_face 即 false')
+  await assert.rejects(
+    () => partial.native('add_custom_face', { file: 'base64://valid' }),
+    (e) => e.certainty === 'not-sent' && e.code === 'unsupported-action',
+  )
+  await partial.stop()
+
+  // capsFromProbes 与 readCapsCache 对 features 校验同步
+  const fromMemberInfoOnly = capsFromProbes({ member_info: { exists: true }, members: { exists: false } })
+  assert.equal(fromMemberInfoOnly.memberList, false)
+  assert.equal(fromMemberInfoOnly.features['chat.member.read'], true)
+
+  const cachedFs = fakeFs({
+    'caps-feat.json': JSON.stringify({
+      v: 1,
+      caps: {
+        poke: true,
+        features: { 'sticker.collect': true, 'unknown.key': true, 'media.fetch': 'yes' },
+      },
+    }),
+  })
+  const loaded = readCapsCache('caps-feat.json', { fs: cachedFs })
+  assert.equal(loaded.caps.features['sticker.collect'], true)
+  assert.equal(loaded.caps.features['media.fetch'], false, '非法非布尔值回落保守值')
+  assert.equal(Object.hasOwn(loaded.caps.features, 'unknown.key'), false, '缓存未知 Feature 键应被清除')
 })

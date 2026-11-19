@@ -29,3 +29,5 @@ jobs:
           node-version: '22'
       - name: Run tests
         run: npm test
+      - name: Typecheck contracts
+        run: npm run test:types

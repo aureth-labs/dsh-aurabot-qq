@@ -19,6 +19,7 @@
 // 记 unknown —— 宁可不声明这项能力，也不谎报。
 
 import * as nodeFs from 'node:fs'
+import { sanitizeFeaturesInput } from '../../gateway/features.js'
 
 /** 单个探测的超时（网关忙的时候别把启动拖太久）。 */
 export const PROBE_TIMEOUT_MS = 5000
@@ -63,6 +64,14 @@ export const CAPS_CONSERVATIVE = Object.freeze({
   history: false,
   memberList: false,
   forwardExpand: false,
+  features: Object.freeze({
+    'message.quote.read': false,
+    'message.reaction': false,
+    'media.fetch': false,
+    'chat.member.read': false,
+    'sticker.collect': false,
+    'sticker.sync.native': false,
+  }),
 })
 
 /** 「这个动作不存在」的文本特征（各家措辞差异都收进来）。 */
@@ -145,18 +154,19 @@ export const PROBE_TABLE = [
   // ── 空间（只用只读的列表接口，绝不发说说）──
   { name: 'qzone_list', action: 'get_qzone_msg_list', params: () => ({ num: 1 }), label: '空间说说列表' },
 
-  // ── 收藏表情（只读）──
+  // ── 收藏表情（仅只读探测 fetch_custom_face；写动作走运行期懒降级，绝不在连接阶段调用）──
   { name: 'custom_faces', action: 'fetch_custom_face', params: () => ({ count: 1 }), label: '收藏表情' },
 
   // ── 语音转文字 ──
   { name: 'ptt_text', action: 'fetch_ptt_text', params: () => ({ message_id: 0 }), label: '语音转文字' },
 
-  // ── 其余常用扩展动作（只进清单，供 native() 白名单与面板提示用）──
+  // ── 其余常用扩展动作（供 L2 Feature / native() 白名单与面板提示用）──
   { name: 'sys_faces', action: 'fetch_sys_faces', params: {}, label: '系统表情表' },
   { name: 'image_download', action: 'get_image', params: () => ({ file: '' }), label: '取图片' },
   { name: 'record_download', action: 'get_record', params: () => ({ file: '' }), label: '取语音' },
   { name: 'stranger_info', action: 'get_stranger_info', params: () => ({ user_id: 0 }), label: '查陌生人资料' },
   { name: 'group_info', action: 'get_group_info', params: () => ({ group_id: 0 }), label: '查群资料' },
+  { name: 'member_info', action: 'get_group_member_info', params: (bag) => ({ group_id: firstGroup(bag), user_id: 0 }), label: '查群成员信息' },
   { name: 'friend_requests', action: 'get_doubt_friends_add_request', params: () => ({ count: 1 }), label: '好友申请列表' },
   { name: 'group_msg', action: 'get_msg', params: () => ({ message_id: 0 }), label: '取单条消息' },
 ]
@@ -297,7 +307,7 @@ export async function probeGateway(call, { log, timeoutMs = PROBE_TIMEOUT_MS, ta
  */
 export function capsFromProbes(entries) {
   const has = (name) => entries?.[name]?.exists === true
-  const caps = { ...CAPS_CONSERVATIVE }
+  const caps = { ...CAPS_CONSERVATIVE, features: { ...CAPS_CONSERVATIVE.features } }
 
   // 网关明确回答「不能发」才降级（这是它自己的答案，不是我们猜的）
   if (entries?.can_send_image?.exists === false) caps.image = false
@@ -319,6 +329,18 @@ export function capsFromProbes(entries) {
   caps.history = has('history')
   caps.memberList = has('members')
   caps.forwardExpand = has('forward')
+
+  // L2 Features（无对应 L1 键及独立演进项按探针严格显式赋值）
+  const mediaFetch = has('image_download') || has('record_download')
+  caps.features = {
+    'message.quote.read': has('group_msg'),
+    'message.reaction': has('emoji_like'),
+    'media.fetch': mediaFetch,
+    'chat.member.read': has('member_info') || has('members'),
+    'sticker.collect': mediaFetch,
+    // 以只读 fetch_custom_face 探测为准；写动作（add/modify/delete）若运行期首次报不支持则懒降级为 false
+    'sticker.sync.native': has('custom_faces'),
+  }
   return caps
 }
 
@@ -327,10 +349,17 @@ export function capsFromProbes(entries) {
  * 只硬编码 OneBot v11 的**标准动作**：探测失败也不该把「发消息 / 查资料」这条路堵死。
  * 扩展动作（send_poke、set_input_status、delete_msg、set_qq_profile……）**必须探到才放行**，
  * 这正是能力探测的意义：模块调 native 时能得到「当前网关不支持 X」的明确答复。
+ * 注：收藏表情写动作（add/modify/delete_custom_face）不在启动期主动写探测，当 fetch_custom_face 存在时
+ * 先伴随放行，并在运行期遇到 unsupported 响应时由 native() 即时懒降级剔除。
  */
 export function supportedActions(probe) {
   const set = new Set(probe?.supported || [])
-  for (const a of ['send_private_msg', 'send_group_msg', 'send_msg', 'get_login_info', 'get_version_info', 'get_status', 'get_friend_list', 'get_group_list', 'get_group_info', 'get_group_member_info', 'get_stranger_info', 'can_send_image', 'can_send_record']) set.add(a)
+  if (set.has('fetch_custom_face')) {
+    set.add('add_custom_face')
+    set.add('modify_custom_face')
+    set.add('delete_custom_face')
+  }
+  for (const a of ['send_private_msg', 'send_group_msg', 'send_msg', 'get_login_info', 'get_version_info', 'get_status', 'get_friend_list', 'get_group_list', 'get_group_info', 'get_group_member_info', 'get_group_member_list', 'get_stranger_info', 'can_send_image', 'can_send_record', 'set_group_ban', 'set_group_whole_ban', 'set_group_kick', 'set_group_special_title', '_send_group_notice']) set.add(a)
   return set
 }
 
@@ -355,13 +384,18 @@ export function readCapsCache(file, { fs: fsImpl, log } = {}) {
     const raw = JSON.parse(f.readFileSync(file, 'utf8'))
     if (!raw || raw.v !== CAPS_CACHE_VERSION || !raw.caps) return null
     const caps = {}
-    for (const key of Object.keys(CAPS_CONSERVATIVE)) if (raw.caps[key] !== undefined) caps[key] = raw.caps[key]
+    for (const key of Object.keys(CAPS_CONSERVATIVE)) {
+      if (key === 'features') continue
+      if (raw.caps[key] !== undefined) caps[key] = raw.caps[key]
+    }
+    const sanitizedFeatures = sanitizeFeaturesInput(raw.caps.features, { source: 'qq.capsCache.features' })
+    const features = { ...CAPS_CONSERVATIVE.features, ...(sanitizedFeatures || {}) }
     // 只认契约里有的取值；缓存里的怪值（比如 voice: 'yes'）丢掉，让它落回保守值
     if (!['native', 'file', false].includes(caps.voice)) delete caps.voice
     if (!['free', 'limited', 'none'].includes(caps.proactive)) delete caps.proactive
     return {
       gateway: raw.gateway && typeof raw.gateway === 'object' ? raw.gateway : {},
-      caps: { ...CAPS_CONSERVATIVE, ...caps },
+      caps: { ...CAPS_CONSERVATIVE, ...caps, features },
       supported: Array.isArray(raw.supported) ? raw.supported.map(String) : [],
       actions: Array.isArray(raw.actions) ? raw.actions.map(String) : [],
       probedAt: Number(raw.probedAt) || 0,

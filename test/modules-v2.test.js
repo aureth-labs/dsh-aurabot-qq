@@ -110,21 +110,23 @@ function makeTestGateway(t, { platforms = {}, nativeHandlers = {}, ids = ['fake'
   return { gateway, adaptersOf: (id) => adaptersById.get(id) || [] }
 }
 
-test('API_VERSION = 2 且向后兼容 MIN_API_VERSION = 1；v1 模块默认 platforms = ["qq"]', () => {
-  assert.equal(API_VERSION, 2)
+test('API_VERSION = 3 且向后兼容 MIN_API_VERSION = 1；v1 模块默认 platforms = ["qq"]', () => {
+  assert.equal(API_VERSION, 3)
   assert.equal(MIN_API_VERSION, 1)
   assert.deepEqual(modulePlatforms({ id: 'old', setup() {} }), ['qq'])
   assert.deepEqual(modulePlatforms({ id: 'multi', api: 2, platforms: ['*', 'fake'], setup() {} }), ['*', 'fake'])
+  assert.deepEqual(modulePlatforms({ id: 'v3mod', api: 3, platforms: ['*'], setup() {} }), ['*'])
   assert.equal(checkDef({ id: 'old', api: 1, setup() {} }), '')
   assert.equal(checkDef({ id: 'new', api: 2, platforms: ['*'], setup() {} }), '')
+  assert.equal(checkDef({ id: 'v3mod', api: 3, platforms: ['*'], features: { required: ['message.quote.read'], optional: ['chat.typing'] }, setup() {} }), '')
   assert.match(checkDef({ id: 'bad', api: 2, platforms: [], setup() {} }), /platforms/)
   assert.match(checkDef({ id: 'bad2', api: 2, platforms: 'qq', setup() {} }), /platforms/)
-  assert.match(checkDef({ id: 'future', api: 3, setup() {} }), /v3/)
+  assert.match(checkDef({ id: 'future', api: 4, setup() {} }), /v4/)
 })
 
 test('内置模块平台声明完备，只开假平台时 QQ 模块跳过（「未启用对应平台」），[*] 模块全部正常运行', async (t) => {
-  const expectedUniversal = ['memory', 'mood', 'purpose', 'autotelic', 'song', 'speakup', 'bili', 'voice', 'imagegen', 'video']
-  const expectedQq = ['qq-api', 'qq-tools', 'qzone-social', 'diary', 'contacts', 'profile', 'stickers']
+  const expectedUniversal = ['memory', 'mood', 'purpose', 'autotelic', 'song', 'speakup', 'bili', 'voice', 'imagegen', 'video', 'stickers', 'chat-tools']
+  const expectedQq = ['qq-api', 'qq-tools', 'qzone-social', 'diary', 'contacts', 'profile']
   for (const def of BUILTINS) {
     if (expectedUniversal.includes(def.id)) {
       assert.deepEqual(def.platforms, ['*'], `${def.id} 应声明 platforms: ['*']`)
@@ -132,7 +134,7 @@ test('内置模块平台声明完备，只开假平台时 QQ 模块跳过（「�
       assert.deepEqual(def.platforms, ['qq'], `${def.id} 应声明 platforms: ['qq']`)
     }
   }
-  assert.deepEqual(groupAdminDef.platforms, ['qq'])
+  assert.deepEqual(groupAdminDef.platforms, ['qq', 'qqbot'])
 
   const { gateway } = makeTestGateway(t, { platforms: { fake: { enabled: true }, qq: { enabled: false } }, ids: ['fake', 'qq'] })
   await gateway.sync()
@@ -151,6 +153,7 @@ test('内置模块平台声明完备，只开假平台时 QQ 模块跳过（「�
   assert.equal(list.find((m) => m.id === 'mood').running, 'builtin', 'platform=["*"] 模块 mood 应照常启动')
   assert.equal(list.find((m) => m.id === 'speakup').running, 'builtin', 'platform=["*"] 模块 speakup 应照常启动')
   assert.equal(list.find((m) => m.id === 'voice').running, 'builtin', 'platform=["*"] 模块 voice 应照常启动')
+  assert.equal(list.find((m) => m.id === 'stickers').running, 'builtin', 'platform=["*"] 模块 stickers（Step 1B）应照常启动')
 })
 
 test('按平台启停模块 & 平台开关热切换 sync：用户/内置模块随平台状态自动启停', async (t) => {
@@ -459,8 +462,10 @@ test('QQ 关闭时或 G3 未同步共存下的旧口强失败与回退', async (
   const g3Gw = {
     instances: () => [{ instance: 'qq', platform: 'qq', name: 'QQ', enabled: true, state: 'stopped', caps: null }],
     caps: () => null,
+    features: () => ({}),
     native: () => { throw new Error('不应直调未启动 run 的 gateway.native') },
     onState: () => () => {},
+    onCapsChanged: () => () => {},
   }
   const directCalls = []
   let g3Api = null

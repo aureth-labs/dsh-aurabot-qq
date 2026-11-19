@@ -57,6 +57,7 @@ export function makeFakeAdapter(overrides = {}) {
     listenAllInGroup: true, proactive: 'free', replyWindowMs: 0, repliesPerMessage: 0,
     history: false, memberList: false, forwardExpand: false,
     ...(overrides.caps || {}),
+    ...(overrides.caps?.features ? { features: { ...overrides.caps.features } } : {}),
   }
   // config 里的 proactive（网关把实例 config 给 ctx.config()，模板端读它的做法一致）
   if (overrides.config?.proactive) caps.proactive = overrides.config.proactive
@@ -73,7 +74,7 @@ export function makeFakeAdapter(overrides = {}) {
     name: overrides.name || '假平台',
     contract: 1,
 
-    caps() { return { ...caps } },
+    caps() { return caps.features ? { ...caps, features: { ...caps.features } } : { ...caps } },
 
     settings: [
       { key: 'proactive', label: '主动消息', type: 'select', options: ['free', 'limited', 'none'], default: 'free' },
@@ -176,7 +177,13 @@ export function makeFakeAdapter(overrides = {}) {
     hangNextSend() { hangNext = true },
     /** 运行中改能力表并通知网关（模拟探测后能力变了）。 */
     setCaps(partial) {
-      Object.assign(caps, partial)
+      if (partial?.features && typeof partial.features === 'object') {
+        const { features, ...rest } = partial
+        Object.assign(caps, rest)
+        caps.features = { ...(caps.features || {}), ...features }
+      } else {
+        Object.assign(caps, partial)
+      }
       ctx?.capsChanged()
     },
 

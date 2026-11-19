@@ -38,7 +38,7 @@ import { parseCommand, runCommand, createMutes, commandList } from './chat/comma
 import { ownerPrivateChatIds } from './chat/access.js'
 import { changePermissions, changePrivateWhitelist, privatePermissionCatalog } from './chat/permission-policy.js'
 import { canUseDelegatedCommand, delegatedCommandKey, runPersonalModelCommand } from './chat/delegated-commands.js'
-import { listPersonas, readPersona, savePersona, deletePersona, currentPersonaText, rulesText, seedPersonas } from './persona/personas.js'
+import { listPersonas, readPersona, savePersona, deletePersona, currentPersonaText, rulesText, qqSessionRulesText, QQ_POKE_RULE, seedPersonas } from './persona/personas.js'
 import { createModules, API_VERSION } from './core/modules.js'
 import { createCommunity, REGISTRY_URL, GITEE_MIRROR } from './core/community.js'
 import { createApprovalRelay } from './security/approval.js'
@@ -54,7 +54,7 @@ import { setSsrpMode, assertPublicUrl, fetchGuarded } from './core/net.js'
 import { BUILTINS } from './modules/index.js'
 import { createOutboundPolicy } from './chat/outbound-policy.js'
 import { createPurposePolicy, createSpeakupPolicy, createSharedBudget } from './features/proactive-policy.js'
-import { parseChatId, formatChatId } from './gateway/address.js'
+import { parseChatId, normalizeChatId, formatChatId } from './gateway/address.js'
 import { createIdentity } from './gateway/identity.js'
 import { createGateway } from './gateway/index.js'
 import { createQqAdapter } from './adapters/qq/index.js'
@@ -380,7 +380,34 @@ export function apply(ctx) {
 
   // ---------- 人格与规则：通过提示词变量注入到 Aurabot 的两个 preset ----------
   const variable = (n, fn) => ctx.effect(() => ctx.systemPrompt.variable(n, (...args) => captureSystemPrompt(n, cleanText(fn(...args)))), `aurabot: 变量 ${n}`)
-  const rulesOpts = (kind) => ({ ...(mods ? { off: mods.builtinOff(), extra: mods.rules(kind) } : {}), identity })
+  const hasNonDefaultQqInstance = () => {
+    const plats = getConfig()?.platforms
+    if (plats && typeof plats === 'object') {
+      for (const [inst, v] of Object.entries(plats)) {
+        if (!v || v.enabled === false) continue
+        const p = String(v.platform || inst.split(':')[0].split('#')[0] || '').trim()
+        if (p === defaultPlatform && inst !== defaultPlatform) return true
+      }
+    }
+    const insts = platformGateway?.instances?.()
+    if (Array.isArray(insts)) {
+      for (const st of insts) {
+        if (st?.enabled && st.platform === defaultPlatform && st.instance !== defaultPlatform) return true
+      }
+    }
+    return false
+  }
+  const globalQqPokeAllowed = () => {
+    if (hasNonDefaultQqInstance()) return false
+    const qqCaps = platformGateway?.caps?.(defaultPlatform)
+    if (qqCaps && qqCaps.poke === false) return false
+    return true
+  }
+  const rulesOpts = (kind) => ({
+    ...(mods ? { off: mods.builtinOff(), extra: mods.rules(kind), activePlatforms: mods.activePlatforms?.() } : {}),
+    identity,
+    poke: globalQqPokeAllowed(),
+  })
   // 扩展模块能整段改写人格和规则（同步：提示词变量不能等）
   const rewrite = (event, text, ...args) => { const r = mods ? mods.filterSync(event, text, ...args) : text; return typeof r === 'string' ? r : r === null ? '' : text }
   variable('aurabot_persona', () => rewrite('persona', currentPersonaText(cfg.persona.current)))
@@ -1121,7 +1148,7 @@ export function apply(ctx) {
     }
   }
   ctx.effect(() => ctx.interval(() => { probeWarmup().catch(() => {}) }, 2000), 'aurabot: 网关预热探测')
-  const groupRoles = createGroupRoles({ onebot, getConfig, log: logger.child('chat') })
+  const groupRoles = createGroupRoles({ onebot, getGateway: () => platformGateway, getConfig, dataDir, log: logger.child('chat') })
   const local = createLocal({ getConfig, log: logger })
   const mutes = createMutes()
 
@@ -1153,6 +1180,7 @@ export function apply(ctx) {
   const use = (id) => mods?.use(id) || null
   const stickers = {
     match: (q) => use('stickers')?.match?.(q) ?? null,
+    partFor: (it) => use('stickers')?.partFor?.(it) ?? null,
     segmentFor: (it) => use('stickers')?.segmentFor?.(it) ?? null,
     markUsed: (md5) => use('stickers')?.markUsed?.(md5),
     pickForReply: (t) => use('stickers')?.pickForReply?.(t) ?? null,
@@ -1198,22 +1226,39 @@ export function apply(ctx) {
     buildTools: (where) => mods.buildTools(where),
     // 模块声明的能力（module.json capabilities）：子智能体委派这类要本机权限的能力靠它把关（一审 #177）
     capabilitiesOf: (id) => (typeof mods.capabilitiesOf === 'function' ? mods.capabilitiesOf(id) : []),
-    contextProviders: [(args) => mods.contextFor(args)],
+    contextProviders: [
+      (args) => mods.contextFor(args),
+      ({ chat }) => {
+        if (!chat || chat.kind === 'system' || !mods) return ''
+        const active = mods.activePlatforms?.() || []
+        const addr = parseChatId(normalizeChatId(chat.chatId) || String(chat.chatId || ''))
+        const plat = chat.platform || addr?.platform || ''
+        if (plat !== defaultPlatform) return ''
+        const isDefInst = !addr?.instance || addr.instance === defaultPlatform
+        const poke = isDefInst && platformGateway?.caps?.(chat.chatId)?.poke !== false
+        if (active.length <= 1 && active.includes(defaultPlatform)) {
+          return !globalQqPokeAllowed() && poke ? QQ_POKE_RULE : ''
+        }
+        return qqSessionRulesText(getConfig(), { off: mods.builtinOff(), poke })
+      },
+    ],
     onActivity: (a) => mods.emit('activity', a),
     // 群聊话题和她的记忆有多相关（插话判断用）
     memoryScore: (text) => use('memory')?.topicScore?.(text) ?? 0,
     dislikes: (qq) => use('memory')?.dislikes?.(qq) ?? false,
     onMemoryCommand: (msg, text) => use('memory')?.handleCommand?.(msg, text),
-    // QQ 里的主人命令（模块加的命令优先）
+    // 主人命令（模块加的命令优先；按当前对话平台和 L2 能力过滤）
     onCommand: async (msg, markSensitive, ownerStillCurrent) => {
-      const commands = mods.commands()
-      const cmd = parseCommand(msg.text, commands)
+      const commands = mods.commands({ platform: msg.platform, chatId: msg.chatId })
+      const msgPlat = msg.platform || parseChatId(msg.chatId)?.platform || 'qq'
+      const hidden = msgPlat !== 'qq' ? new Set(['diary']) : null
+      const cmd = parseCommand(msg.text, commands, { hidden })
       if (!cmd) return null
       if (!ownerStillCurrent()) {
         const key = delegatedCommandKey(cmd)
         if (!canUseDelegatedCommand(getConfig(), msg, key)) return '你没有使用这个命令的权限，请联系主人设置。'
         if (key === 'help') {
-          const list = commandList(commands).filter((item) => canUseDelegatedCommand(getConfig(), msg, delegatedCommandKey(parseCommand('/' + item.name, commands))))
+          const list = commandList(commands, { hidden }).filter((item) => canUseDelegatedCommand(getConfig(), msg, delegatedCommandKey(parseCommand('/' + item.name, commands, { hidden }))))
           return '你可以使用的命令：\n' + list.map((item) => {
             const desc = item.name === 'model' ? '查看或切换当前私聊模型' : item.desc
             return `/${item.name}  ${desc}`
@@ -1226,7 +1271,7 @@ export function apply(ctx) {
         return String((await cmd.ext.run(cmd.arg, msg)) ?? '')
       }
       if (cmd.name === 'permissions' && !markSensitive(cmd.name)) return ''
-      return runCommand(cmd, msg, { getConfig, setConfig, mutes, hub, identity, mood: use('mood'), memory: use('memory'), qzone: use('diary'), song: use('song'), listModels, reasoningFor: (provider, model) => modelReasoning(ctx, provider, model, { refresh: true }), defaultModel: () => defaultModel(ctx, { model: {} }), extraCommands: mods.commands() })
+      return runCommand(cmd, msg, { getConfig, setConfig, mutes, hub, identity, mood: use('mood'), memory: use('memory'), qzone: use('diary'), song: use('song'), listModels, reasoningFor: (provider, model) => modelReasoning(ctx, provider, model, { refresh: true }), defaultModel: () => defaultModel(ctx, { model: {} }), extraCommands: commands, hidden })
     },
     isMuted: (chatId) => mutes.muted(chatId),
     moodEffects: () => use('mood')?.effects?.() ?? null,
@@ -1268,13 +1313,34 @@ export function apply(ctx) {
     const offFlushed = gw.onFlushed((message, result) => {
       try { hub?.onGatewayFlushed?.(message, result) } catch (error) { logger.child('gateway').debug?.('补发留痕出错：', error?.message || error) }
     })
+    const offEvent = gw.onEvent?.((ev) => {
+      if (!ev) return
+      if (ev.type === 'recall' && ev.messageId) {
+        hub?.onGatewayRecall?.(ev.chatId || '', ev.messageId)
+      } else if (ev.type === 'native' && ev.name === 'im.message.recalled_v1') {
+        const mid = ev.raw?.event?.message_id
+        if (mid) hub?.onGatewayRecall?.('', mid)
+      }
+    })
     const offState = gw.onState?.(() => {
       const curOwner = identity.owner() || ''
       const curAccs = curOwner ? (identity.accountsOf(curOwner) || []) : []
       syncOwnerFallbackOnAccountChange({ prevOwner: curOwner, prevAccounts: curAccs, allowAutoAppend: false })
     })
+    let capsRemountTimer = null
+    const offCapsChanged = gw.onCapsChanged?.(() => {
+      if (capsRemountTimer) clearTimeout(capsRemountTimer)
+      capsRemountTimer = setTimeout(() => {
+        capsRemountTimer = null
+        try { hub?.remountAll?.('平台能力变化') } catch (error) { logger.child('gateway').warn('能力变化重挂工具失败：', error?.message || error) }
+      }, 100)
+      capsRemountTimer.unref?.()
+    })
     gw.sync().catch((error) => logger.child('gateway').warn('网关首次同步失败：', error?.message || error))
-    return () => { offMsg?.(); offFlushed?.(); offState?.() }
+    return () => {
+      if (capsRemountTimer) { clearTimeout(capsRemountTimer); capsRemountTimer = null }
+      offCapsChanged?.(); offEvent?.(); offMsg?.(); offFlushed?.(); offState?.()
+    }
   }
   let gatewayOff = null
   if (platformGateway) gatewayOff = gatewayReady(platformGateway)
@@ -1554,6 +1620,33 @@ export function apply(ctx) {
     hub, onebot, snowluma, local, groupRoles, mutes, logger, bridge: null, identity, resolveOwnerRoute, routeOwner,
     proactHealth: () => lastBlockedRoute,
     get gateway() { return platformGateway },
+    stickerSync: (() => {
+      const ACTIONS = new Set(['fetch_custom_face', 'add_custom_face', 'modify_custom_face', 'delete_custom_face'])
+      const qqGwInsts = () => (platformGateway?.instances?.() || [])
+        .filter((st) => st?.enabled && st.platform === defaultPlatform && !(st.instance === defaultPlatform && legacyQqActive()))
+      const readyGwInst = () => qqGwInsts()
+        .find((st) => st.caps !== null && platformGateway.features?.(st.instance)?.['sticker.sync.native'])
+      return {
+        ready() {
+          const hit = readyGwInst()
+          if (hit) return true
+          if (qqGwInsts().some((st) => st.caps !== null)) return false
+          return Boolean(legacyQqActive() && onebotState === 'connected')
+        },
+        call(action, params, opts) {
+          if (!ACTIONS.has(action)) throw new Error(`不支持的表情同步动作：${action}`)
+          const hit = readyGwInst()
+          if (hit) return platformGateway.native(hit.instance, action, params, opts)
+          if (qqGwInsts().some((st) => st.caps !== null)) {
+            throw Object.assign(new Error('当前 QQ 网关未启用收藏表情同步（sticker.sync.native=false）'), { code: 'FEATURE_UNAVAILABLE' })
+          }
+          if (!legacyQqActive() || onebotState !== 'connected') {
+            throw Object.assign(new Error('QQ 网关未连接'), { code: 'FEATURE_UNAVAILABLE' })
+          }
+          return onebot.call(action, params, opts)
+        },
+      }
+    })(),
     root: ROOT,
     // 模块经 api.proactive 访问出站治理面（modules.js 里读它）
     outbound,
@@ -2023,7 +2116,7 @@ export function apply(ctx) {
       stats: hub.stats(),
       // 模块关着时给个空壳，面板照常显示
       mood: moodSummary,
-      stickers: { count: stickers.library().items.length },
+      stickers: { count: stickers.library().items.length, canQqSync: core.stickerSync.ready() },
       diary: diary ? { next: diary.nextTime(), last: diary.history()[0] || null } : { next: 0, last: null },
       qzoneSocial: use('qzone-social')?.state?.() ?? null,
       speakUp: use('speakup')?.state?.() ?? { count: 0 },
@@ -3854,7 +3947,11 @@ export function apply(ctx) {
     const msg = { ...chat, sender: { person: owner ? identity.owner() : null, isOwner: owner }, nickname: owner ? cfg.ownerName || '主人' : '路人', role: '', messageId: 'sim', text, mentioned: Boolean(b.mentioned), replyId: '', images: [], stickers: [], records: [], forwards: [], raw: { simulated: true } }
     const { sent } = await hub.capture(async () => {
       if (text) {
-        const cmd = (owner || chat.kind === 'private') && /^\s*[/／]/.test(text) ? parseCommand(text, mods.commands()) : null
+        const simPlat = chat.platform || parseChatId(chat.chatId)?.platform || 'qq'
+        const hidden = simPlat !== 'qq' ? new Set(['diary']) : null
+        const cmd = (owner || chat.kind === 'private') && /^\s*[/／]/.test(text)
+          ? parseCommand(text, mods.commands({ platform: chat.platform, chatId: chat.chatId }), { hidden })
+          : null
         if (cmd && !owner && !canUseDelegatedCommand(cfg, msg, delegatedCommandKey(cmd))) {
           steps.push('这个私聊对象没有使用该命令的权限')
         } else if (cmd && cmd.ext) {
@@ -3886,7 +3983,9 @@ export function apply(ctx) {
     const b = await readBody(req)
     const { owner, userId, chat } = simChat(b)
     const level = owner && chat.kind === 'private' ? 'full' : 'social'
-    const tool = mods.buildTools({ chat, level, sessionId: 'sim' }).find((t) => t.name === b.name)
+    const tool = typeof mods.resolveTool === 'function'
+      ? mods.resolveTool({ chat, level, sessionId: 'sim' }, b.name)
+      : mods.buildTools({ chat, level, sessionId: 'sim' }).find((t) => t.name === b.name)
     if (!tool) return { ok: false, message: `这个场合没有 ${b.name} 这个工具` }
     hub.simulateTurn('sim', [userId])
     const { result, sent } = await hub.capture(() => tool.execute(b.args && typeof b.args === 'object' ? b.args : {}, {}), { simulate: true })

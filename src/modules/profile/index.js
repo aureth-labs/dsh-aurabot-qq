@@ -44,7 +44,7 @@ export default {
   id: 'profile',
   name: '改资料',
   version: '1.2.0',
-  api: 2,
+  api: 3,
   platforms: ['qq'],
   description: '主人私聊时查看自己的 QQ 资料与头像图片（qq_get_profile）、发送当前头像（qq_send_avatar）；按权限修改 QQ 资料',
   files: ['features/qq-profile.js'],
@@ -56,7 +56,9 @@ export default {
     }
     const reader = createQqProfile({ getConfig: api.config, onebot: qqOnebot, dsh: api.dsh, log: api.log, fetchAvatar, ask })
     api.onDispose(reader.dispose)
-    api.rule((kind) => kind === 'private' ? '主人谈到你自己的 QQ 昵称、个性签名或头像时，可以主动用 qq_get_profile 查看当前资料，不必等主人明确说“查询”。例如“你现在叫什么”“签名是什么”“喜欢这个头像吗”。问头像画面时传 view_avatar=true，依据本次头像附件和描述回答；查不到就如实说明，不凭旧聊天记录猜。主人明确说“把现在头像发出来”“发你的头像给我”时，用 qq_send_avatar 直接发送，不必先识图；只有工具报告 sent=true 才能说发出去了，成功后不要再用链接或 Markdown 重复发图。查询不会发送图片或修改资料；普通无关聊天无需查询。' : '')
+    api.context?.(({ chat }) => (chat?.kind === 'private' && isOwner(api.core.identity, chat)
+      ? '主人谈到你自己的 QQ 昵称、个性签名或头像时，可以主动用 qq_get_profile 查看当前资料，不必等主人明确说“查询”。例如“你现在叫什么”“签名是什么”“喜欢这个头像吗”。问头像画面时传 view_avatar=true，依据本次头像附件和描述回答；查不到就如实说明，不凭旧聊天记录猜。主人明确说“把现在头像发出来”“发你的头像给我”时，用 qq_send_avatar 直接发送，不必先识图；只有工具报告 sent=true 才能说发出去了，成功后不要再用链接或 Markdown 重复发图。查询不会发送图片或修改资料；普通无关聊天无需查询。'
+      : ''))
 
     /** 真正换头像：图先压到 QQ 能收下，再依次试 base64、临时文件（网关可能不在同一台机器）。 */
     const applyAvatar = async (buf, c, okMessage) => {

@@ -10,7 +10,7 @@ import { buildEdges, layoutGraph3d, brightness, regionOf, FADING_THRESHOLD, LAYO
 import { readFileSync, writeFileSync } from 'node:fs'
 import { defineTool, str } from '../../tools/tools.js'
 import { isOwnerPrivateChat } from '../../chat/access.js'
-import { parseChatId } from '../../gateway/address.js'
+import { formatChatId, normalizeChatId, parseChatId } from '../../gateway/address.js'
 
 /** 把「2026-03-05」或「2026-03-01..2026-03-31」解析成检索用的时间窗；裸的年月算整月。 */
 function parsePeriod(text) {
@@ -31,7 +31,7 @@ export default {
   id: 'memory',
   name: '记忆',
   version: '1.0.0',
-  api: 2,
+  api: 3,
   platforms: ['*'],
   description: '长期记忆：记事、想起、每日整理、小档案和相处经验',
   // 面板拆页后记忆有自己的页（beta 原先挂在心情页）
@@ -62,15 +62,15 @@ export default {
       return [
         defineTool({
           name: 'lookup_person',
-          description: '查你对某个人的整体印象和人物关系。聊到不在眼前的人、别人问你觉得谁怎么样时用；具体的事用 recall_memory。who 写名字、称呼或 QQ 号。',
-          properties: { who: str('名字、称呼或 QQ 号') },
+          description: '查你对某个人的整体印象和人物关系。聊到不在眼前的人、别人问你觉得谁怎么样时用；具体的事用 recall_memory。who 写名字、称呼或账号。',
+          properties: { who: str('名字、称呼或账号') },
           required: ['who'],
           execute: async ({ who }) => memory.lookupPerson(chat, who, senders()),
         }),
         ...(chat.kind === 'group' || isOwnerPrivateChat(identity, chat) ? [defineTool({
           name: 'chat_impression',
-          description: chat.kind === 'group' ? '想一想你对这个群的印象：气氛、常聊什么、怎么相处。' : '查你对某个群的印象。group 写群号或群名，不写就列出有印象的群。',
-          properties: chat.kind === 'group' ? {} : { group: str('群号或群名，可选') },
+          description: chat.kind === 'group' ? '想一想你对这个群的印象：气氛、常聊什么、怎么相处。' : '查你对某个群的印象。group 写群名称或群地址，不写就列出有印象的群。',
+          properties: chat.kind === 'group' ? {} : { group: str('群名称或群地址，可选') },
           execute: async ({ group }) => memory.lookupChat(chat, group),
         })] : []),
         defineTool({
@@ -103,15 +103,23 @@ export default {
             // 群聊 / 非主人私聊里只翻「这个人自己」的记忆，不能把主人的私事翻出来。
             // F2：群聊的 onlyAbout 必须是本轮说话的人（以前 chat.userId 为空 → 完全不按人物过滤，能翻到不在场的人）。
             const owner = isOwnerPrivateChat(identity, chat)
-            const speakers = owner ? []
+            const plat = chat.platform || parseChatId(current)?.platform || ''
+            const selfPerson = chat.sender?.person || (chat.userId && plat && identity?.lookup?.(plat, String(chat.userId))) || ''
+            const rawSpeakers = owner ? []
               : chat.kind === 'group'
                 // 群聊 = 本轮所有说话人；拿不到本轮记录就退回 hub 能提供的说话人（都拿不到时 fail closed）
                 ? (typeof hub.turnSenders === 'function'
                     ? hub.turnSenders(sessionId)
                     : (typeof hub.speakersOf === 'function' ? hub.speakersOf(sessionId) || [] : []))
-                : (chat.userId ? [String(chat.userId)] : [])
+                : [...new Set([String(chat.userId || ''), String(selfPerson || '')].filter(Boolean))]
+            const speakers = owner ? [] : [...new Set(rawSpeakers.flatMap((s) => {
+              const id = String(s || '').trim()
+              if (!id) return []
+              const looked = plat && typeof identity?.lookup === 'function' ? identity.lookup(plat, id) : ''
+              return looked && looked !== id ? [id, looked] : [id]
+            }))]
             const onlyAbout = owner ? undefined : speakers
-            const about = owner ? chat.userId : (chat.kind === 'group' ? speakers : chat.userId)
+            const about = owner ? (chat.sender?.person || chat.userId) : speakers
             const window = period ? parsePeriod(period) : null
             if (period && !window) return { ok: false, message: 'period 没认出来，写 2026-03-05 或 2026-03-01..2026-03-31' }
             const vectorHits = await memory.vectorHits(query)
@@ -138,16 +146,23 @@ export default {
     // 面板「联想预览」：走真正的 recall 路径，能看见 A→B→C 到底带出了什么、第几跳、打了几折。
     // /memories 用的是 list()，不经过联想扩散，所以那边看不到跳数。
     api.route('/memory/assoc/preview', async (req) => {
-      const q = String(http.query(req).q || '').trim()
+      const query = http.query(req) || {}
+      const q = String(query.q || '').trim()
       if (!q) return { ok: false, message: '给个查询词' }
       const owner = identity?.owner?.() || ''
       const routed = typeof resolveOwnerRoute === 'function' ? resolveOwnerRoute({ purpose: 'proactive' }) : null
       const defPlat = parseChatId('private:0')?.platform || ''
       const defAcc = owner && defPlat ? identity?.accountOn?.(owner, defPlat) : ''
-      const chatId = (routed && !routed.blocked ? routed.chatId : '')
+      const firstAcc = owner && typeof identity?.accountsOf === 'function' ? (identity.accountsOf(owner) || [])[0] : null
+      const firstChat = firstAcc?.platform && firstAcc?.account ? formatChatId({ instance: firstAcc.platform, kind: 'private', id: firstAcc.account }) : ''
+      const requestedWhere = String(query.chatId || '').trim()
+      const rawChatId = (requestedWhere ? (normalizeChatId(requestedWhere) || requestedWhere) : '')
+        || (routed && !routed.blocked ? routed.chatId : '')
         || (typeof api.ownerChat === 'function' ? api.ownerChat() : '')
         || (typeof routeOwner === 'function' ? routeOwner() : '')
         || (defAcc ? `private:${defAcc}` : '')
+        || firstChat
+      const chatId = rawChatId ? (normalizeChatId(rawChatId) || rawChatId) : ''
       let vec = []
       try { vec = await memory.vectorHits(q) } catch (error) {}
       // shown: false —— 预览不能算「真想起过」，否则你点几下预览就把记忆加深了、还乱涨 critical 计数

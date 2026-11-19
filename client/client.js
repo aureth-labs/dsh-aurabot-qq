@@ -1766,8 +1766,12 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       }
       const capsText = (caps) => {
         if (!caps) return '未连接，能力未知'
-        const labels = { image: '图片', sticker: '表情', video: '视频', file: '文件', voice: '语音', quoteReply: '引用', mention: '@', poke: '戳一戳', card: '卡片', history: '历史', memberList: '成员', forwardExpand: '合并转发' }
-        return Object.entries(labels).filter(([k]) => caps[k] && caps[k] !== 'none' && caps[k] !== 0).map(([k]) => labels[k]).join(' · ') || '基础文字'
+        const labels = { image: '图片', sticker: '表情', video: '视频', file: '文件', voice: '语音', quoteReply: '引用', mention: '@', poke: '戳一戳', card: '卡片', history: '历史', memberList: '成员列表', forwardExpand: '合并转发' }
+        const base = Object.entries(labels).filter(([k]) => caps[k] && caps[k] !== 'none' && caps[k] !== 0).map(([k]) => labels[k]).join(' · ') || '基础文字'
+        if (caps.memberList && caps.features?.['chat.member.read'] === false) {
+          return base + '（成员列表可用；跨群身份校验不可用，非主人跨群默认拒绝）'
+        }
+        return base
       }
       const claim = async (candidate) => {
         setBusy('claim')
@@ -2541,7 +2545,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             h(Btn, { kind: 'primary', disabled: busy || !valid || groups.includes(id), onClick: async () => { if (await apply(id, 'group', { chat: true })) setInput('') } }, '添加群聊')),
           groups.map((qq) => h(Row, { key: qq, label: qq }, h(Btn, { small: true, disabled: busy, onClick: () => apply(qq, 'group', { chat: false }) }, '移除'))),
         ),
-        modOn(st, 'group-admin') ? h(GroupRoles, null) : null,
+        modOn(st, 'group-admin') ? h(GroupRoles, { toast }) : null,
       )
     }
 
@@ -3094,21 +3098,101 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h('td', null, c.desc))))))
     }
 
-    /** 她在每个白名单群里的身份：群主 / 管理员才能禁言踢人。 */
-    function GroupRoles() {
-      const [list, setList] = useState(null)
-      const load = () => { setList(null); get('/groups/roles').then((r) => setList(r.list || [])) }
+    /** 她在每个白名单/绑定群里的身份：群主 / 管理员才能做群管；兼容 QQ 直连与 QQ 官方机器人。 */
+    function GroupRoles({ toast } = {}) {
+      const [data, setData] = useState(null)
+      const [openid, setOpenid] = useState('')
+      const [alias, setAlias] = useState('')
+      const [groupName, setGroupName] = useState('')
+      const [inst, setInst] = useState('')
+      const [saving, setSaving] = useState(false)
+      const load = () => {
+        setData(null)
+        get('/groups/roles').then((r) => {
+          const list = r.list || []
+          const bindings = r.bindings || []
+          const candidates = r.candidates || []
+          const qqbotInstances = r.qqbotInstances || []
+          setData({ list, bindings, candidates, qqbotInstances })
+          if (!inst && qqbotInstances.length) setInst(qqbotInstances[0].instance)
+        }).catch(() => setData({ list: [], bindings: [], candidates: [], qqbotInstances: [] }))
+      }
       useEffect(load, [])
-      return h(Card, { title: '群管权限', desc: 'ta在群里是群主或管理员时，主人才能让ta禁言、踢人、发公告；改专属头衔要群主。按已保存的群白名单查。',
-        right: h(Btn, { small: true, kind: 'ghost', onClick: load }, '刷新') },
-        !list ? h('div', { className: 'ab-muted ab-small' }, h('i', { className: 'ab-spin' }), ' 查询中…')
-          : list.length === 0 ? h('div', { className: 'ab-muted ab-small' }, '群白名单是空的。')
-          : h('table', { className: 'ab-table' },
-            h('thead', null, h('tr', null, ['群', 'ta的身份', '群管'].map((x) => h('th', { key: x }, x)))),
-            h('tbody', null, list.map((g) => h('tr', { key: g.groupId },
-              h('td', null, (g.name && g.name !== g.groupId ? g.name + ' ' : '') + '(' + g.groupId + ')'),
-              h('td', null, g.label),
-              h('td', null, g.canManage ? h('span', { className: 'ab-badge' }, '可以') : h('span', { className: 'ab-muted ab-small' }, '不行')))))))
+
+      const bindGroup = async () => {
+        if (!openid.trim()) return
+        setSaving(true)
+        const r = await post('/groups/qqbot/bind', {
+          instance: inst || data?.qqbotInstances?.[0]?.instance || 'qqbot',
+          openid: openid.trim(),
+          alias: alias.trim(),
+          name: groupName.trim(),
+        })
+        setSaving(false)
+        toast && toast(r.message || (r.ok ? '绑定好了' : '绑定失败'), r.ok ? 'ok' : 'err')
+        if (r.ok) {
+          setOpenid(''); setAlias(''); setGroupName('')
+          load()
+        }
+      }
+
+      const unbindGroup = async (chatId) => {
+        setSaving(true)
+        const r = await post('/groups/qqbot/unbind', { chatId })
+        setSaving(false)
+        toast && toast(r.message || (r.ok ? '已解除绑定' : '解绑失败'), r.ok ? 'ok' : 'err')
+        if (r.ok) load()
+      }
+
+      const list = data?.list || null
+      const bindings = data?.bindings || []
+      const candidates = data?.candidates || []
+      const qqbotInstances = data?.qqbotInstances || []
+      const showQqbotCard = qqbotInstances.length > 0 || bindings.length > 0 || candidates.length > 0
+
+      return h('div', { className: 'ab-grid' },
+        h(Card, { title: '群管权限', desc: 'ta在群里是群主或管理员时，主人才能让ta执行群管；QQ 官方机器人支持禁言、解禁与踢人（公告/头衔暂不支持）。',
+          right: h(Btn, { small: true, kind: 'ghost', onClick: load }, '刷新') },
+          !list ? h('div', { className: 'ab-muted ab-small' }, h('i', { className: 'ab-spin' }), ' 查询中…')
+            : list.length === 0 ? h('div', { className: 'ab-muted ab-small' }, '群白名单和绑定表都是空的。')
+            : h('table', { className: 'ab-table' },
+              h('thead', null, h('tr', null, ['群', '接入方式', 'ta的身份', '群管', '说明'].map((x) => h('th', { key: x }, x)))),
+              h('tbody', null, list.map((g) => h('tr', { key: g.groupId },
+                h('td', null, (g.name && g.name !== g.groupId ? g.name + ' ' : '') + '(' + (g.displayId || g.groupId) + ')'),
+                h('td', null, g.backendLabel || 'QQ 直连'),
+                h('td', null, g.label),
+                h('td', null, g.canManage ? h('span', { className: 'ab-badge' }, '可以') : h('span', { className: 'ab-muted ab-small' }, '不行')),
+                h('td', { className: 'ab-muted ab-small' }, g.reason || (g.backend === 'gateway-admin' && g.canManage ? '仅按 member_openid 操作，不支持公告/头衔/全员禁言' : ''))))))),
+        showQqbotCard ? h(Card, {
+          title: 'QQ 官方机器人群绑定',
+          desc: 'QQ 官方机器人只能按群成员 member_openid 操作，请在群里 @ 对方或从成员列表选择；不能直接按 QQ 号操作。绑定后可用于按正式 group_openid 或数字别名查询与群管。',
+        },
+          candidates.length ? h(Row, { label: '最近收到消息的候选群', hint: '点一个自动填入 group_openid，可在下方补充展示别名（如数字群号）。' },
+            h('div', { className: 'ab-flex', style: { flexWrap: 'wrap' } },
+              candidates.map((c) => h(Btn, {
+                key: c.chatId,
+                small: true,
+                kind: c.bound ? 'ghost' : 'primary',
+                onClick: () => { setInst(c.instance); setOpenid(c.openid); if (c.alias) setAlias(c.alias); if (c.name) setGroupName(c.name) },
+              }, `${c.name || c.openid.slice(0, 10) + '…'}${c.bound ? '（已绑）' : ''}`)))) : null,
+          qqbotInstances.length > 1 ? h(Row, { label: '机器人实例' },
+            h('select', { className: 'ab-select', value: inst || qqbotInstances[0]?.instance || 'qqbot', onChange: (e) => setInst(e.target.value) },
+              qqbotInstances.map((x) => h('option', { key: x.instance, value: x.instance }, x.name + ' (' + x.instance + ')')))) : null,
+          h(Row, { label: 'group_openid', hint: '在群里 @ 机器人发一条消息即可从候选列表看到。' },
+            h('input', { className: 'ab-input', placeholder: '输入 QQ 官方群 group_openid', value: openid, onChange: (e) => setOpenid(e.target.value) })),
+          h(Row, { label: '展示别名 / 数字群号（可选）', hint: '仅用于面板显示及关联白名单里的旧数字群号，不参与官方 API 调用。' },
+            h('input', { className: 'ab-input', placeholder: '例如 1136292994（可选）', value: alias, onChange: (e) => setAlias(e.target.value) })),
+          h(Row, { label: '群名称（可选，推荐填写）' },
+            h('div', { className: 'ab-flex' },
+              h('input', { className: 'ab-input', placeholder: '推荐填写以便权限页显示；留空时有 info 权限会自动读取', value: groupName, onChange: (e) => setGroupName(e.target.value) }),
+              h(Btn, { kind: 'primary', disabled: saving || !openid.trim(), onClick: bindGroup }, saving ? '保存中…' : '保存绑定'))),
+          bindings.length ? bindings.map((b) => h(Row, {
+            key: b.chatId,
+            label: (b.name || b.alias || b.openid) + (b.active ? '' : '（实例已停用或移除）'),
+            hint: `${b.instance} · ${b.openid}${b.alias ? ' · 别名 ' + b.alias : ''}`,
+          }, h(Btn, { small: true, disabled: saving, onClick: () => unbindGroup(b.chatId) }, '解除绑定'))) : null,
+        ) : null,
+      )
     }
 
     /** 按群头衔不理：勾选的群里，专属头衔是某个词的成员（别的机器人）她不理。头衔可以从群里现有的里面点一个。 */
@@ -3801,13 +3885,39 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         s && s.enabled && ['ready', 'standby'].includes(s.phase) ? h(Btn, { small: true, onClick: async () => { toast('正在测试…'); const r = await post('/voice/asr-test', { text: '今天想吃白米饭' }); toast(r.ok ? '念的是「' + r.said + '」，听成了「' + r.heard + '」' : r.message) } }, '测试一下') : null)
     }
 
-    function Stickers({ draft, setDraft, toast }) {
+    function Stickers({ st, draft, setDraft, toast }) {
       const f = useField(draft, setDraft)
       const [items, setItems] = useState(null)
       const [hasMore, setHasMore] = useState(false)
       const [stickerTotal, setStickerTotal] = useState(0)
       const [moreBusy, setMoreBusy] = useState(false)
       const fileRef = useRef(null)
+      const platRows = Array.isArray(st && st.platforms) && st.platforms.length
+        ? st.platforms
+        : Object.entries((draft && draft.platforms) || {}).map(([k, p]) => ({
+          instance: k,
+          platform: (p && p.platform) || String(k).split('#')[0] || k,
+          enabled: Boolean(p && p.enabled !== false),
+          legacy: k === 'qq' && Boolean(draft && draft.enabled),
+        }))
+      const activePlats = platRows.filter((x) => x && (x.legacy || x.enabled !== false))
+      const qqPlats = activePlats.filter((x) => x.platform === 'qq')
+      const cfgPlatforms = (draft && draft.platforms && typeof draft.platforms === 'object') ? draft.platforms : {}
+      const legacyQqConfigured = Boolean(draft && draft.enabled && draft.botQQ && (!cfgPlatforms.qq || cfgPlatforms.qq.enabled !== false))
+      const hasActiveQq = Boolean(qqPlats.length || legacyQqConfigured)
+      const hasServerSync = Boolean(st && st.stickers && typeof st.stickers.canQqSync === 'boolean')
+      const qqProbed = qqPlats.filter((x) => x && x.caps)
+      const canQqSync = hasActiveQq && (
+        hasServerSync
+          ? Boolean(st.stickers.canQqSync)
+          : (qqProbed.length
+            ? qqProbed.some((x) => (!x.state || x.state === 'connected') && (!x.caps.features || x.caps.features['sticker.sync.native'] !== false))
+            : qqPlats.some((x) => x.legacy) || legacyQqConfigured)
+      )
+      const hasStickerImageFallback = activePlats.some((x) => {
+        if (x && x.caps) return x.caps.sticker === false && x.caps.image !== false
+        return Boolean(x && x.platform && x.platform !== 'qq')
+      })
       const load = () => getCached('/stickers?limit=40&offset=0').then((r) => {
         setItems(r.items || []); setHasMore(Boolean(r.hasMore)); setStickerTotal(Number(r.total) || 0)
       })
@@ -3892,9 +4002,12 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const dropPicked = async () => {
         if (!picked.length) return
         const n = picked.length
-        const ask = dropQQ ? '删掉选中的 ' + n + ' 张表情？（QQ 收藏里也会一起删）' : '删掉选中的 ' + n + ' 张表情？（只删本地库，QQ 收藏保留）'
+        const syncQq = Boolean(canQqSync && dropQQ)
+        const ask = syncQq
+          ? '删掉选中的 ' + n + ' 张表情？（QQ 收藏里也会一起删）'
+          : (canQqSync ? '删掉选中的 ' + n + ' 张表情？（只删本地库，QQ 收藏保留）' : '删掉选中的 ' + n + ' 张表情？')
         if (!confirm(ask)) return
-        const r = await post('/sticker/delete-batch', { md5s: picked, fromQQ: dropQQ })
+        const r = await post('/sticker/delete-batch', { md5s: picked, fromQQ: syncQq })
         toast(r.message || (r.ok ? '删掉了 ' + n + ' 张' : '没删成'), r.ok ? 'ok' : 'err')
         if (r.ok) { removeStickers(picked); setPicked([]) }
       }
@@ -3925,27 +4038,28 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h('span', { key: 'n', className: 'ab-muted ab-small' }, '已选 ' + picked.length + ' 张'),
           h(Btn, { key: 'all', small: true, kind: 'ghost', onClick: () => setPicked(allPicked ? [] : (items || []).map((i) => i.md5)) }, allPicked ? '全不选' : '全选'),
           h(Btn, { key: 'inv', small: true, kind: 'ghost', onClick: () => setPicked((items || []).map((i) => i.md5).filter((md5) => !picked.includes(md5))) }, '反选'),
-          h('label', { key: 'qq', className: 'ab-small ab-muted', title: '取消勾选就只删本地库，QQ 收藏里的表情留着' },
-            h('input', { type: 'checkbox', checked: dropQQ, onChange: (e) => setDropQQ(e.target.checked) }), ' 连 QQ 收藏一起删'),
+          canQqSync ? h('label', { key: 'qq', className: 'ab-small ab-muted', title: '取消勾选就只删本地库，QQ 收藏里的表情留着' },
+            h('input', { type: 'checkbox', checked: dropQQ, onChange: (e) => setDropQQ(e.target.checked) }), ' 连 QQ 收藏一起删') : null,
           h(Btn, { key: 'del', small: true, kind: 'danger', disabled: !picked.length, onClick: dropPicked }, '删除所选'),
           h(Btn, { key: 'end', small: true, kind: 'ghost', onClick: () => { setPicking(false); setPicked([]) } }, '取消多选'),
-        ]
+        ].filter(Boolean)
         : [
           h('input', { key: 'file', ref: fileRef, type: 'file', accept: 'image/*', multiple: true, style: { display: 'none' }, onChange: (e) => { upload(e.target.files); e.target.value = '' } }),
           h('input', { key: 'name', className: 'ab-input sm', style: { width: 140 }, placeholder: '名字（可不填）', value: newName, onChange: (e) => setNewName(e.target.value) }),
           h(Btn, { key: 'up', small: true, onClick: () => fileRef.current && fileRef.current.click() }, '＋ 上传'),
-          h(Btn, { key: 'imp', small: true, title: '把机器人号 QQ「我喜欢的」里已有的表情导进来', onClick: async () => { toast('正在从 QQ 收藏导入…'); const r = await post('/sticker/import-qq'); toast(r.message, r.ok === false ? 'err' : 'ok'); load() } }, '从 QQ 收藏导入'),
+          canQqSync ? h(Btn, { key: 'imp', small: true, title: '把机器人号 QQ「我喜欢的」里已有的表情导进来', onClick: async () => { toast('正在从 QQ 收藏导入…'); const r = await post('/sticker/import-qq'); toast(r.message, r.ok === false ? 'err' : 'ok'); load() } }, '从 QQ 收藏导入') : null,
           h(Btn, { key: 'ai', small: true, kind: 'primary', disabled: jobRunning, title: '用「起名用的模型」看图（默认跟随聊天模型），给还没有名字或标签的表情起名字、打标签（后台跑，可以关掉面板）', onClick: startCaption }, 'AI 补全标签'),
           h('label', { key: 'redo', className: 'ab-small ab-muted', title: '勾上以后连已经有名字的也重新起一遍（会重新花模型调用）' },
             h('input', { type: 'checkbox', checked: redoAll, onChange: (e) => setRedoAll(e.target.checked) }), ' 全部重做'),
           h(Btn, { key: 'pick', small: true, kind: 'ghost', onClick: () => { setPicking(true); setPicked([]) } }, '多选'),
           h(Btn, { key: 'reload', small: true, kind: 'ghost', onClick: () => { bustCache(); load() } }, '刷新'),
-        ]
+        ].filter(Boolean)
       return h('div', { className: 'ab-grid' },
         h(Card, { title: '表情包', right: f.sw('stickers.enabled'), desc: '回复里写 <sticker:名字> 就会发对应的表情；也会按概率自动配一张。' },
+          hasStickerImageFallback ? h('div', { className: 'ab-note', style: { marginBottom: 8 } }, '当前包含不支持原生表情包的实例（如飞书或精简网关），发送表情包时会自动按图片降级发出。') : null,
           h(Row, { label: '自动配表情的概率' }, f.percent('stickers.autoChance')),
-          h(Row, { label: '夹 QQ 小黄脸', hint: '回复里能夹 QQ 自带的系统表情（/捂脸 /斜眼笑 这种），和文字在同一条消息里' }, f.sw('stickers.faces')),
-          h(Row, { label: '偷表情', hint: '别人发的表情包会被收藏（普通照片不收）。' }, f.sw('stickers.collect'), h('span', { className: 'ab-muted' }, '从群里'), f.sw('stickers.fromGroups'), h('span', { className: 'ab-muted' }, '从私聊'), f.sw('stickers.fromPrivate')),
+          hasActiveQq ? h(Row, { label: '夹 QQ 小黄脸', hint: '回复里能夹 QQ 自带的系统表情（/捂脸 /斜眼笑 这种），和文字在同一条消息里' }, f.sw('stickers.faces')) : null,
+          h(Row, { label: '偷表情', hint: hasActiveQq ? '别人发的表情包会被收藏（普通照片不收）。' : '收到兼容的表情图片时会收进本地库（普通照片不收）。' }, f.sw('stickers.collect'), h('span', { className: 'ab-muted' }, '从群里'), f.sw('stickers.fromGroups'), h('span', { className: 'ab-muted' }, '从私聊'), f.sw('stickers.fromPrivate')),
           draft.stickers.collect ? h(Row, { label: '怎么偷', hint: '「ta挑」只递给ta看，喜欢才收；「只听主人的」只在主人私聊 / 这一轮只有主人时ta才可自己收，有别人在场要主人发话' },
             f.choices('stickers.collectMode', [
               { value: 'auto', label: '全都偷', desc: '看到就收，不用ta同意（默认，保持原行为）' },
@@ -3953,7 +4067,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
               { value: 'owner', label: '只听主人的', desc: '只有主人私聊 / 只有主人时ta才可自己收；别人在场要主人发话' },
             ])) : null,
           h(Row, { label: '每小时最多收' }, f.num('stickers.maxPerHour', { min: 0 }), h('span', { className: 'ab-muted' }, '张')),
-          h(Row, { label: '表情库最多存', hint: 'QQ 收藏表情有数量上限，满了就收不进去了。超过这个数会自动清掉最少用的偷来的表情（你自己加的不会动）' }, f.num('stickers.maxLibrary', { min: 20, max: 2000 }), h('span', { className: 'ab-muted' }, '张')),
+          h(Row, { label: '表情库最多存', hint: canQqSync ? 'QQ 收藏表情有数量上限，满了就收不进去了。超过这个数会自动清掉最少用的偷来的表情（你自己加的不会动）' : '超过这个数会自动清掉最少用的偷来的表情（你自己加的不会动）。' }, f.num('stickers.maxLibrary', { min: 20, max: 2000 }), h('span', { className: 'ab-muted' }, '张')),
           h(Row, { label: '看图起名', hint: '收下后让模型看图起个 12 字以内的备注；库里已有的名字可以点右边「AI 补全标签」批量补' }, f.sw('stickers.caption')),
           h(Row, { label: '起名用的模型', hint: 'AI 补全标签 / 看图起名都要看图：留空就用「模型」页那个聊天模型，也可以单独挑一个 DSH 里已经接好的视觉模型。' },
             h(Select, {
@@ -3980,13 +4094,13 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
               ? h(Btn, { key: 'stop', small: true, kind: 'ghost', onClick: async () => { const r = await post('/sticker/caption-stop', {}); toast(r.message || '停了') } }, '停')
               : h(Btn, { key: 'ok', small: true, kind: 'ghost', onClick: () => setJob(null) }, '知道了'),
           ) : null,
-          items === null ? h(Empty, { icon: '⏳', text: '加载中…' }) : items.length === 0 ? h(Empty, { icon: '🐳', text: '表情库还是空的。别人在群里发表情包，ta会自己收；也可以点右上角上传，或者「从 QQ 收藏导入」机器人号已经收藏的表情。' }) :
+          items === null ? h(Empty, { icon: '⏳', text: '加载中…' }) : items.length === 0 ? h(Empty, { icon: '🐳', text: canQqSync ? '表情库还是空的。别人在群里发表情包，ta会自己收；也可以点右上角上传，或者「从 QQ 收藏导入」机器人号已经收藏的表情。' : '表情库还是空的。收到合适表情时 ta 会收进本地库；也可以点击右上角上传。' }) :
             h('div', { className: cx('ab-stickers', picking && 'picking') },
-              items.map((it) => h(StickerCell, { key: it.md5, it, onChanged: load, onDeleted: (md5) => removeStickers([md5]), onEdited: editSticker, toast, picking, selected: picked.includes(it.md5), onToggle: toggle }))),
+              items.map((it) => h(StickerCell, { key: it.md5, it, canQqSync, onChanged: load, onDeleted: (md5) => removeStickers([md5]), onEdited: editSticker, toast, picking, selected: picked.includes(it.md5), onToggle: toggle }))),
           hasMore ? h('div', { className: 'ab-flex', style: { marginTop: 8 } },
             h(Btn, { small: true, kind: 'ghost', disabled: moreBusy, onClick: loadMore }, moreBusy ? '加载中…' : `加载更多（已显示 ${items ? items.length : 0}/${stickerTotal}）`)) : null,
         ),
-        h(Card, {
+        hasActiveQq ? h(Card, {
           title: '贴表情',
           right: f.sw('stickers.react'),
           desc: '默认关。打开后看到谁的消息，就可能贴个表情——不一定回话，只在旁边看着也行。emoji 直接给 Unicode 码点（🍬 127852、👍 128077），QQ 老表情是另一套编号（❓ 10068），两种混着用都行。',
@@ -4017,8 +4131,8 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
               )
             })()),
           h(Row, { label: '每小时上限', hint: '每个会话单独算，免得在热闹的群里刷屏' }, f.range('stickers.reactMaxPerHour', 0, 60, 1, (v) => v + ' 次')),
-        ),
-        h(FaceMapCard, null),
+        ) : null,
+        hasActiveQq ? h(FaceMapCard, null) : null,
       )
     }
 
@@ -4026,7 +4140,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
      * 一张表情：名字（备注）和标签都能直接改，改完离开输入框就保存（#31：模型起的名字 / 标签不对时手动纠正）。
      * 多选模式下整张卡片就是勾选框，点一下就选中。
      */
-    function StickerCell({ it, onChanged, onDeleted, onEdited, toast, picking, selected, onToggle }) {
+    function StickerCell({ it, canQqSync, onChanged, onDeleted, onEdited, toast, picking, selected, onToggle }) {
       const [name, setName] = useState(it.name || '')
       const tagText = (it.tags || []).join(' ')
       const [tags, setTags] = useState(tagText)
@@ -4052,7 +4166,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           onBlur: () => { if (!picking && name !== (it.name || '')) save({ name }, '名字') } }),
         h('input', { className: 'tg', value: tags, placeholder: '加标签，空格隔开', title: '标签，空格或逗号隔开，最多 5 个', readOnly: Boolean(picking), tabIndex: picking ? -1 : undefined, onChange: (e) => setTags(e.target.value),
           onBlur: () => { if (!picking && tags.trim() !== tagText) save({ tags: tags.split(/[\s,，、#]+/).map((x) => x.trim()).filter(Boolean).slice(0, 5) }, '标签') } }),
-        picking ? null : h('button', { type: 'button', className: 'ab-btn sm danger x', title: '删除', onClick: async () => { if (!confirm('删掉这张表情？（QQ 收藏里也会删）')) return; const r = await post('/sticker/delete', { md5: it.md5 }); if (r.ok) { if (onDeleted) onDeleted(it.md5); else onChanged() } } }, '✕'),
+        picking ? null : h('button', { type: 'button', className: 'ab-btn sm danger x', title: '删除', onClick: async () => { if (!confirm(canQqSync ? '删掉这张表情？（QQ 收藏里也会删）' : '删掉这张表情？')) return; const r = await post('/sticker/delete', { md5: it.md5 }); if (r.ok) { if (onDeleted) onDeleted(it.md5); else onChanged() } } }, '✕'),
       )
     }
 
@@ -7758,6 +7872,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       if (m.running === 'user') return { cls: 'mine', text: '在跑' }
       if (m.running === 'builtin' && m.fallback) return { cls: 'warn', text: '你的版本没加载成功，先用内置的' }
       if (m.running === 'builtin') return { cls: '', text: '在跑' }
+      if (!m.error && m.skipReason) return { cls: 'dim', text: m.skipReason }
       return { cls: 'err', text: m.error ? '没加载成功' : '没在跑' }
     }
 
@@ -7780,7 +7895,8 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         reload()
         return r
       }
-      const what = [m.tools.length ? '工具：' + m.tools.join('、') : '', m.commands.length ? '命令：' + m.commands.map((c) => '/' + c).join(' ') : ''].filter(Boolean).join('　')
+      const reqFeat = m.features?.required?.length ? '依赖能力：' + m.features.required.join('、') : ''
+      const what = [m.tools.length ? '工具：' + m.tools.join('、') : '', m.commands.length ? '命令：' + m.commands.map((c) => '/' + c).join(' ') : '', reqFeat].filter(Boolean).join('　')
       const errs = (m.error ? [{ label: '加载', message: m.error }] : []).concat(m.errors || [])
       return h('div', { className: 'ab-mod' },
         h('div', { className: 'main' },
