@@ -1122,7 +1122,7 @@ test('试运行/调试下生图仍算画好了：存盘、有编号，只是没�
     assert.equal(r.ok, true, '试运行下生图不该判失败：' + JSON.stringify(r))
     assert.ok(r.path && existsSync(r.path), '画作仍要存盘')
     assert.match(String(r.message), /画作编号 #1/, '仍要给她画作编号')
-    assert.match(String(r.message), /没真发到 QQ/, '如实说明没真发')
+    assert.match(String(r.message), /没真发(?:出去|到 QQ)/, '如实说明没真发')
   } finally {
     await fake.call('/save', { dryRun: false })
     srv.close()

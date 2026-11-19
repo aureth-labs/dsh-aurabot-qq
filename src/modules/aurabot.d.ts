@@ -509,6 +509,8 @@ export interface AurabotModule {
   platforms?: (Platform | '*')[]
   /** 仅作元信息申报（方案 A：不阻断模块加载），模块内部通过 api.can / api.require 运行时降级 */
   features?: FeatureRequirements
+  /** 旧工具名 → 本模块权威工具名兼容映射（仅用于 resolveTool / /modules/tool，不暴露给模型） */
+  toolAliases?: Record<string, string>
   description?: string
   defaults?: Record<string, any>
   settings?: Setting[]

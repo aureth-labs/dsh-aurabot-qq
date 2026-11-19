@@ -3,7 +3,7 @@
 
 /**
  * 和 @deepseek-ai/dsh-tools 的 defineTool 产物同形：parameters / output.schema 是 JSON Schema。
- * render 可选：默认只回一行文字；工具要把图片之类的内容块放进结果时自己传（见 imagegen 的 qq_draw_image）。
+ * render 可选：默认只回一行文字；工具要把图片之类的内容块放进结果时自己传（见 imagegen 的 draw_image）。
  */
 export function defineTool({ name, description, properties = {}, required = [], execute, render, slow, platforms, features }) {
   const parameters = { type: 'object', properties, required, additionalProperties: false }

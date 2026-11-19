@@ -1,4 +1,4 @@
-// 多平台工具命名规范与别名门禁测试（T0 建立，T1/T2 逐步缩短临时白名单，T3 清空严格执行）
+// 多平台工具命名规范与别名门禁测试（T3 收口：全内置模块与 group-admin 严格执行，无临时迁移白名单）
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
@@ -21,12 +21,6 @@ const PLATFORM_PREFIX_RE = /^(qq|feishu|qqbot)_/
 const noopLog = { debug() {}, info() {}, warn() {}, error() {}, child() { return this } }
 
 const ALL_MODS = [...BUILTINS, groupAdminMod]
-
-/**
- * T0 临时迁移白名单：仅允许正在分阶段迁移的旧工具名暂留。
- * 规则：T1/T2 只许缩短，不许加长；T3 清空删除。
- */
-const MIGRATION_ALLOWLIST = new Set([])
 
 /**
  * 跨平台模块里按平台显式门控的平台专属动作白名单：
@@ -189,10 +183,9 @@ test('静态工具清单：格式合法、全局唯一、跨平台模块无新�
         if (PLATFORM_PREFIX_RE.test(name)) {
           const gated = PLATFORM_GATED_IN_SHARED.get(name)
           const allowedByGate = gated && gated.moduleId === mod.id
-          const allowedByMigration = MIGRATION_ALLOWLIST.has(name)
           assert.ok(
-            allowedByGate || allowedByMigration,
-            `跨平台模块 ${mod.id} (platforms=${JSON.stringify(plats)}) 不得新增平台前缀工具名「${name}」`,
+            allowedByGate,
+            `跨平台模块 ${mod.id} (platforms=${JSON.stringify(plats)}) 不得包含平台前缀工具名「${name}」`,
           )
         }
       } else if (singlePlatform) {
@@ -250,12 +243,11 @@ test('运行时工具面：纯 Feishu / 纯 QQ / QQBot 均无重名、模型不�
 
     if (where.chat.platform !== 'qq') {
       for (const name of names) {
-        if (name.startsWith('qq_')) {
-          assert.ok(
-            MIGRATION_ALLOWLIST.has(name),
-            `${label} 非 QQ 平台工具面出现未登记白名单的 qq_* 工具「${name}」`,
-          )
-        }
+        assert.equal(
+          name.startsWith('qq_'),
+          false,
+          `${label} 非 QQ 平台工具面严禁出现 qq_* 工具「${name}」`,
+        )
       }
       for (const [gatedName, spec] of PLATFORM_GATED_IN_SHARED.entries()) {
         if (spec.platform !== where.chat.platform) {

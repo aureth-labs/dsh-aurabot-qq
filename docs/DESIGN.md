@@ -23,7 +23,7 @@ Aurabot 在 DeepSeek Harness 上做了几件事：把人设、心情和记忆放
 | 语音 | TTS 用 edge-tts（装在插件自己的 Python 虚拟环境里，Windows / Linux / macOS 都行），也可以接本地的 CosyVoice、GPT-SoVITS，或者用内置的豆包（火山）/ MiniMax / Breeze 在线引擎；Windows 上装不上时用 Windows 自带中文语音兜底。面板「语音」页的**「其他 HTTP 接口」**能自己填接口地址、请求方式、请求头和请求体（`{text}` 自动转义、`{reqid}` 每次换新），所以火山、阿里、讯飞这类要鉴权的云 TTS 也能直接接，返回 JSON（base64）会自动解成音频。面板「语音」页还能用**翻唱里导入的 RVC 音色**给语音条变声：先 TTS 再变声，让说话和唱歌是同一个声音（翻唱环境要装好；失败自动用原声）。ASR 先用 QQ 自带的语音转文字（`fetch_ptt_text`），再试 DSH 的 `speechToText`。 |
 | 表情包 | 只收真正的表情（`sub_type=1`、mface、带 `emoji_id` 的），再过尺寸、宽高比、体积、MD5 去重、每小时限额几道关。收下后 `add_custom_face`，视觉模型起备注后 `modify_custom_face`。商城表情按商城表情原样发；面板里能改表情的名字和标签；关掉表情包后回复里写的表情也不发。 |
 | 空间 | 空间日记用 `send_qzone_msg`，在专用的后台会话里写，结合当天聊天流水。空间互动：定期看自己说说下的新评论和回复（按整串评论来回，一串只回一次），逛好友动态按概率点赞、评论；评论时结合说说内容和楼里已有的评论。 |
-| 翻唱 | 点歌（`qq_song_cover` 工具或 `/sing`）→ 网易云下载（weapi，可填 Cookie 下会员歌）→ 先截要发的那一段 → audio-separator 分离人声和伴奏 → Applio（RVC，固定版本）换成她的音色 → ffmpeg 混音 → 发语音条。插件不带音色，用户在面板里导入自己有权使用的 .pth / zip。一键安装不依赖电脑上的 Python / git / uv，可以选装到哪个盘，进度可见，下载走系统代理并能断点续传。 |
+| 翻唱 | 点歌（`song_cover` 工具或 `/sing`）→ 网易云下载（weapi，可填 Cookie 下会员歌）→ 先截要发的那一段 → audio-separator 分离人声和伴奏 → Applio（RVC，固定版本）换成她的音色 → ffmpeg 混音 → 发语音条。插件不带音色，用户在面板里导入自己有权使用的 .pth / zip。一键安装不依赖电脑上的 Python / git / uv，可以选装到哪个盘，进度可见，下载走系统代理并能断点续传。 |
 
 ## 模块与内核
 

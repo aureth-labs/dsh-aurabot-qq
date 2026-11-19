@@ -140,3 +140,16 @@ test('<平台名> 平台端过全套契约', async () => {
 - `test/helpers/fake-adapter.js` —— 内存假平台端：给你的中枢 / 网关 / 模块测试当平台用
   （`makeFakeAdapter(overrides)`，能注入入站、记录出站 `adapter.sent`、按指令抛
   `not-sent` / `unknown`、模拟断线重连、运行中改 caps）。它自己先过了全套契约。
+
+## 新平台接入检查清单（工具面与能力）
+
+新增平台端时，按以下 8 项逐一核对，避免跨平台模块泄露旧前缀或误伤其他平台：
+
+1. **`CAPS` 与 `features` 声明清晰**：只声明本平台真实支持的一级能力与 L2 `features`，不乐观猜测。
+2. **`fetch` 按需实现**：按平台能力补齐 `message` / `history` / `forward` / `media` / `members` / `chats`。
+3. **模块 `platforms` 按需开放**：先只把新平台加入已适配模块的 `platforms`（平台无关模块用 `['*']`）。
+4. **跨平台模块保持通用工具名**：使用 `<verb>_<noun>` 或 `<module>_<verb>_<noun>`，不新造带平台前缀的通用工具。
+5. **平台专属工具显式带前缀**：仅该平台独有的操作才使用 `<platform>_<verb>_<noun>`，且只挂在对应平台模块或严格按平台门控。
+6. **`api.context` 提供工具发现**：按新平台当前能力注入工具发现提示，明确提示工具名不是 `/命令`。
+7. **补全测试矩阵**：覆盖 adapter contract、纯新平台、与 QQ/Feishu 双平台共存、以及工具面/别名解析测试。
+8. **通过命名门禁**：运行 `node --test test/tool-naming.test.js`，确认全内置模块无冲突、非 QQ 工具面零 `qq_*` 泄露。
