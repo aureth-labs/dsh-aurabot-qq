@@ -11,6 +11,16 @@ import { isOwner } from '../../chat/access.js'
 
 const CUSTOM_FACE_ACTIONS = new Set(['fetch_custom_face', 'add_custom_face', 'modify_custom_face', 'delete_custom_face'])
 
+export const toolAliases = Object.freeze({
+  qq_send_sticker: 'send_sticker',
+  qq_list_stickers: 'list_stickers',
+  qq_edit_sticker: 'edit_sticker',
+  qq_collect_sticker: 'collect_sticker',
+  qq_save_sticker: 'save_sticker',
+  qq_add_sticker: 'add_sticker',
+  qq_import_qq_stickers: 'qq_import_stickers',
+})
+
 export default {
   id: 'stickers',
   name: '表情包',
@@ -20,6 +30,7 @@ export default {
   features: {
     optional: ['sticker.send.native', 'sticker.collect', 'sticker.sync.native', 'media.fetch'],
   },
+  toolAliases,
   description: '偷表情、回复时按情绪配表情、她自己改名删图；支持原生表情与跨平台图片降级，关掉后不发也不收表情',
   tab: 'stickers',
   files: ['features/stickers.js'],
@@ -108,7 +119,7 @@ export default {
       const tools = [
         // 表情包关着或平台既不支持原生表情也不支持发图时，不挂「发表情」
         ...(canSend ? [defineTool({
-          name: 'qq_send_sticker',
+          name: 'send_sticker',
           description: '在当前聊天里发一张表情包。name 写表情的名字或情绪（如「委屈」「开心」「早晚安」），会在表情库里模糊匹配。一般直接在回复里写 <sticker:名字> 就行，这个工具用于回复之外单独补发。',
           properties: { name: str('表情名字或情绪关键词') },
           required: ['name'],
@@ -122,7 +133,7 @@ export default {
           },
         })] : []),
         defineTool({
-          name: 'qq_list_stickers',
+          name: 'list_stickers',
           description: '看看表情库里有哪些表情（名字和标签），挑表情前可以先看。非主人只能看到数量，名字和标签只给主人看。',
           properties: { query: str('可选，按名字/标签筛选') },
           execute: async ({ query }) => {
@@ -134,7 +145,7 @@ export default {
           },
         }),
         defineTool({
-          name: 'qq_edit_sticker',
+          name: 'edit_sticker',
           description: '整理表情库：给一张表情改名字、改标签，或者删掉。名字不贴切、别人建议改名、标签不对的时候用；不喜欢、重复、发不出去的表情可以删。sticker 写现在的名字或标签（模糊匹配）。',
           properties: {
             sticker: str('要改的那张表情现在的名字或标签'),
@@ -163,7 +174,7 @@ export default {
         // 「她挑」模式：聊天里刚收到的表情，喜欢就凭编号收下；也能收自己刚画的图
         // （「只听主人的」下，别人在场时不能自己收，得等主人发话）
         tools.push(defineTool({
-          name: 'qq_collect_sticker',
+          name: 'collect_sticker',
           description: '悄悄把聊天里刚出现的表情收进自己的表情库（喜欢才收，不喜欢就别调）。index 从 1 开始；name 是你给它起的名字。收表情是你自己的小习惯，通常不用跟对方说你收没收到。主人让你收哪张，你收哪张（「只听主人的」模式下：主人私聊里可以自己挑着收；群里这一轮只有主人说话时也能自己收，有别人在场就要等主人发话）。传 painting（画作编号，如 #1）时，收的是你自己刚画的那张图，不是聊天里的表情。',
           properties: {
             index: int('第几张表情（从 1 开始，默认 1）'),
@@ -218,7 +229,7 @@ export default {
         // 主人让她存表情：存这个聊天里刚发来的那张（她看得见图，但拿不到图片地址，所以由插件去找）；
         // 传 painting（画作编号）时存的是她自己刚画的那张
         tools.push(defineTool({
-          name: 'qq_save_sticker',
+          name: 'save_sticker',
           description: '把这个聊天里刚发来的那张表情包 / 图片收进你的表情库。主人说「存一下这个表情」「导入这个表情」「收藏这张」时用。传 painting（画作编号，如 #1）时，存的是你自己刚画的那张图。name 是不超过 12 个字的备注，可以不填（会自动看图起名）。',
           properties: {
             name: str('备注（≤12 字，可不填）'),
@@ -256,8 +267,8 @@ export default {
       }
       if (canImportQq) {
         tools.push(defineTool({
-          name: 'qq_import_qq_stickers',
-          description: '把你 QQ「我喜欢的」收藏里已有的表情全部导进表情库（已经有的跳过），之后就能用 <sticker:名字> 发它们。主人让你「导入收藏的表情」「同步一下 QQ 表情」时用。',
+          name: 'qq_import_stickers',
+          description: '把你 QQ「我喜欢的」收藏里已有的表情全部导进表情库（仅 QQ；已经有的跳过），之后就能用 <sticker:名字> 发它们。主人让你「导入收藏的表情」「同步一下 QQ 表情」时用。',
           execute: async () => {
             if (!hub.turnSendersAllOwner(sessionId)) return { ok: false, message: '只有主人能让我导入收藏的表情' }
             return store.importFromQQ()
@@ -266,7 +277,7 @@ export default {
       }
       // 主人私聊（完整权限）才能往库里加图
       if (level === 'full') tools.push(defineTool({
-        name: 'qq_add_sticker',
+        name: 'add_sticker',
         description: '把一张图片收进表情库。source 是本地图片路径或图片网址；name 是不超过 12 个字的备注。',
         properties: { source: str('本地路径或 http(s) 地址'), name: str('备注（≤12 字）'), tags: { type: 'array', items: { type: 'string' }, description: '标签，如 开心/委屈' } },
         required: ['source'],
@@ -284,15 +295,17 @@ export default {
         if (!chat || chat.kind === 'system') return ''
         const current = chat.chatId || ''
         const { canCollect, canImportQq, caps, canSend } = stickerCapsState(current, chat.platform, chatFeatures)
-        const lines = []
+        const lines = [
+          '- 想看表情库有哪些表情，用 list_stickers；不要写 /sticker、/stickers 或 [表情] 命令——这些不是聊天命令。',
+        ]
         if (canCollect) {
-          lines.push('- 主人让你存某个表情（「存一下」「导入这个表情」）时用 qq_save_sticker；别人让你存，不用理。')
+          lines.push('- 主人让你存某个表情（「存一下」「导入这个表情」）时用 save_sticker；别人让你存，不用理。')
         }
         if (canImportQq) {
-          lines.push('- 主人让你把 QQ 收藏里的表情导进来时用 qq_import_qq_stickers。')
+          lines.push('- 主人让你把 QQ 收藏里的表情导进来时用 qq_import_stickers。')
         }
         if (canSend && caps && caps.sticker === false && caps.image) {
-          lines.push('- 当前平台不支持原生表情包，回复写 <sticker:名字> 或调 qq_send_sticker 时会自动按图片发出。')
+          lines.push('- 当前平台不支持原生表情包，回复写 <sticker:名字> 或调 send_sticker 时会自动按图片发出。')
         }
         return lines.join('\n')
       })

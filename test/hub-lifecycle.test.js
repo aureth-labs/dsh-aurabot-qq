@@ -155,7 +155,7 @@ test('同一会话连续重载两轮：工具、上下文、限制全部清理�
   process.env.AURABOT_DATA_DIR = data
   writeFileSync(join(data, 'config.json'), JSON.stringify(config({ bridge: { dshTools: true } })))
   const fake = createFakeDsh({ brain: async ({ text, callTool }) => {
-    if (text.includes('collect')) await callTool('qq_collect_sticker', { index: 1, name: '新表情' })
+    if (text.includes('collect')) await callTool('collect_sticker', { index: 1, name: '新表情' })
     else {
       await callTool('qq_set_nickname', { name: '大肥鱼' })
       await callTool('qq_set_signature', { text: '新签名' })
@@ -189,7 +189,7 @@ test('同一会话连续重载两轮：工具、上下文、限制全部清理�
     await api.hub.onMessage(event('collect', [image(round + 1)]))
     for (let i = 0; fake.turns.length === turnCount && i < 100; i++) await new Promise((r) => setTimeout(r, 10))
     assert.ok(fake.turns.length > turnCount)
-    const collected = fake.turns.at(-1).toolCalls.find((c) => c.name === 'qq_collect_sticker')
+    const collected = fake.turns.at(-1).toolCalls.find((c) => c.name === 'collect_sticker')
     assert.equal(collected?.result.ok, true, collected?.result.message)
     const library = JSON.parse(readFileSync(join(data, 'stickers', 'index.json'), 'utf8'))
     assert.equal(library.items.length, round + 1, '应收下本轮的新图片，而非旧缓存图片')

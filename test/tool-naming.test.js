@@ -27,14 +27,6 @@ const ALL_MODS = [...BUILTINS, groupAdminMod]
  * 规则：T1/T2 只许缩短，不许加长；T3 清空删除。
  */
 const MIGRATION_ALLOWLIST = new Set([
-  // T1: stickers
-  'qq_send_sticker',
-  'qq_list_stickers',
-  'qq_edit_sticker',
-  'qq_collect_sticker',
-  'qq_save_sticker',
-  'qq_add_sticker',
-  'qq_import_qq_stickers',
   // T2-1: video
   'qq_generate_video',
   // T2-2: song
@@ -423,8 +415,12 @@ test('createModules 别名与权威名启动校验：冲突阻断、跨模块隔
 })
 
 test('usage.moduleOfTool 覆盖已迁移工具的权威名与旧别名', () => {
-  // 校验 chat-tools 之外尚未迁移但已登记的映射保持兼容（T1/T2 迁移后会在此补充全部新权威名断言）
-  assert.equal(moduleOfTool('qq_send_sticker'), '表情包')
+  for (const name of [
+    'send_sticker', 'list_stickers', 'edit_sticker', 'collect_sticker', 'save_sticker', 'add_sticker', 'qq_import_stickers',
+    'qq_send_sticker', 'qq_list_stickers', 'qq_edit_sticker', 'qq_collect_sticker', 'qq_save_sticker', 'qq_add_sticker', 'qq_import_qq_stickers',
+  ]) {
+    assert.equal(moduleOfTool(name), '表情包', `${name} 应归属 表情包`)
+  }
   assert.equal(moduleOfTool('qq_draw_image'), '生图')
   assert.equal(moduleOfTool('qq_generate_video'), '生视频')
   assert.equal(moduleOfTool('qq_send_shot'), '刷 B 站')

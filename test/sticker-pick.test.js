@@ -36,7 +36,7 @@ const { createFakeDsh } = await import(`file:///${REPO}/test/helpers/fake-dsh.js
 const fake = createFakeDsh({
   brain: async ({ text, callTool }) => {
     if (text.includes('收下吧收下')) {
-      const r = await callTool('qq_collect_sticker', { index: 1, name: '偷偷笑' })
+      const r = await callTool('collect_sticker', { index: 1, name: '偷偷笑' })
       return '收好了：' + (r && r.message)
     }
     return '嗯'
@@ -66,7 +66,7 @@ const send = async (text, buf) => {
 test('她挑：没让她收就不收，但会收到提示', async () => {
   await send('随便聊聊', png(1))
   const t = fake.turns.at(-1)
-  assert.match(String(t.userText), /qq_collect_sticker/, '应该给她一句"喜欢就收"的提示')
+  assert.match(String(t.userText), /collect_sticker/, '应该给她一句"喜欢就收"的提示')
   assert.equal(library().length, 0, '她没说要收，库里应该还是空的')
   // 表情暂存要落盘：只在内存里的话，DSH 一重启她就收不了了（真实踩过）
   const stashFile = join(dataDir, 'sticker-stash.json')
@@ -78,8 +78,8 @@ test('她挑：没让她收就不收，但会收到提示', async () => {
 test('她挑：她调了工具才真的收下，而且名字是她给的', async () => {
   await send('收下吧收下', png(2))
   const t = fake.turns.at(-1)
-  const call = t.toolCalls.find((c) => c.name === 'qq_collect_sticker')
-  assert.ok(call, '应该调用了 qq_collect_sticker')
+  const call = t.toolCalls.find((c) => c.name === 'collect_sticker')
+  assert.ok(call, '应该调用了 collect_sticker')
   assert.equal(call.result.ok, true, JSON.stringify(call.result))
   const items = library()
   assert.equal(items.length, 1, '库里应该多了一张')
@@ -91,7 +91,7 @@ test('全都偷：不用她同意，看到就收（也不给她提示）', async
   await send('这张图好好笑', png(3))
   await wait(600)
   assert.equal(library().length, 2, 'auto 模式应该自动收下')
-  assert.doesNotMatch(String(fake.turns.at(-1).userText), /qq_collect_sticker/, 'auto 模式不该再给提示')
+  assert.doesNotMatch(String(fake.turns.at(-1).userText), /collect_sticker/, 'auto 模式不该再给提示')
 })
 
 test('拿不到了：没这张编号时给个说法，不报错', async () => {
@@ -120,7 +120,7 @@ test('群里也收得到「她挑」的提示（以前群聊那条路会把它�
   const fresh = fake.turns.slice(before)
   assert.ok(fresh.length >= 1, '群里 @ 她应该走一轮')
   const t = fresh.at(-1)
-  assert.match(String(t.userText), /qq_collect_sticker/, '群里也该告诉她可以收表情')
+  assert.match(String(t.userText), /collect_sticker/, '群里也该告诉她可以收表情')
   assert.match(String(t.userText), /你自己的小爱好/, '措辞要是她自己的念头，不是发图的人在提醒')
   assert.equal(library().length, 2, '只是提示，她没说要收，库里不该多')
 })
@@ -128,8 +128,8 @@ test('群里也收得到「她挑」的提示（以前群聊那条路会把它�
 test('4:3 的表情收得下（以前会被「尺寸不像表情」误拦）', async () => {
   await send('收下吧收下', png(5, 310, 224))
   const t = fake.turns.at(-1)
-  const call = t.toolCalls.find((c) => c.name === 'qq_collect_sticker')
-  assert.ok(call, '应该调用了 qq_collect_sticker')
+  const call = t.toolCalls.find((c) => c.name === 'collect_sticker')
+  assert.ok(call, '应该调用了 collect_sticker')
   assert.equal(call.result.ok, true, '310x224 是 QQ 最常见的一档，不能挡：' + JSON.stringify(call.result))
   assert.ok(!/尺寸不像表情/.test(String(call.result.message || '')), '不该再报尺寸问题')
 })

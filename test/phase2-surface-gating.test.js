@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { createFakeDsh } from './helpers/fake-dsh.js'
 import { makeFakeAdapter } from './helpers/fake-adapter.js'
 
-const QQ_LEAK_RE = /你现在在 QQ 上|发到 QQ|QQ 空间|<at:QQ号>|QQ 自带的小黄脸|<face:|<poke>|qq_chat_history|qq_get_profile|qq_send_avatar|qq_send_qzone|qq_api_find|qq_api_call|qq_import_qq_stickers|不能碰 onebot|发 QQ 消息/
+const QQ_LEAK_RE = /你现在在 QQ 上|发到 QQ|QQ 空间|<at:QQ号>|QQ 自带的小黄脸|<face:|<poke>|qq_chat_history|qq_get_profile|qq_send_avatar|qq_send_qzone|qq_api_find|qq_api_call|qq_import_stickers|qq_import_qq_stickers|不能碰 onebot|发 QQ 消息/
 
 const until = async (predicate, ms = 4000) => {
   const deadline = Date.now() + ms
@@ -205,7 +205,7 @@ test('PR-2G 场景2：QQ + Feishu 双平台共存下，全局 preset / Feishu �
   await until(() => fake.turns.length >= 1)
   const fsTurn = fake.turns[0]
   assert.doesNotMatch(fsTurn.ctxText, QQ_LEAK_RE, `飞书回合 ctxText 不得含 QQ 内容：\n${fsTurn.ctxText}`)
-  assert.doesNotMatch(fsTurn.ctxText, /chat_history|发 QQ 空间说说|当前是 QQ 会话|qq_import_qq_stickers/)
+  assert.doesNotMatch(fsTurn.ctxText, /chat_history|发 QQ 空间说说|当前是 QQ 会话|qq_import_stickers|qq_import_qq_stickers/)
 
   // 4) QQ 主人私聊入站回合：ctxText 应完整拿到 profile / diary / qq-api / qqSessionRulesText
   await app.hub.onMessage({

@@ -161,7 +161,7 @@ function saveTool(hub, cfg, chat = { kind: 'private', chatId: CHAT, userId: OWNE
     core: { hub, identity, routeOwner: identity.routeOwner, onebot: {}, http: {} }, config: () => cfg, dsh: {}, log,
     tool: (fn) => { build = fn }, route() {}, rule() {},
   })
-  return build({ chat, sessionId: 'save-test', level: 'full' }).find((tool) => tool.name === 'qq_save_sticker')
+  return build({ chat, sessionId: 'save-test', level: 'full' }).find((tool) => tool.name === 'save_sticker')
 }
 const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(64)])
 

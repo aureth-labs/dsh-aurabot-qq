@@ -41,7 +41,7 @@ const fake = createFakeDsh({
       return '记：' + JSON.stringify(r)
     }
     if (String(text).includes('删掉鲸鱼害羞')) {
-      const r = await callTool('qq_edit_sticker', { sticker: '鲸鱼害羞', delete: true })
+      const r = await callTool('edit_sticker', { sticker: '鲸鱼害羞', delete: true })
       return '删：' + JSON.stringify(r)
     }
     return '嗯'
@@ -79,7 +79,7 @@ test('H01：主人问候 + 群友删表情同轮，执行层不能放行', async
   assert.match(combined, /在吗/)
   assert.match(combined, /删掉鲸鱼害羞/)
 
-  const call = turn.toolCalls.find((c) => c.name === 'qq_edit_sticker')
+  const call = turn.toolCalls.find((c) => c.name === 'edit_sticker')
   assert.ok(call, '模型应该尝试删表情')
   assert.equal(call.result.ok, false, '普通群友借主人在场删表情，执行层必须拒绝')
   assert.equal(library().length, 1, '表情不能被删')

@@ -179,28 +179,37 @@ test('Step 1B 纯飞书：无 QQ 零报错启动 stickers / 按图片降级发�
   assert.equal(status.running, 'builtin', '纯飞书环境下 stickers 必须照常启动')
   assert.deepEqual(status.errors, [], '纯飞书启动 stickers 不得有任何 QQ 报错')
 
-  // 全局规则不得再出现 qq_import_qq_stickers / QQ 收藏
+  // 全局规则不得再出现 qq_import_stickers / qq_import_qq_stickers / QQ 收藏
   const globalRules = mods.rules('private')
-  assert.equal(globalRules.some((r) => /qq_import_qq_stickers|QQ\s*收藏/.test(r)), false, 'api.rule 不得包含 QQ 专属规则')
+  assert.equal(globalRules.some((r) => /qq_import_stickers|qq_import_qq_stickers|QQ\s*收藏/.test(r)), false, 'api.rule 不得包含 QQ 专属规则')
 
-  // 飞书群聊工具集：无 qq_import_qq_stickers、工具名不重复、context 不泄漏 QQ 收藏
+  // 飞书群聊工具集：跨平台规范名，无 qq_* 别名、无 qq_import_stickers、工具名不重复、context 不泄漏 QQ 收藏
   const feishuChat = { kind: 'group', chatId: 'feishu:group:oc_1', platform: 'feishu' }
   const feishuTools = mods.buildTools({ chat: feishuChat, sessionId: 's_feishu', level: 'chat' })
   const toolNames = feishuTools.map((x) => x.name)
   assert.equal(new Set(toolNames).size, toolNames.length, '单套工具名去重无冲突')
-  assert.equal(toolNames.includes('qq_send_sticker'), true)
-  assert.equal(toolNames.includes('qq_list_stickers'), true)
-  assert.equal(toolNames.includes('qq_edit_sticker'), true)
-  assert.equal(toolNames.includes('qq_collect_sticker'), true)
-  assert.equal(toolNames.includes('qq_save_sticker'), true)
+  assert.equal(toolNames.includes('send_sticker'), true)
+  assert.equal(toolNames.includes('list_stickers'), true)
+  assert.equal(toolNames.includes('edit_sticker'), true)
+  assert.equal(toolNames.includes('collect_sticker'), true)
+  assert.equal(toolNames.includes('save_sticker'), true)
+  assert.equal(toolNames.includes('qq_list_stickers'), false, '模型工具面不得出现旧别名 qq_list_stickers')
+  assert.equal(toolNames.includes('qq_send_sticker'), false, '模型工具面不得出现旧别名 qq_send_sticker')
+  assert.equal(toolNames.includes('qq_import_stickers'), false, '飞书会话绝不挂 qq_import_stickers')
   assert.equal(toolNames.includes('qq_import_qq_stickers'), false, '飞书会话绝不挂 qq_import_qq_stickers')
 
-  const feishuCtx = mods.contextFor({ chat: feishuChat, sessionId: 's_feishu' })
-  assert.match(feishuCtx, /qq_save_sticker/)
-  assert.match(feishuCtx, /按图片发出/)
-  assert.doesNotMatch(feishuCtx, /qq_import_qq_stickers|QQ 收藏/)
+  // 旧别名经 resolveTool 仍可解析执行，但 QQ 专属导入工具旧别名在飞书不可解析
+  assert.equal(mods.resolveTool({ chat: feishuChat, sessionId: 's_feishu', level: 'chat' }, 'qq_list_stickers')?.name, 'list_stickers')
+  assert.equal(mods.resolveTool({ chat: feishuChat, sessionId: 's_feishu', level: 'chat' }, 'qq_import_qq_stickers'), undefined)
 
-  // 飞书主人入站一张图 → recentMedia → qq_save_sticker 经 gatewayMediaBytes 拉字节存入本地库
+  const feishuCtx = mods.contextFor({ chat: feishuChat, sessionId: 's_feishu' })
+  assert.match(feishuCtx, /list_stickers/)
+  assert.match(feishuCtx, /不要写 \/sticker/)
+  assert.match(feishuCtx, /save_sticker/)
+  assert.match(feishuCtx, /按图片发出/)
+  assert.doesNotMatch(feishuCtx, /qq_import_stickers|qq_import_qq_stickers|QQ 收藏/)
+
+  // 飞书主人入站一张图 → recentMedia → save_sticker 经 gatewayMediaBytes 拉字节存入本地库
   await hub.onGatewayMessage({
     v: 1, instance: 'feishu', platform: 'feishu', chatId: 'feishu:private:ou_owner', kind: 'private',
     chat: { kind: 'private', id: 'ou_owner' },
@@ -211,7 +220,7 @@ test('Step 1B 纯飞书：无 QQ 零报错启动 stickers / 按图片降级发�
   })
   hub.simulateTurn('s_save_feishu', ['ou_owner'], 'feishu')
   const privTools = mods.buildTools({ chat: { kind: 'private', chatId: 'feishu:private:ou_owner', platform: 'feishu' }, sessionId: 's_save_feishu', level: 'full' })
-  const saveTool = privTools.find((x) => x.name === 'qq_save_sticker')
+  const saveTool = privTools.find((x) => x.name === 'save_sticker')
   const saveRes = await saveTool.execute({ name: '开心猫猫', tags: ['开心'] })
   assert.equal(saveRes.ok, true, saveRes.message)
   const libItem = mods.use('stickers').library().items[0]
@@ -219,7 +228,7 @@ test('Step 1B 纯飞书：无 QQ 零报错启动 stickers / 按图片降级发�
   assert.equal(libItem.emojiId, '', '纯飞书不写 QQ emojiId')
 
   // 飞书发送表情：<sticker> → gateway degrade → msg_type: 'image'
-  const sendTool = feishuTools.find((x) => x.name === 'qq_send_sticker')
+  const sendTool = feishuTools.find((x) => x.name === 'send_sticker')
   const sendOk = await sendTool.execute({ name: '开心猫猫' })
   assert.equal(sendOk.ok, true, sendOk.message)
   assert.equal(sentReqs.length, 1)
@@ -374,22 +383,23 @@ test('Step 1B 双平台 coexistence + QQ native 懒降级 + 不可 collect 平�
   const feishuChat = { kind: 'group', chatId: 'feishu:group:oc_2', platform: 'feishu' }
   const textChat = { kind: 'private', chatId: 'textonly:private:u1', platform: 'textonly' }
 
-  // 1) 初始双平台各取各的：QQ 挂 qq_import_qq_stickers，Feishu 不挂，textOnly 连发送/收藏工具都不挂
+  // 1) 初始双平台各取各的：QQ 挂 qq_import_stickers，Feishu 不挂，textOnly 连发送/收藏工具都不挂
   const qqToolsBefore = mods.buildTools({ chat: qqChat, sessionId: 's_q', level: 'full' }).map((x) => x.name)
   const feishuTools = mods.buildTools({ chat: feishuChat, sessionId: 's_f', level: 'chat' }).map((x) => x.name)
   const textTools = mods.buildTools({ chat: textChat, sessionId: 's_t', level: 'chat' }).map((x) => x.name)
-  assert.equal(qqToolsBefore.includes('qq_import_qq_stickers'), true, 'QQ 探测有 fetch_custom_face 应挂导入工具')
-  assert.equal(feishuTools.includes('qq_import_qq_stickers'), false, '飞书会话绝不挂 qq_import_qq_stickers')
-  assert.equal(textTools.includes('qq_send_sticker'), false, '无图无表情能力平台不挂发送')
-  assert.equal(textTools.includes('qq_collect_sticker'), false, '无 collect 能力平台不挂收集')
-  assert.equal(textTools.includes('qq_list_stickers'), true)
+  assert.equal(qqToolsBefore.includes('qq_import_stickers'), true, 'QQ 探测有 fetch_custom_face 应挂导入工具')
+  assert.equal(feishuTools.includes('qq_import_stickers'), false, '飞书会话绝不挂 qq_import_stickers')
+  assert.equal(textTools.includes('send_sticker'), false, '无图无表情能力平台不挂发送')
+  assert.equal(textTools.includes('collect_sticker'), false, '无 collect 能力平台不挂收集')
+  assert.equal(textTools.includes('list_stickers'), true)
 
-  assert.match(mods.contextFor({ chat: qqChat, sessionId: 's_q' }), /qq_import_qq_stickers/)
-  assert.doesNotMatch(mods.contextFor({ chat: feishuChat, sessionId: 's_f' }), /qq_import_qq_stickers/)
+  assert.match(mods.contextFor({ chat: qqChat, sessionId: 's_q' }), /qq_import_stickers/)
+  assert.doesNotMatch(mods.contextFor({ chat: feishuChat, sessionId: 's_f' }), /qq_import_stickers|qq_import_qq_stickers/)
 
   // 2) QQ 会话导入并发送表情：导入调 gateway native fetch_custom_face，发送走 Part('sticker') → sub_type: 1
   hub.simulateTurn('s_q', ['10000001'])
-  const importTool = mods.buildTools({ chat: qqChat, sessionId: 's_q', level: 'full' }).find((x) => x.name === 'qq_import_qq_stickers')
+  const importTool = mods.buildTools({ chat: qqChat, sessionId: 's_q', level: 'full' }).find((x) => x.name === 'qq_import_stickers')
+  assert.equal(mods.resolveTool({ chat: qqChat, sessionId: 's_q', level: 'full' }, 'qq_import_qq_stickers')?.name, 'qq_import_stickers')
   const imp = await importTool.execute()
   assert.equal(imp.ok, true, imp.message)
   assert.equal(favCalls >= 1, true)
@@ -401,7 +411,7 @@ test('Step 1B 双平台 coexistence + QQ native 懒降级 + 不可 collect 平�
   assert.equal(sentOb.at(-1).params.message[0].data.sub_type, 1, 'QQ 发送标准化 Part(sticker) 必须保持 sub_type=1')
   assert.equal(await hub.sendSticker('textonly:private:u1', '双平台兔'), false, '纯文本平台发送表情返回 false')
 
-  // 3) 运行期懒降级：add_custom_face 返回 1404 unsupported 后，capsChanged 触发，sticker.sync.native 降成 false 且 qq_import_qq_stickers 自动撤销
+  // 3) 运行期懒降级：add_custom_face 返回 1404 unsupported 后，capsChanged 触发，sticker.sync.native 降成 false 且 qq_import_stickers 自动撤销
   failAddCustomFaceUnsupported = true
   const beforeChanges = capsChangedCount
   const addRes = await mods.use('stickers').addFromBuffer(makePng(22), { name: '触发降级', from: 'tool' })
@@ -409,7 +419,8 @@ test('Step 1B 双平台 coexistence + QQ native 懒降级 + 不可 collect 平�
   assert.equal(gateway.features('qq:private:10000001')['sticker.sync.native'], false, 'unsupported 后必须立即懒降级')
   assert.equal(capsChangedCount > beforeChanges, true, '懒降级必须触发 capsChanged')
   const qqToolsAfter = mods.buildTools({ chat: qqChat, sessionId: 's_q', level: 'full' }).map((x) => x.name)
-  assert.equal(qqToolsAfter.includes('qq_import_qq_stickers'), false, '降级后会话不再挂 qq_import_qq_stickers')
+  assert.equal(qqToolsAfter.includes('qq_import_stickers'), false, '降级后会话不再挂 qq_import_stickers')
+  assert.equal(mods.resolveTool({ chat: qqChat, sessionId: 's_q', level: 'full' }, 'qq_import_qq_stickers'), undefined, '降级后旧别名也不可用')
 })
 
 test('Step 1B 面板 client/client.js#Stickers：纯飞书隐藏 QQ 专属按钮并提示图片降级，有活跃 QQ 时正常显示', () => {
@@ -639,7 +650,7 @@ test('Step 1B 审阅 P1：传统 QQ 直连与 G3 caps=null 下收集本机路径
     chat: { kind: 'private', chatId: 'private:10000001', platform: 'qq' },
     sessionId: 's_legacy_qq',
     level: 'full',
-  }).find((x) => x.name === 'qq_collect_sticker')
+  }).find((x) => x.name === 'collect_sticker')
   const collectRes = await legacyCollectTool.execute({ index: 1, name: '直连本地' })
   assert.equal(collectRes.ok, true, collectRes.message)
   assert.equal(legacyRig.mods.use('stickers').library().items.some((x) => x.name === '直连本地'), true)

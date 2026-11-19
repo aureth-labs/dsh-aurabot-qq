@@ -305,8 +305,8 @@ function toolTextRanges (raw, { ownerPrivate = false } = {}) {
   }
 
   // 4) 通用下划线标签：只认 tool/param/invoke 类名（<x_1>、<snake_case> 这类正常文字不删）
-  // 只认协议类名和本插件已知的工具名前缀（qq_/bili_/...），避免 <x_1>、<snake_case> 这类正常文字被误删。
-  for (const match of raw.matchAll(/[<＜]\s*[\/／]?\s*(?:tool|function|invoke|param(?:eter)?|antml|dsml|arguments?|call|qq|bili|qzone|song|pet|memory|mood|sticker|diary|video|voice|contact|profile|purpose|speak|draw|image|send|get|set)[_:\s]+[a-z0-9_]+["＂]?\s*[>＞]/gi)) {
+  // 只认协议类名和本插件已知的工具名前缀（qq_/bili_/... 及跨平台动词前缀），避免 <x_1>、<snake_case> 这类正常文字被误删。
+  for (const match of raw.matchAll(/[<＜]\s*[\/／]?\s*(?:tool|function|invoke|param(?:eter)?|antml|dsml|arguments?|call|qq|bili|qzone|song|pet|memory|mood|sticker|diary|video|voice|contact|profile|purpose|speak|draw|image|send|get|set|list|edit|collect|save|add|generate|close|group|chat|search)[_:\s]+[a-z0-9_]+["＂]?\s*[>＞]/gi)) {
     if (toolTag(match[0])) continue // 已知协议标签已单独处理，这里只补通用下划线形式
     found.push({ start: match.index, end: match.index + match[0].length, kind: 'generic', paired: false })
   }

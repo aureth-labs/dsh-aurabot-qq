@@ -38,7 +38,7 @@ const { createFakeDsh } = await import(`file:///${REPO}/test/helpers/fake-dsh.js
 const fake = createFakeDsh({
   brain: async ({ text, callTool }) => {
     if (String(text).includes('收下')) {
-      const r = await callTool('qq_collect_sticker', { index: 1, name: '试试' })
+      const r = await callTool('collect_sticker', { index: 1, name: '试试' })
       return '结果：' + (r && (r.message || r.ok))
     }
     return '嗯'
@@ -72,14 +72,14 @@ test('别人发的表情：不提示她可以收', async () => {
   await send({ from: MEMBER, member: true, salt: 11 })
   const t = fake.turns.slice(before).at(-1)
   assert.ok(t, '群里被 @ 应该走一轮')
-  assert.doesNotMatch(String(t.userText), /qq_collect_sticker/, '只听主人的模式，别人发的表情不给提示')
+  assert.doesNotMatch(String(t.userText), /collect_sticker/, '只听主人的模式，别人发的表情不给提示')
 })
 
 test('别人在场时她不能自己收（工具被拦）', async () => {
   const before = fake.turns.length
   await send({ from: MEMBER, member: true, salt: 12, text: '收下这张' })
   const t = fake.turns.slice(before).at(-1)
-  const call = t.toolCalls.find((c) => c.name === 'qq_collect_sticker')
+  const call = t.toolCalls.find((c) => c.name === 'collect_sticker')
   assert.ok(call, '她确实尝试收了')
   assert.equal(call.result.ok, false, '应该被拦下来')
   assert.match(String(call.result.message), /只听主人的/)
@@ -90,8 +90,8 @@ test('主人发话就能收，而且会给她提示', async () => {
   const before = fake.turns.length
   await send({ from: OWNER, salt: 13, text: '收下这张' })
   const t = fake.turns.slice(before).at(-1)
-  assert.match(String(t.userText), /qq_collect_sticker/, '主人发的表情要提示她')
-  const call = t.toolCalls.find((c) => c.name === 'qq_collect_sticker')
+  assert.match(String(t.userText), /collect_sticker/, '主人发的表情要提示她')
+  const call = t.toolCalls.find((c) => c.name === 'collect_sticker')
   assert.ok(call)
   assert.equal(call.result.ok, true, JSON.stringify(call.result))
   assert.equal(library().length, 1, '应该收进库里了')
@@ -102,7 +102,7 @@ test('切回「她挑」后又不拦了（owner 模式才有这道闸）', async
   const before = fake.turns.length
   await send({ from: MEMBER, member: true, salt: 14, text: '收下这张' })
   const t = fake.turns.slice(before).at(-1)
-  const call = t.toolCalls.find((c) => c.name === 'qq_collect_sticker')
+  const call = t.toolCalls.find((c) => c.name === 'collect_sticker')
   assert.equal(call.result.ok, true, '「她挑」模式下别人发的也能收')
   assert.equal(library().length, 2)
 })

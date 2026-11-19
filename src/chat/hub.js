@@ -353,7 +353,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   const recentMediaOf = (chatId, userId) => recentMedia.get(chatId, userId).filter((item) => !isBeforeMemoryReset(chatId, item.userId, item.at))
   const recentFiles = new Map() // chatId → 最近发来的文件
   // 「她挑 / 只听主人的」：这一轮收到的表情先按会话记着，她想收时凭编号来取。
-  // 落盘存一份 —— 只在内存里的话，DSH 一重启就什么都没有了，她只好绕路（拷附件 + qq_add_sticker）。
+  // 落盘存一份 —— 只在内存里的话，DSH 一重启就什么都没有了，她只好绕路（拷附件 + add_sticker）。
   const stickerStash = new Map() // chatId → { at, segs: [seg] }
   const STICKER_TTL = 30 * 60_000 // 和「最近图片」一个尺度
   const stashFile = () => dataDir('sticker-stash.json')
@@ -406,7 +406,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
    */
   function stickerHint (n) {
     const range = n > 1 ? `1~${n}` : '1'
-    return `（这轮里夹着 ${n} 张表情，是你自己看到的。有中意的就用 qq_collect_sticker ${range} 收进自己库；收表情是你自己的小爱好，不用每张都跟对方说，偶尔提一句也行。）`
+    return `（这轮里夹着 ${n} 张表情，是你自己看到的。有中意的就用 collect_sticker ${range} 收进自己库；收表情是你自己的小爱好，不用每张都跟对方说，偶尔提一句也行。）`
   }
 
   const slowNoticeSent = new Set() // sessionKey → 这一轮已经发过「正在做」提示（慢工具，issue #74）
