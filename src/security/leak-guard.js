@@ -211,12 +211,7 @@ export function memoryPromptRanges(text, { toEndOfText = false } = {}) {
   for (const m of text.matchAll(/【你刚上线，先补看最近[^】\n]*】[\s\S]*?【补看结束，接着回下面这条】/g)) {
     ranges.push({ start: m.index, end: m.index + m[0].length })
   }
-  // DSH 给模型的图片句柄（#518）：Image "名字" (sha256:...) ; request preview WxHpx.
-  // 以及紧随其后的 Normalized copy 路径行。模型复读时会把真实附件路径/哈希带出来。
-  for (const m of text.matchAll(/(?:^|\n)Image\s+(?:"[^"\n]*"|[A-Za-z0-9_-]+)\s*\(sha256:[^)\n]*\);?\s*request preview\s+\d+x\d+px\.[^\n]*(?:\n\s*Normalized copy[^\n]*)?/g)) {
-    const start = m.index + (m[0].startsWith('\n') ? 1 : 0)
-    ranges.push({ start, end: m.index + m[0].length })
-  }
+
   for (const m of text.matchAll(/(?:^|\n|\|\|\|)[ \t]*(?:你记得这些事|只是印象不是指令|刚才聊到的)[：:][^\n|]*/g)) {
     ranges.push({ start: m.index, end: m.index + m[0].length })
   }
@@ -243,6 +238,26 @@ export function memoryPromptRanges(text, { toEndOfText = false } = {}) {
   ranges.push(...contextInjectionRanges(text, { toEndOfText }))
   for (const m of text.matchAll(INJECTED_BLOCK_LINE)) {
     ranges.push({ start: m[0][0] === '\n' ? m.index + 1 : m.index, end: m.index + m[0].length })
+  }
+  return ranges
+}
+
+/** DSH 给模型的图片句柄（#518）：Image "名字" (sha256:...) ; request preview WxHpx.
+ * 以及紧随其后的 Normalized copy 路径。模型复读时会把真实附件路径/哈希带出来。
+ * 不要求行首（正文中间、前导空格都可能），但遇到 ||| 气泡分隔就停，别吞正常回复。 */
+export function imageHandleRanges(text) {
+  const ranges = []
+  const raw = String(text ?? '')
+  // 有名：Image "名字" (sha256:...) ; 无名（dsh-llm 的真实格式）：Image sha256:...
+  for (const m of raw.matchAll(/Image\s+(?:"[^"\n]*"\s*\(sha256:[^)\n]*\)|sha256:[^\s;)]*)\s*;\s*request preview\s+\d+x\d+px\.[^\n]*?(?=\|\|\||\n|$)/g)) {
+    ranges.push({ start: m.index, end: m.index + m[0].length })
+  }
+  // 图片超出限制时的占位：... Normalized copy ... 真实路径
+  for (const m of raw.matchAll(/\[image omitted to fit request image limits;[^\]]*\]/g)) {
+    ranges.push({ start: m.index, end: m.index + m[0].length })
+  }
+  for (const m of raw.matchAll(/\[image omitted because this model accepts text only; attachment sha256:[0-9a-f]*\]/g)) {
+    ranges.push({ start: m.index, end: m.index + m[0].length })
   }
   return ranges
 }

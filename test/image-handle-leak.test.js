@@ -18,3 +18,38 @@ test('普通正文里提到 Image 两个字不误伤', () => {
   const text = 'Image 这个词我今天已经听三遍了'
   assert.equal(cleanOutboundText(text), text)
 })
+
+test('图片句柄：正文中间、前导空格也删（不要求行首）', () => {
+  const leak = '前面这句是正常话  Image "qq--abc-1" (sha256:deadbeef); request preview 90x90px. Normalized copy (read-only; may be resized or re-encoded): "/home/alice/.dsh/attachments/secret.png" (90x90px, image/png). 后面这句也正常'
+  const out = cleanOutboundText(leak)
+  assert.doesNotMatch(out, /secret\.png|sha256|Normalized copy/)
+  assert.match(out, /前面这句是正常话/)
+})
+
+test('图片句柄：主人私聊里前面有正常话也要删（不受 prompt 复读豁免影响）', () => {
+  const leak = '好呀，我在呢  Image "qq--abc-1" (sha256:deadbeef); request preview 90x90px. Normalized copy (read-only; may be resized or re-encoded): "/home/alice/.dsh/attachments/secret.png" (90x90px, image/png).'
+  const out = cleanOutboundText(leak, { ownerPrivate: true })
+  assert.doesNotMatch(out, /secret\.png|Normalized copy/)
+  assert.match(out, /好呀，我在呢/)
+})
+
+test('图片句柄：后面接 ||| 气泡分隔时只删句柄，不吞正常回答', () => {
+  const leak = 'Image "qq--abc-1" (sha256:deadbeef); request preview 90x90px.|||正常回复'
+  const out = cleanOutboundText(leak)
+  assert.doesNotMatch(out, /sha256|request preview/)
+  assert.match(out, /\|\|\|正常回复/)
+})
+
+test('图片句柄：dsh-llm 无名字格式 Image sha256:... 也删', () => {
+  const leak = '前文\nImage sha256:27f12155428077bd041826d5883c0069098b5cdeadbeef; request preview 180x180px. Normalized copy (read-only; may be resized or re-encoded): "/home/alice/.dsh/attachments/secret.png" (180x180px, image/png). Source dimensions, format, and byte size may differ.'
+  const out = cleanOutboundText(leak)
+  assert.doesNotMatch(out, /secret\.png|request preview|sha256/)
+  assert.match(out, /前文/)
+})
+
+test('图片句柄：超出限制的 [image omitted to fit request image limits; ...] 整段删', () => {
+  const leak = '好\n[image omitted to fit request image limits; "qq--abc-1" (sha256:deadbeef). Normalized copy (read-only; may be resized or re-encoded): "/home/alice/.dsh/attachments/secret.png" (90x90px, image/png).]'
+  const out = cleanOutboundText(leak)
+  assert.doesNotMatch(out, /secret\.png|image omitted/)
+  assert.match(out, /好/)
+})
