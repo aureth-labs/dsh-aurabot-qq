@@ -52,13 +52,232 @@ const MODULE_FILES = new Map([
   ['group-admin', 'src/modules/group-admin/index.js'],
 ])
 
-function extractDefinedToolNames(relPath) {
-  const src = readFileSync(join(ROOT, relPath), 'utf8')
+const REGEX_PRECEDING_KEYWORDS = new Set([
+  'return', 'throw', 'case', 'delete', 'void', 'typeof', 'in', 'instanceof', 'new', 'else', 'do', 'yield', 'await', 'of',
+])
+
+function skipWsAndComments(src, i) {
+  while (i < src.length) {
+    if (/\s/.test(src[i])) { i++; continue }
+    if (src[i] === '/' && src[i + 1] === '/') {
+      const nl = src.indexOf('\n', i + 2)
+      i = nl === -1 ? src.length : nl + 1
+      continue
+    }
+    if (src[i] === '/' && src[i + 1] === '*') {
+      const end = src.indexOf('*/', i + 2)
+      i = end === -1 ? src.length : end + 2
+      continue
+    }
+    break
+  }
+  return i
+}
+
+function skipQuotedRange(src, start) {
+  const quote = src[start]
+  let i = start + 1
+  let value = ''
+  while (i < src.length) {
+    const c = src[i]
+    if (c === '\\' && i + 1 < src.length) {
+      value += src[i + 1]
+      i += 2
+      continue
+    }
+    if (c === quote) return { next: i + 1, value }
+    value += c
+    i++
+  }
+  return { next: i, value }
+}
+
+function skipRegexRange(src, start) {
+  let i = start + 1
+  let inClass = false
+  while (i < src.length) {
+    const c = src[i]
+    if (c === '\\') { i += 2; continue }
+    if (c === '[' && !inClass) { inClass = true; i++; continue }
+    if (c === ']' && inClass) { inClass = false; i++; continue }
+    if (c === '/' && !inClass) {
+      i++
+      while (i < src.length && /[a-z]/i.test(src[i])) i++
+      return i
+    }
+    if (c === '\n' || c === '\r') return start + 1
+    i++
+  }
+  return i
+}
+
+function skipCodeToken(src, i, canRegex) {
+  const ch = src[i]
+  if (/\s/.test(ch)) return { next: i + 1, canRegex, kind: 'ws' }
+  if (ch === '/' && src[i + 1] === '/') {
+    const nl = src.indexOf('\n', i + 2)
+    return { next: nl === -1 ? src.length : nl + 1, canRegex, kind: 'comment' }
+  }
+  if (ch === '/' && src[i + 1] === '*') {
+    const end = src.indexOf('*/', i + 2)
+    return { next: end === -1 ? src.length : end + 2, canRegex, kind: 'comment' }
+  }
+  if (ch === '/' && canRegex) return { next: skipRegexRange(src, i), canRegex: false, kind: 'regex' }
+  if (ch === '\'' || ch === '"') {
+    const q = skipQuotedRange(src, i)
+    return { next: q.next, canRegex: false, kind: 'string', value: q.value }
+  }
+  if (ch === '`') {
+    let p = i + 1
+    while (p < src.length) {
+      if (src[p] === '\\') { p += 2; continue }
+      if (src[p] === '`') return { next: p + 1, canRegex: false, kind: 'template' }
+      if (src[p] === '$' && src[p + 1] === '{') {
+        p = skipBracedBlock(src, p + 2)
+        continue
+      }
+      p++
+    }
+    return { next: p, canRegex: false, kind: 'template' }
+  }
+  return null
+}
+
+function skipBracedBlock(src, startAfterOpen) {
+  let depth = 1
+  let i = startAfterOpen
+  let canRegex = true
+  while (i < src.length && depth > 0) {
+    const skipped = skipCodeToken(src, i, canRegex)
+    if (skipped) {
+      i = skipped.next
+      canRegex = skipped.canRegex
+      continue
+    }
+    const ch = src[i]
+    if (/[A-Za-z_$]/.test(ch)) {
+      let j = i + 1
+      while (j < src.length && /[A-Za-z0-9_$]/.test(src[j])) j++
+      canRegex = REGEX_PRECEDING_KEYWORDS.has(src.slice(i, j))
+      i = j
+      continue
+    }
+    if (ch === '{') { depth++; canRegex = true; i++; continue }
+    if (ch === '}') { depth--; canRegex = false; i++; continue }
+    canRegex = '([,;:=!&|^~+-*%<>?'.includes(ch)
+    i++
+  }
+  return i
+}
+
+/**
+ * 平衡括号词法扫描器：从源码中提取所有 `defineTool({ ... })` 顶层属性 `name`。
+ * 跳过注释、字符串、模板字面量、正则与嵌套属性对象，不依赖固定字符窗口长度。
+ */
+export function extractDefinedToolNamesFromSource(src) {
   const names = []
-  const re = /defineTool\s*\(\s*\{[\s\S]{0,180}?name:\s*['"]([^'"]+)['"]/g
-  let m
-  while ((m = re.exec(src))) names.push(m[1])
+  let i = 0
+  let canRegex = true
+  while (i < src.length) {
+    const skipped = skipCodeToken(src, i, canRegex)
+    if (skipped) {
+      i = skipped.next
+      canRegex = skipped.canRegex
+      continue
+    }
+    if (/[A-Za-z_$]/.test(src[i])) {
+      let j = i + 1
+      while (j < src.length && /[A-Za-z0-9_$]/.test(src[j])) j++
+      const word = src.slice(i, j)
+      if (word === 'defineTool') {
+        const parenIdx = skipWsAndComments(src, j)
+        if (src[parenIdx] === '(') {
+          const braceIdx = skipWsAndComments(src, parenIdx + 1)
+          if (src[braceIdx] === '{') {
+            let depth = 1
+            let p = braceIdx + 1
+            let expectKey = true
+            let innerCanRegex = true
+            let extracted = false
+            while (p < src.length && depth > 0) {
+              const s = skipCodeToken(src, p, innerCanRegex)
+              if (s) {
+                p = s.next
+                innerCanRegex = s.canRegex
+                continue
+              }
+              const ch = src[p]
+              if (depth === 1 && expectKey && /[A-Za-z_$]/.test(ch)) {
+                let k = p + 1
+                while (k < src.length && /[A-Za-z0-9_$]/.test(src[k])) k++
+                const key = src.slice(p, k)
+                const colonIdx = skipWsAndComments(src, k)
+                if (src[colonIdx] === ':') {
+                  if (key === 'name' && !extracted) {
+                    const valIdx = skipWsAndComments(src, colonIdx + 1)
+                    if (src[valIdx] === '\'' || src[valIdx] === '"') {
+                      const q = skipQuotedRange(src, valIdx)
+                      names.push(q.value)
+                      extracted = true
+                      p = q.next
+                      expectKey = false
+                      innerCanRegex = false
+                      continue
+                    }
+                  }
+                  p = colonIdx + 1
+                  expectKey = false
+                  innerCanRegex = true
+                  continue
+                }
+                p = k
+                if (REGEX_PRECEDING_KEYWORDS.has(key)) innerCanRegex = true
+                else innerCanRegex = false
+                continue
+              }
+              if (/[A-Za-z_$]/.test(ch)) {
+                let k = p + 1
+                while (k < src.length && /[A-Za-z0-9_$]/.test(src[k])) k++
+                innerCanRegex = REGEX_PRECEDING_KEYWORDS.has(src.slice(p, k))
+                p = k
+                continue
+              }
+              if (ch === '{') {
+                depth++
+                if (depth === 2) expectKey = false
+                innerCanRegex = true
+                p++
+                continue
+              }
+              if (ch === '}') {
+                depth--
+                innerCanRegex = false
+                p++
+                continue
+              }
+              if (depth === 1 && ch === ',') expectKey = true
+              else if (depth === 1 && !/\s/.test(ch)) expectKey = false
+              innerCanRegex = '([,;:=!&|^~+-*%<>?'.includes(ch)
+              p++
+            }
+            i = p
+            canRegex = false
+            continue
+          }
+        }
+      }
+      canRegex = REGEX_PRECEDING_KEYWORDS.has(word)
+      i = j
+      continue
+    }
+    canRegex = '([,;:=!&|^~+-*%<>?'.includes(src[i])
+    i++
+  }
   return names
+}
+
+function extractDefinedToolNames(relPath) {
+  return extractDefinedToolNamesFromSource(readFileSync(join(ROOT, relPath), 'utf8'))
 }
 
 function makeFullHarness(t, { builtins = ALL_MODS, platforms = null, adapters = null } = {}) {
@@ -414,4 +633,25 @@ test('usage.moduleOfTool 覆盖已迁移工具的权威名与旧别名', () => {
   assert.equal(moduleOfTool('qq_list_shots'), '刷 B 站')
   assert.equal(moduleOfTool('group_admin'), '群管')
   assert.equal(moduleOfTool('qq_group_admin'), '群管')
+})
+
+test('extractDefinedToolNamesFromSource：支持超长前置字段并忽略注释与嵌套 properties.name', () => {
+  const longPadding = '说明'.repeat(200)
+  const sample = `
+    // defineTool({ name: 'commented_out_tool' })
+    /* defineTool({ name: 'block_commented_tool' }) */
+    api.defineTool({
+      description: '${longPadding}',
+      properties: {
+        name: str(' nested field named name '),
+        query: str('regex test /a{1,2}/i'),
+      },
+      execute: async ({ name }) => {
+        const inner = { name: 'inner_obj_name' }
+        return { ok: Boolean(name && inner) }
+      },
+      name: 'delayed_top_level_tool',
+    })
+  `
+  assert.deepEqual(extractDefinedToolNamesFromSource(sample), ['delayed_top_level_tool'])
 })

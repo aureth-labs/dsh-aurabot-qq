@@ -302,7 +302,7 @@ api.tool(({ chat, level, sessionId }) => {
 - 工具的生成函数每次挂工具时调用（会话第一次用到、工具清单变化时），不是每次调用工具都调
 - 只想给主人用：在 `execute` 里判断 `api.core.hub.turnSendersAllOwner(sessionId)`（这一轮说话的人**全是主人**才放行；主人私聊会自动放行）。别用 `turnHasOwner`——它只表示本轮「有人是主人」，主人和群友同轮时别人能借权（H01 的教训）。
 - 工具的名字和描述尽量别经常改：改一次，DeepSeek 的缓存就失效一次
-- **命名规范（多平台）**：跨平台模块（`platforms: ['*']` 或多平台）的工具用通用动宾名（`<verb>_<noun>`，如 `send_sticker`、`draw_image`）或模块域前缀（`<module>_<verb>_<noun>`，如 `bili_send_shot`），**不要**用 `qq_` 等平台前缀伪装通用能力；只有单平台专属工具才用 `<platform>_<verb>_<noun>`（如 `qq_send_card`）。若重命名旧工具，在模块上声明 `toolAliases: { old_name: 'new_name' }` 保持旧脚本与 `/modules/tool` 兼容，模型侧仍只暴露权威名。
+- **命名规范（多平台）**：跨平台模块（`platforms: ['*']` 或多平台）的工具用通用动宾名（`<verb>_<noun>`，如 `send_sticker`、`draw_image`）或模块域前缀（`<module>_<verb>_<noun>`，如 `bili_send_shot`），**不要**用 `qq_` 等平台前缀伪装通用能力；只有单平台专属工具才用 `<platform>_<verb>_<noun>`（如 `qq_send_card`）。跨平台模块里的平台前缀只允许用于“显式平台门控动作”，且必须有运行时测试证明其他平台工具面不会出现（目前仅 `stickers` 的 `qq_import_stickers` 一例，未来不再扩大）。若重命名旧工具，在模块上声明 `toolAliases: { old_name: 'new_name' }` 保持旧脚本与 `/modules/tool` 兼容，模型侧仍只暴露权威名。
 - 想让她**知道**自己有这个本事，优先用 `api.context` 按当前会话平台/能力提供工具发现提示（并避免让她在正文里写 `/工具名` 等斜杠命令）；纯全局说明才放 `api.rule`。
 
 ## 面板

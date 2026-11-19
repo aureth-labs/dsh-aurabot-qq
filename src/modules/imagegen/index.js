@@ -46,11 +46,15 @@ export default {
     })
     const auth = gen.codexAuth
     api.onDispose?.(() => gen.dispose())
-    api.context?.(({ chat, level }) => {
+    api.context?.(({ chat, level, sessionId }) => {
       const cfg = api.config()
       if (!gen.enabled() || !chat || chat.kind === 'system') return ''
       const granted = privateCapabilityAllowed(cfg, chat, 'image')
-      const canUse = !cfg.imageGen.ownerOnly || level === 'full' || chat.kind === 'group' || granted
+      const ownerRequest = Boolean(
+        level === 'full'
+        || (sessionId && (hub?.turnSendersAllOwner?.(sessionId) || (chat.kind === 'group' && hub?.turnDirectFromOwner?.(sessionId)))),
+      )
+      const canUse = !cfg.imageGen.ownerOnly || ownerRequest || granted
       if (!canUse) return ''
       const lines = [
         '- 需要画图或按图改图时直接调 draw_image 工具，不要在正文里写 /draw 或 /draw_image 之类的斜杠命令。',

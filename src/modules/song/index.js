@@ -40,12 +40,19 @@ export default {
     const { hub, local, http } = api.core
     const mood = api.lazy('mood')
     const memory = api.lazy('memory')
-    api.context?.(({ chat }) => {
-      if (!api.config().song.enabled || !chat || chat.kind === 'system') return ''
+    api.context?.(({ chat, level, sessionId }) => {
+      const cfg = api.config()
+      if (!cfg.song.enabled || !chat || chat.kind === 'system') return ''
+      const granted = privateCapabilityAllowed(cfg, chat, 'song')
+      const ownerRequest = Boolean(
+        level === 'full'
+        || (sessionId && hub?.turnSendersAllOwner?.(sessionId)),
+      )
+      if (cfg.song.ownerOnly && !ownerRequest && !granted) return ''
       const lines = [
         '- 别人点歌让你唱时直接调 song_cover 工具，不要在正文里写 /song 或 /song_cover 之类的斜杠命令。',
       ]
-      if (privateCapabilityAllowed(api.config(), chat, 'song')) {
+      if (granted) {
         lines.push('- 当前私聊对象已经获得主人的点歌授权。对方请求唱歌时可以使用 song_cover，以当前授权为准。')
       }
       return lines.join('\n')

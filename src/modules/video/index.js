@@ -26,12 +26,18 @@ export default {
     let running = false
     let stopped = false
     api.onDispose?.(() => { stopped = true })
-    api.context?.(({ chat }) => {
+    api.context?.(({ chat, level, sessionId }) => {
       if (!local.active('video') || !chat || chat.kind === 'system') return ''
+      const granted = privateCapabilityAllowed(api.config(), chat, 'video')
+      const ownerRequest = Boolean(
+        level === 'full'
+        || (sessionId && hub?.turnSendersAllOwner?.(sessionId)),
+      )
+      if (!ownerRequest && !granted) return ''
       const lines = [
         '- 需要生成视频时直接调 generate_video 工具，不要在正文里写 /video 或 /generate_video 之类的斜杠命令。',
       ]
-      if (privateCapabilityAllowed(api.config(), chat, 'video')) {
+      if (granted) {
         lines.push('- 当前私聊对象已经获得主人的视频生成授权。对方请求生成视频时可以使用 generate_video，以当前授权为准。')
       }
       return lines.join('\n')

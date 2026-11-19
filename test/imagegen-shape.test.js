@@ -136,3 +136,34 @@ test('qq_draw_image 的 size 参数暴露 2K/4K，传给生成器', async () => 
   assert.equal((await tool.execute({ prompt: '猫', size: '4096x4096' })).ok, true)
   assert.equal(seen.at(-1).size, '4096x4096')
 })
+
+test('imagegen context 权限收敛：群聊 ownerOnly 时非主人不注射 draw_image 提示，主人/关闭 ownerOnly/私聊正常注射', () => {
+  let context
+  let allOwner = false
+  let directOwner = false
+  const c = config()
+  c.imageGen.ownerOnly = true
+  imagegenModule.setup({
+    config: () => c, log, dsh: {}, lazy: () => ({}), route() {}, tool() {}, context: (fn) => { context = fn },
+    core: {
+      local: { active: () => true },
+      hub: { turnSendersAllOwner: () => allOwner, turnDirectFromOwner: () => directOwner },
+    },
+  })
+  const groupChat = { kind: 'group', chatId: 'feishu:group:oc_1', groupId: 'oc_1', platform: 'feishu' }
+  assert.equal(context({ chat: groupChat, level: 'social', sessionId: 's-g1' }), '', '群聊非主人开启 ownerOnly 时不注入 draw_image 上下文')
+
+  allOwner = true
+  assert.match(context({ chat: groupChat, level: 'social', sessionId: 's-g2' }), /draw_image/, '群聊全为主人时注入 draw_image 上下文')
+
+  allOwner = false
+  directOwner = true
+  assert.match(context({ chat: groupChat, level: 'social', sessionId: 's-g3' }), /draw_image/, '群聊主人明确 @/引用请求时注入 draw_image 上下文')
+
+  directOwner = false
+  c.imageGen.ownerOnly = false
+  assert.match(context({ chat: groupChat, level: 'social', sessionId: 's-g4' }), /draw_image/, '关闭 ownerOnly 后群聊放行 draw_image 上下文')
+
+  c.imageGen.ownerOnly = true
+  assert.match(context({ chat: { kind: 'private', chatId: 'feishu:private:ou_owner', userId: 'ou_owner' }, level: 'full', sessionId: 's-p1' }), /draw_image/, '主人私聊 level=full 时注入 draw_image 上下文')
+})
