@@ -13,13 +13,18 @@ import { redact } from '../../core/redact.js'
 
 function reason(error) { if (error?.imageStatus) return `接口返回 HTTP ${error.imageStatus}`; if (error?.imageNetworkFailure) return error.name === 'TimeoutError' ? '连接超时' : '连接失败'; const m = String(error?.message || ''); if (m.includes('不支持参考图')) return '该模型不支持参考图'; if (m.includes('登录')) return '订阅登录不可用'; return '生图请求失败' }
 
+export const toolAliases = Object.freeze({
+  qq_draw_image: 'draw_image',
+})
+
 export default {
   id: 'imagegen',
   name: '生图',
   version: '1.0.0',
   api: 2,
   platforms: ['*'],
-  description: '画一张图发到聊天里（qq_draw_image）',
+  toolAliases,
+  description: '画一张图发到聊天里（draw_image）',
   tab: 'imagegen',
   files: ['features/imagegen.js', 'features/image-shape.js', 'features/paintings.js', 'features/codex-auth.js', 'features/codex-image.js'],
   setup(api) {
@@ -41,9 +46,19 @@ export default {
     })
     const auth = gen.codexAuth
     api.onDispose?.(() => gen.dispose())
-    api.context?.(({ chat }) => {
-      if (!gen.enabled() || !privateCapabilityAllowed(api.config(), chat, 'image')) return ''
-      return '当前私聊对象已经获得主人的画图授权。对方请求画图时可以直接使用 qq_draw_image；之前说过的权限限制已更新，以当前授权为准。'
+    api.context?.(({ chat, level }) => {
+      const cfg = api.config()
+      if (!gen.enabled() || !chat || chat.kind === 'system') return ''
+      const granted = privateCapabilityAllowed(cfg, chat, 'image')
+      const canUse = !cfg.imageGen.ownerOnly || level === 'full' || chat.kind === 'group' || granted
+      if (!canUse) return ''
+      const lines = [
+        '- 需要画图或按图改图时直接调 draw_image 工具，不要在正文里写 /draw 或 /draw_image 之类的斜杠命令。',
+      ]
+      if (granted) {
+        lines.push('- 当前私聊对象已经获得主人的画图授权。对方请求画图时可以直接使用 draw_image；之前说过的权限限制已更新，以当前授权为准。')
+      }
+      return lines.join('\n')
     })
     const accountAction = (fn) => async (req) => {
       if (req?.method !== 'POST' || !/^application\/json(?:\s*;|$)/i.test(String(req.headers?.['content-type'] || ''))) return { ok: false, message: '账号操作需要 POST JSON 请求' }
@@ -103,8 +118,8 @@ export default {
     // 生图模块开着就把工具挂上；「没开启 / 没填地址 / Codex 没登录」在执行时再如实提示。
     // 不能按登录状态决定挂不挂：Codex 订阅常是「先开会话、后登录」，那样工具会缺失（unknown tool）。
     api.tool(({ chat, sessionId }) => ((api.config().imageGen.enabled && chat.kind !== 'system') ? defineTool({
-      name: 'qq_draw_image',
-      description: '画一张图并发到当前 QQ 聊天里。prompt 详细描述画面；用户要按图改时，把参考图传给 image：last = 当前聊天最近一张图，quote = 引用消息里的图，也可以填自己画作的文件名。image 是可选的：传了就是图生图/改图，不传就是纯文生图。shape 可按用途选择方图、竖图、横图或宽幅；size 可显式指定常用尺寸（含 2K/4K），不填就沿用 shape / 面板默认。画好会直接发出去，并给你一个画作编号（换头像、收成表情时用这个编号）。回复里简单说一句就行。',
+      name: 'draw_image',
+      description: '画一张图并发到当前聊天里。prompt 详细描述画面；用户要按图改时，把参考图传给 image：last = 当前聊天最近一张图，quote = 引用消息里的图，也可以填自己画作的文件名。image 是可选的：传了就是图生图/改图，不传就是纯文生图。shape 可按用途选择方图、竖图、横图或宽幅；size 可显式指定常用尺寸（含 2K/4K），不填就沿用 shape / 面板默认。画好会直接发出去，并给你一个画作编号（换头像、收成表情时用这个编号）。回复里简单说一句就行。',
       properties: {
         prompt: str('画面描述'),
         notice: str('结合对方的要求和当前对话写一句自然简短的回应，开始画图前会直接发送'),
@@ -200,8 +215,8 @@ export default {
         }
         if (img) out.image = img
         if (index && saved) out.message += `\n画作编号 #${index}（想换头像、收成表情时用这个编号）`
-        if (simulated) out.message += '\n（试运行/调试：这张图没真发到 QQ，只在本地存下了）'
-        // 只有**图真的交给模型了**才把本地路径告诉她（#59）：收录表情包 / 存素材 / qq_add_sticker 用；
+        if (simulated) out.message += '\n（试运行/调试：这张图没真发出去，只在本地存下了）'
+        // 只有**图真的交给模型了**才把本地路径告诉她（#59）：收录表情包 / 存素材 / add_sticker 用；
         // 看不了图或开关关着时不给路径，免得她知道路径就去读图，绕开「不给看」的判断。
         if (shown && saved) out.message += `\n已保存到本机：${saved}（要收录表情包、存素材时可以用这个路径）`
         return out

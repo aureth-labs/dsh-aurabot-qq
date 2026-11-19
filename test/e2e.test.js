@@ -62,7 +62,7 @@ async function brain({ preset, text, images, callTool }) {
   if (text.includes('慢慢想') && !text.includes('补充')) { await sleep(2500); return '想好了' }
   if (text.includes('引用测试') && text.includes('【群聊')) { const n = (text.match(/\[(\d+)\][^\n]*引用测试/) || [])[1]; return n ? `<reply:${n}>收到这条啦\n别的我就不挨个回了` : '没看到编号' }
   if (text.includes('第一句') && text.includes('第二句')) return '两句我都看到啦'
-  if (text.includes('画一只')) { const r = await callTool('qq_draw_image', { prompt: '一只蓝色小鲸鱼' }); return r && r.ok ? '画好啦' : '画不了' }
+  if (text.includes('画一只')) { const r = await callTool('draw_image', { prompt: '一只蓝色小鲸鱼' }); return r && r.ok ? '画好啦' : '画不了' }
   if (text.includes('禁言')) {
     const r = await callTool('qq_group_admin', { action: 'ban', user_id: '999', minutes: 5 })
     return r && r.ok ? '好 禁了' : '你谁啊 我只听主人的'
@@ -1025,7 +1025,7 @@ test('生图工具结果：能看图时带 image 块，纯文本模型只给文�
   await new Promise((r) => srv.listen(0, '127.0.0.1', r))
   const baseUrl = `http://127.0.0.1:${srv.address().port}/v1`
   // 找准「这次画图」那一轮：别用 sentTo 计数判断，前一个用例的回复可能还在异步发送
-  const drawTurn = () => [...fake.turns].reverse().find((t) => (t.toolCalls || []).some((c) => c.name === 'qq_draw_image'))
+  const drawTurn = () => [...fake.turns].reverse().find((t) => (t.toolCalls || []).some((c) => c.name === 'draw_image'))
   const draw = async (vision, seeOwn = true) => {
     const before = drawTurn()
     await fake.call('/save', {
@@ -1034,7 +1034,7 @@ test('生图工具结果：能看图时带 image 块，纯文本模型只给文�
     })
     mock.push(priv(OWNER, text('画一只鲸鱼')))
     await until(() => drawTurn() && drawTurn() !== before, 15000)
-    return drawTurn().toolCalls.find((c) => c.name === 'qq_draw_image').result
+    return drawTurn().toolCalls.find((c) => c.name === 'draw_image').result
   }
 
   // 手动声明「支持」：工具结果里要有图，而且是登记过的附件块
@@ -1112,13 +1112,13 @@ test('试运行/调试下生图仍算画好了：存盘、有编号，只是没�
   })
   await new Promise((r) => srv.listen(0, '127.0.0.1', r))
   const baseUrl = `http://127.0.0.1:${srv.address().port}/v1`
-  const drawTurn = () => [...fake.turns].reverse().find((t) => (t.toolCalls || []).some((c) => c.name === 'qq_draw_image'))
+  const drawTurn = () => [...fake.turns].reverse().find((t) => (t.toolCalls || []).some((c) => c.name === 'draw_image'))
   try {
     await fake.call('/save', { dryRun: true, imageGen: { enabled: true, baseUrl, model: 'test-model', apiKey: 'img-key-123456' } })
     const before = drawTurn()
     mock.push(priv(OWNER, text('画一只鲸鱼')))
     await until(() => drawTurn() && drawTurn() !== before, 15000)
-    const r = drawTurn().toolCalls.find((c) => c.name === 'qq_draw_image').result
+    const r = drawTurn().toolCalls.find((c) => c.name === 'draw_image').result
     assert.equal(r.ok, true, '试运行下生图不该判失败：' + JSON.stringify(r))
     assert.ok(r.path && existsSync(r.path), '画作仍要存盘')
     assert.match(String(r.message), /画作编号 #1/, '仍要给她画作编号')
@@ -1131,18 +1131,18 @@ test('试运行/调试下生图仍算画好了：存盘、有编号，只是没�
 
 test('生图工具常驻：Codex 未登录时工具仍在，执行时提示去登录', async () => {
   // 上一次生图那一轮的会话
-  const turn = [...fake.turns].reverse().find((t) => (t.toolCalls || []).some((c) => c.name === 'qq_draw_image'))
+  const turn = [...fake.turns].reverse().find((t) => (t.toolCalls || []).some((c) => c.name === 'draw_image'))
   const agent = turn && fake.agents.get(turn.sessionId)
   assert.ok(agent, '应该有已挂载的会话')
   const prevProvider = (await fake.call('/state')).json().config.imageGen.provider || 'openai'
   try {
     await fake.call('/save', { imageGen: { enabled: true, provider: 'codex' } })
-    assert.ok(agent.tools.has('qq_draw_image'), 'Codex 没登录也要先挂上工具，不能报 unknown tool')
+    assert.ok(agent.tools.has('draw_image'), 'Codex 没登录也要先挂上工具，不能报 unknown tool')
     const before = fake.turns.length
     mock.push(priv(OWNER, text('画一只鲸鱼')))
-    await until(() => fake.turns.slice(before).some((t) => (t.toolCalls || []).some((c) => c.name === 'qq_draw_image')), 15000)
-    const t = fake.turns.slice(before).find((x) => (x.toolCalls || []).some((c) => c.name === 'qq_draw_image'))
-    const call = t.toolCalls.find((c) => c.name === 'qq_draw_image')
+    await until(() => fake.turns.slice(before).some((t) => (t.toolCalls || []).some((c) => c.name === 'draw_image')), 15000)
+    const t = fake.turns.slice(before).find((x) => (x.toolCalls || []).some((c) => c.name === 'draw_image'))
+    const call = t.toolCalls.find((c) => c.name === 'draw_image')
     assert.equal(call.result.ok, false, '没登录时调用应失败')
     assert.match(String(call.result.message), /登录/, '要告诉她是去登录，而不是工具不存在')
   } finally {
@@ -1151,13 +1151,13 @@ test('生图工具常驻：Codex 未登录时工具仍在，执行时提示去�
 })
 
 test('面板保存设置后，已挂载会话的工具清单立即刷新（不用等新消息）', async () => {
-  const turn = [...fake.turns].reverse().find((t) => (t.toolCalls || []).some((c) => c.name === 'qq_draw_image'))
+  const turn = [...fake.turns].reverse().find((t) => (t.toolCalls || []).some((c) => c.name === 'draw_image'))
   const agent = fake.agents.get(turn.sessionId)
   try {
     await fake.call('/save', { imageGen: { enabled: false } })
-    assert.ok(!agent.tools.has('qq_draw_image'), '关掉生图后，已挂会话里的工具应该立刻消失')
+    assert.ok(!agent.tools.has('draw_image'), '关掉生图后，已挂会话里的工具应该立刻消失')
     await fake.call('/save', { imageGen: { enabled: true } })
-    assert.ok(agent.tools.has('qq_draw_image'), '再打开后应该立刻回来，不用等新消息')
+    assert.ok(agent.tools.has('draw_image'), '再打开后应该立刻回来，不用等新消息')
   } finally {
     await fake.call('/save', { imageGen: { enabled: true } })
   }

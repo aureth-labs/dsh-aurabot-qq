@@ -141,6 +141,7 @@ const TOOL_MODULES = {
   // bili 模块注册的，但名字是 qq_ 开头（B 站截图）
   qq_send_shot: 'bili',
   qq_list_shots: 'bili',
+  draw_image: 'imagegen',
   qq_draw_image: 'imagegen',
   generate_video: 'video',
   qq_generate_video: 'video',

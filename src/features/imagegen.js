@@ -281,7 +281,7 @@ export function createImageGen({ getConfig, log, local, dsh, fetchImpl, codexAut
 }
 
 /**
- * qq_draw_image 工具结果里那句话。
+ * draw_image 工具结果里那句话。
  * 看不了图、或者「让她画完自己看一眼」关着时，都要如实说，否则她会照着提示词编画面细节。
  * 这里只回一句话，不带文件路径；能不能把「已保存到本机：路径」告诉她，由调用方按
  * 「这张图有没有真的交出去」决定（能看图 + 开关开着 + 附件登记成功才给）。
@@ -293,7 +293,7 @@ export function drawToolMessage ({ visual = false, seeOwn = true } = {}) {
 }
 
 /**
- * qq_draw_image 的工具结果怎么渲染：一行文字 +（有图时）image 块。
+ * draw_image 的工具结果怎么渲染：一行文字 +（有图时）image 块。
  * image 一般是 DSH 附件块（imageToolBlock() 登记过的），原样透传；没图就只回文字。
  */
 export function drawResultBlocks (_args, value) {
