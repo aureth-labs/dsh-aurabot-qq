@@ -98,3 +98,23 @@ test('普通方括号（[图片] 之类）不受影响', () => {
   assert.deepEqual(texts(parseReply('[图片] 这张好看')), ['[图片] 这张好看'])
   assert.deepEqual(texts(parseReply('[动画表情] 笑死')), ['[动画表情] 笑死'])
 })
+
+test('方括号表情占位归一成真表情，不把标记当正文发出去', () => {
+  for (const src of ['[sticker:卖萌]', '[表情:卖萌]', '[表情：卖萌]', '【sticker:卖萌】']) {
+    const r = parseReply(src)
+    assert.deepEqual(r.items, [{ kind: 'sticker', value: '卖萌' }], src)
+  }
+  const mixed = parseReply('[sticker:卖萌] 好呀 [表情：干饭]')
+  assert.deepEqual(mixed.items, [
+    { kind: 'sticker', value: '卖萌' },
+    { kind: 'text', value: '好呀' },
+    { kind: 'sticker', value: '干饭' },
+  ])
+})
+
+test('孤立方括号表情占位不发正文', () => {
+  for (const src of ['[表情]', '[sticker]', '[表情包]', '[表情] [sticker]']) {
+    assert.deepEqual(parseReply(src), { silent: true, items: [] }, src)
+  }
+  assert.deepEqual(texts(parseReply('[表情] 好呀')), ['好呀'])
+})

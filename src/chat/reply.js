@@ -429,7 +429,12 @@ export function cleanOutboundSegments(message, options) {
 export function parseReply(text, options) {
   // 模型偶尔把「戳人」写成方括号动作（[戳了戳你：尾巴往回一收]），插件不认这种写法，
   // 会原样当文字发出去。这里统一转成 <poke>，让戳一戳变成真的系统动作。
-  const forwarded = String(text || '').replace(/[[【]\s*戳了戳(?:你|他|她)?[^\]】]*[\]】]/g, '<poke>')
+  // 表情同理：聊天流水里显示成「[表情：名字]」，模型会模仿；先归一成真正的 <sticker:…>，
+  // 避免方括号占位被当成正文发到聊天里。普通 [图片] / [动画表情] 不能误伤。
+  const forwarded = String(text || '')
+    .replace(/[[【]\s*戳了戳(?:你|他|她)?[^\]】]*[\]】]/g, '<poke>')
+    .replace(/[[【]\s*(?:sticker|表情)[：:]\s*([^\]】\r\n]{1,80})\s*[\]】]/gi, '<sticker:$1>')
+    .replace(/[[【]\s*(?:sticker|表情|表情包)\s*[\]】]/gi, '')
   // 模型偶尔把换行写成 HTML `<br>`：当真正的换行处理；代码示例里的字面量保留。
   const cleaned = stripModelArtifacts(cleanOutboundText(forwarded, options))
   const code = codeRanges(cleaned)
