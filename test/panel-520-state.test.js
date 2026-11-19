@@ -2,7 +2,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
-import { commitConfig, loadConfig, mergeFromPanel, normalize, publicConfig } from '../src/core/config.js'
+import { commitConfig, loadConfig, mergeFromPanel, normalize, publicConfig, saveConfig } from '../src/core/config.js'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -75,4 +75,26 @@ test('旧客户端只传 baseUrl（不带 mode）仍能切到在线服务', () =
 
 test('在途编辑回执也同步 *Set 标志，避免假 dirty', () => {
   assert.match(CLIENT(), /copySecretFlags\(next, snap\)/)
+})
+
+test('默认 local 不写盘、旧客户端只传 baseUrl 仍能切在线', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'aurabot-520b-'))
+  const oldDir = process.env.AURABOT_DATA_DIR
+  try {
+    process.env.AURABOT_DATA_DIR = dir
+    const base = normalize({ ownerQQ: '10001' })
+    assert.equal(base.memory.vector.mode, 'local')
+    assert.equal(base.memory.vector.modeExplicit, false)
+    saveConfig(base, base)
+    const raw = JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8'))
+    assert.equal(Object.hasOwn(raw.memory.vector, 'mode'), false, '默认 local 不该写盘')
+    const merged = mergeFromPanel(base, { memory: { vector: { enabled: true, baseUrl: 'https://example.invalid/v1', model: 'test' } } })
+    const saved = commitConfig(merged, base)
+    assert.equal(saved.memory.vector.mode, 'remote', '旧客户端 baseUrl 应推 remote')
+    assert.equal(loadConfig().memory.vector.mode, 'remote')
+  } finally {
+    if (oldDir === undefined) delete process.env.AURABOT_DATA_DIR
+    else process.env.AURABOT_DATA_DIR = oldDir
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

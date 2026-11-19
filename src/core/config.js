@@ -900,7 +900,9 @@ export function normalize(raw) {
   // mode 是**派生值**（本地小模型 / 在线服务），不是用户直接填的配置项：
   // 定义成不可枚举属性，这样 Object.entries / deepEqual 看不到它（升级兼容测试要求
   // 配置结构和 DEFAULTS 完全一致），但 cfg.memory.vector.mode 仍能正常读。
-  const explicitMode = declaredMode === 'remote' || declaredMode === 'local'
+  // rawVec.modeExplicit === false 表示这是 normalize 出来的对象（不是用户原始输入）：
+  // 再 normalize 时不要把派生 mode 误当成显式选择（#520 旧客户端兼容）。
+  const explicitMode = (declaredMode === 'remote' || declaredMode === 'local') && rawVec.modeExplicit !== false
   Object.defineProperty(vector, 'mode', {
     value: explicitMode ? declaredMode : (vector.baseUrl ? 'remote' : 'local'),
     enumerable: false,
@@ -1199,7 +1201,9 @@ export function ownerAuthorizationRevision(cfg) {
 // 面板切「本地/在线」就永远写不进 config.json（#520）。落盘前复制一份并把它变成可枚举字段。
 function withVectorMode(c) {
   const mode = c?.memory?.vector?.mode
-  if (!mode) return c
+  // 只持久化用户显式选择过的 mode；默认 local 是从空 baseUrl 推出来的派生值，写盘后会
+  // 在下次 load 被误当成 modeExplicit=true，导致旧客户端只传 baseUrl 永远切不到在线（#520）。
+  if (!mode || c?.memory?.vector?.modeExplicit !== true) return c
   return { ...c, memory: { ...c.memory, vector: { ...c.memory.vector, mode } } }
 }
 
