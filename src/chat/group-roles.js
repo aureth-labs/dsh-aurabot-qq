@@ -213,6 +213,23 @@ export function createGroupRoles({ onebot = null, gateway = null, getGateway = n
     const parsed = raw.includes(':') && norm ? parseChatId(norm) : null
     const isDefaultInstance = parsed ? (!parsed.instance || parsed.instance === defPlat) : true
 
+    // 飞书裸群号 oc_xxx 自动归一化为规范飞书群地址
+    if (!parsed && /^oc_[0-9A-Za-z_-]+$/.test(raw)) {
+      const allowedFs = (cfg?.allow?.groups || [])
+        .map((g) => normalizeChatId(String(g || '').trim()))
+        .filter(Boolean)
+        .find((normKey) => {
+          const p = parseChatId(normKey)
+          return p?.platform === 'feishu' && p.kind === 'group' && p.id === raw
+        })
+      if (allowedFs) return resolveBackend(allowedFs)
+      const enabledFeishu = Object.entries(cfg?.platforms || {})
+        .filter(([id, v]) => v && v.enabled === true && (id === 'feishu' || id.startsWith('feishu#')))
+        .map(([id]) => id)
+      const targetInst = enabledFeishu.length === 1 ? enabledFeishu[0] : 'feishu'
+      return resolveBackend(`${targetInst}:group:${raw}`)
+    }
+
     const gwDefInst = gw && typeof gw.instances === 'function' ? gw.instances().find((x) => x.instance === defPlat) : null
     const gwDefGa = gw?.groupAdmin?.(defPlat) || null
     const hasOnebotFn = Boolean(onebot && typeof onebot.call === 'function')
@@ -416,6 +433,7 @@ export function createGroupRoles({ onebot = null, gateway = null, getGateway = n
       if (platform === 'feishu') return '当前飞书实例不支持该接口'
       return isDefPlat ? '当前 QQ 网关不支持该接口' : '当前 QQ 官方机器人不支持该接口'
     }
+    if (code === 'group-admin-not-in-chat') return error?.message || '机器人不在该群里'
     if (code === 'group-admin-rate-limited') return '查询触发平台频率限制，请稍后再试'
     return error?.message || '查询失败'
   }
@@ -467,13 +485,17 @@ export function createGroupRoles({ onebot = null, gateway = null, getGateway = n
           : (spec.platform === 'feishu'
               ? { ban: false, unban: false, kick: true, wholeBan: false, title: false, notice: false, listMembers: true }
               : { ban: true, unban: true, kick: true, wholeBan: false, title: false, notice: false })
+        const rawActions = spec.groupAdmin.supportedActions || defaultActions
+        const actions = spec.platform === 'feishu' && role === 'member'
+          ? { ...rawActions, kick: false }
+          : rawActions
         const info = {
           role,
           label: ROLE_LABEL[role] || '不清楚',
           canManage: manageable,
           supported: true,
           reason: isUnknown ? (st?.reason || '平台未暴露管理员列表，执行时以 API 结果为准') : (manageable ? '' : '机器人不是管理员'),
-          actions: spec.groupAdmin.supportedActions || defaultActions,
+          actions,
           backend: 'gateway-admin',
           platform: spec.platform,
           instance: spec.instance,

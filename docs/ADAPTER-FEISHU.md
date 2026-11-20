@@ -198,7 +198,7 @@
 |---|---|---|
 | `GET /open-apis/bot/v3/info` | `200 / code: 0` | 返回 `bot.open_id`，用于核对群主归属与禁止误操作机器人自己 |
 | `GET /open-apis/im/v1/chats/:chat_id?user_id_type=open_id` | `200 / code: 0` | 返回 `owner_id`、`name`、`user_count`、`user_manager_id_list` 与 **`bot_manager_id_list`**（含机器人 `app_id`）；据此判断 `owner` / `admin` / `member`，缺失 `bot_manager_id_list` 时诚实标记为 `unknown` |
-| `GET /open-apis/im/v1/chats/:chat_id/members?member_id_type=open_id` | `200 / code: 0` | 分页返回人类成员列表（`member_id` + `name`），不包含管理角色字段 |
+| `GET /open-apis/im/v1/chats/:chat_id/members?member_id_type=open_id` | `200 / code: 0` | 分页返回人类成员列表（`member_id` + `name`），不包含管理角色字段；默认最多拉取 `maxMemberPages=20` 页（2000 人），截断时会明示 |
 | `GET /open-apis/im/v1/chats/:chat_id/managers` | **`404`** | 该路径在飞书开放平台不存在；管理员列表直接随群信息接口返回 |
 | `DELETE /open-apis/im/v1/chats/:chat_id/members?member_id_type=open_id` | body `{ id_list: [openId] }` | 空数组探测返回 `HTTP 400 / code: 232027`（非 `99991672`），说明已具备移出群成员权限（而非 `DELETE .../members/:member_id`） |
 | `GET /open-apis/im/v1/chats/:chat_id/moderation` | `200 / code: 0` | 可读取群发言权限（如 `all_members`）；该能力不等同于按成员限时禁言，本阶段不伪装成 `ban` / `whole_ban` |
@@ -207,8 +207,8 @@
 
 | 动作 | 是否支持 | 说明 |
 |---|---|---|
-| `list_members` | ✅ 支持 | 列出群成员 `open_id`（`ou_` 开头）与昵称，支持按 `query` 筛选；需主人发言 |
-| `kick` | ✅ 有条件支持 | 调用 `DELETE /open-apis/im/v1/chats/:chat_id/members?member_id_type=open_id` 移出成员；需主人发言、目标在当前群内且非主人/非机器人自身，且**机器人需为群管理员（或群主）**并获批对应 scope |
+| `list_members` | ✅ 支持 | 列出群成员 `open_id`（`ou_` 开头）与昵称，支持按 `query` 筛选；`group_id` 支持裸 `oc_xxx` 自动归一化为 `feishu:group:oc_xxx`；需主人发言 |
+| `kick` | ✅ 有条件支持 | 调用 `DELETE /open-apis/im/v1/chats/:chat_id/members?member_id_type=open_id` 移出成员；需主人发言、目标在当前群内且非主人/非机器人自身，且**机器人需为群管理员（或群主）**并获批对应 scope；若已探测到 `role === 'member'` 则在工具 schema 提前收窄为只读 |
 | `ban` / `unban` | ❌ 不支持 | 飞书开放平台无 QQ 式按成员定时禁言/解禁接口，工具 schema 不暴露、执行层直接拒绝 |
 | `whole_ban` / `whole_unban` | ❌ 不支持 | 群发言权限设置不能替代限时禁言语义，暂不混入 `group_admin` |
 | `title` / `notice` | ❌ 不支持 | 飞书无专属头衔等价物，暂不开放群公告动作 |
@@ -220,10 +220,12 @@
 | `im:chat:readonly`（或 `im:chat`） | 读取群信息（`owner_id` / `bot_manager_id_list`）与群成员列表 | 缺少时无法探测群角色 |
 | `im:chat:member`（或 `im:chat` 更新成员权限） | `kick` 移出群成员 | 同时要求机器人已被群主设为**群管理员** |
 
-- **应用维度隔离**：飞书用户 `open_id`（`ou_` 开头）与群内绑定只在当前应用与当前群有效，禁止跨应用或跨群复用；`kick` 执行显式 `open_id` 时会先核对当前群成员列表。
+- **应用维度隔离**：飞书用户 `open_id`（`ou_` 开头）与群内绑定只在当前应用与当前群有效，禁止跨应用或跨群复用；`kick` 执行显式 `open_id` 时若成员列表未截断会先核对当前群成员列表。
+- **成员角色探测建议**：真实租户下建议在真机群分别核对**普通成员 / 群管理员 / 群主**三种状态下 `bot_manager_id_list` 的返回；若某租户版本不返回该字段，会降级为 `unknown` 并在执行 `kick` 时以 API 返回为准。
 - **常见错误码映射**：
-  - `99991672` / `99991663` / `99991668` / HTTP `403` → 归类 `group-admin-forbidden`（应用缺少接口 scope）。
-  - `232025` → 归类 `group-admin-not-admin`（机器人不是群管理员）。
+  - `232025` → 归类 `group-admin-not-admin`（机器人不是群管理员，优先级高于通用 HTTP `403`）。
+  - `99991672` / `99991663` / `99991668` / 其余 HTTP `403` → 归类 `group-admin-forbidden`（应用缺少接口 scope）。
   - `232027` 或 `invalid_id_list` → 归类 `group-admin-not-member`（目标成员不在本群或 `open_id` 无效）。
+  - `230002` / `232002` → 归类 `group-admin-not-in-chat`（机器人不在该飞书群里）。
   - `232019` / HTTP `429` → 归类 `group-admin-rate-limited`（接口触发限流，建议串行调用）。
-  - `232010` → 归类 `group-admin-forbidden`（跨租户操作拒绝）；`230002` / `232002` → `group-admin-failed`（机器人不在该群）。
+  - `232010` → 归类 `group-admin-forbidden`（跨租户操作拒绝）。

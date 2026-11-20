@@ -188,7 +188,7 @@ test('Feishu adapter groupAdmin：能力边界、角色探测、分页成员列�
   kickMode = '232010'
   await assert.rejects(() => ga.kickMember('oc_g1', 'ou_bob'), (e) => e.code === 'group-admin-forbidden')
   kickMode = '230002'
-  await assert.rejects(() => ga.kickMember('oc_g1', 'ou_bob'), (e) => e.code === 'group-admin-failed' && /不在该飞书群里/.test(e.message))
+  await assert.rejects(() => ga.kickMember('oc_g1', 'ou_bob'), (e) => e.code === 'group-admin-not-in-chat' && /不在该飞书群里/.test(e.message))
 })
 
 test('groupRoles 支持 Feishu：owner/admin/member/unknown、离线与权限报错文案、与 QQ 不串台', async (t) => {
@@ -456,6 +456,7 @@ test('Feishu group_admin 全链路：仅暴露 kick/list_members、禁止 ban/wh
   assert.match(ctxMember, /普通成员.*list_members/)
   assert.doesNotMatch(ctxMember, /QQ/)
   chatRoleMode = 'admin'
+  await groupRoles.inspect('feishu:group:oc_g1', { fresh: true })
 
   // 7) 双平台共存：开启 QQ 后各自保持独立 schema 与行为，不串台
   cfg.platforms.qq.enabled = true
@@ -496,4 +497,191 @@ test('Feishu group_admin 全链路：仅暴露 kick/list_members、禁止 ban/wh
   const clientCode = readFileSync(new URL('../client/client.js', import.meta.url), 'utf8')
   assert.match(clientCode, /飞书群支持查成员与踢人（不支持禁言\/全体禁言\/头衔\/公告）/)
   assert.match(clientCode, /支持：查成员、踢人（不支持禁言\/全体禁言\/头衔\/公告）/)
+})
+
+test('飞书群管审阅加固：裸 oc_ 归一化（P1）、member 身份 schema 收窄（P2-1）、>500 成员分页与截断（P2-2）、403+232025 优先级（P2-3）与不在群（P2-5）', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aurabot-feishu-review-'))
+  const identity = createIdentity({ dataDir: dir, log: silent })
+  t.after(() => identity.close?.())
+  identity.claimOwner('feishu', 'ou_owner')
+
+  const cfg = normalize({
+    enabled: true,
+    dryRun: false,
+    allow: { groups: ['feishu:group:oc_g1', 'feishu:group:oc_big'] },
+    platforms: {
+      qq: { enabled: false },
+      qqbot: { enabled: false },
+      feishu: { enabled: true, appId: 'cli_rev', appSecret: 'sec_rev', transport: 'webhook', maxMemberPages: 2 },
+    },
+  })
+  cfg.platforms = {
+    qq: { enabled: false },
+    qqbot: { enabled: false },
+    feishu: { enabled: true, appId: 'cli_rev', appSecret: 'sec_rev', transport: 'webhook', maxMemberPages: 2 },
+  }
+
+  let roleMode = 'admin' // 'admin' | 'member' | 'unknown' | '232002'
+  let kickErrMode = 'ok' // 'ok' | '403_232025' | '403_99991672' | '403_unknown' | '232002'
+  const apiCalls = []
+
+  const makePageItems = (pageNo, count = 100) => Array.from({ length: count }, (_, i) => ({
+    member_id: `ou_p${pageNo}_${i}`,
+    member_id_type: 'open_id',
+    name: `成员${pageNo}_${i}`,
+  }))
+
+  const gw = createGateway({ config: cfg, dataDir: (...p) => join(dir, 'gw', ...p), http: { route: () => () => {} }, identity, log: silent })
+  gw.register(() => createFeishuAdapter({
+    client: makeFeishuMockClient(async (req) => {
+      apiCalls.push({ method: req.method, path: req.path, query: Object.fromEntries(req.query), body: req.body })
+      if (req.method === 'GET' && req.path === '/open-apis/im/v1/chats/oc_g1') {
+        if (roleMode === '232002') return { status: 400, json: { code: 232002, msg: 'bot not in chat' } }
+        const data = { name: '裸地址测试群', owner_id: 'ou_owner', user_count: '4' }
+        if (roleMode === 'admin') data.bot_manager_id_list = ['cli_rev']
+        else if (roleMode === 'member') data.bot_manager_id_list = []
+        return { status: 200, json: { code: 0, data } }
+      }
+      if (req.method === 'GET' && req.path === '/open-apis/im/v1/chats/oc_g1/members') {
+        return {
+          status: 200,
+          json: {
+            code: 0,
+            data: {
+              has_more: false,
+              items: [
+                { member_id: 'ou_owner', member_id_type: 'open_id', name: '主人' },
+                { member_id: 'ou_alice', member_id_type: 'open_id', name: '爱丽丝' },
+              ],
+            },
+          },
+        }
+      }
+      if (req.method === 'GET' && req.path === '/open-apis/im/v1/chats/oc_big') {
+        return { status: 200, json: { code: 0, data: { name: '超千人大群', owner_id: 'ou_owner', bot_manager_id_list: ['cli_rev'] } } }
+      }
+      if (req.method === 'GET' && req.path === '/open-apis/im/v1/chats/oc_big/members') {
+        const pt = Number(req.query.get('page_token') || 1)
+        const hasMore = pt < 6
+        return {
+          status: 200,
+          json: {
+            code: 0,
+            data: {
+              has_more: hasMore,
+              page_token: hasMore ? String(pt + 1) : '',
+              items: makePageItems(pt, 100),
+            },
+          },
+        }
+      }
+      if (req.method === 'DELETE' && (req.path === '/open-apis/im/v1/chats/oc_g1/members' || req.path === '/open-apis/im/v1/chats/oc_big/members')) {
+        if (kickErrMode === '403_232025') return { status: 403, json: { code: 232025, msg: 'Only group owner or admin can remove members' } }
+        if (kickErrMode === '403_99991672') return { status: 403, json: { code: 99991672, msg: 'No permission' } }
+        if (kickErrMode === '403_unknown') return { status: 403, json: { code: 999999, msg: 'Forbidden' } }
+        if (kickErrMode === '232002') return { status: 400, json: { code: 232002, msg: 'bot not in chat' } }
+        return { status: 200, json: { code: 0, data: { invalid_id_list: [] } } }
+      }
+      return { status: 404, json: { code: 404 } }
+    }),
+  }))
+  await gw.sync()
+  t.after(() => gw.stopAll())
+
+  const groupRoles = createGroupRoles({ getGateway: () => gw, getConfig: () => cfg, dataDir: (...p) => join(dir, 'roles', ...p), log: silent })
+  let toolFactory = null
+  groupAdminDef.setup({
+    core: {
+      hub: { turnSendersAllOwner: () => true, groupName: async (g) => String(g) },
+      groupRoles,
+      gateway: gw,
+      identity,
+      http: { body: async (r) => r?.body || {}, query: (r) => r?.query || {} },
+    },
+    config: () => cfg,
+    dataDir: (...p) => join(dir, 'mod', ...p),
+    tool: (fn) => { toolFactory = fn },
+    context: () => {},
+    route: () => {},
+  })
+
+  const pickAdmin = (ctx) => [toolFactory(ctx)].flat().filter(Boolean).find((x) => x.name === 'group_admin')
+  const privTool = pickAdmin({ chat: { chatId: 'feishu:private:ou_owner', kind: 'private', userId: 'ou_owner', platform: 'feishu' }, level: 'full', sessionId: 's_p' })
+
+  // P1：groupRoles.resolveBackend 与 group_admin 支持裸 oc_xxx 归一化
+  const bareSpec = groupRoles.resolveBackend('oc_g1')
+  assert.equal(bareSpec.backend, 'gateway-admin')
+  assert.equal(bareSpec.platform, 'feishu')
+  assert.equal(bareSpec.chatId, 'feishu:group:oc_g1')
+  assert.equal(bareSpec.openid, 'oc_g1')
+
+  const bareLm = await privTool.execute({ action: 'list_members', group_id: 'oc_g1' })
+  assert.equal(bareLm.ok, true, bareLm.message)
+  const bareKick = await privTool.execute({ action: 'kick', group_id: 'oc_g1', member_openid: 'ou_alice' })
+  assert.equal(bareKick.ok, true, bareKick.message)
+  assert.deepEqual(
+    apiCalls.filter((c) => c.method === 'DELETE' && c.path === '/open-apis/im/v1/chats/oc_g1/members').at(-1)?.body,
+    { id_list: ['ou_alice'] },
+  )
+  const bareUnlisted = await privTool.execute({ action: 'kick', group_id: 'oc_unlisted', member_openid: 'ou_alice' })
+  assert.equal(bareUnlisted.ok, false)
+  assert.match(bareUnlisted.message, /不在白名单/)
+
+  // P2-1：探测到 role === 'member' 后，工具 schema 自动收窄为仅 ['list_members']；unknown 保留 ['kick', 'list_members']
+  const fsGroupChat = { chatId: 'feishu:group:oc_g1', kind: 'group', groupId: 'oc_g1', platform: 'feishu' }
+  roleMode = 'member'
+  const memInfo = await groupRoles.inspect('feishu:group:oc_g1', { fresh: true })
+  assert.equal(memInfo.actions.kick, false)
+  const memberTool = pickAdmin({ chat: fsGroupChat, level: 'social', sessionId: 's_mem' })
+  assert.deepEqual(memberTool.parameters.properties.action.enum, ['list_members'])
+
+  roleMode = 'unknown'
+  const unkInfo = await groupRoles.inspect('feishu:group:oc_g1', { fresh: true })
+  assert.equal(unkInfo.actions.kick, true)
+  const unknownTool = pickAdmin({ chat: fsGroupChat, level: 'social', sessionId: 's_unk' })
+  assert.deepEqual(unknownTool.parameters.properties.action.enum, ['kick', 'list_members'])
+  roleMode = 'admin'
+
+  // P2-2：超过 500 人群按页拉取，以及达到 maxMemberPages 上限时明确标记 truncated 而不误杀显式 kick
+  const ga = gw.groupAdmin('feishu')
+  const full600 = await ga.listMembers('oc_big', { limit: 1000, maxPages: 10 })
+  assert.equal(full600.length, 600)
+  assert.equal(full600.truncated, false)
+
+  const capped200 = await privTool.execute({ action: 'list_members', group_id: 'oc_big' })
+  assert.equal(capped200.ok, true)
+  assert.equal(capped200.count, 200)
+  assert.equal(capped200.truncated, true)
+  assert.match(capped200.message, /超过拉取上限/)
+
+  const kickPage3 = await privTool.execute({ action: 'kick', group_id: 'oc_big', member_openid: 'ou_p3_1' })
+  assert.equal(kickPage3.ok, true, '成员列表被页数上限截断时，不应误判第 3 页显式 open_id 不在本群')
+  assert.deepEqual(
+    apiCalls.filter((c) => c.method === 'DELETE' && c.path === '/open-apis/im/v1/chats/oc_big/members').at(-1)?.body,
+    { id_list: ['ou_p3_1'] },
+  )
+
+  // P2-3：HTTP 403 + code 232025 优先归类为 not-admin，99991672 与未知 403 仍为 forbidden
+  kickErrMode = '403_232025'
+  await assert.rejects(() => ga.kickMember('oc_g1', 'ou_alice'), (e) => e.code === 'group-admin-not-admin')
+  kickErrMode = '403_99991672'
+  await assert.rejects(() => ga.kickMember('oc_g1', 'ou_alice'), (e) => e.code === 'group-admin-forbidden')
+  kickErrMode = '403_unknown'
+  await assert.rejects(() => ga.kickMember('oc_g1', 'ou_alice'), (e) => e.code === 'group-admin-forbidden')
+
+  // P2-5：机器人不在群内（232002）在状态探测与踢人时均明确提示“机器人不在该飞书群里”，且不误附带 open_id 无效后缀
+  kickErrMode = '232002'
+  await assert.rejects(() => ga.kickMember('oc_g1', 'ou_alice'), (e) => e.code === 'group-admin-not-in-chat')
+  kickErrMode = 'ok'
+  roleMode = '232002'
+  const notInChatRole = await groupRoles.inspect('feishu:group:oc_g1', { fresh: true })
+  assert.equal(notInChatRole.canManage, false)
+  assert.match(notInChatRole.reason, /机器人不在该飞书群里/)
+  roleMode = 'admin'
+  await groupRoles.inspect('feishu:group:oc_g1', { fresh: true })
+  kickErrMode = '232002'
+  const kickNotInChat = await privTool.execute({ action: 'kick', group_id: 'oc_g1', member_openid: 'ou_alice' })
+  assert.equal(kickNotInChat.ok, false)
+  assert.match(kickNotInChat.message, /机器人不在该飞书群里/)
+  assert.doesNotMatch(kickNotInChat.message, /可能无效或不在本群/)
 })

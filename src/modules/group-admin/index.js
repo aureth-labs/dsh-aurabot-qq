@@ -267,7 +267,7 @@ export default {
       }
     }
 
-    async function fetchGatewayMembers(ga, groupOpenid, chatId) {
+    async function fetchGatewayMembers(ga, groupOpenid, chatId, { platform = '' } = {}) {
       const merged = new Map()
       let observedDirty = false
       const upsert = (item, persist = false) => {
@@ -284,22 +284,36 @@ export default {
 
       let apiError = ''
       let apiFetched = false
+      let truncated = false
       if (ga && typeof ga.listMembers === 'function' && groupOpenid) {
-        let startIndex = 0
-        for (let page = 0; page < 3; page++) {
-          let batch
+        if (platform === 'feishu') {
           try {
-            batch = await ga.listMembers(groupOpenid, { startIndex, limit: 100 })
+            const batch = await ga.listMembers(groupOpenid, { startIndex: 0, limit: 5000 })
             apiFetched = true
+            truncated = Boolean(batch?.truncated)
+            if (Array.isArray(batch)) {
+              for (const m of batch) upsert(m, true)
+            }
           } catch (error) {
             apiError = error?.message || '查询群成员列表失败'
-            break
           }
-          if (!Array.isArray(batch) || !batch.length) break
-          const beforeSize = merged.size
-          for (const m of batch) upsert(m, true)
-          if (batch.length < 100 || merged.size === beforeSize) break
-          startIndex += batch.length
+        } else {
+          let startIndex = 0
+          for (let page = 0; page < 3; page++) {
+            let batch
+            try {
+              batch = await ga.listMembers(groupOpenid, { startIndex, limit: 100 })
+              apiFetched = true
+            } catch (error) {
+              apiError = error?.message || '查询群成员列表失败'
+              break
+            }
+            if (!Array.isArray(batch) || !batch.length) break
+            const beforeSize = merged.size
+            for (const m of batch) upsert(m, true)
+            if (batch.length < 100 || merged.size === beforeSize) break
+            startIndex += batch.length
+          }
         }
       } else {
         apiError = '当前网关不支持查询群成员列表'
@@ -311,7 +325,7 @@ export default {
         // 先拷快照再合并，绝不在遍历 obs 的同时修改 obs 造成死循环
         for (const m of [...obs.values()]) upsert(m, false)
       }
-      return { members: [...merged.values()], fromApi: apiFetched && !apiError, error: apiError }
+      return { members: [...merged.values()], fromApi: apiFetched && !apiError, error: apiError, truncated }
     }
 
     async function resolveGatewayTarget({ rawUserId, rawMemberOpenid, chatId, groupOpenid, ga, identity, platform, action }) {
@@ -472,7 +486,7 @@ export default {
       const parsedChat = parseChatId(normChatKey(chat?.chatId || ''))
       const instForGa = info?.instance || parsedChat?.instance || (mode === 'feishu' ? (platformEntries('feishu')[0]?.[0] || 'feishu') : '')
       const gaTool = instForGa ? gateway?.groupAdmin?.(instForGa) : null
-      const feishuCanKick = info?.actions?.kick !== false && gaTool?.supportedActions?.kick !== false
+      const feishuCanKick = info?.canManage !== false && info?.actions?.kick !== false && gaTool?.supportedActions?.kick !== false
       const properties = mode === 'feishu'
         ? {
             action: {
@@ -526,11 +540,24 @@ export default {
         execute: async ({ action, group_id, user_id, member_openid, query, minutes, text }) => {
           if (!hub.turnSendersAllOwner(sessionId)) return { ok: false, message: '只有主人能让我做群管操作' }
           const cfg = api.config()
-          const rawGroup = String(group_id || '').trim() || (chat.kind === 'group' ? String(chat.chatId || chat.groupId || '').trim() : '')
-          if (!rawGroup) return { ok: false, message: '不知道是哪个群' }
+          const rawGroupInput = String(group_id || '').trim() || (chat.kind === 'group' ? String(chat.chatId || chat.groupId || '').trim() : '')
+          if (!rawGroupInput) return { ok: false, message: '不知道是哪个群' }
+
+          const chatAddr = parseChatId(normChatKey(chat?.chatId || ''))
+          let rawGroup = rawGroupInput
+          if (/^oc_[0-9A-Za-z_-]+$/.test(rawGroupInput) && chatAddr?.platform === 'feishu' && chatAddr?.instance) {
+            const allowMatchedFs = (cfg.allow?.groups || [])
+              .map((g) => normalizeChatId(String(g || '').trim()))
+              .filter(Boolean)
+              .find((k) => {
+                const p = parseChatId(k)
+                return p?.platform === 'feishu' && p.kind === 'group' && p.id === rawGroupInput
+              })
+            if (!allowMatchedFs) rawGroup = `${chatAddr.instance}:group:${rawGroupInput}`
+          }
 
           const spec = typeof groupRoles?.resolveBackend === 'function' ? groupRoles.resolveBackend(rawGroup) : null
-          const parsedNorm = normalizeChatId(rawGroup)
+          const parsedNorm = normalizeChatId(spec?.chatId || rawGroup)
           const parsedAddr = parsedNorm ? parseChatId(parsedNorm) : null
           const targetPlat = spec?.platform || parsedAddr?.platform || chat.platform || 'qq'
           const targetChatId = spec?.chatId || parsedNorm || `group:${rawGroup}`
@@ -623,7 +650,7 @@ export default {
             const idLabel = isFeishu ? 'open_id' : 'member_openid'
             if (action === 'list_members') {
               if (!ga) return { ok: false, message: `${platLabel}未连接，无法查询群成员` }
-              const { members, error } = await fetchGatewayMembers(ga, spec.openid, targetChatId)
+              const { members, error, truncated } = await fetchGatewayMembers(ga, spec.openid, targetChatId, { platform: spec.platform })
               const q = String(query || text || '').trim().toLowerCase()
               const filtered = q
                 ? members.filter((m) => String(m.nick || '').toLowerCase().includes(q) || String(m.openid || '').toLowerCase().includes(q))
@@ -636,15 +663,19 @@ export default {
                 const label = m.nick ? `${m.nick}（${m.openid}）` : m.openid
                 return m.role ? `${label}[${m.role}]` : label
               })
+              const truncNote = truncated
+                ? `（群成员超过拉取上限，当前仅展示前 ${members.length} 位；未找到时可在群里 @ 对方或直接提供 ${idLabel}）`
+                : ''
               const note = error
                 ? (isFeishu
                     ? `（飞书成员列表接口受限：${error}；以下为近期群内 @/发言缓存）`
                     : `（官方成员列表接口受限：${error}；以下为近期群内 @/发言缓存）`)
-                : ''
+                : truncNote
               return {
                 ok: true,
                 count: filtered.length,
                 members: shown,
+                ...(truncated ? { truncated: true } : {}),
                 message: shown.length ? `${note}共 ${filtered.length} 位成员：${lines.join('、')}` : '没有找到匹配的群成员',
               }
             }
@@ -709,13 +740,13 @@ export default {
               return { ok: false, message: '不能对我自己做这个操作' }
             }
 
-            // 飞书禁止跨群使用 open_id：显式或历史缓存命中时，若成员列表接口可用则先校验目标属于当前群
+            // 飞书禁止跨群使用 open_id：显式或历史缓存命中时，若成员列表接口可用且未截断则先校验目标属于当前群
             if (isFeishu && action === 'kick' && (resolved.via === 'explicit' || resolved.via === 'observed') && ga && typeof ga.listMembers === 'function') {
               let liveMembers = null
               try {
-                liveMembers = await ga.listMembers(spec.openid, { limit: 500 })
+                liveMembers = await ga.listMembers(spec.openid, { startIndex: 0, limit: 5000 })
               } catch {}
-              if (Array.isArray(liveMembers) && !liveMembers.some((m) => m.openid === resolvedOpenid)) {
+              if (Array.isArray(liveMembers) && !liveMembers.truncated && !liveMembers.some((m) => m.openid === resolvedOpenid)) {
                 return { ok: false, message: '该 open_id 不在当前飞书群的成员列表里（请用 list_members 核对，不能跨群复用 open_id）' }
               }
             }
@@ -742,10 +773,17 @@ export default {
               }
             } catch (error) {
               const base = error?.message || `群管操作失败（${action}）`
-              if (error?.code === 'group-admin-not-member') {
+              if (error?.code === 'group-admin-not-member' || error?.code === 'group-admin-not-in-chat') {
                 return { ok: false, message: base }
               }
-              const knownStatusError = ['group-admin-forbidden', 'group-admin-not-admin', 'group-admin-rate-limited', 'group-admin-unsupported', 'group-admin-not-member'].includes(error?.code)
+              const knownStatusError = [
+                'group-admin-forbidden',
+                'group-admin-not-admin',
+                'group-admin-rate-limited',
+                'group-admin-unsupported',
+                'group-admin-not-member',
+                'group-admin-not-in-chat',
+              ].includes(error?.code)
               if (resolved.via === 'explicit' && !knownStatusError) {
                 return {
                   ok: false,

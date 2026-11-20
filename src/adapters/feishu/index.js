@@ -1457,13 +1457,8 @@ export function createFeishuAdapter(options = {}) {
   function classifyGroupAdminError(status, json, actionLabel) {
     const codeNum = Number(json?.code ?? 0)
     const msg = String(json?.msg || json?.message || '').trim()
-    if (codeNum === 99991672 || codeNum === 99991663 || codeNum === 99991668 || status === 403) {
-      return groupAdminError('group-admin-forbidden', `飞书应用未获得群管理接口权限（${codeNum || status}）${msg ? '：' + msg : ''}`)
-    }
-    if (codeNum === 232010) {
-      return groupAdminError('group-admin-forbidden', `操作者与目标群不在同一飞书租户（232010）${msg ? '：' + msg : ''}`)
-    }
-    if (codeNum === 232025 || /not.*(owner|manager|admin)|no (permission|authority)|only.*(owner|manager|admin)/i.test(msg)) {
+    const isForbiddenCode = codeNum === 99991672 || codeNum === 99991663 || codeNum === 99991668
+    if (codeNum === 232025 || (!isForbiddenCode && /not.*(owner|manager|admin)|no (permission|authority)|only.*(owner|manager|admin)/i.test(msg))) {
       return groupAdminError('group-admin-not-admin', `机器人不是群管理员，无法${actionLabel}${msg ? '：' + msg : ''}`)
     }
     if (codeNum === 232027) {
@@ -1472,8 +1467,14 @@ export function createFeishuAdapter(options = {}) {
     if (codeNum === 232019 || status === 429) {
       return groupAdminError('group-admin-rate-limited', `${actionLabel}触发飞书频率限制（${codeNum || 429}），请稍后再试`)
     }
-    if (codeNum === 230002 || codeNum === 232002) {
-      return groupAdminError('group-admin-failed', `机器人不在该飞书群里（${codeNum}）`)
+    if (codeNum === 230002 || codeNum === 232002 || /bot not in chat|not in.*chat/i.test(msg)) {
+      return groupAdminError('group-admin-not-in-chat', `机器人不在该飞书群里（${codeNum || status}），请先把机器人拉入群内`)
+    }
+    if (codeNum === 232010) {
+      return groupAdminError('group-admin-forbidden', `操作者与目标群不在同一飞书租户（232010）${msg ? '：' + msg : ''}`)
+    }
+    if (isForbiddenCode || status === 403) {
+      return groupAdminError('group-admin-forbidden', `飞书应用未获得群管理接口权限（${codeNum || status}）${msg ? '：' + msg : ''}`)
     }
     return groupAdminError('group-admin-failed', `${actionLabel}失败${msg ? '：' + msg : `（HTTP ${status || '?'} / code ${codeNum || '?'}）`}`)
   }
@@ -1994,12 +1995,17 @@ export function createFeishuAdapter(options = {}) {
           ...(data.name ? { groupName: String(data.name) } : {}),
         }
       },
-      async listMembers(chatId, { startIndex = 0, limit = 100 } = {}) {
+      async listMembers(chatId, { startIndex = 0, limit = 100, maxPages } = {}) {
         const gid = String(chatId || '').trim()
         if (!gid) throw groupAdminError('group-admin-failed', '缺少飞书群 chat_id')
+        const pageCap = Math.max(1, Math.min(50, Number(maxPages ?? config().maxMemberPages) || 20))
+        const start = Math.max(0, Number(startIndex) || 0)
+        const take = Math.max(1, Math.min(5000, Number(limit) || 100))
         const seen = new Map()
+        const seenPageTokens = new Set()
         let pageToken = ''
-        for (let pageNo = 0; pageNo < 5; pageNo++) {
+        let truncated = false
+        for (let pageNo = 0; pageNo < pageCap; pageNo++) {
           const params = new URLSearchParams({ member_id_type: 'open_id', page_size: '100' })
           if (pageToken) params.set('page_token', pageToken)
           const data = await requestGroupAdmin({
@@ -2012,13 +2018,25 @@ export function createFeishuAdapter(options = {}) {
             if (!openid || seen.has(openid)) continue
             seen.set(openid, { openid, nick: String(item?.name || ''), role: '' })
           }
-          if (!data.has_more || !data.page_token) break
-          pageToken = String(data.page_token)
+          if (!data.has_more || !data.page_token) {
+            truncated = false
+            break
+          }
+          if (seen.size >= start + take) {
+            truncated = false
+            break
+          }
+          const nextToken = String(data.page_token)
+          if (pageNo + 1 >= pageCap || seenPageTokens.has(nextToken)) {
+            truncated = true
+            break
+          }
+          seenPageTokens.add(nextToken)
+          pageToken = nextToken
         }
-        const all = [...seen.values()]
-        const start = Math.max(0, Number(startIndex) || 0)
-        const take = Math.max(1, Math.min(500, Number(limit) || 100))
-        return all.slice(start, start + take)
+        const out = [...seen.values()].slice(start, start + take)
+        Object.defineProperty(out, 'truncated', { value: truncated, enumerable: false })
+        return out
       },
       async kickMember(chatId, memberOpenId) {
         const gid = String(chatId || '').trim()
