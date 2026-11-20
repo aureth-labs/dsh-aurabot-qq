@@ -478,6 +478,22 @@ test('长轮询持久化游标 / context_token 跨重启恢复，以及 -14 会�
   assert.equal(ctx3.states.at(-1)?.[0], 'disconnected')
   assert.equal(midPolls, 2)
   await a3.stop()
+
+  // 4) 重新扫码换号（botId 变化）：同一 dataDir 下旧游标与旧 context_token 不得带入新账号
+  let otherSeenBuf = null
+  let otherPolls = 0
+  const client4 = makeMockIlinkClient(async ({ url, bodyObj }) => {
+    if (!url.includes('/ilink/bot/getupdates')) return null
+    if (otherPolls++ > 0) return null // 之后挂起，避免即时返回造成忙轮询
+    otherSeenBuf = bodyObj?.get_updates_buf
+    return { status: 200, headers: {}, json: { ret: 0, get_updates_buf: 'cursor_other', msgs: [] } }
+  })
+  const a4 = createWechatClawbotAdapter({ client: client4, dataDir: () => dir })
+  const ctx4 = makeCtx(a4, { botToken: 'tok_new', botId: 'bot_other' })
+  await a4.start(ctx4)
+  assert.equal(otherSeenBuf, '', '换号后首轮游标必须从空开始')
+  assert.equal(a4.__clawbot.getContextToken('wxu_persist'), '', '换号后不得沿用旧账号的 context_token')
+  await a4.stop()
 })
 
 test('sendtyping 票据缓存与扫码登录状态机（wait → scaned → confirmed / expired）', async () => {

@@ -607,15 +607,24 @@ export function createWechatClawbotAdapter(options = {}) {
     return typeof dir === 'string' && dir && isAbsolute(dir) ? dir : null
   }
 
-  function loadStateFiles() {
+  /**
+   * 载入游标与 context_token。落盘文件带 botId：重新扫码换号后 botId 变化（或旧文件无 botId）时，
+   * 旧游标 / 旧会话令牌一律丢弃，避免首轮游标错配或回复串到旧账号的会话。
+   */
+  function loadStateFiles(botAccount) {
+    syncBuf = ''
+    msgContextTokens.clear()
+    chatContextTokens.clear()
+    typingTickets.clear()
     const dir = dataDirPath()
     if (!dir) return
     try {
       const rawSync = JSON.parse(readFileSync(join(dir, 'sync-buf.json'), 'utf8'))
-      if (typeof rawSync?.get_updates_buf === 'string') syncBuf = rawSync.get_updates_buf
+      if (rawSync?.botId === botAccount && typeof rawSync?.get_updates_buf === 'string') syncBuf = rawSync.get_updates_buf
     } catch {}
     try {
       const rawCtx = JSON.parse(readFileSync(join(dir, 'context-tokens.json'), 'utf8'))
+      if (rawCtx?.botId !== botAccount) throw new Error('bot-changed')
       const now = clock()
       const ttl = Math.max(60_000, Number(cfgOf().contextTokenTtlMs) || DEFAULT_CONTEXT_TOKEN_TTL_MS)
       if (rawCtx?.chats && typeof rawCtx.chats === 'object') {
@@ -650,11 +659,12 @@ export function createWechatClawbotAdapter(options = {}) {
   }
 
   function persistSyncBuf() {
-    saveJsonAtomic('sync-buf.json', { get_updates_buf: syncBuf, updatedAt: clock() })
+    saveJsonAtomic('sync-buf.json', { botId: self.account, get_updates_buf: syncBuf, updatedAt: clock() })
   }
 
   function persistContextTokens() {
     saveJsonAtomic('context-tokens.json', {
+      botId: self.account,
       chats: Object.fromEntries(chatContextTokens),
       msgs: Object.fromEntries(msgContextTokens),
     })
@@ -1154,7 +1164,7 @@ export function createWechatClawbotAdapter(options = {}) {
       sessionExpired = false
       connected = false
       serverPollTimeoutMs = 0
-      loadStateFiles()
+      loadStateFiles(botAccount)
 
       const allowGroup = cfg.allowGroup === true || cfg.allowGroup === 'true'
       capsState = {

@@ -51,6 +51,7 @@
 - ✅ **受限主动消息**：在已保存有效 `context_token` 且未触发个人号频率限制（默认同对象 ≥ 3 秒/次、≤ 20 次/小时）时可主动发送；超过上限直接按 `not-sent / proactive-limit` 如实失败，绝不无限重试。
 - ✅ **启动握手、群过滤与安全边界**：
   - `start()` 必须同时具备有效 `botToken` 与真实 `botId`（手动填写时必填，扫码会自动写入），不以 `getconfig` 猜调机器人自身 ID；启动后进入 `connecting` 并发起首轮 `POST /ilink/bot/getupdates` 长轮询，首轮 `getupdates` 成功响应（`200` 且 `ret/errcode === 0`）后才转为 `connected`；若遇 `-14` / `401` / `403` 立即置为 `disconnected` 并拒绝启动；若服务端在短暂等待窗内保持长轮询挂起或网络暂时波动，状态诚实维持 `connecting`（不中止挂起请求，也不伪造 `connected`），直至首轮 `getupdates` 真正成功后再切为 `connected`；
+  - 游标 `sync-buf.json` 与会话令牌 `context-tokens.json` 落盘时均带 `botId`；重新扫码换号（`botId` 变化，或旧文件无 `botId`）时启动会丢弃旧游标与旧 `context_token`，首轮 `getupdates` 从空游标开始，避免回复串到旧账号会话；
   - 当开启 `allowGroup=true` 且 `listenAllInGroup=false` 时，严格只放行 `mentioned_me === true` 的群消息；缺失具体成员 `sender` 的群消息直接丢弃，不回退猜成群 ID；
   - 出站/拉取 `media.url` 统一走与平台核心一致的 SSRF 校验（禁止内网/本机 IP、禁用 `file://`、手动跟踪最多 5 跳重定向并逐跳重检）；`media.path` 在平台端默认 fail-closed（未传 `allowedLocalDirs` 时直接拦截本地路径），宿主机注入动态 `allowedLocalDirs`（工作区、`dataDir`、`files.dirs`）并经 `realpath` 解析做目录边界包含校验；`fetch(media)` 不直接读取本地路径。
 
