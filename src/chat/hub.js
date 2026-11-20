@@ -1937,9 +1937,24 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     return sendSegments(chatId, [...quote(replyId), ...mention(userId, segs), ...segs], (replyId ? '[引用] ' : '') + text.slice(0, 60), verdict ? { ...opts, outboundVerdict: verdict } : opts)
   }
 
+  /**
+   * 平台侧语音开关：wechat-clawbot 可以单独关闭语音，改发文字。
+   * 全局 voice.enabled 仍是最上层开关；这里只看对应平台实例的 voiceEnabled。
+   */
+  function platformVoiceDisabled(chatId) {
+    const norm = normalizeChatId(chatId) || String(chatId || '')
+    const addr = parseChatId(norm)
+    if (!addr || addr.platform !== 'wechat-clawbot') return false
+    const cfg = getConfig()
+    const inst = addr.instance || 'wechat-clawbot'
+    const platform = cfg?.platforms?.[inst] || cfg?.platforms?.['wechat-clawbot']
+    return platform?.voiceEnabled === false || platform?.voiceEnabled === 'false'
+  }
+
   async function sendVoice(chatId, text, replyId, userId) {
     text = cleanOutboundText(text, cleaningFor(chatId))
     if (!text.trim()) return false
+    if (platformVoiceDisabled(chatId)) return await sendText(chatId, text, replyId, undefined, userId)
     let b64, engine, extras
     try {
       // 表情标签 / emoji 不念出来：TTS 只念能说的字（用户反馈：发语音时「呲牙」被读出来）
@@ -2022,6 +2037,11 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   /** 把一个音频文件当语音条发出去（翻唱用）。 */
   async function sendVoiceFile(chatId, file, note) {
     if (disposed) return null
+    if (platformVoiceDisabled(chatId)) {
+      const fallback = String(note || '').replace(/^\[[^\]]+\]\s*/, '').trim() || '（这条语音已关闭，改发文字）'
+      await sendText(chatId, fallback, undefined, undefined, undefined, { quiet: true })
+      return { skipped: true, voiceDisabled: true }
+    }
     const b64 = readFileSync(file).toString('base64')
     const r = await sendSegments(chatId, [{ type: 'record', data: { file: 'base64://' + b64 } }], note || '[语音]')
     if (r || getConfig().dryRun || !getConfig().enabled) bump('voice')
@@ -2368,14 +2388,15 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     // 分条发出的中间段（chat.everyStep）：只发她当时说的原话，不做语音转换、不补表情、不按概率改形态，
     // 免得一段闲聊被拆成语音条和表情乱入。标签、markdown 图片照旧解析。
     const interim = Boolean(opts.interim)
+    const voiceAllowed = !platformVoiceDisabled(chatId)
     // 对方明确要语音、她却只打了字：整段改成语音发（模型偶尔会忘，这里兜底）
-    if (!interim && opts.wantVoice && cfg.voice.enabled && !items.some((i) => i.kind === 'voice')) {
+    if (!interim && voiceAllowed && opts.wantVoice && cfg.voice.enabled && !items.some((i) => i.kind === 'voice')) {
       const spoken = items.filter((i) => i.kind === 'text').map((i) => i.value).join('，')
       if (spoken && spoken.length <= 300) items = [{ kind: 'voice', value: spoken }, ...items.filter((i) => i.kind !== 'text')]
     }
     // 短回复按概率整条变语音
     const texts = items.filter((i) => i.kind === 'text')
-    if (!interim && cfg.voice.enabled && items.length === texts.length && texts.length > 0) {
+    if (!interim && voiceAllowed && cfg.voice.enabled && items.length === texts.length && texts.length > 0) {
       const all = texts.map((t) => t.value).join('，')
       if (all.length <= cfg.voice.autoMaxChars && Math.random() < cfg.voice.autoChance * mood().voice) items = [{ kind: 'voice', value: all }]
     }
@@ -2428,7 +2449,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         const sentBefore = outputScope.getStore().sent
         if (it.kind === 'text') await sendText(chatId, it.value, replyId, missedAt, userId)
         else if (it.kind === 'voice') {
-          if (cfg.voice.enabled) await sendVoice(chatId, it.value, replyId, userId)
+          if (cfg.voice.enabled && voiceAllowed) await sendVoice(chatId, it.value, replyId, userId)
           else await sendText(chatId, it.value, replyId, missedAt, userId)
         } else if (it.kind === 'sticker') await sendSticker(chatId, it.value, replyId, userId)
         else if (it.kind === 'poke') { if (!opts.simulate) await pokeBack(chatId) }

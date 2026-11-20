@@ -488,6 +488,32 @@ test('语音出站：voiceOutbound=true 时转 SILK 语音条，编码失败才�
   await fallbackAdapter.stop()
 })
 
+test('voiceEnabled=false：适配器拒发语音，交给中枢改发文字', async () => {
+  const client = makeMockIlinkClient()
+  const adapter = createWechatClawbotAdapter({ client })
+  const ctx = makeCtx(adapter, { botToken: 'tok_no_voice', botId: 'bot_no_voice', voiceEnabled: false })
+  await adapter.start(ctx)
+  adapter.platform.deliver({
+    message_id: 'in_no_voice',
+    from_user_id: 'wxu_no_voice',
+    message_type: MESSAGE_TYPE.USER,
+    context_token: 'ctx_no_voice',
+    item_list: [{ type: ITEM_TYPE.TEXT, text_item: { text: '发语音' } }],
+  })
+  const before = client.calls.filter((c) => c.url.includes('/ilink/bot/sendmessage')).length
+  await assert.rejects(
+    () => adapter.send({
+      chat: { kind: 'private', id: 'wxu_no_voice' },
+      inResponseTo: 'in_no_voice',
+      parts: [{ type: 'voice', media: { bytes: makeWavPcm16({ seconds: 0.3 }), mime: 'audio/wav' } }],
+    }),
+    (e) => e.certainty === 'not-sent' && e.code === 'voice-disabled',
+  )
+  assert.equal(client.calls.filter((c) => c.url.includes('/ilink/bot/sendmessage')).length, before)
+  assert.equal(client.calls.filter((c) => c.url.includes('/ilink/bot/getuploadurl')).length, 0)
+  await adapter.stop()
+})
+
 test('长轮询持久化游标 / context_token 跨重启恢复，以及 -14 会话过期立即断开停止轮询', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'aurabot-wx-persist-'))
   let pollStep = 0

@@ -63,6 +63,21 @@
 - ❌ **原生语音条默认关闭（服务端不投递）**：实测 iLink 接受机器人 `voice_item`（`ret=0`）但不投递给收件人；默认 `voiceOutbound=false`，按音频文件发送。只有显式打开时才尝试 SILK 语音条，失败/缺依赖仍降级文件；不要把它当作稳定能力。
 - ❌ **不支持拉取聊天历史、群成员列表、合并转发、@、戳一戳、撤回、卡片**：`history` / `memberList` / `forwardExpand` / `quoteReply` / `mention` / `recall` / `card` 均为 `false`。
 
+### 3.3 平台语音开关
+
+`platforms.wechat-clawbot.voiceEnabled`（默认 `true`）：
+
+- `true`：允许语音/音频文件；默认按文件发（`voiceOutbound=false`），避免语音条被服务端吞掉；
+- `false`：完全禁用该平台的语音发送。适配器会以 `not-sent / voice-disabled` 拒绝 `voice` Part，中枢自动把同一句改发文字；`sendVoiceFile`（翻唱等）也会改发文字提示，不再产生音频文件。
+
+面板：
+
+```text
+通讯平台 → 个人微信（ClawBot）→ 允许发送语音
+```
+
+这是平台级开关，不影响 QQ / 飞书等其他平台。
+
 ---
 
 ## 四、内置模块兼容矩阵

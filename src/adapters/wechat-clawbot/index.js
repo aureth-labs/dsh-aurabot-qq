@@ -604,6 +604,11 @@ export function createWechatClawbotAdapter(options = {}) {
     const value = cfgOf().voiceOutbound
     return value === true || value === 'true'
   }
+  // 平台级语音总开关：关闭后适配器拒发 voice Part，中枢会改发文字。
+  const voiceEnabledOf = () => {
+    const value = cfgOf().voiceEnabled
+    return value !== false && value !== 'false'
+  }
 
   function dataDirPath() {
     let dir = null
@@ -1213,6 +1218,7 @@ export function createWechatClawbotAdapter(options = {}) {
       { key: 'routeTag', label: '路由标签（可选）', type: 'text', placeholder: 'SKRouteTag（一般留空）', hint: '仅内网/灰度环境需要填写' },
       { key: 'allowGroup', label: '允许接收群聊消息（实验性）', type: 'boolean', default: false, hint: '个人微信 ClawBot 群聊依赖官方账号灰度权限，默认只开放 1:1 私聊' },
       { key: 'listenAllInGroup', label: '群内接收全部消息', type: 'boolean', default: false, hint: '仅在开启群聊后生效；关闭时仅处理 @ 机器人消息' },
+      { key: 'voiceEnabled', label: '允许发送语音', type: 'boolean', default: true, hint: '关闭后不再发语音/音频文件，语音内容改发文字；适合不想让聊天里堆音频文件的场景' },
       { key: 'voiceOutbound', label: '发送原生语音条（实验性，默认关）', type: 'boolean', default: false, hint: '实测 iLink 会接受机器人 voice_item 但不投递，开了可能让语音附件无声消失；默认按文件发送。只有想验证腾讯是否已放开时才打开' },
       { key: 'maxTextChars', label: '单条文本上限（字符）', type: 'number', default: DEFAULT_MAX_TEXT_CHARS, hint: '超出自动分段发送' },
       { key: 'timeoutMs', label: '请求超时（毫秒）', type: 'number', default: DEFAULT_TIMEOUT_MS },
@@ -1417,6 +1423,9 @@ export function createWechatClawbotAdapter(options = {}) {
 
       if (!itemsToSend.length) {
         throw createSendError('not-sent', 'nothing-to-send', instance, '没有可发送的内容')
+      }
+      if (!voiceEnabledOf() && itemsToSend.some((entry) => entry.kind === 'voice')) {
+        throw createSendError('not-sent', 'voice-disabled', instance, '当前平台已关闭语音发送（voiceEnabled=false），语音内容应改发文字')
       }
 
       let lastMessageId = ''
