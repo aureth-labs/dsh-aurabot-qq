@@ -215,17 +215,50 @@ export function createGroupRoles({ onebot = null, gateway = null, getGateway = n
 
     // 飞书裸群号 oc_xxx 自动归一化为规范飞书群地址
     if (!parsed && /^oc_[0-9A-Za-z_-]+$/.test(raw)) {
-      const allowedFs = (cfg?.allow?.groups || [])
+      const allowedMatches = (cfg?.allow?.groups || [])
         .map((g) => normalizeChatId(String(g || '').trim()))
         .filter(Boolean)
-        .find((normKey) => {
+        .filter((normKey) => {
           const p = parseChatId(normKey)
           return p?.platform === 'feishu' && p.kind === 'group' && p.id === raw
         })
-      if (allowedFs) return resolveBackend(allowedFs)
+      if (allowedMatches.length === 1) return resolveBackend(allowedMatches[0])
+      if (allowedMatches.length > 1) {
+        const activeMatches = allowedMatches.filter((normKey) => {
+          const p = parseChatId(normKey)
+          return p && isInstanceActive(p.instance)
+        })
+        if (activeMatches.length === 1) return resolveBackend(activeMatches[0])
+        const candidates = (activeMatches.length ? activeMatches : allowedMatches).join(' / ')
+        return {
+          backend: 'none',
+          platform: 'feishu',
+          instance: '',
+          openid: raw,
+          chatId: raw,
+          alias: '',
+          name: '',
+          cacheKey: `none:feishu:${raw}`,
+          ambiguous: true,
+          reason: `存在多个飞书实例匹配该群，请使用完整规范群地址（如 ${candidates}）`,
+        }
+      }
       const enabledFeishu = Object.entries(cfg?.platforms || {})
         .filter(([id, v]) => v && v.enabled === true && (id === 'feishu' || id.startsWith('feishu#')))
         .map(([id]) => id)
+      if (enabledFeishu.length > 1) {
+        return {
+          backend: 'none',
+          platform: 'feishu',
+          instance: '',
+          openid: raw,
+          chatId: raw,
+          alias: '',
+          name: '',
+          cacheKey: `none:feishu:${raw}`,
+          reason: `已启用多个飞书实例（${enabledFeishu.join('、')}），请使用完整规范群地址（如 ${enabledFeishu[0]}:group:${raw}）`,
+        }
+      }
       const targetInst = enabledFeishu.length === 1 ? enabledFeishu[0] : 'feishu'
       return resolveBackend(`${targetInst}:group:${raw}`)
     }

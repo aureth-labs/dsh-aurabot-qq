@@ -24,12 +24,13 @@ function makeFeishuMockClient(handler) {
       const u = new URL(req.url)
       const body = typeof req.body === 'string' && req.body ? JSON.parse(req.body) : req.body
       if (u.pathname.endsWith('/tenant_access_token/internal')) {
-        return { status: 200, json: { code: 0, tenant_access_token: 't_feishu_test', expire: 7200 } }
+        const tok = body?.app_id ? `tok_${body.app_id}` : 't_feishu_test'
+        return { status: 200, json: { code: 0, tenant_access_token: tok, expire: 7200 } }
       }
       if (u.pathname.endsWith('/bot/v3/info')) {
         return { status: 200, json: { code: 0, bot: { open_id: 'ou_bot', app_name: '飞书测试Bot' } } }
       }
-      return handler({ method: req.method, path: u.pathname, query: u.searchParams, body })
+      return handler({ method: req.method, path: u.pathname, query: u.searchParams, body, headers: req.headers || {} })
     },
   }
 }
@@ -661,6 +662,11 @@ test('飞书群管审阅加固：裸 oc_ 归一化（P1）、member 身份 schem
     { id_list: ['ou_p3_1'] },
   )
 
+  const kickTruncatedNick = await privTool.execute({ action: 'kick', group_id: 'oc_big', user_id: '成员4_1' })
+  assert.equal(kickTruncatedNick.ok, false)
+  assert.match(kickTruncatedNick.message, /超过拉取上限/)
+  assert.match(kickTruncatedNick.message, /成员4_1/)
+
   // P2-3：HTTP 403 + code 232025 优先归类为 not-admin，99991672 与未知 403 仍为 forbidden
   kickErrMode = '403_232025'
   await assert.rejects(() => ga.kickMember('oc_g1', 'ou_alice'), (e) => e.code === 'group-admin-not-admin')
@@ -684,4 +690,173 @@ test('飞书群管审阅加固：裸 oc_ 归一化（P1）、member 身份 schem
   assert.equal(kickNotInChat.ok, false)
   assert.match(kickNotInChat.message, /机器人不在该飞书群里/)
   assert.doesNotMatch(kickNotInChat.message, /可能无效或不在本群/)
+})
+
+test('飞书群管复审 P2：>300 人按昵称踢人走飞书分页 & 多飞书实例裸 oc_ 消歧', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aurabot-feishu-p2-'))
+  const identity = createIdentity({ dataDir: dir, log: silent })
+  t.after(() => identity.close?.())
+  const ownerPid = identity.claimOwner('feishu', 'ou_owner')
+  identity.link('qq', '10001', ownerPid, 'owner')
+
+  const makePageItems = (pageNo, count = 100) => Array.from({ length: count }, (_, i) => ({
+    member_id: `ou_p${pageNo}_${i}`,
+    member_id_type: 'open_id',
+    name: `成员${pageNo}_${i}`,
+  }))
+
+  // 1) 600 人大群（默认分页 20 页），按第 4 页成员昵称 kick 不再受通用 3 页（300 人）上限截断
+  const bigCfg = normalize({
+    enabled: true,
+    dryRun: false,
+    allow: { groups: ['feishu:group:oc_big'] },
+    platforms: {
+      qq: { enabled: false },
+      qqbot: { enabled: false },
+      feishu: { enabled: true, appId: 'cli_big', appSecret: 'sec_big', transport: 'webhook' },
+    },
+  })
+  bigCfg.platforms = {
+    qq: { enabled: false },
+    qqbot: { enabled: false },
+    feishu: { enabled: true, appId: 'cli_big', appSecret: 'sec_big', transport: 'webhook' },
+  }
+  const bigCalls = []
+  const gwBig = createGateway({ config: bigCfg, dataDir: (...p) => join(dir, 'gw_big', ...p), http: { route: () => () => {} }, identity, log: silent })
+  gwBig.register(() => createFeishuAdapter({
+    client: makeFeishuMockClient(async (req) => {
+      bigCalls.push({ method: req.method, path: req.path, query: Object.fromEntries(req.query), body: req.body })
+      if (req.method === 'GET' && req.path === '/open-apis/im/v1/chats/oc_big') {
+        return { status: 200, json: { code: 0, data: { name: '600人大群', owner_id: 'ou_owner', bot_manager_id_list: ['cli_big'] } } }
+      }
+      if (req.method === 'GET' && req.path === '/open-apis/im/v1/chats/oc_big/members') {
+        const pt = Number(req.query.get('page_token') || 1)
+        const hasMore = pt < 6
+        return {
+          status: 200,
+          json: {
+            code: 0,
+            data: { has_more: hasMore, page_token: hasMore ? String(pt + 1) : '', items: makePageItems(pt, 100) },
+          },
+        }
+      }
+      if (req.method === 'DELETE' && req.path === '/open-apis/im/v1/chats/oc_big/members') {
+        return { status: 200, json: { code: 0, data: { invalid_id_list: [] } } }
+      }
+      return { status: 404, json: { code: 404 } }
+    }),
+  }))
+  await gwBig.sync()
+  t.after(() => gwBig.stopAll())
+
+  const bigRoles = createGroupRoles({ getGateway: () => gwBig, getConfig: () => bigCfg, dataDir: (...p) => join(dir, 'roles_big', ...p), log: silent })
+  let bigToolFactory = null
+  groupAdminDef.setup({
+    core: {
+      hub: { turnSendersAllOwner: () => true, groupName: async (g) => String(g) },
+      groupRoles: bigRoles,
+      gateway: gwBig,
+      identity,
+      http: { body: async (r) => r?.body || {}, query: (r) => r?.query || {} },
+    },
+    config: () => bigCfg,
+    dataDir: (...p) => join(dir, 'mod_big', ...p),
+    tool: (fn) => { bigToolFactory = fn },
+    context: () => {},
+    route: () => {},
+  })
+  const bigAdmin = [bigToolFactory({ chat: { chatId: 'feishu:private:ou_owner', kind: 'private', userId: 'ou_owner', platform: 'feishu' }, level: 'full', sessionId: 's_big' })].flat().find((x) => x.name === 'group_admin')
+
+  const kickPage4ByNick = await bigAdmin.execute({ action: 'kick', group_id: 'feishu:group:oc_big', user_id: '成员4_1' })
+  assert.equal(kickPage4ByNick.ok, true, kickPage4ByNick.message)
+  assert.deepEqual(
+    bigCalls.filter((c) => c.method === 'DELETE' && c.path === '/open-apis/im/v1/chats/oc_big/members').at(-1)?.body,
+    { id_list: ['ou_p4_1'] },
+  )
+
+  // 2) 多飞书实例（feishu#a / feishu#b）下裸 oc_ 消歧
+  const multiCfg = normalize({
+    enabled: true,
+    dryRun: false,
+    allow: { groups: ['feishu#b:group:oc_only_b', 'feishu#a:group:oc_shared', 'feishu#b:group:oc_shared'] },
+    platforms: { qq: { enabled: false }, qqbot: { enabled: false } },
+  })
+  multiCfg.platforms = {
+    qq: { enabled: false },
+    qqbot: { enabled: false },
+    'feishu#a': { enabled: true, appId: 'cli_a', appSecret: 'sec_a', transport: 'webhook' },
+    'feishu#b': { enabled: true, appId: 'cli_b', appSecret: 'sec_b', transport: 'webhook' },
+  }
+  const multiCalls = []
+  const gwMulti = createGateway({ config: multiCfg, dataDir: (...p) => join(dir, 'gw_multi', ...p), http: { route: () => () => {} }, identity, log: silent })
+  gwMulti.register(() => createFeishuAdapter({
+    client: makeFeishuMockClient(async (req) => {
+      multiCalls.push({ method: req.method, path: req.path, auth: req.headers?.authorization || '' })
+      if (req.method === 'GET' && (req.path === '/open-apis/im/v1/chats/oc_shared' || req.path === '/open-apis/im/v1/chats/oc_only_b')) {
+        return { status: 200, json: { code: 0, data: { name: '多实例测试群', owner_id: 'ou_owner', bot_manager_id_list: ['cli_a', 'cli_b'] } } }
+      }
+      if (req.method === 'GET' && (req.path === '/open-apis/im/v1/chats/oc_shared/members' || req.path === '/open-apis/im/v1/chats/oc_only_b/members')) {
+        return {
+          status: 200,
+          json: {
+            code: 0,
+            data: { has_more: false, items: [{ member_id: 'ou_owner', member_id_type: 'open_id', name: '主人' }] },
+          },
+        }
+      }
+      return { status: 404, json: { code: 404 } }
+    }),
+  }))
+  await gwMulti.sync()
+  t.after(() => gwMulti.stopAll())
+
+  const multiRoles = createGroupRoles({ getGateway: () => gwMulti, getConfig: () => multiCfg, dataDir: (...p) => join(dir, 'roles_multi', ...p), log: silent })
+  let multiToolFactory = null
+  groupAdminDef.setup({
+    core: {
+      hub: { turnSendersAllOwner: () => true, groupName: async (g) => String(g) },
+      groupRoles: multiRoles,
+      gateway: gwMulti,
+      identity,
+      http: { body: async (r) => r?.body || {}, query: (r) => r?.query || {} },
+    },
+    config: () => multiCfg,
+    dataDir: (...p) => join(dir, 'mod_multi', ...p),
+    tool: (fn) => { multiToolFactory = fn },
+    context: () => {},
+    route: () => {},
+  })
+  const pickMulti = (chat, sessionId) => [multiToolFactory({ chat, level: 'full', sessionId })].flat().filter(Boolean).find((x) => x.name === 'group_admin')
+
+  const onlyBSpec = multiRoles.resolveBackend('oc_only_b')
+  assert.equal(onlyBSpec.backend, 'gateway-admin')
+  assert.equal(onlyBSpec.instance, 'feishu#b')
+  assert.equal(onlyBSpec.chatId, 'feishu#b:group:oc_only_b')
+
+  const sharedSpec = multiRoles.resolveBackend('oc_shared')
+  assert.equal(sharedSpec.backend, 'none')
+  assert.equal(sharedSpec.ambiguous, true)
+  assert.match(sharedSpec.reason, /存在多个飞书实例匹配该群/)
+  assert.match(sharedSpec.reason, /feishu#a:group:oc_shared/)
+
+  const toolFromB = pickMulti({ chatId: 'feishu#b:private:ou_owner', kind: 'private', userId: 'ou_owner', platform: 'feishu' }, 's_mb')
+  const sharedFromB = await toolFromB.execute({ action: 'list_members', group_id: 'oc_shared' })
+  assert.equal(sharedFromB.ok, true, sharedFromB.message)
+  assert.equal(
+    multiCalls.filter((c) => c.path === '/open-apis/im/v1/chats/oc_shared/members').at(-1)?.auth,
+    'Bearer tok_cli_b',
+  )
+
+  const toolFromQq = pickMulti({ chatId: 'qq:private:10001', kind: 'private', userId: '10001', platform: 'qq' }, 's_mq')
+  const sharedFromQq = await toolFromQq.execute({ action: 'list_members', group_id: 'oc_shared' })
+  assert.equal(sharedFromQq.ok, false)
+  assert.match(sharedFromQq.message, /存在多个飞书实例匹配该群/)
+
+  const unlistedSpec = multiRoles.resolveBackend('oc_unlisted')
+  assert.equal(unlistedSpec.backend, 'none')
+  assert.match(unlistedSpec.reason, /已启用多个飞书实例/)
+
+  const unlistedRes = await toolFromB.execute({ action: 'list_members', group_id: 'oc_unlisted' })
+  assert.equal(unlistedRes.ok, false)
+  assert.match(unlistedRes.message, /不在白名单/)
 })

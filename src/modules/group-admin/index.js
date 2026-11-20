@@ -390,7 +390,7 @@ export default {
         return { openid: cleaned, nick: obsExact?.nick || '', via: 'explicit' }
       }
 
-      const { members, fromApi, error } = await fetchGatewayMembers(ga, groupOpenid, chatId)
+      const { members, fromApi, error, truncated } = await fetchGatewayMembers(ga, groupOpenid, chatId, { platform })
       const hit = matchMemberCandidates(members, cleaned)
       if (hit?.ambiguous) {
         return { error: `匹配到多位群成员，请改用 ${idLabel} 指定：${formatCandidates(hit.ambiguous)}` }
@@ -403,6 +403,9 @@ export default {
 
       if (error) {
         return { error: `按「${cleaned}」找不到对应的 ${idLabel}（${error}）；请在群里 @ 对方或直接提供 ${idLabel}` }
+      }
+      if (truncated) {
+        return { error: `群成员超过拉取上限（已查前 ${members.length} 位），未找到「${cleaned}」；请在群里 @ 对方或直接提供 ${idLabel}` }
       }
       return { error: `群成员列表里没找到「${cleaned}」，请确认昵称或在群里 @ 对方 / 用 list_members 查看 ${idLabel}` }
     }
@@ -546,17 +549,23 @@ export default {
           const chatAddr = parseChatId(normChatKey(chat?.chatId || ''))
           let rawGroup = rawGroupInput
           if (/^oc_[0-9A-Za-z_-]+$/.test(rawGroupInput) && chatAddr?.platform === 'feishu' && chatAddr?.instance) {
-            const allowMatchedFs = (cfg.allow?.groups || [])
+            const matchedFsAllow = (cfg.allow?.groups || [])
               .map((g) => normalizeChatId(String(g || '').trim()))
               .filter(Boolean)
-              .find((k) => {
+              .filter((k) => {
                 const p = parseChatId(k)
                 return p?.platform === 'feishu' && p.kind === 'group' && p.id === rawGroupInput
               })
-            if (!allowMatchedFs) rawGroup = `${chatAddr.instance}:group:${rawGroupInput}`
+            const sameInst = matchedFsAllow.find((k) => parseChatId(k)?.instance === chatAddr.instance)
+            if (sameInst) rawGroup = sameInst
+            else if (matchedFsAllow.length === 1) rawGroup = matchedFsAllow[0]
+            else rawGroup = `${chatAddr.instance}:group:${rawGroupInput}`
           }
 
           const spec = typeof groupRoles?.resolveBackend === 'function' ? groupRoles.resolveBackend(rawGroup) : null
+          if (spec?.backend === 'none' && spec?.ambiguous) {
+            return { ok: false, message: spec.reason }
+          }
           const parsedNorm = normalizeChatId(spec?.chatId || rawGroup)
           const parsedAddr = parsedNorm ? parseChatId(parsedNorm) : null
           const targetPlat = spec?.platform || parsedAddr?.platform || chat.platform || 'qq'
