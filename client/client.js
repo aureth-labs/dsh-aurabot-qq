@@ -1402,7 +1402,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         h(Row, { label: 'HTTP 令牌' }, f.text('snowluma.httpToken', { type: 'password', placeholder: draft.snowluma.httpTokenSet ? '已保存' : '没有就留空' })))
     }
 
-    const PLATFORM_NAMES = { qq: 'QQ', feishu: '飞书', qqbot: 'QQ 官方机器人', bridge: '通用桥' }
+    const PLATFORM_NAMES = { qq: 'QQ', feishu: '飞书', qqbot: 'QQ 官方机器人', 'wechat-clawbot': '个人微信（ClawBot）', bridge: '通用桥' }
     const platformLabel = (name) => PLATFORM_NAMES[name] || name || '平台'
     const ownerTargetText = (t) => {
       if (!t) return ''
@@ -1689,6 +1689,72 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       )
     }
 
+    function WechatClawbotQrBox({ instance = 'wechat-clawbot', baseUrl = '', routeTag = '', hasToken = false, toast, onConfirmed }) {
+      const [qr, setQr] = useState(null) // { sessionId, qrDataUri, qrcodeUrl, state, message }
+      const [busy, setBusy] = useState(false)
+      useEffect(() => {
+        if (!qr?.sessionId || (qr.state !== 'wait' && qr.state !== 'scaned')) return undefined
+        let alive = true
+        const timer = setInterval(async () => {
+          try {
+            const r = await post('/platforms/wechat-clawbot/qr/status', { sessionId: qr.sessionId })
+            if (!alive) return
+            if (r.state === 'confirmed') {
+              clearInterval(timer)
+              setQr({ sessionId: '', qrDataUri: '', qrcodeUrl: '', state: 'confirmed', message: r.message || '扫码成功，已保存凭证' })
+              toast && toast(r.message || '微信扫码登录成功', 'ok')
+              onConfirmed && onConfirmed(r)
+              return
+            }
+            if (r.state === 'expired' || r.ok === false) {
+              clearInterval(timer)
+              setQr((cur) => cur ? { ...cur, sessionId: '', state: r.state || 'error', message: r.message || '二维码已过期' } : cur)
+              return
+            }
+            setQr((cur) => cur ? { ...cur, state: r.state, message: r.message } : cur)
+          } catch (e) {}
+        }, 2000)
+        return () => { alive = false; clearInterval(timer) }
+      }, [qr?.sessionId, qr?.state])
+
+      const beginQr = async () => {
+        if (busy) return
+        setBusy(true)
+        try {
+          const r = await post('/platforms/wechat-clawbot/qr/start', { instance, baseUrl, routeTag })
+          if (r.ok === false) {
+            toast && toast(r.message || '获取二维码失败', 'err')
+            setQr({ sessionId: '', qrDataUri: '', qrcodeUrl: '', state: 'error', message: r.message || '获取二维码失败' })
+            return
+          }
+          setQr({
+            sessionId: r.sessionId,
+            qrDataUri: r.qrDataUri,
+            qrcodeUrl: r.qrcodeUrl || '',
+            state: r.state || 'wait',
+            message: r.message || '请用手机微信扫描二维码',
+          })
+        } finally { setBusy(false) }
+      }
+
+      return h('div', { style: { padding: '10px 12px', marginBottom: 10, borderRadius: 8, border: '1px solid var(--ab-line)', background: 'var(--ab-bg-soft, rgba(0,0,0,0.02))' } },
+        h('div', { className: 'ab-flex', style: { alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
+          h(Btn, { small: true, kind: 'primary', disabled: busy, onClick: beginQr },
+            busy ? '生成中…' : (hasToken || qr?.state === 'confirmed' ? '重新扫码登录微信' : '微信扫码登录')),
+          h('span', { className: 'ab-small ab-muted' },
+            hasToken && (!qr || qr.state === 'confirmed') ? '已保存扫码凭证（会话过期或换号时可点此重新扫码）' : '通过腾讯官方 iLink 协议扫码授权个人微信')),
+        qr && (qr.qrDataUri || qr.message) ? h('div', { style: { marginTop: 10 } },
+          qr.qrDataUri && (qr.state === 'wait' || qr.state === 'scaned')
+            ? h('img', { src: qr.qrDataUri, width: 200, height: 200, alt: '微信 ClawBot 登录二维码', style: { display: 'block', background: '#fff', padding: 6, borderRadius: 8, border: '1px solid var(--ab-line)' } })
+            : null,
+          h('div', { className: cx('ab-small', qr.state === 'confirmed' ? '' : (qr.state === 'expired' || qr.state === 'error' ? 'ab-note warn' : 'ab-muted')), style: { marginTop: 6 } },
+            qr.message || ''),
+          qr.qrcodeUrl && (qr.state === 'wait' || qr.state === 'scaned')
+            ? h('div', { className: 'ab-small ab-muted', style: { marginTop: 4, wordBreak: 'break-all' } }, '链接：' + qr.qrcodeUrl)
+            : null,
+        ) : null)
+    }
+
     /** U1：平台页。平台端声明的 settings 自动生成表单；开关即时生效，不需要重启。 */
     function Platforms({ st, draft, setDraft, toast, reload, go, openWizard }) {
       const f = useField(draft, setDraft)
@@ -1885,6 +1951,25 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             : h(Switch, { on: Boolean(inst.enabled), disabled: busy === inst.instance, onChange: () => toggle(inst) })),
           inst.self ? h(Row, { label: '登录账号' }, h('span', null, inst.self.name ? inst.self.name + '（' + inst.self.account + '）' : inst.self.account)) : null,
           inst.detail ? h('div', { className: cx('ab-small', inst.state === 'connected' ? 'ab-muted' : 'ab-note warn'), style: { marginBottom: 8 } }, inst.detail) : null,
+          inst.platform === 'wechat-clawbot' ? h(Fragment, null,
+            h('div', { className: 'ab-note', style: { marginBottom: 8 } },
+              '个人微信（ClawBot）优先 1:1 私聊：表情按图片降级、语音按音频文件发送、不支持拉取历史记录与群管；个人账号存在平台风控风险，请留意使用频率。'),
+            h(WechatClawbotQrBox, {
+              instance: inst.instance,
+              baseUrl: getPath(draft, 'platforms.' + inst.instance + '.baseUrl') || data?.configs?.[inst.instance]?.baseUrl || '',
+              routeTag: getPath(draft, 'platforms.' + inst.instance + '.routeTag') || data?.configs?.[inst.instance]?.routeTag || '',
+              hasToken: Boolean(getPath(draft, 'platforms.' + inst.instance + '.botTokenSet') || data?.configs?.[inst.instance]?.botTokenSet),
+              toast,
+              onConfirmed: (r) => {
+                setData(r)
+                let nextDraft = setPath(draft, 'platforms.' + inst.instance + '.botTokenSet', true)
+                if (r.botId) nextDraft = setPath(nextDraft, 'platforms.' + inst.instance + '.botId', r.botId)
+                if (r.baseUrl) nextDraft = setPath(nextDraft, 'platforms.' + inst.instance + '.baseUrl', r.baseUrl)
+                setDraft(nextDraft)
+                reload()
+              },
+            }),
+          ) : null,
           (inst.settings || []).length ? h('div', null,
             inst.settings.map((s) => h(Row, { key: s.key, label: s.label || s.key, hint: s.hint }, field(inst, s))),
             h('div', { className: 'ab-flex', style: { marginTop: 8 } }, h(Btn, { small: true, kind: 'primary', disabled: busy === inst.instance, onClick: () => save(inst) }, '保存平台设置')),
@@ -9628,6 +9713,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       { id: 'qq', label: 'QQ', desc: 'SnowLuma 或已有 OneBot，适合已经有机器人 QQ 号' },
       { id: 'feishu', label: '飞书', desc: '企业自建应用，默认 WebSocket，不需要公网回调' },
       { id: 'qqbot', label: 'QQ 官方机器人', desc: 'AppID + AppSecret，默认 WebSocket' },
+      { id: 'wechat-clawbot', label: '个人微信（ClawBot）', desc: '腾讯官方 iLink 长轮询，面板微信扫码即用（1:1 为主，不做群管）' },
       { id: 'bridge', label: '通用接入端', desc: '外部程序按 HTTP 长轮询接入，自建平台/脚本用' },
     ]
 
@@ -10001,6 +10087,27 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         !entry
           ? h('div', { className: 'ab-note warn' }, '这个平台端没有注册，先重启 DSH 或检查平台目录。')
           : h('div', null,
+            mode === 'wechat-clawbot' ? h(Fragment, null,
+              h('div', { className: 'ab-note', style: { marginBottom: 8 } },
+                '可直接使用下方「微信扫码登录」授权个人微信（1:1 私聊为主，不做群管，请注意个人账号风控风险）。扫码成功后凭证会自动保存。'),
+              h(WechatClawbotQrBox, {
+                instance: platformInst?.instance || 'wechat-clawbot',
+                baseUrl: String(platformValues.baseUrl || ''),
+                routeTag: String(platformValues.routeTag || ''),
+                hasToken: Boolean(pdata?.configs?.[platformInst?.instance || 'wechat-clawbot']?.botTokenSet),
+                toast,
+                onConfirmed: (r) => {
+                  setPdata(r)
+                  setPlatformValues((prev) => ({
+                    ...prev,
+                    ...(r.botId ? { botId: r.botId } : {}),
+                    ...(r.baseUrl ? { baseUrl: r.baseUrl } : {}),
+                    botToken: '',
+                  }))
+                  reload()
+                },
+              }),
+            ) : null,
             (entry.settings || []).map((s) => h(Row, { key: s.key, label: s.label || s.key, hint: s.hint }, platformField(s))),
             !(entry.settings || []).length ? h('div', { className: 'ab-small ab-muted' }, '这个平台端没有可填的设置。') : null,
             platformError ? h('div', { className: 'ab-note err', style: { marginTop: 8 } }, platformError) : null,

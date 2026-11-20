@@ -9,6 +9,7 @@
 //
 // ⚠ 安全默认：总开关关、试运行开。不手动打开，一句都不会真的发到 QQ。
 
+import { randomUUID } from 'node:crypto'
 import { readFileSync, readdirSync, existsSync, writeFileSync, unlinkSync, statSync, mkdirSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -60,6 +61,7 @@ import { createGateway } from './gateway/index.js'
 import { createQqAdapter } from './adapters/qq/index.js'
 import { createFeishuAdapter } from './adapters/feishu/index.js'
 import { createQqbotAdapter } from './adapters/qqbot/index.js'
+import { createWechatClawbotAdapter, startQrLogin, pollQrStatus, DEFAULT_BASE_URL as WECHAT_CLAWBOT_BASE_URL } from './adapters/wechat-clawbot/index.js'
 import { createBridgeAdapter } from './adapters/bridge/index.js'
 import { ensureUpgradedStorage } from './features/import-qq.js'
 import { clearToolsCache, listTools, probeTool } from './core/tools.js'
@@ -151,7 +153,7 @@ export function isChatSession(hub, session) {
   try { return Boolean(session?.id && hub?.chatOfSession?.(session.id)) } catch (error) { return false }
 }
 
-export function apply(ctx) {
+export function apply(ctx, opts = {}) {
   const logger = createLogger({ dsh: ctx })
   const log = logger.child('core')
   // 恢复备份必须在读配置之前：读完配置后内存里的旧状态会写回去
@@ -309,7 +311,20 @@ export function apply(ctx) {
   const enginePolicies = new Map()
   const getConfig = () => cfg
   setSsrpMode(() => (getConfig().security && getConfig().security.ssrfMode === 'loose' ? 'loose' : 'strict'))
-  const secrets = () => { for (const k of ['webuiPassword', 'httpToken', 'wsToken']) registerSecret(cfg.snowluma[k]); registerSecret(cfg.imageGen.apiKey); for (const e of cfg.imageGen.fallbacks || []) registerSecret(e.apiKey); registerSecret(cfg.bridge.token); registerSecret(cfg.backup?.remote?.token); registerSecret(cfg.backup?.remote?.webdav?.password) } // backup 令牌/WebDAV 密码也按密钥脱敏（云备份）
+  const secrets = () => {
+    for (const k of ['webuiPassword', 'httpToken', 'wsToken']) registerSecret(cfg.snowluma[k])
+    registerSecret(cfg.imageGen.apiKey)
+    for (const e of cfg.imageGen.fallbacks || []) registerSecret(e.apiKey)
+    registerSecret(cfg.bridge.token)
+    registerSecret(cfg.backup?.remote?.token)
+    registerSecret(cfg.backup?.remote?.webdav?.password)
+    for (const p of Object.values(cfg.platforms || {})) {
+      if (!p || typeof p !== 'object') continue
+      for (const k of ['botToken', 'appSecret', 'clientSecret', 'encryptKey', 'verificationToken', 'botSecret', 'secret', 'token']) {
+        registerSecret(p[k])
+      }
+    }
+  } // 含平台与云备份凭据，日志统一打码
   const setConfig = (next) => {
     const before = cfg
     cfg = saveConfig(next, before)
@@ -1045,7 +1060,13 @@ export function apply(ctx) {
       } catch (error) {
         logger.child('gateway').warn('注册平台回调兜底路由失败：', error?.message || error)
       }
-      for (const [factory, id] of [[createQqAdapter, 'qq'], [createFeishuAdapter, 'feishu'], [createQqbotAdapter, 'qqbot'], [createBridgeAdapter, 'bridge']]) {
+      for (const [factory, id] of [
+        [createQqAdapter, 'qq'],
+        [createFeishuAdapter, 'feishu'],
+        [createQqbotAdapter, 'qqbot'],
+        [() => createWechatClawbotAdapter(opts?.wechatClient ? { client: opts.wechatClient } : undefined), 'wechat-clawbot'],
+        [createBridgeAdapter, 'bridge'],
+      ]) {
         try { platformGateway.register(() => factory()) } catch (error) { logger.child('gateway').warn(`注册平台端 ${id} 失败：`, error?.message || error) }
       }
       syncOwnerFixedCleanup(platformGateway, { allowMigrate: true })
@@ -3395,13 +3416,14 @@ export function apply(ctx) {
   }
   const platformView = () => {
     const list = knownPlatformInstances()
+    const pubPlats = publicConfig(getConfig()).platforms || {}
     return {
       ok: true,
       owner: identity.owner(),
       instances: list,
       catalog: platformGateway?.catalog?.() || [],
       candidates: [...platformCandidates.values()].sort((a, b) => b.at - a.at).slice(0, 10),
-      configs: Object.fromEntries(list.map((x) => [x.instance, (getConfig().platforms || {})[x.instance] || {}])),
+      configs: Object.fromEntries(list.map((x) => [x.instance, pubPlats[x.instance] || {}])),
     }
   }
   route('/platforms', async () => platformView())
@@ -3541,6 +3563,113 @@ export function apply(ctx) {
     setConfig(mergeFromPanel(getConfig(), { platforms: { [instance]: next } }))
     try { await platformGateway?.sync?.() } catch (error) { log.warn('保存平台设置后同步失败：', error.message) }
     return { ...platformView(), message: '平台设置已保存' }
+  })
+  const wechatQrSessions = new Map()
+  const validateWechatQrBaseUrl = (raw) => {
+    const uStr = String(raw || WECHAT_CLAWBOT_BASE_URL).trim().replace(/\/+$/, '')
+    let u
+    try { u = new URL(uStr) } catch { return { error: 'iLink 接口地址格式不对' } }
+    const localHost = u.hostname === '127.0.0.1' || u.hostname === 'localhost' || u.hostname === '::1'
+    if (u.protocol !== 'https:' && !(u.protocol === 'http:' && localHost)) {
+      return { error: 'iLink 接口地址必须使用 https://（仅本地测试允许 http://localhost）' }
+    }
+    return { url: uStr }
+  }
+  route('/platforms/wechat-clawbot/qr/start', async (req) => {
+    const b = await readBody(req)
+    const instance = String(b.instance || 'wechat-clawbot').trim() || 'wechat-clawbot'
+    if (!/^wechat-clawbot(?:#[a-z0-9_-]+)?$/.test(instance)) {
+      return { ok: false, message: '实例名必须为 wechat-clawbot 或 wechat-clawbot#<别名>' }
+    }
+    const current = (getConfig().platforms || {})[instance] || {}
+    const checkedUrl = validateWechatQrBaseUrl(b.baseUrl || current.baseUrl || WECHAT_CLAWBOT_BASE_URL)
+    if (checkedUrl.error) return { ok: false, message: checkedUrl.error }
+    const routeTag = String(b.routeTag ?? current.routeTag ?? '').trim()
+    try {
+      const now = Date.now()
+      for (const [sid, s] of wechatQrSessions) {
+        if (now - s.createdAt > 10 * 60_000) wechatQrSessions.delete(sid)
+      }
+      if (wechatQrSessions.size >= 20) wechatQrSessions.delete(wechatQrSessions.keys().next().value)
+      const qr = await startQrLogin({
+        baseUrl: checkedUrl.url,
+        routeTag,
+        client: opts?.wechatQrClient || opts?.wechatClient,
+      })
+      const sessionId = randomUUID()
+      wechatQrSessions.set(sessionId, {
+        qrcode: qr.qrcode,
+        baseUrl: qr.baseUrl,
+        routeTag,
+        instance,
+        createdAt: now,
+      })
+      return {
+        ok: true,
+        sessionId,
+        instance,
+        qrDataUri: qr.qrDataUri,
+        qrcodeUrl: qr.qrcodeUrl,
+        state: 'wait',
+        message: '请用手机微信扫描二维码，并点击确认登录',
+      }
+    } catch (error) {
+      return { ok: false, message: error?.message || '获取微信登录二维码失败' }
+    }
+  })
+  route('/platforms/wechat-clawbot/qr/status', async (req) => {
+    const b = await readBody(req)
+    const sessionId = String(b.sessionId || '').trim()
+    const session = sessionId ? wechatQrSessions.get(sessionId) : null
+    if (!session) {
+      return { ok: false, state: 'expired', message: '扫码会话不存在或已过期，请重新生成二维码' }
+    }
+    try {
+      const r = await pollQrStatus({
+        baseUrl: session.baseUrl,
+        qrcode: session.qrcode,
+        routeTag: session.routeTag,
+        client: opts?.wechatQrClient || opts?.wechatClient,
+      })
+      if (r.state === 'confirmed') {
+        wechatQrSessions.delete(sessionId)
+        if (!platformGateway) ensureGateway()
+        const curPlats = getConfig().platforms || {}
+        const curInst = curPlats[session.instance] || {}
+        const entry = (platformGateway?.catalog?.() || []).find((x) => x.id === 'wechat-clawbot')
+        const defaults = {}
+        for (const s of entry?.settings || []) {
+          if (s.default !== undefined && curInst[s.key] === undefined) defaults[s.key] = s.default
+        }
+        const nextInst = {
+          ...defaults,
+          ...curInst,
+          enabled: true,
+          botToken: r.botToken,
+          ...(r.botId ? { botId: r.botId } : {}),
+          ...(r.baseUrl ? { baseUrl: r.baseUrl } : {}),
+          ...(session.routeTag ? { routeTag: session.routeTag } : {}),
+        }
+        registerSecret(r.botToken)
+        setConfig(mergeFromPanel(getConfig(), { platforms: { [session.instance]: nextInst } }))
+        try { await platformGateway?.sync?.() } catch (error) { log.warn('微信扫码后同步网关失败：', error.message) }
+        return {
+          ...platformView(),
+          ok: true,
+          state: 'confirmed',
+          botId: r.botId || '',
+          baseUrl: r.baseUrl || '',
+          userId: r.userId || '',
+          message: '微信扫码登录成功，已保存凭证并启动连接',
+        }
+      }
+      if (r.state === 'expired') {
+        wechatQrSessions.delete(sessionId)
+      }
+      return { ok: true, state: r.state, message: r.message }
+    } catch (error) {
+      return { ok: false, message: error?.message || '查询微信扫码状态失败' }
+    }
   })
   route('/platforms/claim', async (req) => {
     const b = await readBody(req)

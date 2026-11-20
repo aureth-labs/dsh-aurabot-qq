@@ -1107,6 +1107,7 @@ export function normalize(raw) {  const c = deepMerge(DEFAULTS, raw)
 
 // 面板里不回传原文的字段：路径（几层都行）
 const SECRETS = [['snowluma', 'webuiPassword'], ['snowluma', 'httpToken'], ['snowluma', 'wsToken'], ['imageGen', 'apiKey'], ['voice', 'asrApi', 'apiKey'], ['memory', 'vector', 'apiKey'], ['memory', 'rerank', 'apiKey'], ['song', 'neteaseCookie'], ['bili', 'cookie'], ['bili', 'sessdata'], ['bili', 'biliJct'], ['heybox', 'cookie'], ['bridge', 'token'], ['voice', 'volcano', 'apiKey'], ['voice', 'breeze', 'key'], ['voice', 'breeze', 'password'], ['voice', 'minimax', 'apiKey'], ['backup', 'remote', 'token'], ['backup', 'remote', 'webdav', 'password']]
+const PLATFORM_SECRET_KEYS = ['botToken', 'appSecret', 'clientSecret', 'encryptKey', 'verificationToken', 'botSecret', 'secret', 'token']
 // 扩展模块设置里的密码类字段（模块加载时登记）：['ext', 模块id, 字段]
 const extraSecrets = new Map()
 export function registerSecretField(path) { extraSecrets.set(path.join('\u0000'), path) }
@@ -1264,6 +1265,14 @@ export function publicConfig(cfg) {
     p[k] = ''
   }
   for (const e of c.imageGen.fallbacks || []) { e.apiKeySet = Boolean(e.apiKey); e.apiKey = '' }
+  for (const platObj of Object.values(c.platforms || {})) {
+    if (!isObj(platObj)) continue
+    for (const k of PLATFORM_SECRET_KEYS) {
+      if (!Object.hasOwn(platObj, k)) continue
+      platObj[`${k}Set`] = Boolean(platObj[k])
+      platObj[k] = ''
+    }
+  }
   return c
 }
 
@@ -1285,6 +1294,21 @@ export function mergeFromPanel(current, incoming) {
     else if (v === undefined || v === '') p[k] = getAt(current, path) ?? ''
     delete p[`${k}Set`]
     delete p[`${k}Hint`]
+  }
+  for (const [inst, platObj] of Object.entries(next.platforms || {})) {
+    if (!isObj(platObj)) continue
+    const incPlat = isObj(incoming?.platforms?.[inst]) ? incoming.platforms[inst] : null
+    const curPlat = isObj(current?.platforms?.[inst]) ? current.platforms[inst] : null
+    for (const k of PLATFORM_SECRET_KEYS) {
+      if (incPlat && Object.hasOwn(incPlat, k)) {
+        const v = incPlat[k]
+        if (v === null) platObj[k] = ''
+        else if (v === undefined || v === '') platObj[k] = curPlat?.[k] ?? ''
+      } else if (curPlat && Object.hasOwn(curPlat, k) && !Object.hasOwn(platObj, k)) {
+        platObj[k] = curPlat[k]
+      }
+      delete platObj[`${k}Set`]
+    }
   }
   if (Array.isArray(incoming?.imageGen?.fallbacks)) {
     const old = new Map((current.imageGen?.fallbacks || []).map(e => [e.id, e]))
