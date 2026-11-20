@@ -10,8 +10,9 @@
 //   4. 面板二维码登录通过 node 内置加密与本地 SVG 生成（不向第三方二维码服务泄漏 URL）。
 
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from 'node:crypto'
-import { isAbsolute, join } from 'node:path'
-import { readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { isAbsolute, join, resolve, sep } from 'node:path'
+import { readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs'
+import { assertPublicUrl } from '../../core/net.js'
 import { ensureDir } from '../../core/store.js'
 import { sanitizeFeaturesInput } from '../../gateway/features.js'
 import {
@@ -238,6 +239,7 @@ export function createIlinkHttpClient({ fetchImpl = globalThis.fetch } = {}) {
             method: req.method || 'GET',
             headers: req.headers || {},
             body: req.body,
+            ...(req.redirect ? { redirect: req.redirect } : {}),
             signal: controller.signal,
           }),
           timeout,
@@ -398,7 +400,7 @@ function firstHeader(headers, name) {
 /**
  * 把单条 iLink WeixinMessage 翻译为内部事件（self-sent / ignored-group / inbound）。
  */
-export function parseInboundMessage(rawMsg, { selfAccount = '', allowGroup = false, registerMedia = () => '' } = {}) {
+export function parseInboundMessage(rawMsg, { selfAccount = '', allowGroup = false, listenAllInGroup = false, registerMedia = () => '' } = {}) {
   if (!rawMsg || typeof rawMsg !== 'object') return null
 
   const messageId = rawMsg.message_id ?? rawMsg.msg_id ?? rawMsg.seq ?? rawMsg.client_id
@@ -408,7 +410,11 @@ export function parseInboundMessage(rawMsg, { selfAccount = '', allowGroup = fal
   const sessionId = String(rawMsg.session_id || '').trim()
   const isGroup = Boolean(rawGroupId || fromUser.endsWith('@chatroom') || sessionId.endsWith('@chatroom'))
   const groupId = rawGroupId || (fromUser.endsWith('@chatroom') ? fromUser : (sessionId.endsWith('@chatroom') ? sessionId : ''))
-  const senderAccount = String(rawMsg.sender_user_id || rawMsg.actual_user_id || fromUser).trim()
+  // 群聊 sender 绝不回退成群 ID 或 @chatroom，缺失真实发言人时下面直接丢弃
+  const rawSender = isGroup
+    ? String(rawMsg.sender_user_id || rawMsg.actual_user_id || (fromUser && fromUser !== groupId && !fromUser.endsWith('@chatroom') ? fromUser : '')).trim()
+    : fromUser
+  const senderAccount = isGroup && (rawSender === groupId || rawSender.endsWith('@chatroom')) ? '' : rawSender
   const at = toTimestampMs(rawMsg)
 
   const msgType = Number(rawMsg.message_type)
@@ -423,6 +429,12 @@ export function parseInboundMessage(rawMsg, { selfAccount = '', allowGroup = fal
 
   if (isGroup && !allowGroup) {
     return { kind: 'ignored-group', reason: 'group-disabled', messageId: stableId }
+  }
+  if (isGroup && !listenAllInGroup && rawMsg.mentioned_me !== true) {
+    return { kind: 'ignored-group', reason: 'group-not-mentioned', messageId: stableId }
+  }
+  if (isGroup && !senderAccount) {
+    return { kind: 'ignored-group', reason: 'missing-group-sender', messageId: stableId }
   }
 
   if (!stableId || (!fromUser && !groupId) || !senderAccount) return null
@@ -537,6 +549,9 @@ export function createWechatClawbotAdapter(options = {}) {
   let instance = id
   const clock = options.clock || (() => Date.now())
   const httpClient = options.client || createIlinkHttpClient()
+  const checkPublicUrl = typeof options.assertUrl === 'function' ? options.assertUrl : assertPublicUrl
+  const allowLocalPath = options.allowLocalPath !== false
+  const allowedLocalDirs = Array.isArray(options.allowedLocalDirs) ? options.allowedLocalDirs.map((d) => resolve(String(d))) : null
 
   let ctx = null
   let running = false
@@ -679,9 +694,12 @@ export function createWechatClawbotAdapter(options = {}) {
   function handleIncomingRaw(rawMsg) {
     if (!running || stopped || !ctx) return false
     const cfg = cfgOf()
+    const allowGroup = cfg.allowGroup === true || cfg.allowGroup === 'true'
+    const listenAllInGroup = allowGroup && (cfg.listenAllInGroup === true || cfg.listenAllInGroup === 'true')
     const parsed = parseInboundMessage(rawMsg, {
       selfAccount: self.account,
-      allowGroup: cfg.allowGroup === true || cfg.allowGroup === 'true',
+      allowGroup,
+      listenAllInGroup,
       registerMedia: registerMediaDescriptor,
     })
     if (!parsed) return false
@@ -795,24 +813,89 @@ export function createWechatClawbotAdapter(options = {}) {
     }
   }
 
-  async function resolvePlainBytes(media, timeoutMs) {
+  async function downloadGuardedMediaUrl(rawUrl, timeoutMs, maxBytes) {
+    let current = String(rawUrl || '').trim()
+    if (!current) {
+      throw createSendError('not-sent', 'ssrf-blocked', instance, '媒体地址为空')
+    }
+    for (let hop = 0; hop <= 5; hop++) {
+      try {
+        await checkPublicUrl(current)
+      } catch (error) {
+        throw createSendError('not-sent', 'ssrf-blocked', instance, `媒体地址未通过安全校验：${error?.message || error}`)
+      }
+      let r
+      try {
+        r = await httpClient.request({ method: 'GET', url: current, timeoutMs, responseType: 'bytes', redirect: 'manual' })
+      } catch (error) {
+        throw createSendError('not-sent', 'media-download-failed', instance, `下载媒体失败：${error?.message || error}`)
+      }
+      if ([301, 302, 303, 307, 308].includes(r.status)) {
+        const loc = firstHeader(r.headers, 'location')
+        if (loc) {
+          try {
+            current = new URL(loc, current).href
+          } catch {
+            throw createSendError('not-sent', 'ssrf-blocked', instance, '媒体重定向地址无效')
+          }
+          continue
+        }
+      }
+      if (r.status < 200 || r.status >= 300 || !r.bytes?.length) {
+        throw createSendError('not-sent', 'media-download-failed', instance, `下载媒体失败（HTTP ${r.status || '?'}）`)
+      }
+      if (maxBytes > 0 && r.bytes.length > maxBytes) {
+        throw createSendError('not-sent', 'too-large', instance, `媒体 ${r.bytes.length} 字节超过微信上限 ${maxBytes}`)
+      }
+      return r.bytes
+    }
+    throw createSendError('not-sent', 'too-many-redirects', instance, '媒体下载地址重定向次数超过上限（5 次）')
+  }
+
+  function readGuardedLocalPath(rawPath, maxBytes) {
+    if (!allowLocalPath) {
+      throw createSendError('not-sent', 'local-path-blocked', instance, '当前配置不允许平台端直接读取本机文件路径')
+    }
+    const p = String(rawPath || '').trim()
+    if (!p || p.includes('\0') || !isAbsolute(p)) {
+      throw createSendError('not-sent', 'local-path-blocked', instance, '仅允许绝对路径读取本地媒体')
+    }
+    let st
+    try {
+      st = statSync(p)
+    } catch (error) {
+      throw createSendError('not-sent', 'local-path-blocked', instance, `读取本地媒体失败：${error?.message || error}`)
+    }
+    if (!st.isFile()) {
+      throw createSendError('not-sent', 'local-path-blocked', instance, '本地媒体路径必须是常规文件')
+    }
+    if (maxBytes > 0 && st.size > maxBytes) {
+      throw createSendError('not-sent', 'too-large', instance, `本地文件 ${st.size} 字节超过微信上限 ${maxBytes}`)
+    }
+    if (allowedLocalDirs && allowedLocalDirs.length) {
+      let realFile
+      try { realFile = realpathSync(p) } catch { realFile = resolve(p) }
+      const inside = allowedLocalDirs.some((d) => {
+        let realDir
+        try { realDir = realpathSync(d) } catch { realDir = resolve(d) }
+        return realFile === realDir || realFile.startsWith(realDir.endsWith(sep) ? realDir : realDir + sep)
+      })
+      if (!inside) {
+        throw createSendError('not-sent', 'local-path-blocked', instance, '本地文件路径不在允许目录范围内')
+      }
+    }
+    return readFileSync(p)
+  }
+
+  async function resolvePlainBytes(media, timeoutMs, maxBytes = maxFileBytesOf()) {
     if (media?.bytes) {
       return Buffer.isBuffer(media.bytes) ? media.bytes : Buffer.from(media.bytes)
     }
     if (media?.path) {
-      return readFileSync(String(media.path))
+      return readGuardedLocalPath(media.path, maxBytes)
     }
     if (media?.url) {
-      let r
-      try {
-        r = await httpClient.request({ method: 'GET', url: String(media.url), timeoutMs, responseType: 'bytes' })
-      } catch (error) {
-        throw createSendError('not-sent', 'media-download-failed', instance, `下载外发媒体失败：${error?.message || error}`)
-      }
-      if (r.status < 200 || r.status >= 300 || !r.bytes?.length) {
-        throw createSendError('not-sent', 'media-download-failed', instance, `下载外发媒体失败（HTTP ${r.status || '?'}）`)
-      }
-      return r.bytes
+      return await downloadGuardedMediaUrl(media.url, timeoutMs, maxBytes)
     }
     return null
   }
@@ -843,7 +926,7 @@ export function createWechatClawbotAdapter(options = {}) {
       }
     }
 
-    const plain = await resolvePlainBytes(media, timeoutMs)
+    const plain = await resolvePlainBytes(media, timeoutMs, maxBytes)
     if (!plain) {
       throw createSendError('not-sent', 'media-needs-upload', instance, `${kindLabel}缺少可用内容（bytes/path/url 或已缓存 media.id）`)
     }
@@ -985,7 +1068,7 @@ export function createWechatClawbotAdapter(options = {}) {
 
     settings: [
       { key: 'botToken', label: 'Bot Token（扫码自动写入）', type: 'password', hint: '推荐点下方「微信扫码登录」自动获取；不改请留空' },
-      { key: 'botId', label: '机器人 ID', type: 'text', placeholder: '扫码后自动填写，例如 bot@im.bot', hint: '扫码确认后由微信 iLink 自动返回' },
+      { key: 'botId', label: '机器人 ID', type: 'text', placeholder: '扫码后自动填写，例如 bot@im.bot', hint: '扫码确认后由微信 iLink 自动填写；手动填写 Bot Token 时此项必填' },
       { key: 'baseUrl', label: 'iLink 接口地址', type: 'text', default: DEFAULT_BASE_URL, hint: '默认 https://ilinkai.weixin.qq.com；扫码若下发区域域名会自动更新' },
       { key: 'cdnBaseUrl', label: 'CDN 媒体域名', type: 'text', default: DEFAULT_CDN_BASE_URL, hint: '微信加密媒体上传/下载域名，通常保持默认' },
       { key: 'routeTag', label: '路由标签（可选）', type: 'text', placeholder: 'SKRouteTag（一般留空）', hint: '仅内网/灰度环境需要填写' },
@@ -1009,6 +1092,15 @@ export function createWechatClawbotAdapter(options = {}) {
         throw new Error('wechat-clawbot 缺少 botToken，请先扫码登录')
       }
 
+      const botAccount = String(cfg.botId || cfg.ilinkBotId || '').trim()
+      if (!botAccount) {
+        running = false
+        connected = false
+        stopped = true
+        ctx.state('unconfigured', '缺少机器人 ID（botId / ilink_bot_id）：请使用「微信扫码登录」自动获取，或手动补填 botId')
+        throw new Error('wechat-clawbot 缺少 botId（ilink_bot_id），请先扫码登录或填写 botId')
+      }
+
       running = true
       stopped = false
       sessionExpired = false
@@ -1028,7 +1120,6 @@ export function createWechatClawbotAdapter(options = {}) {
         capsOverride.proactive = 'none'
       }
 
-      const botAccount = String(cfg.botId || cfg.ilinkBotId || `${instance}-bot`).trim()
       self = {
         account: botAccount,
         name: String(cfg.botName || name),
@@ -1040,7 +1131,36 @@ export function createWechatClawbotAdapter(options = {}) {
         clock,
       })
 
-      ctx.state('connecting', '正在连接微信 iLink 长轮询…')
+      ctx.state('connecting', '正在校验微信 iLink 会话与连接…')
+      let probe
+      try {
+        probe = await postIlink(PATH_GET_CONFIG, {
+          ilink_user_id: botAccount,
+          base_info: { channel_version: CHANNEL_VERSION },
+        }, { timeoutMs: Math.min(timeoutMsOf(), 8000) })
+      } catch (error) {
+        running = false
+        connected = false
+        stopped = true
+        const msg = formatWechatErrorSummary('连接微信 iLink 失败', '', error?.message || error, [botTokenOf()])
+        ctx.state('disconnected', msg)
+        throw classifyTransportError(error, instance, '校验微信 iLink 会话')
+      }
+      const probeJson = probe.json || {}
+      const probeCode = Number(probeJson.errcode ?? probeJson.ret ?? 0)
+      if (probe.status === 401 || probe.status === 403 || probeCode === SESSION_EXPIRED_ERRCODE) {
+        markSessionExpired('微信 ClawBot 会话已过期（-14），请在面板重新扫码登录')
+        throw createSendError('not-sent', 'session-expired', instance, '微信 ClawBot 会话已过期（-14），请在面板重新扫码登录')
+      }
+      if (probe.status < 200 || probe.status >= 300 || probeCode !== 0) {
+        running = false
+        connected = false
+        stopped = true
+        const msg = formatWechatErrorSummary('校验微信 iLink 会话失败', probeCode || probe.status, probeJson.errmsg || probe.text, [botTokenOf()])
+        ctx.state('disconnected', msg)
+        throw createSendError('not-sent', `startup-probe-${probeCode || probe.status}`, instance, msg)
+      }
+
       connected = true
       ctx.state('connected')
 
@@ -1241,20 +1361,15 @@ export function createWechatClawbotAdapter(options = {}) {
           }
         }
         if (media.url) {
-          let r
-          try {
-            r = await httpClient.request({ method: 'GET', url: String(media.url), timeoutMs: timeoutMsOf(), responseType: 'bytes' })
-          } catch (error) {
-            throw classifyTransportError(error, instance, '下载微信媒体 URL')
-          }
-          if (r.status < 200 || r.status >= 300 || !r.bytes?.length) {
-            throw createSendError('not-sent', `url-download-${r.status || 'empty'}`, instance, `下载媒体失败（HTTP ${r.status || '?'}）`)
-          }
+          const bytes = await downloadGuardedMediaUrl(media.url, timeoutMsOf(), maxFileBytesOf())
           return {
-            bytes: r.bytes,
-            mime: inferMimeFromBytes(r.bytes) || media.mime || 'application/octet-stream',
+            bytes,
+            mime: inferMimeFromBytes(bytes) || media.mime || 'application/octet-stream',
             ...(media.name ? { name: media.name } : {}),
           }
+        }
+        if (media.path) {
+          throw createSendError('not-sent', 'local-path-blocked', instance, 'fetch(media) 不直接读取本地路径')
         }
         throw createSendError('not-sent', 'media-not-found', instance, '未找到可拉取的微信媒体缓存或地址')
       }

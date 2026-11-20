@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { runAdapterContract, makeCtx } from '../contract/adapter-kit.js'
+import { assertPublicUrl } from '../../src/core/net.js'
 import {
   createWechatClawbotAdapter,
   CAPS_WECHAT_CLAWBOT,
@@ -114,7 +115,13 @@ test('wechat-clawbot 平台端过全套契约（runAdapterContract）', async ()
     config: { botToken: 'wx_token_contract', botId: 'wx_bot_1@im.bot' },
     makeAdapter() {
       const client = makeMockIlinkClient()
-      return createWechatClawbotAdapter({ client })
+      return createWechatClawbotAdapter({
+        client,
+        assertUrl: async (u) => {
+          if (String(u).startsWith('https://example.com/')) return
+          return assertPublicUrl(u)
+        },
+      })
     },
     async injectInbound(adapter) {
       kitSeq++
@@ -493,16 +500,172 @@ test('sendtyping 票据缓存与扫码登录状态机（wait → scaned → conf
   assert.equal(confirmed.baseUrl, 'https://sz.ilinkai.weixin.qq.com')
   assert.equal((await pollQrStatus({ qrcode: qr.qrcode, client: statusClient })).state, 'expired')
 
-  // 2) native('send_typing') 命中 getconfig 缓存，两次打字只请求一次 getconfig
+  // 2) native('send_typing') 命中 getconfig 缓存，两次打字只请求一次 wxu_bob 的 getconfig
   const adapter = createWechatClawbotAdapter({ client })
   const ctx = makeCtx(adapter, { botToken: 'tok_t', botId: 'bot_t' })
   await adapter.start(ctx)
   await adapter.native('send_typing', { chatId: 'wxu_bob' })
   await adapter.native('send_typing', { chatId: 'wxu_bob', cancel: true })
-  assert.equal(client.calls.filter((c) => c.url.includes('/ilink/bot/getconfig')).length, 1)
+  assert.equal(client.calls.filter((c) => c.url.includes('/ilink/bot/getconfig') && c.body?.ilink_user_id === 'wxu_bob').length, 1)
   const typingCalls = client.calls.filter((c) => c.url.includes('/ilink/bot/sendtyping'))
   assert.equal(typingCalls.length, 2)
   assert.equal(typingCalls[0].body.status, 1)
   assert.equal(typingCalls[1].body.status, 2)
   await adapter.stop()
+})
+
+test('审阅加固：P1 群 @ 过滤、P2-1 启动探活、P2-2 缺 botId 拦截、P2-3 群 sender 不猜群号、P2-4 SSRF 与路径边界', async () => {
+  // ── P1：allowGroup=true + listenAllInGroup=false 时，严格只放行 mentioned_me=true 的群消息 ──
+  const clientGroup = makeMockIlinkClient()
+  const aGroup = createWechatClawbotAdapter({ client: clientGroup })
+  const ctxGroup = makeCtx(aGroup, { botToken: 'tok_g', botId: 'bot_g', allowGroup: true, listenAllInGroup: false })
+  await aGroup.start(ctxGroup)
+
+  // 未 @ 且 mentioned_me 缺失 / false → 不 emit
+  assert.equal(aGroup.platform.deliver({
+    message_id: 'g_plain_1',
+    group_id: '123456@chatroom',
+    sender_user_id: 'wxu_alice',
+    message_type: MESSAGE_TYPE.USER,
+    item_list: [{ type: ITEM_TYPE.TEXT, text_item: { text: '群友闲聊' } }],
+  }), false)
+  assert.equal(aGroup.platform.deliver({
+    message_id: 'g_plain_2',
+    group_id: '123456@chatroom',
+    sender_user_id: 'wxu_alice',
+    mentioned_me: false,
+    message_type: MESSAGE_TYPE.USER,
+    item_list: [{ type: ITEM_TYPE.TEXT, text_item: { text: '另一句闲聊' } }],
+  }), false)
+  assert.equal(ctxGroup.emitted.length, 0)
+
+  // mentioned_me=true → emit
+  assert.equal(aGroup.platform.deliver({
+    message_id: 'g_at_1',
+    group_id: '123456@chatroom',
+    sender_user_id: 'wxu_alice',
+    mentioned_me: true,
+    message_type: MESSAGE_TYPE.USER,
+    context_token: 'ctx_g_at',
+    item_list: [{ type: ITEM_TYPE.TEXT, text_item: { text: '@Bot 帮我看看' } }],
+  }), true)
+  assert.equal(ctxGroup.emitted.length, 1)
+  assert.equal(ctxGroup.emitted[0].sender.account, 'wxu_alice')
+
+  // P2-3：缺少成员 sender（仅 group_id / from_user_id=@chatroom）时即使 mentioned_me=true 也不猜成群 ID
+  assert.equal(aGroup.platform.deliver({
+    message_id: 'g_nosender',
+    from_user_id: '123456@chatroom',
+    mentioned_me: true,
+    message_type: MESSAGE_TYPE.USER,
+    item_list: [{ type: ITEM_TYPE.TEXT, text_item: { text: '缺 sender' } }],
+  }), false)
+  assert.equal(ctxGroup.emitted.length, 1)
+  await aGroup.stop()
+
+  // allowGroup=true + listenAllInGroup=true 时，未 @ 的合法群消息也放行
+  const aGroupAll = createWechatClawbotAdapter({ client: makeMockIlinkClient() })
+  const ctxGroupAll = makeCtx(aGroupAll, { botToken: 'tok_ga', botId: 'bot_ga', allowGroup: true, listenAllInGroup: true })
+  await aGroupAll.start(ctxGroupAll)
+  assert.equal(aGroupAll.platform.deliver({
+    message_id: 'g_all_1',
+    group_id: '123456@chatroom',
+    sender_user_id: 'wxu_bob',
+    message_type: MESSAGE_TYPE.USER,
+    item_list: [{ type: ITEM_TYPE.TEXT, text_item: { text: '群全量监听测试' } }],
+  }), true)
+  assert.equal(ctxGroupAll.emitted.length, 1)
+  await aGroupAll.stop()
+
+  // ── P2-1 & P2-2：启动未填 botId 拒启动；token 失效（-14 / 401）绝不误报 connected ──
+  const aNoBotId = createWechatClawbotAdapter({ client: makeMockIlinkClient() })
+  const ctxNoId = makeCtx(aNoBotId, { botToken: 'tok_only' })
+  await assert.rejects(() => aNoBotId.start(ctxNoId), /botId/)
+  assert.equal(ctxNoId.states.at(-1)?.[0], 'unconfigured')
+  assert.ok(!ctxNoId.states.some(([s]) => s === 'connected'))
+
+  for (const failCase of [
+    { status: 200, json: { errcode: -14, errmsg: 'session timeout' } },
+    { status: 401, json: { errmsg: 'unauthorized' } },
+  ]) {
+    const failClient = makeMockIlinkClient(async ({ url }) => {
+      if (url.includes('/ilink/bot/getconfig')) return { ...failCase, headers: {} }
+      return null
+    })
+    const aFail = createWechatClawbotAdapter({ client: failClient })
+    const ctxFail = makeCtx(aFail, { botToken: 'tok_expired', botId: 'bot_expired' })
+    await assert.rejects(() => aFail.start(ctxFail))
+    assert.equal(ctxFail.states.at(-1)?.[0], 'disconnected')
+    assert.ok(!ctxFail.states.some(([s]) => s === 'connected'), '启动校验失败时绝不能出现 connected')
+  }
+
+  // ── P2-4：媒体 URL SSRF + 重定向保护 & 本地路径边界（不绕过真实 assertPublicUrl） ──
+  const redirectClient = makeMockIlinkClient(async ({ url }) => {
+    if (url === 'https://93.184.216.34/redirect-inner.png') {
+      return { status: 302, headers: { location: 'http://127.0.0.1/secret' }, bytes: Buffer.alloc(0) }
+    }
+    if (String(url).startsWith('https://93.184.216.34/loop-')) {
+      const n = Number(url.split('-').pop()) || 0
+      return { status: 302, headers: { location: `https://93.184.216.34/loop-${n + 1}` }, bytes: Buffer.alloc(0) }
+    }
+    return null
+  })
+  const aSec = createWechatClawbotAdapter({ client: redirectClient, allowLocalPath: false })
+  const ctxSec = makeCtx(aSec, { botToken: 'tok_sec', botId: 'bot_sec' })
+  await aSec.start(ctxSec)
+  aSec.platform.deliver({
+    message_id: 'sec_in_1',
+    from_user_id: 'wxu_sec',
+    message_type: MESSAGE_TYPE.USER,
+    context_token: 'ctx_sec',
+    item_list: [{ type: ITEM_TYPE.TEXT, text_item: { text: '安全边界' } }],
+  })
+
+  for (const blockedUrl of [
+    'http://127.0.0.1/admin',
+    'http://169.254.169.254/latest/meta-data/',
+    'http://192.168.1.2/lan.png',
+    'file:///etc/passwd',
+    'https://93.184.216.34/redirect-inner.png',
+  ]) {
+    await assert.rejects(
+      () => aSec.send({ chat: { kind: 'private', id: 'wxu_sec' }, inResponseTo: 'sec_in_1', parts: [{ type: 'image', media: { url: blockedUrl } }] }),
+      (e) => e.certainty === 'not-sent' && e.code === 'ssrf-blocked',
+      `应拦截不安全媒体地址：${blockedUrl}`,
+    )
+  }
+
+  await assert.rejects(
+    () => aSec.send({ chat: { kind: 'private', id: 'wxu_sec' }, inResponseTo: 'sec_in_1', parts: [{ type: 'image', media: { url: 'https://93.184.216.34/loop-0' } }] }),
+    (e) => e.certainty === 'not-sent' && e.code === 'too-many-redirects',
+  )
+
+  await assert.rejects(
+    () => aSec.send({ chat: { kind: 'private', id: 'wxu_sec' }, inResponseTo: 'sec_in_1', parts: [{ type: 'file', media: { path: '../relative.txt' } }] }),
+    (e) => e.certainty === 'not-sent' && e.code === 'local-path-blocked',
+  )
+
+  await assert.rejects(
+    () => aSec.fetch({ kind: 'media', media: { path: 'C:\\Windows\\win.ini' } }),
+    (e) => e.certainty === 'not-sent' && e.code === 'local-path-blocked',
+  )
+
+  await aSec.stop()
+
+  // allowLocalPath=true 默认只放行绝对常规文件，仍拒绝相对路径
+  const aPath = createWechatClawbotAdapter({ client: makeMockIlinkClient() })
+  const ctxPath = makeCtx(aPath, { botToken: 'tok_path', botId: 'bot_path' })
+  await aPath.start(ctxPath)
+  aPath.platform.deliver({
+    message_id: 'path_in_1',
+    from_user_id: 'wxu_p',
+    message_type: MESSAGE_TYPE.USER,
+    context_token: 'ctx_path',
+    item_list: [{ type: ITEM_TYPE.TEXT, text_item: { text: 'path' } }],
+  })
+  await assert.rejects(
+    () => aPath.send({ chat: { kind: 'private', id: 'wxu_p' }, inResponseTo: 'path_in_1', parts: [{ type: 'file', media: { path: '../relative.txt' } }] }),
+    (e) => e.certainty === 'not-sent' && e.code === 'local-path-blocked',
+  )
+  await aPath.stop()
 })

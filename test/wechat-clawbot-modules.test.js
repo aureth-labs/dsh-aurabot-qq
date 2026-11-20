@@ -9,19 +9,30 @@ import { publicConfig, mergeFromPanel } from '../src/core/config.js'
 
 const QQ_LEAK_RE = /你现在在 QQ 上|发到 QQ|QQ 空间|<at:QQ号>|QQ 自带的小黄脸|<face:|<poke>|qq_chat_history|qq_get_profile|qq_send_avatar|qq_send_qzone|qq_api_find|qq_api_call|qq_import_stickers|qq_import_qq_stickers|不能碰 onebot|发 QQ 消息/
 
-const until = async (predicate, ms = 4000) => {
+const until = async (predicate, ms = 10_000) => {
   const deadline = Date.now() + ms
   while (!predicate() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10))
   assert.ok(predicate(), '等待条件超时')
 }
 
-function makeHostIlinkClient({ pollMsgs = [] } = {}) {
+function makeHostIlinkClient({ pollMsgs = [], autoRelease = true } = {}) {
   const calls = []
   let pollIdx = 0
   let qrPollStep = 0
   let waiters = []
+  let pollReleased = autoRelease
+  const flushPollWaiters = () => {
+    if (!pollReleased || pollIdx >= pollMsgs.length || !waiters.length) return
+    const w = waiters.shift()
+    const msg = pollMsgs[pollIdx++]
+    w.resolve({ status: 200, headers: {}, json: { ret: 0, get_updates_buf: `buf_${pollIdx}`, msgs: [msg] } })
+  }
   return {
     calls,
+    releasePoll() {
+      pollReleased = true
+      flushPollWaiters()
+    },
     async request(req) {
       const url = String(req.url || '')
       const body = typeof req.body === 'string' && req.body ? JSON.parse(req.body) : null
@@ -49,11 +60,14 @@ function makeHostIlinkClient({ pollMsgs = [] } = {}) {
           },
         }
       }
+      if (url.includes('/ilink/bot/getconfig')) {
+        return { status: 200, headers: {}, json: { ret: 0, typing_ticket: 'host_ticket' } }
+      }
       if (url.includes('/ilink/bot/sendmessage')) {
         return { status: 200, headers: {}, json: { ret: 0, message_id: `wx_host_reply_${calls.length}` } }
       }
       if (url.includes('/ilink/bot/getupdates')) {
-        if (pollIdx < pollMsgs.length) {
+        if (pollReleased && pollIdx < pollMsgs.length) {
           const msg = pollMsgs[pollIdx++]
           return { status: 200, headers: {}, json: { ret: 0, get_updates_buf: `buf_${pollIdx}`, msgs: [msg] } }
         }
@@ -155,6 +169,7 @@ test('宿主机扫码登录接口：自动写入凭证并连接，绝不在配�
 
 test('纯 wechat-clawbot 运行时：19 模块矩阵、tool/context 无 QQ 泄漏、端到端私聊闭环与双平台隔离', async (t) => {
   const wechatClient = makeHostIlinkClient({
+    autoRelease: false,
     pollMsgs: [{
       message_id: 'wx_e2e_1',
       from_user_id: 'wxu_owner',
@@ -187,6 +202,7 @@ test('纯 wechat-clawbot 运行时：19 模块矩阵、tool/context 无 QQ 泄�
   })
 
   app.gateway.identity.claimOwner('wechat-clawbot', 'wxu_owner')
+  wechatClient.releasePoll()
 
   // 1) group-admin 与 6 个 QQ 专属模块在纯 wechat-clawbot 下均不得运行
   const statuses = app.modules.status()
