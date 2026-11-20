@@ -304,8 +304,8 @@ test('纯 wechat-clawbot 运行时：19 模块矩阵、tool/context 无 QQ 泄�
 test('面板源码契约：PLATFORM_NAMES、设置向导与扫码组件接好 wechat-clawbot', () => {
   const client = readFileSync(new URL('../client/client.js', import.meta.url), 'utf8')
   const host = readFileSync(new URL('../src/host.js', import.meta.url), 'utf8')
-  assert.ok(client.includes("'wechat-clawbot': '微信（ClawBot）'"))
-  assert.ok(host.includes("'wechat-clawbot': '微信（ClawBot）'"))
+  assert.ok(client.includes("'wechat-clawbot': '微信 ClawBot'"))
+  assert.ok(host.includes("'wechat-clawbot': '微信 ClawBot'"))
   assert.ok(client.includes('function WechatClawbotQrBox'))
   assert.ok(client.includes("post('/platforms/wechat-clawbot/qr/start'"))
   assert.ok(client.includes("post('/platforms/wechat-clawbot/qr/status'"))

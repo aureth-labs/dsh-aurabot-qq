@@ -547,7 +547,7 @@ export function parseInboundMessage(rawMsg, { selfAccount = '', allowGroup = fal
  */
 export function createWechatClawbotAdapter(options = {}) {
   const id = options.id || PLATFORM_ID
-  const name = options.name || '微信（ClawBot）'
+  const name = options.name || '微信 ClawBot'
   let instance = id
   const clock = options.clock || (() => Date.now())
   const httpClient = options.client || createIlinkHttpClient()
@@ -583,7 +583,7 @@ export function createWechatClawbotAdapter(options = {}) {
   const typingTickets = new Map() // chatId -> { ticket, expiresAt }
   let capsState = { ...CAPS_WECHAT_CLAWBOT, features: { ...CAPS_WECHAT_CLAWBOT.features } }
   let capsOverride = null
-  let self = { account: '', name: '微信（ClawBot）' }
+  let self = { account: '', name: '微信 ClawBot' }
 
   let rateLimiter = createProactiveRateLimiter({ minIntervalMs: 3000, windowMs: 3600_000, maxPerWindow: 20, clock })
 

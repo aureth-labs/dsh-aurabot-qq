@@ -547,7 +547,7 @@ export function apply(ctx, opts = {}) {
   let platformGateway = null
   const platformCandidates = new Map() // 私聊里最近发话的人：首次向导用它认主
   const defaultPlatform = parseChatId('private:0')?.platform || ''
-  const platformLabel = (platform) => ({ qq: 'QQ', feishu: '飞书', qqbot: 'QQ 官方机器人', 'wechat-clawbot': '微信（ClawBot）', bridge: '通用桥' })[platform] || platform
+  const platformLabel = (platform) => ({ qq: 'QQ', feishu: '飞书', qqbot: 'QQ 官方机器人', 'wechat-clawbot': '微信 ClawBot', bridge: '通用桥' })[platform] || platform
   const legacyQqActive = () => Boolean(getConfig()?.enabled)
   const hasAnyPlatform = () => Object.entries((getConfig()?.platforms) || {}).some(
     ([k, p]) => p && p.enabled !== false && !(k === defaultPlatform && legacyQqActive()),
