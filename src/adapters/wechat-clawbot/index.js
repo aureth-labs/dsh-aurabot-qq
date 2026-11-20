@@ -987,7 +987,8 @@ export function createWechatClawbotAdapter(options = {}) {
 
     const detected = inferMimeFromBytes(bytes)
     const fallbackMime = detected || media?.mime || 'audio/mpeg'
-    const fallbackName = media?.name || `voice.${extForMime(fallbackMime, 'mp3')}`
+    // 语音文件名按真实魔数纠正：中枢历史上会把 record 段标成 audio/amr，不能因此一律 voice.amr。
+    const fallbackName = `voice.${extForMime(fallbackMime, 'mp3')}`
     const fallbackMedia = { ...media, bytes, mime: fallbackMime, name: fallbackName }
 
     if (!voiceOutboundOf()) {
