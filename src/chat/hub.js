@@ -495,7 +495,37 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     }
   }
   const sentIds = new Set()
-  const stats = { received: 0, sent: 0, voice: 0, stickers: 0, errors: 0, day: new Date().toDateString() }
+  // #254：概览「今日统计」重启后归零。计数按日期落盘，同一天重启继续累计，跨天自动重置。
+  // 只在脏了的时候节流写盘（默认 5 秒），不占收发主链路。
+  const statsFile = dataDir('stats.json')
+  const emptyStats = (day) => ({ received: 0, sent: 0, voice: 0, stickers: 0, errors: 0, day })
+  const stats = (() => {
+    const today = new Date().toDateString()
+    try {
+      const saved = readJson(statsFile, null)
+      if (saved && typeof saved === 'object' && saved.day === today) {
+        const next = emptyStats(today)
+        for (const k of ['received', 'sent', 'voice', 'stickers', 'errors']) {
+          const n = Number(saved[k])
+          if (Number.isFinite(n) && n >= 0) next[k] = Math.floor(n)
+        }
+        return next
+      }
+    } catch (error) { log.debug('今日统计读不出来，从零开始：', error.message) }
+    return emptyStats(today)
+  })()
+  let statsDirty = false
+  let statsTimer = null
+  function saveStats(force = false) {
+    if (!statsDirty && !force) return
+    statsDirty = false
+    try { writeJson(statsFile, stats) } catch (error) { log.debug('今日统计写盘失败：', error.message) }
+  }
+  function scheduleStatsSave() {
+    if (statsTimer) return
+    statsTimer = setTimeout(() => { statsTimer = null; saveStats() }, 5000)
+    statsTimer.unref?.()
+  }
   let selfId = ''
   let lastChatAt = 0
   let lastOwnerChatAt = 0
@@ -504,8 +534,10 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
 
   function bump(k) {
     const d = new Date().toDateString()
-    if (stats.day !== d) Object.assign(stats, { received: 0, sent: 0, voice: 0, stickers: 0, errors: 0, day: d })
+    if (stats.day !== d) Object.assign(stats, emptyStats(d))
     stats[k]++
+    statsDirty = true
+    scheduleStatsSave()
   }
 
   // ---------- 聊天流水（给空间日记、主动搭话、面板用） ----------
@@ -4023,6 +4055,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   function dispose() {
     if (disposed) return
     disposed = true
+    // 卸载前把没落盘的今日统计补一次，别让最后几秒的计数白丢（#254）。
+    if (statsTimer) { clearTimeout(statsTimer); statsTimer = null }
+    saveStats(true)
     // 三审 #177：常驻的子智能体父级 agent 一并置空——插件重装/重启后下次 spawn 重新建，
     // 别攥着旧句柄不放（旧的父会话交给 DSH 自己的会话回收去清）。
     subagentParentAgent = null
