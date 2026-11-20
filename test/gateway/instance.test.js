@@ -226,3 +226,39 @@ test('所有平台实例的连接状态都写日志，不只 QQ 直连', async (
     )
   }
 })
+
+test('并发调用 sync 时串行执行，绝不把异步启动中的实例误判配置变更而杀掉重拉', async () => {
+  let startCount = 0
+  let stopCount = 0
+  const asyncSlowAdapter = () => ({
+    id: 'slow',
+    contract: 1,
+    caps: () => ({
+      image: true, sticker: false, voice: false, video: false, file: false, maxFileBytes: 0,
+      quoteReply: false, mention: false, mentionAll: false, poke: false, typing: false,
+      recall: false, card: false, listenAllInGroup: false, proactive: 'free',
+      replyWindowMs: 0, repliesPerMessage: 0, history: false, memberList: false, forwardExpand: false,
+    }),
+    whoami: async () => ({ account: 'bot-slow', name: 'Slow Bot' }),
+    async start(ctx) {
+      startCount++
+      ctx.state('connecting')
+      await new Promise((r) => setTimeout(r, 40))
+      ctx.state('connected')
+    },
+    async stop() {
+      stopCount++
+    },
+    async send() { return { messageId: 'm1' } },
+  })
+  const { gateway } = makeGateway({
+    platforms: { slow: { enabled: true } },
+    adapters: [asyncSlowAdapter],
+  })
+  await Promise.all([gateway.sync(), gateway.sync()])
+  assert.equal(startCount, 1, '并发两次 sync 只应启动一次，不能在首个 start 未完成时误杀重启')
+  assert.equal(stopCount, 0)
+  const st = gateway.instances().find((i) => i.instance === 'slow')
+  assert.equal(st?.state, 'connected')
+  await gateway.stopAll()
+})

@@ -351,6 +351,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
       idle.set(instanceName, { state: 'stopped', detail: `平台端工厂出错：${error?.message || error}` })
       return
     }
+    const cfgJson = JSON.stringify(rawConfig)
     const run = {
       instance: instanceName,
       // 平台名取实例名前缀：adapter 另指时（mychat → bridge），地址、身份表里仍用 mychat
@@ -359,6 +360,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
       name: adapter.name || instanceName,
       adapter,
       rawConfig,
+      cfgJson,
       state: 'unconfigured',
       detail: undefined,
       self: null,
@@ -409,8 +411,9 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
     emitCapsChanged(instanceName, { platform: run.platform, state: 'stopped', caps: null })
   }
 
-  /** 按 config.platforms 启停实例；只动有变化的实例 */
-  async function sync() {
+  let syncTail = Promise.resolve()
+
+  async function syncOnce() {
     const desired = platformsConfig()
     // 停掉：被移除 / disabled / 配置变了
     for (const [instanceName, run] of Array.from(runs)) {
@@ -433,6 +436,13 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
       if (runs.has(instanceName)) continue
       await startInstance(instanceName, want)
     }
+  }
+
+  /** 按 config.platforms 启停实例；只动有变化的实例（串行化防并发 sync 误杀启动中的实例） */
+  function sync() {
+    const next = syncTail.then(syncOnce, syncOnce)
+    syncTail = next.catch(() => {})
+    return next
   }
 
   // 记住每份配置的 JSON（sync 的「只动有变化」判据）
@@ -663,6 +673,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
      * 平台端的重连定时器、长轮询、HTTP 回调路由都必须在这里收掉，否则宿主关了进程还不退出。
      */
     async stopAll() {
+      await syncTail.catch(() => {})
       for (const instanceName of Array.from(runs.keys())) {
         await stopInstance(instanceName, '网关已停止')
       }

@@ -3,7 +3,7 @@
 //   /** @type {import('../aurabot').AurabotModule} */
 // VS Code 等编辑器就会给 api.* 补全和参数说明。完整说明见同目录的 API.md。
 
-export type Platform = 'qq' | 'feishu' | 'qqbot' | 'bridge' | (string & {})
+export type Platform = 'qq' | 'feishu' | 'qqbot' | 'wechat-clawbot' | 'bridge' | (string & {})
 
 export type ChatId =
   | `private:${string}`
