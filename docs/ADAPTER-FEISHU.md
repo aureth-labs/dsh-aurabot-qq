@@ -187,3 +187,43 @@
    文本 + 图片 + 文件会拆成 2~3 次调用；`send` 返回**最后一条**的 `messageId`。
 7. **超长文本会分条**（默认 4000 字符，可配 `maxTextChars`），优先在换行处断开，
    再按 150KB 字节上限兜底。分条后拼起来与原文逐字相同（有测试守着）。
+
+## 七、群管理能力边界与所需权限（F0 实测与接入说明）
+
+`group-admin` 模块通过网关 `groupAdmin` 能力接入飞书群管（对应 `feishu:group:<chat_id>`，无需额外绑定表）。经真实飞书自建应用与真实群（Phase F0）核验，接口行为与能力边界如下：
+
+### 1. F0 实测核对结论
+
+| 探测接口 | 实测结果 | 说明 |
+|---|---|---|
+| `GET /open-apis/bot/v3/info` | `200 / code: 0` | 返回 `bot.open_id`，用于核对群主归属与禁止误操作机器人自己 |
+| `GET /open-apis/im/v1/chats/:chat_id?user_id_type=open_id` | `200 / code: 0` | 返回 `owner_id`、`name`、`user_count`、`user_manager_id_list` 与 **`bot_manager_id_list`**（含机器人 `app_id`）；据此判断 `owner` / `admin` / `member`，缺失 `bot_manager_id_list` 时诚实标记为 `unknown` |
+| `GET /open-apis/im/v1/chats/:chat_id/members?member_id_type=open_id` | `200 / code: 0` | 分页返回人类成员列表（`member_id` + `name`），不包含管理角色字段 |
+| `GET /open-apis/im/v1/chats/:chat_id/managers` | **`404`** | 该路径在飞书开放平台不存在；管理员列表直接随群信息接口返回 |
+| `DELETE /open-apis/im/v1/chats/:chat_id/members?member_id_type=open_id` | body `{ id_list: [openId] }` | 空数组探测返回 `HTTP 400 / code: 232027`（非 `99991672`），说明已具备移出群成员权限（而非 `DELETE .../members/:member_id`） |
+| `GET /open-apis/im/v1/chats/:chat_id/moderation` | `200 / code: 0` | 可读取群发言权限（如 `all_members`）；该能力不等同于按成员限时禁言，本阶段不伪装成 `ban` / `whole_ban` |
+
+### 2. 飞书群管能力矩阵（工具面 `group_admin`）
+
+| 动作 | 是否支持 | 说明 |
+|---|---|---|
+| `list_members` | ✅ 支持 | 列出群成员 `open_id`（`ou_` 开头）与昵称，支持按 `query` 筛选；需主人发言 |
+| `kick` | ✅ 有条件支持 | 调用 `DELETE /open-apis/im/v1/chats/:chat_id/members?member_id_type=open_id` 移出成员；需主人发言、目标在当前群内且非主人/非机器人自身，且**机器人需为群管理员（或群主）**并获批对应 scope |
+| `ban` / `unban` | ❌ 不支持 | 飞书开放平台无 QQ 式按成员定时禁言/解禁接口，工具 schema 不暴露、执行层直接拒绝 |
+| `whole_ban` / `whole_unban` | ❌ 不支持 | 群发言权限设置不能替代限时禁言语义，暂不混入 `group_admin` |
+| `title` / `notice` | ❌ 不支持 | 飞书无专属头衔等价物，暂不开放群公告动作 |
+
+### 3. 所需应用权限与注意事项
+
+| Scope（按实际需要申请并发布版本） | 用途 | 备注 |
+|---|---|---|
+| `im:chat:readonly`（或 `im:chat`） | 读取群信息（`owner_id` / `bot_manager_id_list`）与群成员列表 | 缺少时无法探测群角色 |
+| `im:chat:member`（或 `im:chat` 更新成员权限） | `kick` 移出群成员 | 同时要求机器人已被群主设为**群管理员** |
+
+- **应用维度隔离**：飞书用户 `open_id`（`ou_` 开头）与群内绑定只在当前应用与当前群有效，禁止跨应用或跨群复用；`kick` 执行显式 `open_id` 时会先核对当前群成员列表。
+- **常见错误码映射**：
+  - `99991672` / `99991663` / `99991668` / HTTP `403` → 归类 `group-admin-forbidden`（应用缺少接口 scope）。
+  - `232025` → 归类 `group-admin-not-admin`（机器人不是群管理员）。
+  - `232027` 或 `invalid_id_list` → 归类 `group-admin-not-member`（目标成员不在本群或 `open_id` 无效）。
+  - `232019` / HTTP `429` → 归类 `group-admin-rate-limited`（接口触发限流，建议串行调用）。
+  - `232010` → 归类 `group-admin-forbidden`（跨租户操作拒绝）；`230002` / `232002` → `group-admin-failed`（机器人不在该群）。

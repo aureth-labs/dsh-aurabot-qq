@@ -3151,7 +3151,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const showQqbotCard = qqbotInstances.length > 0 || bindings.length > 0 || candidates.length > 0
 
       return h('div', { className: 'ab-grid' },
-        h(Card, { title: '群管权限', desc: 'ta在群里是群主或管理员时，主人才能让ta执行群管；QQ 官方机器人支持禁言、解禁与踢人（公告/头衔暂不支持）。',
+        h(Card, { title: '群管权限', desc: 'ta在群里是群主或管理员时，主人才能让ta执行群管。QQ 官方机器人支持单人禁言、解禁、踢人与查成员；飞书群支持查成员与踢人（不支持禁言/全体禁言/头衔/公告）。',
           right: h(Btn, { small: true, kind: 'ghost', onClick: load }, '刷新') },
           !list ? h('div', { className: 'ab-muted ab-small' }, h('i', { className: 'ab-spin' }), ' 查询中…')
             : list.length === 0 ? h('div', { className: 'ab-muted ab-small' }, '群白名单和绑定表都是空的。')
@@ -3162,7 +3162,11 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
                 h('td', null, g.backendLabel || 'QQ 直连'),
                 h('td', null, g.label),
                 h('td', null, g.canManage ? h('span', { className: 'ab-badge' }, '可以') : h('span', { className: 'ab-muted ab-small' }, '不行')),
-                h('td', { className: 'ab-muted ab-small' }, g.reason || (g.backend === 'gateway-admin' && g.canManage ? '仅按 member_openid 操作，不支持公告/头衔/全员禁言' : ''))))))),
+                h('td', { className: 'ab-muted ab-small' }, g.platform === 'feishu'
+                  ? ((g.reason ? g.reason + '；' : '') + (g.actions && g.actions.kick === false
+                      ? '仅支持：查成员（不支持禁言/全体禁言/头衔/公告）'
+                      : '支持：查成员、踢人（不支持禁言/全体禁言/头衔/公告）'))
+                  : (g.reason || (g.backend === 'gateway-admin' && g.canManage ? '仅按 member_openid 操作，不支持公告/头衔/全员禁言' : '')))))))),
         showQqbotCard ? h(Card, {
           title: 'QQ 官方机器人群绑定',
           desc: 'QQ 官方机器人只能按群成员 member_openid 操作，请在群里 @ 对方或从成员列表选择；不能直接按 QQ 号操作。绑定后可用于按正式 group_openid 或数字别名查询与群管。',

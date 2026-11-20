@@ -135,10 +135,10 @@ test('内置模块平台声明完备，只开假平台时 QQ/QQBot 模块跳过�
     } else if (expectedQq.includes(def.id)) {
       assert.deepEqual(def.platforms, ['qq'], `${def.id} 应声明 platforms: ['qq']`)
     } else if (expectedQqDual.includes(def.id)) {
-      assert.deepEqual(def.platforms, ['qq', 'qqbot'], `${def.id} 应声明 platforms: ['qq', 'qqbot']`)
+      assert.deepEqual(def.platforms, ['qq', 'qqbot', 'feishu'], `${def.id} 应声明 platforms: ['qq', 'qqbot', 'feishu']`)
     }
   }
-  assert.deepEqual(groupAdminDef.platforms, ['qq', 'qqbot'])
+  assert.deepEqual(groupAdminDef.platforms, ['qq', 'qqbot', 'feishu'])
 
   const { gateway } = makeTestGateway(t, { platforms: { fake: { enabled: true }, qq: { enabled: false } }, ids: ['fake', 'qq'] })
   await gateway.sync()

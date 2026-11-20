@@ -87,11 +87,13 @@ test('PR-2G 场景1：纯 Feishu 环境下所有非工具面（rule / context / 
   })))
   await app.gateway.sync()
 
-  // 1) QQ 专属模块应均处于未运行状态
-  for (const id of ['diary', 'profile', 'qq-api', 'group-admin', 'qq-tools', 'contacts', 'qzone-social']) {
+  // 1) QQ 专属模块应均处于未运行状态；group-admin 已接入飞书，在纯 Feishu 下以 builtin 正常运行且无 QQ 泄漏
+  for (const id of ['diary', 'profile', 'qq-api', 'qq-tools', 'contacts', 'qzone-social']) {
     const row = app.modules.status().find((m) => m.id === id)
     assert.ok(!row || row.running === null, `${id} 在纯 Feishu 下不应运行`)
   }
+  const gaRow = app.modules.status().find((m) => m.id === 'group-admin')
+  assert.equal(gaRow?.running, 'builtin', 'group-admin 已适配飞书，纯 Feishu 下应作为 builtin 运行')
   assert.equal(warns.filter((w) => w.includes('api.rule')).length, 0)
 
   // 2) 4 档全局 preset 变量均不得含 QQ 专属提示
@@ -100,11 +102,18 @@ test('PR-2G 场景1：纯 Feishu 环境下所有非工具面（rule / context / 
     assert.doesNotMatch(text, QQ_LEAK_RE, `${varName} 不得泄漏 QQ 内容：\n${text}`)
   }
 
-  // 3) Feishu 会话 context（模块 + host QQ 会话规则提供者）不得含 QQ 内容
+  // 3) Feishu 会话 context（模块 + host QQ 会话规则提供者）不得含 QQ 内容（含飞书群会话 group_admin context/tool）
   const fsCtx = app.hub ? app.modules.contextFor({ chat: { chatId: 'feishu:private:ou_owner', kind: 'private', platform: 'feishu', userId: 'ou_owner' }, level: 'full' }) : ''
+  const fsGroupCtx = app.modules.contextFor({ chat: { chatId: 'feishu:group:oc_g1', kind: 'group', groupId: 'oc_g1', platform: 'feishu', userId: 'ou_owner' }, level: 'social' })
   assert.match(fsCtx, /飞书可用上下文/)
   assert.doesNotMatch(fsCtx, /QQ专属上下文泄露/)
   assert.doesNotMatch(fsCtx, QQ_LEAK_RE)
+  assert.doesNotMatch(fsGroupCtx, /QQ/)
+  const fsGroupTools = app.modules.buildTools({ chat: { chatId: 'feishu:group:oc_g1', kind: 'group', groupId: 'oc_g1', platform: 'feishu', userId: 'ou_owner' }, level: 'social', sessionId: 's-fs-g' })
+  const fsAdminTool = fsGroupTools.find((x) => x.name === 'group_admin')
+  assert.ok(fsAdminTool)
+  assert.deepEqual(fsAdminTool.parameters.properties.action.enum, ['kick', 'list_members'])
+  assert.doesNotMatch(JSON.stringify(fsAdminTool), /QQ/)
 
   // 4) 真正走一条飞书入站消息，验证完整回合里的 ctxText / 命令面无 QQ 内容
   fsAdapter.pushInbound({

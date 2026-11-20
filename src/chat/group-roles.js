@@ -6,10 +6,17 @@ import { dirname } from 'node:path'
 import { normalizeChatId, parseChatId } from '../gateway/address.js'
 
 const TTL = 10 * 60_000
-export const ROLE_LABEL = { owner: '群主', admin: '管理员', member: '普通成员' }
+export const ROLE_LABEL = { owner: '群主', admin: '管理员', member: '普通成员', unknown: '未知' }
 
 const ONE_BOT_ACTIONS = Object.freeze({ ban: true, unban: true, kick: true, wholeBan: true, title: true, notice: true })
 const NO_ACTIONS = Object.freeze({ ban: false, unban: false, kick: false, wholeBan: false, title: false, notice: false })
+
+function platformDisplayName(plat) {
+  if (plat === 'qqbot') return 'QQ 官方机器人'
+  if (plat === 'feishu') return '飞书'
+  if (plat === 'qq') return 'QQ 网关'
+  return plat ? `平台 ${plat}` : '平台'
+}
 
 function readBindingsFile(file) {
   if (!file || !existsSync(file)) return {}
@@ -255,7 +262,7 @@ export function createGroupRoles({ onebot = null, gateway = null, getGateway = n
             : '当前平台不支持群管理能力',
         }
       }
-      const reason = ga ? '' : (parsed.platform === defPlat ? 'QQ 网关未连接' : 'QQ 官方机器人未连接')
+      const reason = ga ? '' : (parsed.platform === defPlat ? 'QQ 网关未连接' : `${platformDisplayName(parsed.platform)}未连接`)
       return {
         backend: 'gateway-admin',
         platform: parsed.platform,
@@ -314,7 +321,7 @@ export function createGroupRoles({ onebot = null, gateway = null, getGateway = n
     if (boundMatch) {
       const ga = gw?.groupAdmin?.(boundMatch.instance) || null
       const instRow = gw?.instances?.().find((x) => x.instance === boundMatch.instance)
-      const reason = ga ? '' : (!gw || !instRow || instRow.state !== 'connected' ? 'QQ 官方机器人未连接' : '当前平台不支持群管理能力')
+      const reason = ga ? '' : (!gw || !instRow || instRow.state !== 'connected' ? `${platformDisplayName(boundMatch.platform)}未连接` : '当前平台不支持群管理能力')
       return {
         backend: 'gateway-admin',
         platform: boundMatch.platform,
@@ -398,11 +405,17 @@ export function createGroupRoles({ onebot = null, gateway = null, getGateway = n
   const canManage = (role) => role === 'owner' || role === 'admin'
   const label = (role) => ROLE_LABEL[role] || '不清楚'
 
-  function mapGatewayRoleError(error, isDefPlat = false) {
+  function mapGatewayRoleError(error, isDefPlat = false, platform = '') {
     const code = String(error?.code || '')
-    if (code === 'group-admin-forbidden') return '未获得 QQ 官方群管理接口权限（11253）'
+    if (code === 'group-admin-forbidden') {
+      if (platform === 'feishu') return error?.message || '飞书应用未获得群管理接口权限'
+      return '未获得 QQ 官方群管理接口权限（11253）'
+    }
     if (code === 'group-admin-not-admin') return '机器人不是管理员'
-    if (code === 'group-admin-unsupported') return isDefPlat ? '当前 QQ 网关不支持该接口' : '当前 QQ 官方机器人不支持该接口'
+    if (code === 'group-admin-unsupported') {
+      if (platform === 'feishu') return '当前飞书实例不支持该接口'
+      return isDefPlat ? '当前 QQ 网关不支持该接口' : '当前 QQ 官方机器人不支持该接口'
+    }
     if (code === 'group-admin-rate-limited') return '查询触发平台频率限制，请稍后再试'
     return error?.message || '查询失败'
   }
@@ -434,7 +447,7 @@ export function createGroupRoles({ onebot = null, gateway = null, getGateway = n
           label: isDefPlat ? '查不到（她在群里吗？）' : '查不到',
           canManage: false,
           supported: false,
-          reason: spec.reason || (isDefPlat ? 'QQ 网关未连接' : 'QQ 官方机器人未连接'),
+          reason: spec.reason || (isDefPlat ? 'QQ 网关未连接' : `${platformDisplayName(spec.platform)}未连接`),
           actions: NO_ACTIONS,
           backend: 'gateway-admin',
           platform: spec.platform,
@@ -446,17 +459,20 @@ export function createGroupRoles({ onebot = null, gateway = null, getGateway = n
       }
       try {
         const st = await spec.groupAdmin.getBotState(spec.openid)
-        const role = ['owner', 'admin', 'member'].includes(st?.role) ? st.role : 'member'
-        const manageable = canManage(role)
+        const isUnknown = st?.role === 'unknown' || Boolean(st?.unknownRole)
+        const role = isUnknown ? 'unknown' : (['owner', 'admin', 'member'].includes(st?.role) ? st.role : 'member')
+        const manageable = isUnknown ? true : canManage(role)
         const defaultActions = isDefPlat
           ? ONE_BOT_ACTIONS
-          : { ban: true, unban: true, kick: true, wholeBan: false, title: false, notice: false }
+          : (spec.platform === 'feishu'
+              ? { ban: false, unban: false, kick: true, wholeBan: false, title: false, notice: false, listMembers: true }
+              : { ban: true, unban: true, kick: true, wholeBan: false, title: false, notice: false })
         const info = {
           role,
           label: ROLE_LABEL[role] || '不清楚',
           canManage: manageable,
           supported: true,
-          reason: manageable ? '' : '机器人不是管理员',
+          reason: isUnknown ? (st?.reason || '平台未暴露管理员列表，执行时以 API 结果为准') : (manageable ? '' : '机器人不是管理员'),
           actions: spec.groupAdmin.supportedActions || defaultActions,
           backend: 'gateway-admin',
           platform: spec.platform,
@@ -464,12 +480,12 @@ export function createGroupRoles({ onebot = null, gateway = null, getGateway = n
           groupOpenid: spec.openid,
           memberOpenid: st?.memberOpenid || '',
           alias: spec.alias || '',
-          name: spec.name || '',
+          name: spec.name || st?.groupName || '',
         }
         cache.set(spec.cacheKey, { at: Date.now(), info })
         return info
       } catch (error) {
-        const reason = mapGatewayRoleError(error, isDefPlat)
+        const reason = mapGatewayRoleError(error, isDefPlat, spec.platform)
         return {
           role: '',
           label: isDefPlat ? '查不到（她在群里吗？）' : '查不到',

@@ -1,4 +1,4 @@
-// 内置模块：群管。主人开口时禁言、解禁、踢人、改头衔、发公告；支持 QQ 直连与 QQ 官方机器人双后端。
+// 内置模块：群管。主人开口时按后端能力执行群管理（QQ 直连 / QQ 官方机器人 / 飞书）。
 
 import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs'
 
@@ -26,6 +26,7 @@ const unwrapMentionToken = (s) => {
 }
 
 const isStrictOpenid = (s) => /^[0-9A-Fa-f]{24,64}$/.test(s)
+const isFeishuOpenid = (s) => /^ou_[0-9A-Za-z_-]{2,128}$/.test(s)
 const looksLikeOpenid = (s) => /^[0-9A-Za-z_-]{8,}$/.test(s) && (/[0-9_-]/.test(s) || /^[0-9A-F]{16,}$/i.test(s))
 
 function matchMemberCandidates(list, rawQuery) {
@@ -46,7 +47,12 @@ function matchMemberCandidates(list, rawQuery) {
 function backendLabelOf(info, spec) {
   const b = info?.backend || spec?.backend
   const p = info?.platform || spec?.platform
-  if (b === 'gateway-admin') return p === 'qqbot' ? 'QQ 官方机器人' : (p === 'qq' ? 'QQ 网关' : `${p || '平台'}网关`)
+  if (b === 'gateway-admin') {
+    if (p === 'qqbot') return 'QQ 官方机器人'
+    if (p === 'feishu') return '飞书群管'
+    if (p === 'qq') return 'QQ 网关'
+    return `${p || '平台'}网关`
+  }
   if (info?.unbound || spec?.unbound) return '未绑定 QQ 官方群'
   if (b === 'none') return '不可用'
   return 'QQ 直连'
@@ -61,12 +67,12 @@ export default {
   name: '群管',
   version: '1.1.0',
   api: 3,
-  platforms: ['qq', 'qqbot'],
+  platforms: ['qq', 'qqbot', 'feishu'],
   features: {
     optional: ['chat.member.list'],
   },
   toolAliases,
-  description: '主人要求时做群管理：QQ 直连支持禁言/解禁/全体禁言/踢人/改头衔/发公告；QQ 官方机器人支持禁言/解禁/踢人/查成员，并支持从 @ 提及与成员列表自动解析 member_openid（group_admin）',
+  description: '主人要求时做群管理：QQ 直连支持禁言/解禁/全体禁言/踢人/改头衔/发公告；QQ 官方机器人支持禁言/解禁/踢人/查成员；飞书支持踢人/查成员（不支持禁言/全体禁言/头衔/公告）（group_admin）',
   setup(api) {
     const { hub, onebot, groupRoles, gateway, http } = api.core
     const groupNameCache = new Map() // chatId -> { name, at }
@@ -261,7 +267,7 @@ export default {
       }
     }
 
-    async function fetchQqbotMembers(ga, groupOpenid, chatId) {
+    async function fetchGatewayMembers(ga, groupOpenid, chatId) {
       const merged = new Map()
       let observedDirty = false
       const upsert = (item, persist = false) => {
@@ -308,15 +314,24 @@ export default {
       return { members: [...merged.values()], fromApi: apiFetched && !apiError, error: apiError }
     }
 
-    async function resolveQqbotTarget({ rawUserId, rawMemberOpenid, chatId, groupOpenid, ga, identity, platform, action }) {
+    async function resolveGatewayTarget({ rawUserId, rawMemberOpenid, chatId, groupOpenid, ga, identity, platform, action }) {
       const formatCandidates = (list) => list.slice(0, 6).map((m) => (m.nick ? `${m.nick}(${m.openid})` : m.openid)).join('、')
+      const isFeishu = platform === 'feishu'
+      const idLabel = isFeishu ? 'open_id' : 'member_openid'
+      const noNumericMsg = isFeishu
+        ? '飞书不能按 QQ 号操作，请在群里 @ 对方、填群成员昵称，或先用 list_members 查出飞书 open_id（ou_ 开头）'
+        : 'QQ 官方机器人不能按 QQ 号操作，请在群里 @ 对方、填群成员昵称，或先用 list_members 查出 member_openid'
 
       if (String(rawMemberOpenid || '').trim()) {
         const explicit = unwrapMentionToken(rawMemberOpenid)
         if (/^\d{5,15}$/.test(explicit)) {
-          return { error: 'QQ 官方机器人不能按 QQ 号操作，请在群里 @ 对方、填群成员昵称，或先用 list_members 查出 member_openid' }
+          return { error: noNumericMsg }
         }
-        if (!/^[0-9A-Za-z_-]{4,128}$/.test(explicit)) {
+        if (isFeishu) {
+          if (!isFeishuOpenid(explicit)) {
+            return { error: '飞书 open_id 格式不对（应以 ou_ 开头），请在群里 @ 对方、填群成员昵称，或先用 list_members 查出 open_id' }
+          }
+        } else if (!/^[0-9A-Za-z_-]{4,128}$/.test(explicit)) {
           return { error: 'member_openid 格式不对，请在群里 @ 对方、填群成员昵称，或先用 list_members 查出 member_openid' }
         }
         return { openid: explicit, nick: '', via: 'explicit' }
@@ -336,19 +351,19 @@ export default {
           return { error: `这一轮 @ 了多位成员，请明确指定要操作谁：${formatCandidates(candidates)}` }
         }
         if (mentionState.expired) {
-          return { error: '上一次 @ 已超过 3 分钟，请重新 @ 对方、提供群昵称，或先用 list_members 查出 member_openid' }
+          return { error: `上一次 @ 已超过 3 分钟，请重新 @ 对方、提供群昵称，或先用 list_members 查出 ${idLabel}` }
         }
-        return { error: '要说清楚对谁操作：可在群里 @ 对方、填对方群昵称，或先用 list_members 查出 member_openid' }
+        return { error: `要说清楚对谁操作：可在群里 @ 对方、填对方群昵称，或先用 list_members 查出 ${idLabel}` }
       }
 
       const cleaned = unwrapMentionToken(raw.replace(/^@+/, '').trim())
       if (/^\d{5,15}$/.test(cleaned)) {
-        return { error: 'QQ 官方机器人不能按 QQ 号操作，请在群里 @ 对方、填群成员昵称，或先用 list_members 查出 member_openid' }
+        return { error: noNumericMsg }
       }
 
       const mentionHit = matchMemberCandidates(mentions, cleaned)
       if (mentionHit?.ambiguous) {
-        return { error: `这一轮 @ 的成员中有重名，请改用 member_openid 指定：${formatCandidates(mentionHit.ambiguous)}` }
+        return { error: `这一轮 @ 的成员中有重名，请改用 ${idLabel} 指定：${formatCandidates(mentionHit.ambiguous)}` }
       }
       if (mentionHit) return { ...mentionHit, via: 'mention' }
 
@@ -357,25 +372,25 @@ export default {
       if (obsExact) return { openid: obsExact.openid, nick: obsExact.nick, via: 'observed' }
       if (isOwner(identity, cleaned, platform)) return { openid: cleaned, nick: '', via: 'explicit' }
 
-      if (isStrictOpenid(cleaned)) {
+      if (isFeishu ? isFeishuOpenid(cleaned) : isStrictOpenid(cleaned)) {
         return { openid: cleaned, nick: obsExact?.nick || '', via: 'explicit' }
       }
 
-      const { members, fromApi, error } = await fetchQqbotMembers(ga, groupOpenid, chatId)
+      const { members, fromApi, error } = await fetchGatewayMembers(ga, groupOpenid, chatId)
       const hit = matchMemberCandidates(members, cleaned)
       if (hit?.ambiguous) {
-        return { error: `匹配到多位群成员，请改用 member_openid 指定：${formatCandidates(hit.ambiguous)}` }
+        return { error: `匹配到多位群成员，请改用 ${idLabel} 指定：${formatCandidates(hit.ambiguous)}` }
       }
       if (hit) return { ...hit, via: fromApi ? 'members' : 'observed' }
 
-      if (looksLikeOpenid(cleaned)) {
+      if (!isFeishu && looksLikeOpenid(cleaned)) {
         return { openid: cleaned, nick: '', via: 'explicit' }
       }
 
       if (error) {
-        return { error: `按「${cleaned}」找不到对应的 member_openid（${error}）；请在群里 @ 对方或直接提供 member_openid` }
+        return { error: `按「${cleaned}」找不到对应的 ${idLabel}（${error}）；请在群里 @ 对方或直接提供 ${idLabel}` }
       }
-      return { error: `群成员列表里没找到「${cleaned}」，请确认昵称或在群里 @ 对方 / 用 list_members 查看 member_openid` }
+      return { error: `群成员列表里没找到「${cleaned}」，请确认昵称或在群里 @ 对方 / 用 list_members 查看 ${idLabel}` }
     }
 
     const platformEntries = (prefix) => Object.entries(api.config?.()?.platforms || {})
@@ -383,17 +398,25 @@ export default {
 
     const hasQqDirectEnabled = () => platformEntries('qq').length > 0 || Boolean(onebot?.connected?.())
     const hasQqbotEnabled = () => platformEntries('qqbot').length > 0
+    const hasFeishuEnabled = () => platformEntries('feishu').length > 0
 
-    const isQqbotOnlyChat = (chat) => {
+    const resolveToolMode = (chat) => {
       const info = chat?.kind === 'group' ? roleInfoSync(chat) : null
       const chatPlat = String(chat?.platform || parseChatId(normChatKey(chat?.chatId))?.platform || '')
       if (chat?.kind === 'group') {
-        if (info?.backend === 'gateway-admin' && info?.platform !== 'qq') return true
-        return chatPlat === 'qqbot'
+        const effPlat = info?.backend === 'gateway-admin' && info?.platform ? info.platform : chatPlat
+        if (effPlat === 'feishu') return 'feishu'
+        if (effPlat === 'qqbot' || (info?.backend === 'gateway-admin' && info?.platform && info.platform !== 'qq')) return 'qqbot'
+        return 'qq'
       }
-      if (chatPlat === 'qqbot') return true
-      if (chatPlat === 'qq') return false
-      return !hasQqDirectEnabled() && hasQqbotEnabled()
+      if (chatPlat === 'feishu') return 'feishu'
+      if (chatPlat === 'qqbot') return 'qqbot'
+      if (chatPlat === 'qq') return 'qq'
+      if (!hasQqDirectEnabled()) {
+        if (hasFeishuEnabled() && !hasQqbotEnabled()) return 'feishu'
+        if (hasQqbotEnabled()) return 'qqbot'
+      }
+      return 'qq'
     }
 
     // 她在这个群的身份：没管理权限或无官方接口权限时直接如实说明
@@ -401,16 +424,33 @@ export default {
       if (chat.kind !== 'group') return ''
       const info = roleInfoSync(chat)
       const role = info?.role || ''
-      const isQqbotGroup = isQqbotOnlyChat(chat)
-      const mentions = isQqbotGroup ? freshOwnerMentions(chat.chatId) : []
+      const mode = resolveToolMode(chat)
+      const mentions = mode === 'qqbot' || mode === 'feishu' ? freshOwnerMentions(chat.chatId) : []
+      const idLabel = mode === 'feishu' ? 'open_id' : 'member_openid'
       const mentionHint = mentions.length
-        ? `\n本轮主人刚刚 @ 的群成员：${mentions.map((m) => (m.nick ? `${m.nick}（member_openid=${m.openid}）` : `member_openid=${m.openid}`)).join('、')}。`
+        ? `\n本轮主人刚刚 @ 的群成员：${mentions.map((m) => (m.nick ? `${m.nick}（${idLabel}=${m.openid}）` : `${idLabel}=${m.openid}`)).join('、')}。`
         : ''
+      if (mode === 'feishu') {
+        if (!role) {
+          if (info?.backend === 'gateway-admin' && info.reason) {
+            return `当前飞书群管理暂不可用（${info.reason}）；主人让你查询成员或踢人时，直接如实说明原因。`
+          }
+          return `当前为飞书群，可用 group_admin 查询群成员（list_members）并在机器人是群管理员/群主时踢出成员（kick），接受对方昵称/@昵称或飞书 open_id（ou_ 开头）。飞书当前不支持按成员单人禁言、限时禁言、全体禁言、改专属头衔或发群公告；也不要把“群发言权限”说成单人禁言。${mentionHint}`
+        }
+        if (role === 'member') {
+          return `你在这个飞书群只是普通成员，没有管理权限：踢人做不了（仍可用 group_admin 的 list_members 查成员）；不支持单人禁言、全体禁言、改头衔或发公告。${mentionHint}`
+        }
+        const canKickNow = info?.actions?.kick !== false
+        const roleNote = role === 'unknown'
+          ? '你在当前飞书群的管理身份待确认（飞书未返回管理员列表）'
+          : `你在这个飞书群是${groupRoles.label(role)}`
+        return `${roleNote}。主人要求时可以用 group_admin ${canKickNow ? '查成员（list_members）或踢出成员（kick）；可直接填对方昵称/@昵称或飞书 open_id（ou_ 开头），若主人刚在消息里 @ 了对方也可以直接调工具自动识别' : '查成员（list_members，当前移出成员能力不可用）'}。飞书当前不支持按成员单人禁言（ban）、限时禁言、全体禁言（whole_ban）、改专属头衔或发群公告；不要把“群发言权限”说成单人禁言，也不要写斜杠命令。${mentionHint}`
+      }
       if (!role) {
         if (info?.backend === 'gateway-admin' && info?.platform !== 'qq' && info.reason) {
           return `当前群的 QQ 官方机器人群管理暂不可用（${info.reason}）；主人让你禁言或踢人时，直接如实说明原因。`
         }
-        if (isQqbotGroup) {
+        if (mode === 'qqbot') {
           return `QQ 官方机器人群可用 group_admin 执行单人禁言（ban）/ 解禁（unban）/ 踢人（kick）/ 查成员（list_members），接受对方昵称/@昵称或 member_openid（不能填 QQ 号）。QQ 官方机器人只支持单人禁言；用户说「群禁言」时先问清是全体禁言还是禁言某个人，全体禁言做不了。${mentionHint}`
         }
         return ''
@@ -427,37 +467,60 @@ export default {
     // 工具层校验：这一轮说话的人必须全是主人
     api.tool(({ chat, level, sessionId }) => {
       if (!(chat.kind === 'group' || level === 'full')) return []
-      const qqbotOnly = isQqbotOnlyChat(chat)
-      const properties = {
-        action: qqbotOnly
-          ? {
+      const mode = resolveToolMode(chat)
+      const info = chat?.kind === 'group' ? roleInfoSync(chat) : null
+      const parsedChat = parseChatId(normChatKey(chat?.chatId || ''))
+      const instForGa = info?.instance || parsedChat?.instance || (mode === 'feishu' ? (platformEntries('feishu')[0]?.[0] || 'feishu') : '')
+      const gaTool = instForGa ? gateway?.groupAdmin?.(instForGa) : null
+      const feishuCanKick = info?.actions?.kick !== false && gaTool?.supportedActions?.kick !== false
+      const properties = mode === 'feishu'
+        ? {
+            action: {
               type: 'string',
-              enum: ['ban', 'unban', 'kick', 'list_members'],
-              description: 'ban 单人禁言，unban 解禁，kick 踢出，list_members 列出群成员及 member_openid（QQ 官方机器人不支持全体禁言/改头衔/发公告）',
-            }
-          : {
-              type: 'string',
-              enum: ['ban', 'unban', 'whole_ban', 'whole_unban', 'kick', 'title', 'notice', 'list_members'],
-              description: 'ban 单人禁言，unban 解禁，whole_ban 全体禁言（仅 QQ 直连），whole_unban 解除全体禁言（仅 QQ 直连），kick 踢出，title 改专属头衔（仅 QQ 直连），notice 发公告（仅 QQ 直连），list_members 列出群成员及 member_openid',
+              enum: feishuCanKick ? ['kick', 'list_members'] : ['list_members'],
+              description: feishuCanKick
+                ? 'kick 移出群成员（需机器人为群管理员），list_members 列出群成员及 open_id（飞书不支持禁言/全体禁言/改头衔/发公告）'
+                : 'list_members 列出群成员及 open_id（当前飞书实例不支持踢出成员及禁言/头衔/公告）',
             },
-        group_id: qqbotOnly
-          ? str('规范群地址（如 qqbot:group:xxx）或已绑定群号；在群里用时可省略，默认当前群')
-          : str('群号或规范群地址（如 qqbot:group:xxx）；在群里用时可省略，默认当前群'),
-        user_id: qqbotOnly
-          ? str('操作对象：填对方群昵称 / @昵称 / member_openid，若主人刚 @ 了对方也可省略自动匹配（不可填纯数字 QQ 号）')
-          : str('操作对象：QQ 直连群填对方 QQ 号；QQ 官方机器人群可填对方群昵称 / @昵称 / member_openid，若主人刚 @ 了对方也可省略自动匹配（不可填纯数字 QQ 号）'),
-        member_openid: str('可选，明确指定 QQ 官方机器人群目标成员的 member_openid'),
-        query: str('可选，action=list_members 时按昵称或 ID 筛选成员'),
-        minutes: int('禁言分钟数，默认 10；QQ 官方机器人最长 43200（30 天）'),
-      }
-      if (!qqbotOnly) {
+            group_id: str('飞书群 chat_id（如 oc_xxx 或 feishu:group:oc_xxx）；在群里用时可省略，默认当前群'),
+            user_id: str('操作对象：填对方群昵称 / @昵称 / 飞书 open_id（ou_ 开头），若主人刚 @ 了对方也可省略自动匹配'),
+            member_openid: str('可选，明确指定飞书群目标成员的 open_id（ou_ 开头，不能跨群复用）'),
+            query: str('可选，action=list_members 时按昵称或 open_id 筛选成员'),
+          }
+        : {
+            action: mode === 'qqbot'
+              ? {
+                  type: 'string',
+                  enum: ['ban', 'unban', 'kick', 'list_members'],
+                  description: 'ban 单人禁言，unban 解禁，kick 踢出，list_members 列出群成员及 member_openid（QQ 官方机器人不支持全体禁言/改头衔/发公告）',
+                }
+              : {
+                  type: 'string',
+                  enum: ['ban', 'unban', 'whole_ban', 'whole_unban', 'kick', 'title', 'notice', 'list_members'],
+                  description: 'ban 单人禁言，unban 解禁，whole_ban 全体禁言（仅 QQ 直连），whole_unban 解除全体禁言（仅 QQ 直连），kick 踢出，title 改专属头衔（仅 QQ 直连），notice 发公告（仅 QQ 直连），list_members 列出群成员及 member_openid',
+                },
+            group_id: mode === 'qqbot'
+              ? str('规范群地址（如 qqbot:group:xxx）或已绑定群号；在群里用时可省略，默认当前群')
+              : str('群号或规范群地址（如 qqbot:group:xxx）；在群里用时可省略，默认当前群'),
+            user_id: mode === 'qqbot'
+              ? str('操作对象：填对方群昵称 / @昵称 / member_openid，若主人刚 @ 了对方也可省略自动匹配（不可填纯数字 QQ 号）')
+              : str('操作对象：QQ 直连群填对方 QQ 号；QQ 官方机器人群可填对方群昵称 / @昵称 / member_openid，若主人刚 @ 了对方也可省略自动匹配（不可填纯数字 QQ 号）'),
+            member_openid: str('可选，明确指定 QQ 官方机器人群目标成员的 member_openid'),
+            query: str('可选，action=list_members 时按昵称或 ID 筛选成员'),
+            minutes: int('禁言分钟数，默认 10；QQ 官方机器人最长 43200（30 天）'),
+          }
+      if (mode === 'qq') {
         properties.text = str('头衔内容或公告内容（QQ 官方机器人不支持）')
       }
       return defineTool({
         name: 'group_admin',
-        description: qqbotOnly
-          ? 'QQ 官方机器人群管理：仅支持单人禁言（ban）/ 解禁（unban）/ 踢人（kick）/ 查成员（list_members），不支持全体禁言。可直接填群昵称/@昵称、填 member_openid，或在主人 @ 对方后省略目标自动识别。只有主人单独发话时才能用。'
-          : '群管理：单人禁言（ban）/ 解禁（unban）/ 踢人（kick）/ 查成员（list_members）；QQ 直连群还支持全体禁言（whole_ban/whole_unban）/ 改头衔（title）/ 发公告（notice）。QQ 官方机器人群可直接填群昵称/@昵称、填 member_openid，或在主人 @ 对方后省略目标自动识别。只有主人单独发话时才能用。',
+        description: mode === 'feishu'
+          ? (feishuCanKick
+              ? '飞书群管理：支持移出群成员（kick）/ 查成员（list_members）；不支持单人禁言、定时禁言、全体禁言、改头衔或发公告。可直接填群昵称/@昵称、填 open_id（ou_ 开头），或在主人 @ 对方后省略目标自动识别。只有主人单独发话时才能用。'
+              : '飞书群管理（只读）：仅支持列出群成员（list_members）；不支持踢人及禁言/全体禁言/改头衔/发公告。只有主人单独发话时才能用。')
+          : (mode === 'qqbot'
+              ? 'QQ 官方机器人群管理：仅支持单人禁言（ban）/ 解禁（unban）/ 踢人（kick）/ 查成员（list_members），不支持全体禁言。可直接填群昵称/@昵称、填 member_openid，或在主人 @ 对方后省略目标自动识别。只有主人单独发话时才能用。'
+              : '群管理：单人禁言（ban）/ 解禁（unban）/ 踢人（kick）/ 查成员（list_members）；QQ 直连群还支持全体禁言（whole_ban/whole_unban）/ 改头衔（title）/ 发公告（notice）。QQ 官方机器人群可直接填群昵称/@昵称、填 member_openid，或在主人 @ 对方后省略目标自动识别。只有主人单独发话时才能用。'),
         properties,
         required: ['action'],
         execute: async ({ action, group_id, user_id, member_openid, query, minutes, text }) => {
@@ -555,22 +618,29 @@ export default {
             }
 
             const ga = spec.groupAdmin || gateway?.groupAdmin?.(spec.instance)
+            const isFeishu = spec.platform === 'feishu'
+            const platLabel = isFeishu ? '飞书' : 'QQ 官方机器人'
+            const idLabel = isFeishu ? 'open_id' : 'member_openid'
             if (action === 'list_members') {
-              if (!ga) return { ok: false, message: 'QQ 官方机器人未连接，无法查询群成员' }
-              const { members, error } = await fetchQqbotMembers(ga, spec.openid, targetChatId)
+              if (!ga) return { ok: false, message: `${platLabel}未连接，无法查询群成员` }
+              const { members, error } = await fetchGatewayMembers(ga, spec.openid, targetChatId)
               const q = String(query || text || '').trim().toLowerCase()
               const filtered = q
                 ? members.filter((m) => String(m.nick || '').toLowerCase().includes(q) || String(m.openid || '').toLowerCase().includes(q))
                 : members
               if (!filtered.length && error) {
-                return { ok: false, message: `${error}；也可以直接在群里 @ 对方让助手识别 member_openid` }
+                return { ok: false, message: `${error}；也可以直接在群里 @ 对方让助手识别 ${idLabel}` }
               }
               const shown = filtered.slice(0, 50)
               const lines = shown.map((m) => {
                 const label = m.nick ? `${m.nick}（${m.openid}）` : m.openid
                 return m.role ? `${label}[${m.role}]` : label
               })
-              const note = error ? `（官方成员列表接口受限：${error}；以下为近期群内 @/发言缓存）` : ''
+              const note = error
+                ? (isFeishu
+                    ? `（飞书成员列表接口受限：${error}；以下为近期群内 @/发言缓存）`
+                    : `（官方成员列表接口受限：${error}；以下为近期群内 @/发言缓存）`)
+                : ''
               return {
                 ok: true,
                 count: filtered.length,
@@ -579,14 +649,35 @@ export default {
               }
             }
 
-            if (UNSUPPORTED_QQBOT_ACTIONS[action]) {
-              return { ok: false, message: `QQ 官方机器人当前不支持${UNSUPPORTED_QQBOT_ACTIONS[action]}` }
-            }
-            if (!['ban', 'unban', 'kick'].includes(action)) {
-              return { ok: false, message: '不认识的操作' }
+            if (isFeishu) {
+              if (action === 'ban' || action === 'unban') {
+                return { ok: false, message: '飞书当前不支持按成员禁言/解禁（飞书开放平台无单人禁言接口）' }
+              }
+              if (action === 'whole_ban' || action === 'whole_unban') {
+                return { ok: false, message: '飞书当前不支持全体禁言（群发言权限不等同于禁言）' }
+              }
+              if (action === 'title') {
+                return { ok: false, message: '飞书当前不支持改专属头衔' }
+              }
+              if (action === 'notice') {
+                return { ok: false, message: '飞书当前不支持发群公告' }
+              }
+              if (action !== 'kick') {
+                return { ok: false, message: '不认识的操作' }
+              }
+              if (ga?.supportedActions?.kick === false || (ga && typeof ga.kickMember !== 'function')) {
+                return { ok: false, message: '当前飞书实例不支持移出群成员' }
+              }
+            } else {
+              if (UNSUPPORTED_QQBOT_ACTIONS[action]) {
+                return { ok: false, message: `QQ 官方机器人当前不支持${UNSUPPORTED_QQBOT_ACTIONS[action]}` }
+              }
+              if (!['ban', 'unban', 'kick'].includes(action)) {
+                return { ok: false, message: '不认识的操作' }
+              }
             }
 
-            const resolved = await resolveQqbotTarget({
+            const resolved = await resolveGatewayTarget({
               rawUserId: user_id,
               rawMemberOpenid: member_openid,
               chatId: targetChatId,
@@ -607,10 +698,38 @@ export default {
             // 动作前实时重新查询身份，不能仅凭旧缓存执行
             const info = await inspectRole(rawGroup, { fresh: true })
             if (!info.role) return { ok: false, message: info.reason || '当前无法确认机器人在该群的管理身份' }
-            if (!groupRoles.canManage(info.role)) return { ok: false, message: '我在这个群只是普通成员，没有管理权限' }
-            if (cfg.dryRun) return { ok: true, message: `试运行：本来要通过 QQ 官方机器人对群 ${spec.openid} 成员 ${resolvedOpenid} 做 ${action}` }
+            if (info.role !== 'unknown' && !groupRoles.canManage(info.role)) return { ok: false, message: '我在这个群只是普通成员，没有管理权限' }
 
-            if (!ga) return { ok: false, message: 'QQ 官方机器人未连接，无法执行群管' }
+            const botSelfId = String(
+              info?.memberOpenid
+              || gateway?.instances?.()?.find((x) => x.instance === spec.instance)?.self?.account
+              || '',
+            ).trim()
+            if (botSelfId && resolvedOpenid === botSelfId && action !== 'unban') {
+              return { ok: false, message: '不能对我自己做这个操作' }
+            }
+
+            // 飞书禁止跨群使用 open_id：显式或历史缓存命中时，若成员列表接口可用则先校验目标属于当前群
+            if (isFeishu && action === 'kick' && (resolved.via === 'explicit' || resolved.via === 'observed') && ga && typeof ga.listMembers === 'function') {
+              let liveMembers = null
+              try {
+                liveMembers = await ga.listMembers(spec.openid, { limit: 500 })
+              } catch {}
+              if (Array.isArray(liveMembers) && !liveMembers.some((m) => m.openid === resolvedOpenid)) {
+                return { ok: false, message: '该 open_id 不在当前飞书群的成员列表里（请用 list_members 核对，不能跨群复用 open_id）' }
+              }
+            }
+
+            if (cfg.dryRun) {
+              return {
+                ok: true,
+                message: isFeishu
+                  ? `试运行：本来要通过飞书对群 ${spec.openid} 成员 ${resolvedOpenid} 做 ${action}`
+                  : `试运行：本来要通过 QQ 官方机器人对群 ${spec.openid} 成员 ${resolvedOpenid} 做 ${action}`,
+              }
+            }
+
+            if (!ga) return { ok: false, message: `${platLabel}未连接，无法执行群管` }
 
             try {
               if (action === 'ban') {
@@ -623,9 +742,17 @@ export default {
               }
             } catch (error) {
               const base = error?.message || `群管操作失败（${action}）`
-              const knownStatusError = ['group-admin-forbidden', 'group-admin-not-admin', 'group-admin-rate-limited', 'group-admin-unsupported'].includes(error?.code)
+              if (error?.code === 'group-admin-not-member') {
+                return { ok: false, message: base }
+              }
+              const knownStatusError = ['group-admin-forbidden', 'group-admin-not-admin', 'group-admin-rate-limited', 'group-admin-unsupported', 'group-admin-not-member'].includes(error?.code)
               if (resolved.via === 'explicit' && !knownStatusError) {
-                return { ok: false, message: `${base}（该 member_openid 可能无效或不在本群，可用 list_members 核对）` }
+                return {
+                  ok: false,
+                  message: isFeishu
+                    ? `${base}（该 open_id 可能无效或不在本群，可用 list_members 核对）`
+                    : `${base}（该 member_openid 可能无效或不在本群，可用 list_members 核对）`,
+                }
               }
               return { ok: false, message: base }
             }
@@ -761,7 +888,7 @@ export default {
 
       const qqbotInstances = typeof gateway?.instances === 'function'
         ? gateway.instances()
-            .filter((x) => x?.enabled && x.platform !== 'qq' && (x.platform === 'qqbot' || Boolean(gateway.groupAdmin?.(x.instance))))
+            .filter((x) => x?.enabled && x.platform === 'qqbot')
             .map((x) => ({ instance: x.instance, platform: x.platform, name: x.name, state: x.state }))
         : []
 

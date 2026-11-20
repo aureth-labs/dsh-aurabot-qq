@@ -1450,6 +1450,51 @@ export function createFeishuAdapter(options = {}) {
     return r
   }
 
+  function groupAdminError(code, message) {
+    return Object.assign(new Error(message), { code, certainty: 'not-sent', instance })
+  }
+
+  function classifyGroupAdminError(status, json, actionLabel) {
+    const codeNum = Number(json?.code ?? 0)
+    const msg = String(json?.msg || json?.message || '').trim()
+    if (codeNum === 99991672 || codeNum === 99991663 || codeNum === 99991668 || status === 403) {
+      return groupAdminError('group-admin-forbidden', `飞书应用未获得群管理接口权限（${codeNum || status}）${msg ? '：' + msg : ''}`)
+    }
+    if (codeNum === 232010) {
+      return groupAdminError('group-admin-forbidden', `操作者与目标群不在同一飞书租户（232010）${msg ? '：' + msg : ''}`)
+    }
+    if (codeNum === 232025 || /not.*(owner|manager|admin)|no (permission|authority)|only.*(owner|manager|admin)/i.test(msg)) {
+      return groupAdminError('group-admin-not-admin', `机器人不是群管理员，无法${actionLabel}${msg ? '：' + msg : ''}`)
+    }
+    if (codeNum === 232027) {
+      return groupAdminError('group-admin-not-member', '目标成员不在本群或 open_id 无效（232027）')
+    }
+    if (codeNum === 232019 || status === 429) {
+      return groupAdminError('group-admin-rate-limited', `${actionLabel}触发飞书频率限制（${codeNum || 429}），请稍后再试`)
+    }
+    if (codeNum === 230002 || codeNum === 232002) {
+      return groupAdminError('group-admin-failed', `机器人不在该飞书群里（${codeNum}）`)
+    }
+    return groupAdminError('group-admin-failed', `${actionLabel}失败${msg ? '：' + msg : `（HTTP ${status || '?'} / code ${codeNum || '?'}）`}`)
+  }
+
+  async function requestGroupAdmin({ method, path, body, actionLabel }) {
+    if (!running || !connected) {
+      throw groupAdminError('group-admin-failed', '飞书平台端未连接')
+    }
+    let r
+    try {
+      r = await api(method, path, body)
+    } catch (error) {
+      if (error?.code && String(error.code).startsWith('group-admin-')) throw error
+      throw groupAdminError('group-admin-failed', `${actionLabel}失败：${error?.message || error}`)
+    }
+    if (r.status >= 200 && r.status < 300 && Number(r.json?.code ?? 0) === 0) {
+      return r.json?.data || {}
+    }
+    throw classifyGroupAdminError(r.status, r.json, actionLabel)
+  }
+
   // ───────────────────────── 平台端契约 ─────────────────────────
 
   const adapter = {
@@ -1883,6 +1928,112 @@ export function createFeishuAdapter(options = {}) {
         })
       }
       return toParts('text', JSON.stringify({ text: String(nativeMessage ?? '') }), [], { selfOpenId: String(self?.account || '') })
+    },
+
+    groupAdmin: {
+      supportedActions: Object.freeze({
+        ban: false,
+        unban: false,
+        kick: true,
+        wholeBan: false,
+        title: false,
+        notice: false,
+        listMembers: true,
+      }),
+      async getGroupInfo(chatId) {
+        const gid = String(chatId || '').trim()
+        if (!gid) throw groupAdminError('group-admin-failed', '缺少飞书群 chat_id')
+        const data = await requestGroupAdmin({
+          method: 'GET',
+          path: `${PATH_CHATS}/${encodeURIComponent(gid)}?user_id_type=open_id`,
+          actionLabel: '查询飞书群信息',
+        })
+        return {
+          groupOpenid: gid,
+          name: String(data.name || ''),
+          ...(Number.isFinite(Number(data.user_count)) ? { memberCount: Number(data.user_count) } : {}),
+          ...(data.owner_id ? { ownerId: String(data.owner_id) } : {}),
+        }
+      },
+      async getBotState(chatId) {
+        const gid = String(chatId || '').trim()
+        if (!gid) throw groupAdminError('group-admin-failed', '缺少飞书群 chat_id')
+        const data = await requestGroupAdmin({
+          method: 'GET',
+          path: `${PATH_CHATS}/${encodeURIComponent(gid)}?user_id_type=open_id`,
+          actionLabel: '查询飞书群管理身份',
+        })
+        const rawSelf = String(self?.account || '').trim()
+        const botOpenId = rawSelf && !rawSelf.startsWith('feishu-') ? rawSelf : ''
+        const appId = String(config().appId || '').trim()
+        const ownerId = String(data.owner_id || '').trim()
+        if (ownerId && ((botOpenId && ownerId === botOpenId) || (appId && ownerId === appId))) {
+          return {
+            role: 'owner',
+            groupOpenid: gid,
+            ...(botOpenId ? { memberOpenid: botOpenId } : {}),
+            ...(data.name ? { groupName: String(data.name) } : {}),
+          }
+        }
+        if (Array.isArray(data.bot_manager_id_list)) {
+          const managers = data.bot_manager_id_list.map((x) => String(x || '').trim()).filter(Boolean)
+          const isAdmin = managers.some((s) => (appId && s === appId) || (botOpenId && s === botOpenId))
+          return {
+            role: isAdmin ? 'admin' : 'member',
+            groupOpenid: gid,
+            ...(botOpenId ? { memberOpenid: botOpenId } : {}),
+            ...(data.name ? { groupName: String(data.name) } : {}),
+          }
+        }
+        return {
+          role: '',
+          unknownRole: true,
+          reason: '飞书未返回管理员列表，执行时以 API 结果为准',
+          groupOpenid: gid,
+          ...(botOpenId ? { memberOpenid: botOpenId } : {}),
+          ...(data.name ? { groupName: String(data.name) } : {}),
+        }
+      },
+      async listMembers(chatId, { startIndex = 0, limit = 100 } = {}) {
+        const gid = String(chatId || '').trim()
+        if (!gid) throw groupAdminError('group-admin-failed', '缺少飞书群 chat_id')
+        const seen = new Map()
+        let pageToken = ''
+        for (let pageNo = 0; pageNo < 5; pageNo++) {
+          const params = new URLSearchParams({ member_id_type: 'open_id', page_size: '100' })
+          if (pageToken) params.set('page_token', pageToken)
+          const data = await requestGroupAdmin({
+            method: 'GET',
+            path: `${PATH_CHATS}/${encodeURIComponent(gid)}/members?${params.toString()}`,
+            actionLabel: '查询飞书群成员列表',
+          })
+          for (const item of Array.isArray(data.items) ? data.items : []) {
+            const openid = String(item?.member_id || '').trim()
+            if (!openid || seen.has(openid)) continue
+            seen.set(openid, { openid, nick: String(item?.name || ''), role: '' })
+          }
+          if (!data.has_more || !data.page_token) break
+          pageToken = String(data.page_token)
+        }
+        const all = [...seen.values()]
+        const start = Math.max(0, Number(startIndex) || 0)
+        const take = Math.max(1, Math.min(500, Number(limit) || 100))
+        return all.slice(start, start + take)
+      },
+      async kickMember(chatId, memberOpenId) {
+        const gid = String(chatId || '').trim()
+        const uid = String(memberOpenId || '').trim()
+        if (!gid || !uid) throw groupAdminError('group-admin-failed', '缺少飞书群或成员 open_id')
+        const data = await requestGroupAdmin({
+          method: 'DELETE',
+          path: `${PATH_CHATS}/${encodeURIComponent(gid)}/members?member_id_type=open_id`,
+          body: { id_list: [uid] },
+          actionLabel: '移出飞书群成员',
+        })
+        if (Array.isArray(data.invalid_id_list) && data.invalid_id_list.map(String).includes(uid)) {
+          throw groupAdminError('group-admin-not-member', '目标成员不在本群或 open_id 无效')
+        }
+      },
     },
   }
 
