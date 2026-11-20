@@ -1064,7 +1064,17 @@ export function apply(ctx, opts = {}) {
         [createQqAdapter, 'qq'],
         [createFeishuAdapter, 'feishu'],
         [createQqbotAdapter, 'qqbot'],
-        [() => createWechatClawbotAdapter(opts?.wechatClient ? { client: opts.wechatClient } : undefined), 'wechat-clawbot'],
+        [() => createWechatClawbotAdapter({
+          ...(opts?.wechatClient ? { client: opts.wechatClient } : {}),
+          allowedLocalDirs: () => {
+            const c = getConfig()
+            return [
+              workspaceDirOf(c),
+              dataDir(),
+              ...(Array.isArray(c?.files?.dirs) ? c.files.dirs : []),
+            ].filter(Boolean)
+          },
+        }), 'wechat-clawbot'],
         [createBridgeAdapter, 'bridge'],
       ]) {
         try { platformGateway.register(() => factory()) } catch (error) { logger.child('gateway').warn(`注册平台端 ${id} 失败：`, error?.message || error) }

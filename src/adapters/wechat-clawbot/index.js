@@ -10,7 +10,7 @@
 //   4. 面板二维码登录通过 node 内置加密与本地 SVG 生成（不向第三方二维码服务泄漏 URL）。
 
 import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from 'node:crypto'
-import { isAbsolute, join, resolve, sep } from 'node:path'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { assertPublicUrl } from '../../core/net.js'
 import { ensureDir } from '../../core/store.js'
@@ -55,6 +55,7 @@ export const DEFAULT_MAX_TEXT_CHARS = 2000
 export const DEFAULT_MAX_FILE_BYTES = 20 * 1024 * 1024
 export const DEFAULT_TIMEOUT_MS = 15_000
 export const DEFAULT_POLL_TIMEOUT_MS = 35_000
+export const DEFAULT_STARTUP_WAIT_MS = 1500
 export const DEFAULT_CONTEXT_TOKEN_TTL_MS = 24 * 60 * 60 * 1000
 export const DEFAULT_TYPING_TICKET_TTL_MS = 9 * 60 * 1000
 const MAX_MEDIA_CACHE_ENTRIES = 500
@@ -541,7 +542,7 @@ export function parseInboundMessage(rawMsg, { selfAccount = '', allowGroup = fal
 
 /**
  * 建一个个人微信 ClawBot（原生 iLink）平台端。
- * @param {{ id?: string, name?: string, client?: ReturnType<typeof createIlinkHttpClient>, clock?: () => number, dataDir?: () => string }} [options]
+ * @param {{ id?: string, name?: string, client?: ReturnType<typeof createIlinkHttpClient>, clock?: () => number, dataDir?: () => string, assertUrl?: Function, allowLocalPath?: boolean, allowedLocalDirs?: string[] | (() => string[]), startupWaitMs?: number }} [options]
  */
 export function createWechatClawbotAdapter(options = {}) {
   const id = options.id || PLATFORM_ID
@@ -550,8 +551,17 @@ export function createWechatClawbotAdapter(options = {}) {
   const clock = options.clock || (() => Date.now())
   const httpClient = options.client || createIlinkHttpClient()
   const checkPublicUrl = typeof options.assertUrl === 'function' ? options.assertUrl : assertPublicUrl
-  const allowLocalPath = options.allowLocalPath !== false
-  const allowedLocalDirs = Array.isArray(options.allowedLocalDirs) ? options.allowedLocalDirs.map((d) => resolve(String(d))) : null
+  const hasAllowedDirsOption = options.allowedLocalDirs != null
+  // 安全默认值 fail-closed：未配置 allowedLocalDirs 时默认禁止本地路径，除非显式传 allowLocalPath: true
+  const allowLocalPath = options.allowLocalPath === true || (options.allowLocalPath !== false && hasAllowedDirsOption)
+
+  function resolveAllowedLocalDirs() {
+    const raw = typeof options.allowedLocalDirs === 'function'
+      ? options.allowedLocalDirs()
+      : options.allowedLocalDirs
+    if (!Array.isArray(raw)) return null
+    return raw.map((d) => String(d || '').trim()).filter(Boolean).map((d) => resolve(d))
+  }
 
   let ctx = null
   let running = false
@@ -562,6 +572,8 @@ export function createWechatClawbotAdapter(options = {}) {
   let pollGen = 0
   let pollAbort = null
   let backoffTimer = null
+  let serverPollTimeoutMs = 0
+  let startupSettle = null
 
   let syncBuf = ''
   const msgContextTokens = new Map() // messageId -> { token, chatId, at }
@@ -747,11 +759,18 @@ export function createWechatClawbotAdapter(options = {}) {
     ctx?.state?.('disconnected', reason || '微信 ClawBot 会话已过期（-14），请在面板重新扫码登录')
   }
 
-  async function pollLoop(myGen) {
+  async function pollLoop(myGen, onFirstRound) {
     let consecutiveFailures = 0
+    let firstNotified = false
+    const notifyFirst = (outcome) => {
+      if (firstNotified) return
+      firstNotified = true
+      onFirstRound?.(outcome)
+    }
+
     while (running && !stopped && myGen === pollGen) {
       const cfg = cfgOf()
-      const pollTimeoutMs = Math.max(5000, Math.min(65_000, Number(cfg.pollTimeoutMs) || DEFAULT_POLL_TIMEOUT_MS))
+      const pollTimeoutMs = Math.max(5000, Math.min(65_000, Number(cfg.pollTimeoutMs) || serverPollTimeoutMs || DEFAULT_POLL_TIMEOUT_MS))
       pollAbort = new AbortController()
       try {
         const r = await postIlink(
@@ -759,28 +778,36 @@ export function createWechatClawbotAdapter(options = {}) {
           { get_updates_buf: syncBuf, base_info: { channel_version: CHANNEL_VERSION } },
           { timeoutMs: pollTimeoutMs + 5000, signal: pollAbort.signal },
         )
-        if (!running || stopped || myGen !== pollGen) return
+        if (!running || stopped || myGen !== pollGen) {
+          notifyFirst({ status: 'stopped' })
+          return
+        }
 
         const json = r.json || {}
         const code = Number(json.errcode ?? json.ret ?? 0)
         if (code === SESSION_EXPIRED_ERRCODE) {
-          markSessionExpired('微信 ClawBot 会话已过期（-14），请在面板重新扫码登录')
+          const reason = '微信 ClawBot 会话已过期（-14），请在面板重新扫码登录'
+          markSessionExpired(reason)
+          notifyFirst({ status: 'expired', error: createSendError('not-sent', 'session-expired', instance, reason) })
           return
         }
         if (r.status === 401 || r.status === 403) {
-          markSessionExpired(`微信 ClawBot 授权失效（HTTP ${r.status}），请在面板重新扫码登录`)
+          const reason = `微信 ClawBot 授权失效（HTTP ${r.status}），请在面板重新扫码登录`
+          markSessionExpired(reason)
+          notifyFirst({ status: 'expired', error: createSendError('not-sent', 'session-expired', instance, reason) })
           return
         }
         if (r.status < 200 || r.status >= 300 || code !== 0) {
           throw new Error(formatWechatErrorSummary('iLink 长轮询失败', code || r.status, json.errmsg || r.text, [botTokenOf()]))
         }
 
-        if (consecutiveFailures > 0) {
-          consecutiveFailures = 0
-          if (!connected) {
-            connected = true
-            ctx?.state?.('connected')
-          }
+        if (Number(json.longpolling_timeout_ms) > 0) {
+          serverPollTimeoutMs = Math.max(5000, Math.min(65_000, Number(json.longpolling_timeout_ms)))
+        }
+        consecutiveFailures = 0
+        if (!connected) {
+          connected = true
+          ctx?.state?.('connected')
         }
         if (typeof json.get_updates_buf === 'string' && json.get_updates_buf !== syncBuf) {
           syncBuf = json.get_updates_buf
@@ -789,18 +816,34 @@ export function createWechatClawbotAdapter(options = {}) {
         for (const rawMsg of Array.isArray(json.msgs) ? json.msgs : []) {
           handleIncomingRaw(rawMsg)
         }
+        notifyFirst({ status: 'connected' })
       } catch (error) {
-        if (!running || stopped || myGen !== pollGen) return
-        if (error?.name === 'AbortError' && pollAbort?.signal?.aborted) return
+        if (!running || stopped || myGen !== pollGen) {
+          notifyFirst({ status: 'stopped' })
+          return
+        }
+        if (error?.name === 'AbortError' && pollAbort?.signal?.aborted) {
+          notifyFirst({ status: 'stopped' })
+          return
+        }
         if (error?.name === 'TimeoutError') {
-          // 长轮询正常超时：不记错误，直接下一轮
+          // 长轮询正常超时：不记错误、也不在未收到成功响应前伪造 connected，直接下一轮
           continue
         }
         consecutiveFailures++
-        if (consecutiveFailures >= 3 && connected) {
+        const errDetail = formatWechatErrorSummary(
+          connected ? '微信连接波动，正在重连' : '微信 iLink 首轮连接失败，正在重试',
+          '',
+          error?.message || error,
+          [botTokenOf()],
+        )
+        if (!connected && consecutiveFailures === 1) {
+          ctx?.state?.('connecting', errDetail)
+        } else if (consecutiveFailures >= 3 && connected) {
           connected = false
-          ctx?.state?.('connecting', formatWechatErrorSummary('微信连接波动，正在重连', '', error?.message, [botTokenOf()]))
+          ctx?.state?.('connecting', errDetail)
         }
+        notifyFirst({ status: 'retry', detail: errDetail })
         const waitMs = Math.min(30_000, 2000 * Math.pow(2, Math.min(4, consecutiveFailures - 1)))
         await new Promise((resolve) => {
           backoffTimer = setTimeout(resolve, waitMs)
@@ -872,13 +915,18 @@ export function createWechatClawbotAdapter(options = {}) {
     if (maxBytes > 0 && st.size > maxBytes) {
       throw createSendError('not-sent', 'too-large', instance, `本地文件 ${st.size} 字节超过微信上限 ${maxBytes}`)
     }
-    if (allowedLocalDirs && allowedLocalDirs.length) {
+    if (hasAllowedDirsOption) {
+      const dirs = resolveAllowedLocalDirs()
+      if (!dirs || !dirs.length) {
+        throw createSendError('not-sent', 'local-path-blocked', instance, '未配置允许读取的本地目录范围')
+      }
       let realFile
       try { realFile = realpathSync(p) } catch { realFile = resolve(p) }
-      const inside = allowedLocalDirs.some((d) => {
+      const inside = dirs.some((d) => {
         let realDir
         try { realDir = realpathSync(d) } catch { realDir = resolve(d) }
-        return realFile === realDir || realFile.startsWith(realDir.endsWith(sep) ? realDir : realDir + sep)
+        const rel = relative(realDir, realFile)
+        return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
       })
       if (!inside) {
         throw createSendError('not-sent', 'local-path-blocked', instance, '本地文件路径不在允许目录范围内')
@@ -1104,6 +1152,8 @@ export function createWechatClawbotAdapter(options = {}) {
       running = true
       stopped = false
       sessionExpired = false
+      connected = false
+      serverPollTimeoutMs = 0
       loadStateFiles()
 
       const allowGroup = cfg.allowGroup === true || cfg.allowGroup === 'true'
@@ -1131,41 +1181,30 @@ export function createWechatClawbotAdapter(options = {}) {
         clock,
       })
 
-      ctx.state('connecting', '正在校验微信 iLink 会话与连接…')
-      let probe
-      try {
-        probe = await postIlink(PATH_GET_CONFIG, {
-          ilink_user_id: botAccount,
-          base_info: { channel_version: CHANNEL_VERSION },
-        }, { timeoutMs: Math.min(timeoutMsOf(), 8000) })
-      } catch (error) {
-        running = false
-        connected = false
-        stopped = true
-        const msg = formatWechatErrorSummary('连接微信 iLink 失败', '', error?.message || error, [botTokenOf()])
-        ctx.state('disconnected', msg)
-        throw classifyTransportError(error, instance, '校验微信 iLink 会话')
-      }
-      const probeJson = probe.json || {}
-      const probeCode = Number(probeJson.errcode ?? probeJson.ret ?? 0)
-      if (probe.status === 401 || probe.status === 403 || probeCode === SESSION_EXPIRED_ERRCODE) {
-        markSessionExpired('微信 ClawBot 会话已过期（-14），请在面板重新扫码登录')
-        throw createSendError('not-sent', 'session-expired', instance, '微信 ClawBot 会话已过期（-14），请在面板重新扫码登录')
-      }
-      if (probe.status < 200 || probe.status >= 300 || probeCode !== 0) {
-        running = false
-        connected = false
-        stopped = true
-        const msg = formatWechatErrorSummary('校验微信 iLink 会话失败', probeCode || probe.status, probeJson.errmsg || probe.text, [botTokenOf()])
-        ctx.state('disconnected', msg)
-        throw createSendError('not-sent', `startup-probe-${probeCode || probe.status}`, instance, msg)
-      }
+      ctx.state('connecting', '正在连接微信 iLink 长轮询…')
 
-      connected = true
-      ctx.state('connected')
-
+      let settleFirst = null
+      const firstRoundDone = new Promise((resolve) => { settleFirst = resolve })
+      startupSettle = settleFirst
       const myGen = ++pollGen
-      void pollLoop(myGen)
+      void pollLoop(myGen, settleFirst)
+
+      const startupWaitMs = Math.max(0, Math.min(10_000, Number(options.startupWaitMs ?? cfg.startupWaitMs ?? DEFAULT_STARTUP_WAIT_MS)))
+      let waitTimer = null
+      const waitPromise = new Promise((resolve) => {
+        waitTimer = setTimeout(() => resolve({ status: 'pending' }), startupWaitMs)
+        waitTimer.unref?.()
+      })
+      let outcome
+      try {
+        outcome = await Promise.race([firstRoundDone, waitPromise])
+      } finally {
+        if (waitTimer) clearTimeout(waitTimer)
+        if (startupSettle === settleFirst) startupSettle = null
+      }
+      if (outcome?.status === 'expired') {
+        throw outcome.error
+      }
     },
 
     async stop() {
@@ -1173,6 +1212,8 @@ export function createWechatClawbotAdapter(options = {}) {
       running = false
       connected = false
       pollGen++
+      startupSettle?.({ status: 'stopped' })
+      startupSettle = null
       if (backoffTimer) { clearTimeout(backoffTimer); backoffTimer = null }
       try { pollAbort?.abort() } catch {}
       pollAbort = null

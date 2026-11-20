@@ -19,6 +19,7 @@ function makeHostIlinkClient({ pollMsgs = [], autoRelease = true } = {}) {
   const calls = []
   let pollIdx = 0
   let qrPollStep = 0
+  let bootstrapDone = false
   let waiters = []
   let pollReleased = autoRelease
   const flushPollWaiters = () => {
@@ -60,6 +61,12 @@ function makeHostIlinkClient({ pollMsgs = [], autoRelease = true } = {}) {
           },
         }
       }
+      if (url.includes('/ilink/bot/getuploadurl')) {
+        return { status: 200, headers: {}, json: { ret: 0, upload_param: `up_${calls.length}` } }
+      }
+      if (url.includes('/upload?')) {
+        return { status: 200, headers: { 'x-encrypted-param': `eqp_${calls.length}` }, json: {}, text: '' }
+      }
       if (url.includes('/ilink/bot/getconfig')) {
         return { status: 200, headers: {}, json: { ret: 0, typing_ticket: 'host_ticket' } }
       }
@@ -67,6 +74,14 @@ function makeHostIlinkClient({ pollMsgs = [], autoRelease = true } = {}) {
         return { status: 200, headers: {}, json: { ret: 0, message_id: `wx_host_reply_${calls.length}` } }
       }
       if (url.includes('/ilink/bot/getupdates')) {
+        if (!bootstrapDone) {
+          bootstrapDone = true
+          if (pollReleased && pollIdx < pollMsgs.length) {
+            const msg = pollMsgs[pollIdx++]
+            return { status: 200, headers: {}, json: { ret: 0, get_updates_buf: `buf_${pollIdx}`, msgs: [msg] } }
+          }
+          return { status: 200, headers: {}, json: { ret: 0, get_updates_buf: 'init_buf', msgs: [] } }
+        }
         if (pollReleased && pollIdx < pollMsgs.length) {
           const msg = pollMsgs[pollIdx++]
           return { status: 200, headers: {}, json: { ret: 0, get_updates_buf: `buf_${pollIdx}`, msgs: [msg] } }
@@ -148,6 +163,7 @@ test('宿主机扫码登录接口：自动写入凭证并连接，绝不在配�
   assert.equal(inst.enabled, true)
   assert.equal(inst.state, 'connected')
   assert.equal(inst.self?.account, 'wx_host_bot@im.bot')
+  assert.equal(wechatClient.calls.filter((c) => c.url.includes('/ilink/bot/getconfig')).length, 0, '扫码连接启动阶段不应调用 getconfig')
   assert.equal(platRes.configs?.['wechat-clawbot']?.botTokenSet, true)
   assert.equal(platRes.configs?.['wechat-clawbot']?.botToken, '')
   assert.ok(!JSON.stringify(platRes).includes('wx_secret_token_do_not_expose'), '/platforms 不得泄漏 botToken 原文')
@@ -181,7 +197,7 @@ test('纯 wechat-clawbot 运行时：19 模块矩阵、tool/context 无 QQ 泄�
     }],
   })
 
-  const { fake, app } = await bootHost(t, {
+  const { fake, app, dataDir } = await bootHost(t, {
     cfg: {
       enabled: true,
       dryRun: false,
@@ -241,6 +257,28 @@ test('纯 wechat-clawbot 运行时：19 模块矩阵、tool/context 无 QQ 泄�
   assert.equal(sent.body.msg.to_user_id, 'wxu_owner')
   assert.equal(sent.body.msg.context_token, 'ctx_e2e_1')
   assert.match(sent.body.msg.item_list[0].text_item.text, /微信收到：/)
+
+  // 3.5) 宿主机注入 allowedLocalDirs：工作区内文件放行，工作区/dataDir 之外的本地绝对路径在 adapter 层拦截
+  const allowedWsFile = join(dataDir, 'ws', 'host-allowed.txt')
+  writeFileSync(allowedWsFile, 'host allowed payload')
+  const outsideSiblingDir = mkdtempSync(join(tmpdir(), 'aurabot-wx-outside-'))
+  const outsideHostFile = join(outsideSiblingDir, 'host-secret.txt')
+  writeFileSync(outsideHostFile, 'host secret payload')
+  const allowedSend = await app.gateway.send({
+    chatId: 'wechat-clawbot:private:wxu_owner',
+    inResponseTo: 'wx_e2e_1',
+    parts: [{ type: 'file', media: { path: allowedWsFile, name: 'host-allowed.txt' } }],
+  })
+  assert.ok(allowedSend.messageId)
+  await assert.rejects(
+    () => app.gateway.send({
+      chatId: 'wechat-clawbot:private:wxu_owner',
+      inResponseTo: 'wx_e2e_1',
+      parts: [{ type: 'file', media: { path: outsideHostFile, name: 'host-secret.txt' } }],
+    }),
+    (e) => e.certainty === 'not-sent' && e.code === 'local-path-blocked',
+    '宿主机注入的 allowedLocalDirs 应拦截工作区与 dataDir 之外的本地路径',
+  )
 
   // 4) 开启 QQ 共存后工具面仍严格隔离，logs 里不出现 botToken 原文
   app.setConfig({

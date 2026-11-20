@@ -8,7 +8,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { randomBytes } from 'node:crypto'
-import { mkdtempSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -36,13 +36,20 @@ function makeMockIlinkClient(customHandler = null) {
   const uploadedPayloads = new Map()
   let uploadSeq = 0
   let msgSeq = 0
+  let needsBootstrap = true
   let longPollWaiters = []
 
   const client = {
     calls,
     uploadedPayloads,
+    longPollWaiters,
     pushUpdateWaiterError(err) {
       for (const w of longPollWaiters.splice(0)) w.reject(err)
+    },
+    resolveNextUpdateWaiter(res) {
+      const w = longPollWaiters.shift()
+      if (w) w.resolve(res)
+      return Boolean(w)
     },
     async request(req) {
       const url = String(req.url || '')
@@ -51,7 +58,10 @@ function makeMockIlinkClient(customHandler = null) {
 
       if (customHandler) {
         const res = await customHandler({ req, url, bodyObj, uploadedPayloads })
-        if (res) return res
+        if (res) {
+          if (url.includes('/ilink/bot/getupdates')) needsBootstrap = false
+          return res
+        }
       }
 
       if (url.startsWith('https://example.com/')) {
@@ -79,12 +89,17 @@ function makeMockIlinkClient(customHandler = null) {
         return { status: 200, headers: {}, json: { ret: 0 } }
       }
       if (url.includes('/ilink/bot/getupdates')) {
+        if (needsBootstrap) {
+          needsBootstrap = false
+          return { status: 200, headers: {}, json: { ret: 0, get_updates_buf: 'init_buf', msgs: [] } }
+        }
         return await new Promise((resolve, reject) => {
           const waiter = { resolve, reject }
           longPollWaiters.push(waiter)
           req.signal?.addEventListener?.('abort', () => {
             const idx = longPollWaiters.indexOf(waiter)
             if (idx >= 0) longPollWaiters.splice(idx, 1)
+            needsBootstrap = true
             const abortErr = new Error('aborted')
             abortErr.name = 'AbortError'
             reject(abortErr)
@@ -437,15 +452,32 @@ test('长轮询持久化游标 / context_token 跨重启恢复，以及 -14 会�
   })
   const a2 = createWechatClawbotAdapter({ client: client2, dataDir: () => dir })
   const ctx2 = makeCtx(a2, { botToken: 'tok_p', botId: 'bot_p' })
-  await a2.start(ctx2)
+  await assert.rejects(() => a2.start(ctx2), (e) => e.certainty === 'not-sent' && e.code === 'session-expired')
   assert.equal(a2.__clawbot.getSyncCursor(), 'cursor_v2')
   assert.equal(a2.__clawbot.getContextToken('wxu_persist'), 'ctx_persisted_abc')
-  await delay(40)
   assert.equal(secondPollSeenBuf, 'cursor_v2')
   assert.equal(a2.__clawbot.isSessionExpired(), true)
   assert.equal(ctx2.states.at(-1)?.[0], 'disconnected')
+  assert.ok(!ctx2.states.some(([s]) => s === 'connected'), '首轮 getupdates 返回 -14 时不得进入 connected')
   assert.equal(a2Polls, 1, '-14 会话失效后应立即停轮询，不死循环')
   await a2.stop()
+
+  // 3) 会话运行中途收到 -14：首轮正常 connected，第二轮返回 -14 -> 立即断开并停止轮询
+  let midPolls = 0
+  const client3 = makeMockIlinkClient(async ({ url }) => {
+    if (!url.includes('/ilink/bot/getupdates')) return null
+    midPolls++
+    if (midPolls === 1) return { status: 200, headers: {}, json: { ret: 0, get_updates_buf: 'cursor_v3', msgs: [] } }
+    return { status: 200, headers: {}, json: { errcode: -14, errmsg: 'session expired mid-run' } }
+  })
+  const a3 = createWechatClawbotAdapter({ client: client3, dataDir: () => dir })
+  const ctx3 = makeCtx(a3, { botToken: 'tok_p', botId: 'bot_p' })
+  await a3.start(ctx3)
+  await delay(40)
+  assert.equal(a3.__clawbot.isSessionExpired(), true)
+  assert.equal(ctx3.states.at(-1)?.[0], 'disconnected')
+  assert.equal(midPolls, 2)
+  await a3.stop()
 })
 
 test('sendtyping 票据缓存与扫码登录状态机（wait → scaned → confirmed / expired）', async () => {
@@ -500,10 +532,11 @@ test('sendtyping 票据缓存与扫码登录状态机（wait → scaned → conf
   assert.equal(confirmed.baseUrl, 'https://sz.ilinkai.weixin.qq.com')
   assert.equal((await pollQrStatus({ qrcode: qr.qrcode, client: statusClient })).state, 'expired')
 
-  // 2) native('send_typing') 命中 getconfig 缓存，两次打字只请求一次 wxu_bob 的 getconfig
+  // 2) native('send_typing') 命中 getconfig 缓存，两次打字只请求一次 wxu_bob 的 getconfig（且 start() 绝不调 getconfig）
   const adapter = createWechatClawbotAdapter({ client })
   const ctx = makeCtx(adapter, { botToken: 'tok_t', botId: 'bot_t' })
   await adapter.start(ctx)
+  assert.equal(client.calls.filter((c) => c.url.includes('/ilink/bot/getconfig')).length, 0, 'start() 绝不应拿 botId 调 getconfig')
   await adapter.native('send_typing', { chatId: 'wxu_bob' })
   await adapter.native('send_typing', { chatId: 'wxu_bob', cancel: true })
   assert.equal(client.calls.filter((c) => c.url.includes('/ilink/bot/getconfig') && c.body?.ilink_user_id === 'wxu_bob').length, 1)
@@ -577,7 +610,7 @@ test('审阅加固：P1 群 @ 过滤、P2-1 启动探活、P2-2 缺 botId 拦截
   assert.equal(ctxGroupAll.emitted.length, 1)
   await aGroupAll.stop()
 
-  // ── P2-1 & P2-2：启动未填 botId 拒启动；token 失效（-14 / 401）绝不误报 connected ──
+  // ── P1 & P2-2：启动未填 botId 拒启动；token 失效（getupdates 返回 -14 / 401）绝不误报 connected，也不调 getconfig ──
   const aNoBotId = createWechatClawbotAdapter({ client: makeMockIlinkClient() })
   const ctxNoId = makeCtx(aNoBotId, { botToken: 'tok_only' })
   await assert.rejects(() => aNoBotId.start(ctxNoId), /botId/)
@@ -589,15 +622,61 @@ test('审阅加固：P1 群 @ 过滤、P2-1 启动探活、P2-2 缺 botId 拦截
     { status: 401, json: { errmsg: 'unauthorized' } },
   ]) {
     const failClient = makeMockIlinkClient(async ({ url }) => {
-      if (url.includes('/ilink/bot/getconfig')) return { ...failCase, headers: {} }
+      if (url.includes('/ilink/bot/getupdates')) return { ...failCase, headers: {} }
       return null
     })
     const aFail = createWechatClawbotAdapter({ client: failClient })
     const ctxFail = makeCtx(aFail, { botToken: 'tok_expired', botId: 'bot_expired' })
     await assert.rejects(() => aFail.start(ctxFail))
     assert.equal(ctxFail.states.at(-1)?.[0], 'disconnected')
-    assert.ok(!ctxFail.states.some(([s]) => s === 'connected'), '启动校验失败时绝不能出现 connected')
+    assert.ok(!ctxFail.states.some(([s]) => s === 'connected'), '首轮 getupdates 授权失败时绝不能出现 connected')
+    assert.equal(failClient.calls.filter((c) => c.url.includes('/ilink/bot/getconfig')).length, 0, 'start() 不得调用 getconfig')
+    await aFail.stop()
   }
+
+  // ── 首轮 getupdates 长轮询挂起超时（未拒绝也未成功响应）→ 停在 connecting，不中止请求；首轮最终响应后再 connected ──
+  const slowWaiters = []
+  const slowClient = makeMockIlinkClient(async ({ req, url }) => {
+    if (!url.includes('/ilink/bot/getupdates')) return null
+    return await new Promise((resolve, reject) => {
+      const w = { resolve, reject, aborted: false }
+      slowWaiters.push(w)
+      req.signal?.addEventListener?.('abort', () => {
+        w.aborted = true
+        const err = new Error('aborted')
+        err.name = 'AbortError'
+        reject(err)
+      }, { once: true })
+    })
+  })
+  const aSlow = createWechatClawbotAdapter({ client: slowClient, startupWaitMs: 30 })
+  const ctxSlow = makeCtx(aSlow, { botToken: 'tok_slow', botId: 'bot_slow' })
+  await aSlow.start(ctxSlow)
+  assert.equal(ctxSlow.states.at(-1)?.[0], 'connecting', '首轮 getupdates 尚在长轮询等待中时应保持 connecting')
+  assert.ok(!ctxSlow.states.some(([s]) => s === 'connected'))
+  assert.equal(slowWaiters.length, 1)
+  assert.equal(slowWaiters[0].aborted, false, 'startupWaitMs 到期不应中止挂起中的首轮 getupdates')
+  assert.equal(slowClient.calls.filter((c) => c.url.includes('/ilink/bot/getconfig')).length, 0)
+  slowWaiters[0].resolve({ status: 200, headers: {}, json: { ret: 0, get_updates_buf: 'slow_buf_1', msgs: [] } })
+  await delay(25)
+  assert.equal(ctxSlow.states.at(-1)?.[0], 'connected', '首轮 getupdates 真正成功后转为 connected')
+  await aSlow.stop()
+
+  // ── 首轮 getupdates 瞬态失败（HTTP 502）→ 维持 connecting 重试，绝不误报 connected ──
+  let errPollCount = 0
+  const errClient = makeMockIlinkClient(async ({ url }) => {
+    if (!url.includes('/ilink/bot/getupdates')) return null
+    errPollCount++
+    return { status: 502, headers: {}, json: {}, text: 'bad gateway' }
+  })
+  const aTransient = createWechatClawbotAdapter({ client: errClient, startupWaitMs: 80 })
+  const ctxTransient = makeCtx(aTransient, { botToken: 'tok_502', botId: 'bot_502' })
+  await aTransient.start(ctxTransient)
+  assert.equal(ctxTransient.states.at(-1)?.[0], 'connecting')
+  assert.ok(!ctxTransient.states.some(([s]) => s === 'connected'))
+  assert.equal(errClient.calls.filter((c) => c.url.includes('/ilink/bot/getconfig')).length, 0)
+  assert.ok(errPollCount >= 1)
+  await aTransient.stop()
 
   // ── P2-4：媒体 URL SSRF + 重定向保护 & 本地路径边界（不绕过真实 assertPublicUrl） ──
   const redirectClient = makeMockIlinkClient(async ({ url }) => {
@@ -652,20 +731,81 @@ test('审阅加固：P1 群 @ 过滤、P2-1 启动探活、P2-2 缺 botId 拦截
 
   await aSec.stop()
 
-  // allowLocalPath=true 默认只放行绝对常规文件，仍拒绝相对路径
-  const aPath = createWechatClawbotAdapter({ client: makeMockIlinkClient() })
-  const ctxPath = makeCtx(aPath, { botToken: 'tok_path', botId: 'bot_path' })
-  await aPath.start(ctxPath)
-  aPath.platform.deliver({
+  // 默认未配置 allowedLocalDirs 时 fail-closed，即使真实存在的绝对文件也拒绝读取
+  const sandboxRoot = mkdtempSync(join(tmpdir(), 'aurabot-wx-dirs-'))
+  const insideDir = join(sandboxRoot, 'allowed')
+  const outsideDir = join(sandboxRoot, 'outside')
+  const insideSiblingPrefixDir = join(sandboxRoot, 'allowed-other')
+  mkdirSync(insideDir, { recursive: true })
+  mkdirSync(outsideDir, { recursive: true })
+  mkdirSync(insideSiblingPrefixDir, { recursive: true })
+  const insideFile = join(insideDir, 'ok.txt')
+  const outsideFile = join(outsideDir, 'secret.txt')
+  const siblingPrefixFile = join(insideSiblingPrefixDir, 'trap.txt')
+  writeFileSync(insideFile, 'hello allowed')
+  writeFileSync(outsideFile, 'secret outside')
+  writeFileSync(siblingPrefixFile, 'prefix trap')
+
+  const aDefaultFailClosed = createWechatClawbotAdapter({ client: makeMockIlinkClient() })
+  const ctxDefaultFC = makeCtx(aDefaultFailClosed, { botToken: 'tok_fc', botId: 'bot_fc' })
+  await aDefaultFailClosed.start(ctxDefaultFC)
+  aDefaultFailClosed.platform.deliver({
+    message_id: 'fc_in_1',
+    from_user_id: 'wxu_fc',
+    message_type: MESSAGE_TYPE.USER,
+    context_token: 'ctx_fc',
+    item_list: [{ type: ITEM_TYPE.TEXT, text_item: { text: 'fc' } }],
+  })
+  await assert.rejects(
+    () => aDefaultFailClosed.send({ chat: { kind: 'private', id: 'wxu_fc' }, inResponseTo: 'fc_in_1', parts: [{ type: 'file', media: { path: insideFile, name: 'ok.txt' } }] }),
+    (e) => e.certainty === 'not-sent' && e.code === 'local-path-blocked',
+    '未传 allowedLocalDirs 时 adapter 默认 fail-closed，禁止直接读取本地绝对路径',
+  )
+  await aDefaultFailClosed.stop()
+
+  // allowedLocalDirs: [] 也应 fail-closed
+  const aEmptyDirs = createWechatClawbotAdapter({ client: makeMockIlinkClient(), allowedLocalDirs: [] })
+  const ctxEmptyDirs = makeCtx(aEmptyDirs, { botToken: 'tok_ed', botId: 'bot_ed' })
+  await aEmptyDirs.start(ctxEmptyDirs)
+  aEmptyDirs.platform.deliver({
+    message_id: 'ed_in_1',
+    from_user_id: 'wxu_ed',
+    message_type: MESSAGE_TYPE.USER,
+    context_token: 'ctx_ed',
+    item_list: [{ type: ITEM_TYPE.TEXT, text_item: { text: 'ed' } }],
+  })
+  await assert.rejects(
+    () => aEmptyDirs.send({ chat: { kind: 'private', id: 'wxu_ed' }, inResponseTo: 'ed_in_1', parts: [{ type: 'file', media: { path: insideFile, name: 'ok.txt' } }] }),
+    (e) => e.certainty === 'not-sent' && e.code === 'local-path-blocked',
+  )
+  await aEmptyDirs.stop()
+
+  // allowedLocalDirs getter：允许白名单目录内文件，拦截相对路径、越界目录与前缀同名目录
+  const aScoped = createWechatClawbotAdapter({
+    client: makeMockIlinkClient(),
+    allowedLocalDirs: () => [insideDir],
+  })
+  const ctxScoped = makeCtx(aScoped, { botToken: 'tok_path', botId: 'bot_path' })
+  await aScoped.start(ctxScoped)
+  aScoped.platform.deliver({
     message_id: 'path_in_1',
     from_user_id: 'wxu_p',
     message_type: MESSAGE_TYPE.USER,
     context_token: 'ctx_path',
     item_list: [{ type: ITEM_TYPE.TEXT, text_item: { text: 'path' } }],
   })
-  await assert.rejects(
-    () => aPath.send({ chat: { kind: 'private', id: 'wxu_p' }, inResponseTo: 'path_in_1', parts: [{ type: 'file', media: { path: '../relative.txt' } }] }),
-    (e) => e.certainty === 'not-sent' && e.code === 'local-path-blocked',
-  )
-  await aPath.stop()
+  const sentOk = await aScoped.send({
+    chat: { kind: 'private', id: 'wxu_p' },
+    inResponseTo: 'path_in_1',
+    parts: [{ type: 'file', media: { path: insideFile, name: 'ok.txt' } }],
+  })
+  assert.ok(sentOk.messageId)
+  for (const badPath of ['../relative.txt', outsideFile, siblingPrefixFile]) {
+    await assert.rejects(
+      () => aScoped.send({ chat: { kind: 'private', id: 'wxu_p' }, inResponseTo: 'path_in_1', parts: [{ type: 'file', media: { path: badPath } }] }),
+      (e) => e.certainty === 'not-sent' && e.code === 'local-path-blocked',
+      `应拦截白名单外路径：${badPath}`,
+    )
+  }
+  await aScoped.stop()
 })
