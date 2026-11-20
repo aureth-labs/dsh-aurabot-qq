@@ -45,8 +45,8 @@
 ### 3.1 能做
 
 - ✅ **1:1 私聊文本收发**：支持超长文本自动按段落/换行分条（默认单条上限 2000 字符）。
+- ✅ **入站语音识别文本优先，出站优先原生语音条**：入站有 `voice_item.text` 时直接当文本；出站默认尝试把音频转成 **16kHz SILK** 发微信语音气泡（`encode_type:0` / `bits_per_sample:16` / `sample_rate:16000` / `playtime` 秒）。缺少 `silk-wasm` / `mpg123-decoder` 或转码失败时，按真实音频文件发送，不谎报语音条。
 - ✅ **图片 / 视频 / 通用文件收发与解密拉取**：入站自动缓存加密媒体描述符，调用 `fetch({ kind: 'media', media })` 即自动下载并 AES 解密（**注意**：媒体描述符 `mediaCache` 仅驻留内存，仅本次进程启动后收到的入站媒体可拉取；进程重启后旧入站媒体不再可拉取）。
-- ✅ **入站语音识别文本优先**：当 `voice_item.text` 有平台自带转写结果时直接当作文本传入；无文本时才保留 `voice` 音频供 ASR 处理。
 - ✅ **入站引用摘要保留**：`ref_msg` 会在正文前附带可读引用摘要 `[引用: ...]`（无需猜测支持主动发送引用格式）。
 - ✅ **受限主动消息**：在已保存有效 `context_token` 且未触发个人号频率限制（默认同对象 ≥ 3 秒/次、≤ 20 次/小时）时可主动发送；超过上限直接按 `not-sent / proactive-limit` 如实失败，绝不无限重试。
 - ✅ **启动握手、群过滤与安全边界**：
@@ -60,7 +60,7 @@
 - ❌ **不做群管（`group-admin` 永不加载）**：ClawBot / iLink 没有可靠的群主/管理员校验与禁言/踢人接口。
 - ❌ **默认不开群聊**：`allowGroup` 与 `listenAllInGroup` 默认均为 `false`；个人微信 ClawBot 群聊依赖官方灰度放开，未经真机证实群聊已通时保持仅开放 1:1 私聊。
 - ❌ **无原生表情包接口**：`sticker: false`，发出的表情包统一按普通图片降级；`qq_import_stickers` 不会出现在工具面。
-- ❌ **语音出站按文件降级**：`voice: 'file'`，出站语音统一封装为音频文件消息发送，不谎称原生语音条。
+- ❌ **原生语音条需要 SILK 编码依赖**：默认开启 `voiceOutbound` 并尝试 SILK；没有 `silk-wasm` / `mpg123-decoder`、或源音频不是 WAV/MP3/SILK 时，按音频文件发送，不谎称语音条。可关闭 `voiceOutbound` 强制只发文件。
 - ❌ **不支持拉取聊天历史、群成员列表、合并转发、@、戳一戳、撤回、卡片**：`history` / `memberList` / `forwardExpand` / `quoteReply` / `mention` / `recall` / `card` 均为 `false`。
 
 ---
@@ -72,7 +72,7 @@
 | `mood` / `memory` / `purpose` / `autotelic` | ✅ 可用 | 纯平台无关中枢逻辑 |
 | `chat-tools` | ✅ 部分开放 | `send_message`、`send_file`、`search_chatlog` 可用；`chat_history` 因 `history:false` 自动隐藏 |
 | `stickers` | ✅ 图片降级 | `send_sticker`/`save_sticker` 等通用工具保留（按图片发）；`qq_import_stickers` 绝不出现 |
-| `voice` | ✅ 降级适配 | 入站优先读平台文字转写；出站按音频文件发送 |
+| `voice` | ✅ 原生/降级 | 入站优先读平台文字转写；出站优先 SILK 语音条，缺依赖/转码失败按文件发送 |
 | `imagegen` / `bili` / `song` / `video` | ✅ 可用 | 全走 `sendParts` 与标准媒体降级 |
 | `speakup` | ✅ 限频发送 | 遵守 `proactive: 'limited'`（依赖已有 `context_token` 与频控） |
 | `group-admin` | ❌ **不加载** | `platforms` 不含 `wechat-clawbot` |
@@ -87,7 +87,7 @@
    - [ ] 面板一键生成二维码并手机微信确认登录后状态变为 `connected`
    - [ ] 1:1 私聊文本收发与超长分条
    - [ ] 1:1 图片收发（含 AI 看图解密与生图回发）
-   - [ ] 1:1 语音入站转写与音频文件出站
+   - [ ] 1:1 语音入站转写与 SILK 语音条出站（失败时按文件发送）
    - [ ] 1:1 视频 / 通用文件收发
    - [ ] 会话 `context_token` 重启持久化与过期报错提示
    - [ ] 个人账号灰度群聊测试（若微信端允许拉入群再按需开启 `allowGroup`）

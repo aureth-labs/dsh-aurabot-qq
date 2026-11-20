@@ -3,7 +3,7 @@
 //   - AES-128-ECB 格式 A / 格式 B / 原始 hex 解密与 CDN 加密上传闭环
 //   - getupdates 长轮询（游标持久化 / context_token 持久化 / -14 会话失效 / 断线退避重连 / stop 中止）
 //   - 入站解析（文本 / ref_msg 引用 / 图片 / 语音转文字优先 / 无文字语音 / 文件 / 视频 / self-sent / 群聊开关）
-//   - 出站发送（长文本拆分 / 媒体加密上传 / 语音按文件降级 / proactive limited 限流 / 缺 context_token 拒绝）
+//   - 出站发送（长文本拆分 / 媒体加密上传 / 语音优先 SILK 语音条、失败降文件 / proactive limited 限流 / 缺 context_token 拒绝）
 //   - getconfig + sendtyping 票据缓存 + 二维码扫码状态机
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -30,6 +30,35 @@ import {
   MESSAGE_STATE,
   UPLOAD_MEDIA_TYPE,
 } from '../../src/adapters/wechat-clawbot/index.js'
+
+let silkAvailable = true
+try {
+  await import('silk-wasm')
+} catch {
+  silkAvailable = false
+}
+
+function makeWavPcm16({ sampleRate = 16000, seconds = 1, frequency = 440 } = {}) {
+  const frames = Math.max(1, Math.round(sampleRate * seconds))
+  const out = Buffer.alloc(44 + frames * 2)
+  out.write('RIFF', 0)
+  out.writeUInt32LE(36 + frames * 2, 4)
+  out.write('WAVE', 8)
+  out.write('fmt ', 12)
+  out.writeUInt32LE(16, 16)
+  out.writeUInt16LE(1, 20)
+  out.writeUInt16LE(1, 22)
+  out.writeUInt32LE(sampleRate, 24)
+  out.writeUInt32LE(sampleRate * 2, 28)
+  out.writeUInt16LE(2, 32)
+  out.writeUInt16LE(16, 34)
+  out.write('data', 36)
+  out.writeUInt32LE(frames * 2, 40)
+  for (let i = 0; i < frames; i++) {
+    out.writeInt16LE(Math.round(Math.sin((2 * Math.PI * frequency * i) / sampleRate) * 8000), 44 + i * 2)
+  }
+  return out
+}
 
 function makeMockIlinkClient(customHandler = null) {
   const calls = []
@@ -400,6 +429,63 @@ test('出站 send：长文本分段、图片/视频/文件/语音降级加密上
   await adapter.send({ chat: { kind: 'private', id: 'wxu_alice' }, parts: [{ type: 'text', text: '主动2成功' }] })
 
   await adapter.stop()
+})
+
+test('语音出站：默认转 SILK 发微信语音条，编码失败才降级文件', { skip: !silkAvailable }, async () => {
+  const client = makeMockIlinkClient()
+  const adapter = createWechatClawbotAdapter({ client })
+  const ctx = makeCtx(adapter, { botToken: 'tok_voice', botId: 'bot_voice', voiceOutbound: true })
+  await adapter.start(ctx)
+  adapter.platform.deliver({
+    message_id: 'in_voice_1',
+    from_user_id: 'wxu_voice',
+    message_type: MESSAGE_TYPE.USER,
+    context_token: 'ctx_voice',
+    item_list: [{ type: ITEM_TYPE.TEXT, text_item: { text: '来条语音' } }],
+  })
+
+  const wav = makeWavPcm16({ seconds: 0.8 })
+  await adapter.send({
+    chat: { kind: 'private', id: 'wxu_voice' },
+    inResponseTo: 'in_voice_1',
+    parts: [{ type: 'voice', media: { bytes: wav, mime: 'audio/wav' }, durationMs: 800 }],
+  })
+
+  const sent = client.calls.filter((c) => c.url.includes('/ilink/bot/sendmessage')).at(-1)
+  const item = sent.body.msg.item_list[0]
+  assert.equal(item.type, ITEM_TYPE.VOICE)
+  assert.equal(item.voice_item.encode_type, 0)
+  assert.equal(item.voice_item.bits_per_sample, 16)
+  assert.equal(item.voice_item.sample_rate, 16000)
+  assert.ok(item.voice_item.playtime >= 1)
+
+  const uploadReq = client.calls.find((c) => c.url.includes('/ilink/bot/getuploadurl') && c.body.media_type === UPLOAD_MEDIA_TYPE.VOICE)
+  assert.ok(uploadReq)
+  const silkBytes = decryptAesEcb(client.uploadedPayloads.get(item.voice_item.media.encrypt_query_param), item.voice_item.media.aes_key)
+  assert.equal(silkBytes.subarray(0, 10).toString('hex'), '02232153494c4b5f5633')
+  await adapter.stop()
+
+  // 坏音频不能谎报语音条：仍然按文件发，且文件名按真实魔数纠正，不再一律 voice.amr。
+  const fallbackClient = makeMockIlinkClient()
+  const fallbackAdapter = createWechatClawbotAdapter({ client: fallbackClient })
+  const fallbackCtx = makeCtx(fallbackAdapter, { botToken: 'tok_voice_bad', botId: 'bot_voice_bad', voiceOutbound: true })
+  await fallbackAdapter.start(fallbackCtx)
+  fallbackAdapter.platform.deliver({
+    message_id: 'in_voice_2',
+    from_user_id: 'wxu_voice',
+    message_type: MESSAGE_TYPE.USER,
+    context_token: 'ctx_voice_2',
+    item_list: [{ type: ITEM_TYPE.TEXT, text_item: { text: '再来一条' } }],
+  })
+  await fallbackAdapter.send({
+    chat: { kind: 'private', id: 'wxu_voice' },
+    inResponseTo: 'in_voice_2',
+    parts: [{ type: 'voice', media: { bytes: Buffer.from('ID3not-a-real-mp3-payload'), mime: 'audio/wav' }, durationMs: 900 }],
+  })
+  const fallbackItem = fallbackClient.calls.filter((c) => c.url.includes('/ilink/bot/sendmessage')).at(-1).body.msg.item_list[0]
+  assert.equal(fallbackItem.type, ITEM_TYPE.FILE)
+  assert.equal(fallbackItem.file_item.file_name, 'voice.mp3')
+  await fallbackAdapter.stop()
 })
 
 test('长轮询持久化游标 / context_token 跨重启恢复，以及 -14 会话过期立即断开停止轮询', async () => {
