@@ -1026,6 +1026,15 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       text = text.replace(qqRe, '').trim()
       return `${label} · ${text}`
     }
+    // wechat-clawbot 旧会话标题用的是原始平台 ID / 旧中文名；迁移成「微信（ClawBot）」。
+    if (platform === 'wechat-clawbot') {
+      const rawRe = /^(?:wechat-clawbot|个人微信（ClawBot）)\s*(私聊|群)?\s*[·・]\s*/i
+      const m = text.match(rawRe)
+      if (m) {
+        const kind = m[1] ? ` ${m[1]}` : ''
+        return `${label}${kind} · ${text.replace(rawRe, '').trim()}`
+      }
+    }
     return text
   }
 

@@ -1402,7 +1402,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         h(Row, { label: 'HTTP 令牌' }, f.text('snowluma.httpToken', { type: 'password', placeholder: draft.snowluma.httpTokenSet ? '已保存' : '没有就留空' })))
     }
 
-    const PLATFORM_NAMES = { qq: 'QQ', feishu: '飞书', qqbot: 'QQ 官方机器人', 'wechat-clawbot': '个人微信（ClawBot）', bridge: '通用桥' }
+    const PLATFORM_NAMES = { qq: 'QQ', feishu: '飞书', qqbot: 'QQ 官方机器人', 'wechat-clawbot': '微信（ClawBot）', bridge: '通用桥' }
     const platformLabel = (name) => PLATFORM_NAMES[name] || name || '平台'
     const ownerTargetText = (t) => {
       if (!t) return ''
@@ -1953,7 +1953,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           inst.detail ? h('div', { className: cx('ab-small', inst.state === 'connected' ? 'ab-muted' : 'ab-note warn'), style: { marginBottom: 8 } }, inst.detail) : null,
           inst.platform === 'wechat-clawbot' ? h(Fragment, null,
             h('div', { className: 'ab-note', style: { marginBottom: 8 } },
-              '个人微信（ClawBot）优先 1:1 私聊：表情按图片降级、语音按音频文件发送、不支持拉取历史记录与群管；个人账号存在平台风控风险，请留意使用频率。'),
+              '微信（ClawBot）优先 1:1 私聊：表情按图片降级、语音按音频文件发送、不支持拉取历史记录与群管；个人账号存在平台风控风险，请留意使用频率。'),
             h(WechatClawbotQrBox, {
               instance: inst.instance,
               baseUrl: getPath(draft, 'platforms.' + inst.instance + '.baseUrl') || data?.configs?.[inst.instance]?.baseUrl || '',
@@ -9713,7 +9713,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       { id: 'qq', label: 'QQ', desc: 'SnowLuma 或已有 OneBot，适合已经有机器人 QQ 号' },
       { id: 'feishu', label: '飞书', desc: '企业自建应用，默认 WebSocket，不需要公网回调' },
       { id: 'qqbot', label: 'QQ 官方机器人', desc: 'AppID + AppSecret，默认 WebSocket' },
-      { id: 'wechat-clawbot', label: '个人微信（ClawBot）', desc: '腾讯官方 iLink 长轮询，面板微信扫码即用（1:1 为主，不做群管）' },
+      { id: 'wechat-clawbot', label: '微信（ClawBot）', desc: '腾讯官方 iLink 长轮询，面板微信扫码即用（1:1 为主，不做群管）' },
       { id: 'bridge', label: '通用接入端', desc: '外部程序按 HTTP 长轮询接入，自建平台/脚本用' },
     ]
 
