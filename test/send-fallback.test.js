@@ -28,7 +28,7 @@ function setup(t, failure, { ttsFailure = false, files = { enabled: true } } = {
     else process.env.AURABOT_DATA_DIR = old
     rmSync(dir, { recursive: true, force: true })
   })
-  return { hub, file, calls, logs }
+  return { hub, file, calls, logs, cfg }
 }
 
 const timeout = () => new OneBotError('send_private_msg', { message: '超时' }, { uncertain: true })
@@ -162,5 +162,14 @@ test('群里回 [沉默]：退出话题，不发东西，日志记下她不想�
   await s.hub.deliver('group:9', '[沉默]')
   assert.equal(s.calls.length, 0)
   assert.ok(s.logs.some((line) => line.includes('她选择不说话')))
+})
+
+test('微信平台 voiceEnabled=false：sendVoice 直接改发文字，不生成语音', async (t) => {
+  const s = setup(t, null)
+  s.cfg.platforms['wechat-clawbot'] = { enabled: true, voiceEnabled: false }
+  const ok = await s.hub.sendVoice('wechat-clawbot:private:10001', '你好呀')
+  assert.ok(ok)
+  assert.deepEqual(s.calls.map((c) => c.params.message[0].type), ['text'])
+  assert.equal(s.calls[0].params.message[0].data.text, '你好呀')
 })
 
