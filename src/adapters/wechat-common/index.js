@@ -241,6 +241,194 @@ export async function transcodeAudioForWechat(inputBytes, { targetFormat = 'amr'
 }
 
 /**
+ * 把音频转成微信 iLink 原生语音条需要的 SILK。
+ *
+ * - WAV（PCM16）直接解码；
+ * - MP3 用 mpg123-decoder 解码；
+ * - 其他格式不硬转，返回 fallbackToFile。
+ *
+ * 输出固定 16kHz 单声道 PCM16，再交给 silk-wasm 编码；缺少依赖或编码失败
+ * 时由调用方降级成文件，绝不谎报语音条。
+ */
+export async function transcodeAudioToSilk(inputBytes, { targetSampleRate = 16000 } = {}) {
+  const buf = Buffer.isBuffer(inputBytes) ? inputBytes : Buffer.from(inputBytes || [])
+  if (!buf.length) {
+    return { ok: false, fallbackToFile: true, reason: '音频内容为空，无法转 SILK' }
+  }
+
+  const rate = [8000, 12000, 16000, 24000, 32000, 44100, 48000].includes(Number(targetSampleRate))
+    ? Number(targetSampleRate)
+    : 16000
+
+  let silk
+  try {
+    silk = await import('silk-wasm')
+  } catch (error) {
+    return { ok: false, fallbackToFile: true, reason: `缺少 silk-wasm，无法生成微信语音条：${error?.message || error}` }
+  }
+
+  // 已经是 SILK：不重复编码。
+  if (inferMimeFromBytes(buf) === 'audio/silk') {
+    let durationMs = 0
+    try {
+      durationMs = Number(silk.getDuration(buf)) || 0
+    } catch {}
+    return {
+      ok: true,
+      fallbackToFile: false,
+      bytes: buf,
+      mime: 'audio/silk',
+      ext: 'silk',
+      durationMs,
+      alreadySilk: true,
+      reason: '',
+    }
+  }
+
+  let decoded
+  const mime = inferMimeFromBytes(buf)
+  try {
+    if (mime === 'audio/wav') {
+      decoded = decodeWavPcm16(buf)
+      if (!decoded) {
+        return { ok: false, fallbackToFile: true, reason: 'WAV 不是 16-bit PCM，无法转 SILK' }
+      }
+    } else if (mime === 'audio/mpeg') {
+      decoded = await decodeMp3Pcm16(buf)
+      if (!decoded) {
+        return { ok: false, fallbackToFile: true, reason: 'MP3 解码为空，无法转 SILK' }
+      }
+    } else {
+      return {
+        ok: false,
+        fallbackToFile: true,
+        reason: `暂不支持把 ${mime || '未知音频格式'} 转成微信 SILK`,
+      }
+    }
+  } catch (error) {
+    return { ok: false, fallbackToFile: true, reason: `音频解码失败：${error?.message || error}` }
+  }
+
+  const mono = resampleMono(decoded.samples, decoded.sampleRate, rate)
+  if (!mono?.length) {
+    return { ok: false, fallbackToFile: true, reason: '音频重采样为空，无法转 SILK' }
+  }
+  const pcm = pcm16Buffer(mono)
+  try {
+    const encoded = await silk.encode(pcm, rate)
+    const out = Buffer.from(encoded?.data || [])
+    if (!out.length) {
+      return { ok: false, fallbackToFile: true, reason: 'SILK 编码结果为空' }
+    }
+    const durationMs = Number(encoded?.duration) || Math.round((mono.length / rate) * 1000)
+    return {
+      ok: true,
+      fallbackToFile: false,
+      bytes: out,
+      mime: 'audio/silk',
+      ext: 'silk',
+      durationMs,
+      alreadySilk: false,
+      reason: '',
+    }
+  } catch (error) {
+    return { ok: false, fallbackToFile: true, reason: `SILK 编码失败：${error?.message || error}` }
+  }
+}
+
+function decodeWavPcm16(buf) {
+  if (buf.length < 44 || buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WAVE') {
+    return null
+  }
+  let fmt = null
+  let data = null
+  let off = 12
+  while (off + 8 <= buf.length) {
+    const id = buf.toString('ascii', off, off + 4)
+    const size = buf.readUInt32LE(off + 4)
+    const body = off + 8
+    if (body + size > buf.length) break
+    if (id === 'fmt ') {
+      if (size < 16) return null
+      fmt = {
+        format: buf.readUInt16LE(body),
+        channels: buf.readUInt16LE(body + 2),
+        sampleRate: buf.readUInt32LE(body + 4),
+        bits: buf.readUInt16LE(body + 14),
+      }
+    } else if (id === 'data') {
+      data = buf.subarray(body, body + size)
+    }
+    off = body + size + (size % 2)
+  }
+  if (!fmt || !data || fmt.format !== 1 || fmt.bits !== 16 || !fmt.channels || !fmt.sampleRate) return null
+  const frames = Math.floor(data.length / (fmt.channels * 2))
+  if (!frames) return null
+  const samples = new Float32Array(frames)
+  for (let i = 0; i < frames; i++) {
+    let sum = 0
+    for (let c = 0; c < fmt.channels; c++) {
+      sum += data.readInt16LE((i * fmt.channels + c) * 2) / 32768
+    }
+    samples[i] = sum / fmt.channels
+  }
+  return { samples, sampleRate: fmt.sampleRate }
+}
+
+async function decodeMp3Pcm16(buf) {
+  let mod
+  try {
+    mod = await import('mpg123-decoder')
+  } catch (error) {
+    throw new Error(`缺少 mpg123-decoder，无法解码 MP3：${error?.message || error}`)
+  }
+  const Decoder = mod.MPEGDecoder || mod.default?.MPEGDecoder
+  if (!Decoder) throw new Error('mpg123-decoder 没有导出 MPEGDecoder')
+  const decoder = new Decoder()
+  try {
+    await decoder.ready
+    const decoded = decoder.decode(new Uint8Array(buf))
+    const channels = Array.isArray(decoded?.channelData) ? decoded.channelData : []
+    const frames = Math.min(...channels.map((c) => c?.length || 0))
+    if (!frames || !channels.length || !decoded?.sampleRate) return null
+    const samples = new Float32Array(frames)
+    for (let i = 0; i < frames; i++) {
+      let sum = 0
+      for (const channel of channels) sum += Number(channel[i]) || 0
+      samples[i] = sum / channels.length
+    }
+    return { samples, sampleRate: Number(decoded.sampleRate) }
+  } finally {
+    try { decoder.free?.() } catch {}
+  }
+}
+
+function resampleMono(samples, fromRate, toRate) {
+  if (!samples?.length || !fromRate || !toRate) return null
+  if (fromRate === toRate) return samples
+  const ratio = fromRate / toRate
+  const out = new Float32Array(Math.max(1, Math.round(samples.length / ratio)))
+  for (let i = 0; i < out.length; i++) {
+    const pos = i * ratio
+    const idx = Math.floor(pos)
+    const frac = pos - idx
+    const a = samples[idx] || 0
+    const b = samples[idx + 1] ?? a
+    out[i] = a + (b - a) * frac
+  }
+  return out
+}
+
+function pcm16Buffer(samples) {
+  const out = Buffer.alloc(samples.length * 2)
+  for (let i = 0; i < samples.length; i++) {
+    const v = Math.max(-1, Math.min(1, Number(samples[i]) || 0))
+    out.writeInt16LE(Math.round(v * 32767), i * 2)
+  }
+  return out
+}
+
+/**
  * 主动消息按目标限流器（支持最小间隔 + 滑动时间窗计数），避免个人微信/企业微信触发风控。
  */
 export function createProactiveRateLimiter({

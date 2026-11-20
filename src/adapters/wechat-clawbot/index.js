@@ -5,7 +5,7 @@
 // 硬边界（方案 §三 / §四 / §五）：
 //   1. 与企业微信 wecom 彻底分离，不共享身份、chatId 命名空间、caps 或 API 客户端。
 //   2. 诚实能力声明：以 1:1 私聊为主（allowGroup 默认 false）；无原生表情包（按图片降级）；
-//      语音按音频文件发送（voice:'file'）；无历史/成员列表/合并转发；不接入 group-admin。
+//      语音优先转 16k SILK 发原生语音条，缺依赖/转码失败按文件降级；无历史/成员列表/合并转发；不接入 group-admin。
 //   3. emit 是特权口：机器人自身消息（message_type===2）走 self-sent 不 emit；stop() 后绝不再 emit。
 //   4. 面板二维码登录通过 node 内置加密与本地 SVG 生成（不向第三方二维码服务泄漏 URL）。
 
@@ -25,6 +25,7 @@ import {
   formatWechatErrorSummary,
   inferMimeFromBytes,
   splitWechatText,
+  transcodeAudioToSilk,
 } from '../wechat-common/index.js'
 
 // ───────────────────────── 平台常量（腾讯 iLink Bot 协议） ─────────────────────────
@@ -68,7 +69,7 @@ const MAX_CONTEXT_ENTRIES = 2000
 export const CAPS_WECHAT_CLAWBOT = Object.freeze({
   image: true,
   sticker: false, // 无原生微信表情包接口：按普通图片发送，禁 qq_import_stickers
-  voice: 'file', // 个人微信以通用文件/音频形式外发；入站优先读平台语音转文字 text
+  voice: 'file', // 仍声明 file：适配器优先尝试 SILK 语音条，缺依赖/转码失败才按文件发；不把 native 写死，避免中枢强制转 Opus
   video: true,
   file: true,
   maxFileBytes: DEFAULT_MAX_FILE_BYTES,
@@ -597,6 +598,11 @@ export function createWechatClawbotAdapter(options = {}) {
     if (Number.isFinite(raw) && raw > 0) return Math.min(DEFAULT_MAX_FILE_BYTES, raw)
     return DEFAULT_MAX_FILE_BYTES
   }
+  // 默认尝试原生语音条；没有 SILK 编码依赖或转码失败时自动降级成文件。
+  const voiceOutboundOf = () => {
+    const value = cfgOf().voiceOutbound
+    return value !== false && value !== 'false'
+  }
 
   function dataDirPath() {
     let dir = null
@@ -958,6 +964,79 @@ export function createWechatClawbotAdapter(options = {}) {
     return null
   }
 
+  /**
+   * 语音准备：
+   * - 能拿到 SILK 就发原生语音条；
+   * - 转码失败/缺少依赖时返回检测过 MIME 的文件媒体，按文件发。
+   *
+   * 微信协议要求 voice_item 固定 16k/16bit/SILK，playtime 为秒。
+   */
+  async function prepareVoiceItem(media, toUserId, timeoutMs, durationMs = 0) {
+    const maxBytes = maxFileBytesOf()
+    const bytes = await resolvePlainBytes(media, timeoutMs, maxBytes)
+    if (!bytes?.length) {
+      // 入站媒体缓存只有描述符、没有明文字节：让 prepareOutboundMedia 复用缓存直传，别把语音弄丢。
+      if (media?.id && mediaCache.has(String(media.id))) {
+        return { item: null, fallbackMedia: media, reason: 'cached-media' }
+      }
+      throw createSendError('not-sent', 'media-needs-upload', instance, '语音缺少可用内容（bytes/path/url）')
+    }
+    if (maxBytes > 0 && bytes.length > maxBytes) {
+      throw createSendError('not-sent', 'too-large', instance, `语音 ${bytes.length} 字节超过微信上限 ${maxBytes}`)
+    }
+
+    const detected = inferMimeFromBytes(bytes)
+    const fallbackMime = detected || media?.mime || 'audio/mpeg'
+    const fallbackName = media?.name || `voice.${extForMime(fallbackMime, 'mp3')}`
+    const fallbackMedia = { ...media, bytes, mime: fallbackMime, name: fallbackName }
+
+    if (!voiceOutboundOf()) {
+      return { item: null, fallbackMedia, reason: 'voiceOutbound=false' }
+    }
+
+    const silkResult = await transcodeAudioToSilk(bytes)
+    if (!silkResult.ok) {
+      ctx?.log?.debug?.(`微信语音转 SILK 失败，按文件发送：${silkResult.reason}`)
+      return { item: null, fallbackMedia, reason: silkResult.reason }
+    }
+
+    const uploaded = await prepareOutboundMedia(
+      { bytes: silkResult.bytes, mime: 'audio/silk', name: 'voice.silk', size: silkResult.bytes.length },
+      UPLOAD_MEDIA_TYPE.VOICE,
+      toUserId,
+      timeoutMs,
+      '语音',
+    )
+    const totalMs = Number(silkResult.durationMs) || Number(durationMs) || 0
+    const playtime = Math.max(1, Math.round(totalMs / 1000) || 1)
+    return {
+      item: {
+        type: ITEM_TYPE.VOICE,
+        voice_item: {
+          media: uploaded.media,
+          encode_type: 0,
+          bits_per_sample: 16,
+          sample_rate: 16000,
+          playtime,
+        },
+      },
+      fallbackMedia,
+      reason: '',
+    }
+  }
+
+  function buildFileItem(uploaded, media) {
+    return {
+      type: ITEM_TYPE.FILE,
+      file_item: {
+        media: uploaded.media,
+        file_name: String(media?.name || `file.${extForMime(media?.mime, 'bin')}`),
+        len: String(uploaded.rawsize || 0),
+        ...(uploaded.rawfilemd5 ? { md5: uploaded.rawfilemd5 } : {}),
+      },
+    }
+  }
+
   async function prepareOutboundMedia(media, uploadMediaType, toUserId, timeoutMs, kindLabel) {
     const maxBytes = maxFileBytesOf()
     if (Number(media?.size) > 0 && Number(media.size) > maxBytes) {
@@ -1132,6 +1211,7 @@ export function createWechatClawbotAdapter(options = {}) {
       { key: 'routeTag', label: '路由标签（可选）', type: 'text', placeholder: 'SKRouteTag（一般留空）', hint: '仅内网/灰度环境需要填写' },
       { key: 'allowGroup', label: '允许接收群聊消息（实验性）', type: 'boolean', default: false, hint: '个人微信 ClawBot 群聊依赖官方账号灰度权限，默认只开放 1:1 私聊' },
       { key: 'listenAllInGroup', label: '群内接收全部消息', type: 'boolean', default: false, hint: '仅在开启群聊后生效；关闭时仅处理 @ 机器人消息' },
+      { key: 'voiceOutbound', label: '发送原生语音条（实验性）', type: 'boolean', default: true, hint: '把语音转成 SILK 发微信语音气泡；缺少 silk-wasm / mpg123-decoder 或转码失败时自动按文件发送' },
       { key: 'maxTextChars', label: '单条文本上限（字符）', type: 'number', default: DEFAULT_MAX_TEXT_CHARS, hint: '超出自动分段发送' },
       { key: 'timeoutMs', label: '请求超时（毫秒）', type: 'number', default: DEFAULT_TIMEOUT_MS },
     ],
@@ -1319,9 +1399,7 @@ export function createWechatClawbotAdapter(options = {}) {
             break
           case 'voice': {
             flushText()
-            const m = part.media || {}
-            const ext = extForMime(m.mime, 'mp3')
-            itemsToSend.push({ kind: 'file', media: { ...m, name: m.name || `voice.${ext}` } })
+            itemsToSend.push({ kind: 'voice', media: part.media || {}, durationMs: Number(part.durationMs) || 0 })
             break
           }
           case 'file':
@@ -1348,17 +1426,17 @@ export function createWechatClawbotAdapter(options = {}) {
         } else if (!item && entry.kind === 'video') {
           const uploaded = await prepareOutboundMedia(entry.media, UPLOAD_MEDIA_TYPE.VIDEO, toUserId, timeoutMs, '视频')
           item = { type: ITEM_TYPE.VIDEO, video_item: { media: uploaded.media, video_size: uploaded.filesize } }
+        } else if (!item && entry.kind === 'voice') {
+          const prepared = await prepareVoiceItem(entry.media, toUserId, timeoutMs, entry.durationMs)
+          if (prepared.item) {
+            item = prepared.item
+          } else {
+            const uploaded = await prepareOutboundMedia(prepared.fallbackMedia, UPLOAD_MEDIA_TYPE.FILE, toUserId, timeoutMs, '语音文件')
+            item = buildFileItem(uploaded, prepared.fallbackMedia)
+          }
         } else if (!item && entry.kind === 'file') {
           const uploaded = await prepareOutboundMedia(entry.media, UPLOAD_MEDIA_TYPE.FILE, toUserId, timeoutMs, '文件')
-          item = {
-            type: ITEM_TYPE.FILE,
-            file_item: {
-              media: uploaded.media,
-              file_name: String(entry.media?.name || `file.${extForMime(entry.media?.mime, 'bin')}`),
-              len: String(uploaded.rawsize || 0),
-              ...(uploaded.rawfilemd5 ? { md5: uploaded.rawfilemd5 } : {}),
-            },
-          }
+          item = buildFileItem(uploaded, entry.media)
         }
 
         const clientId = `wx-${randomUUID().replace(/-/g, '').slice(0, 16)}`
