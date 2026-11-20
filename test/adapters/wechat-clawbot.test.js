@@ -431,7 +431,7 @@ test('出站 send：长文本分段、图片/视频/文件/语音降级加密上
   await adapter.stop()
 })
 
-test('语音出站：默认转 SILK 发微信语音条，编码失败才降级文件', { skip: !silkAvailable }, async () => {
+test('语音出站：voiceOutbound=true 时转 SILK 语音条，编码失败才降级文件', { skip: !silkAvailable }, async () => {
   const client = makeMockIlinkClient()
   const adapter = createWechatClawbotAdapter({ client })
   const ctx = makeCtx(adapter, { botToken: 'tok_voice', botId: 'bot_voice', voiceOutbound: true })

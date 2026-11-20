@@ -5,7 +5,7 @@
 // 硬边界（方案 §三 / §四 / §五）：
 //   1. 与企业微信 wecom 彻底分离，不共享身份、chatId 命名空间、caps 或 API 客户端。
 //   2. 诚实能力声明：以 1:1 私聊为主（allowGroup 默认 false）；无原生表情包（按图片降级）；
-//      语音优先转 16k SILK 发原生语音条，缺依赖/转码失败按文件降级；无历史/成员列表/合并转发；不接入 group-admin。
+//      语音默认按文件发送（iLink 实测会接受机器人 voice_item 但不投递）；仅 voiceOutbound=true 时尝试 SILK 语音条；无历史/成员列表/合并转发；不接入 group-admin。
 //   3. emit 是特权口：机器人自身消息（message_type===2）走 self-sent 不 emit；stop() 后绝不再 emit。
 //   4. 面板二维码登录通过 node 内置加密与本地 SVG 生成（不向第三方二维码服务泄漏 URL）。
 
@@ -69,7 +69,7 @@ const MAX_CONTEXT_ENTRIES = 2000
 export const CAPS_WECHAT_CLAWBOT = Object.freeze({
   image: true,
   sticker: false, // 无原生微信表情包接口：按普通图片发送，禁 qq_import_stickers
-  voice: 'file', // 仍声明 file：适配器优先尝试 SILK 语音条，缺依赖/转码失败才按文件发；不把 native 写死，避免中枢强制转 Opus
+  voice: 'file', // 默认按文件发；实测 iLink 接受机器人 voice_item 但不投递，voiceOutbound=true 仅作实验
   video: true,
   file: true,
   maxFileBytes: DEFAULT_MAX_FILE_BYTES,
@@ -598,10 +598,11 @@ export function createWechatClawbotAdapter(options = {}) {
     if (Number.isFinite(raw) && raw > 0) return Math.min(DEFAULT_MAX_FILE_BYTES, raw)
     return DEFAULT_MAX_FILE_BYTES
   }
-  // 默认尝试原生语音条；没有 SILK 编码依赖或转码失败时自动降级成文件。
+  // 实测 iLink 会接受机器人 voice_item（ret=0）但不投递，造成“文件和语音都没有”。
+  // 因此默认按文件发；只有显式 voiceOutbound=true 才尝试语音气泡。
   const voiceOutboundOf = () => {
     const value = cfgOf().voiceOutbound
-    return value !== false && value !== 'false'
+    return value === true || value === 'true'
   }
 
   function dataDirPath() {
@@ -1212,7 +1213,7 @@ export function createWechatClawbotAdapter(options = {}) {
       { key: 'routeTag', label: '路由标签（可选）', type: 'text', placeholder: 'SKRouteTag（一般留空）', hint: '仅内网/灰度环境需要填写' },
       { key: 'allowGroup', label: '允许接收群聊消息（实验性）', type: 'boolean', default: false, hint: '个人微信 ClawBot 群聊依赖官方账号灰度权限，默认只开放 1:1 私聊' },
       { key: 'listenAllInGroup', label: '群内接收全部消息', type: 'boolean', default: false, hint: '仅在开启群聊后生效；关闭时仅处理 @ 机器人消息' },
-      { key: 'voiceOutbound', label: '发送原生语音条（实验性）', type: 'boolean', default: true, hint: '把语音转成 SILK 发微信语音气泡；缺少 silk-wasm / mpg123-decoder 或转码失败时自动按文件发送' },
+      { key: 'voiceOutbound', label: '发送原生语音条（实验性，默认关）', type: 'boolean', default: false, hint: '实测 iLink 会接受机器人 voice_item 但不投递，开了可能让语音附件无声消失；默认按文件发送。只有想验证腾讯是否已放开时才打开' },
       { key: 'maxTextChars', label: '单条文本上限（字符）', type: 'number', default: DEFAULT_MAX_TEXT_CHARS, hint: '超出自动分段发送' },
       { key: 'timeoutMs', label: '请求超时（毫秒）', type: 'number', default: DEFAULT_TIMEOUT_MS },
     ],
