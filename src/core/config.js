@@ -59,7 +59,7 @@ export const DEFAULTS = {
   // DeepSeek 峰谷省钱模式（默认关，现有行为不变）：打开后只把「不着急的后台模型调用」尽量挪到谷时，
   // 聊天回复/工具/审批/定时任务本身不变。offPeakHolidays 是中国法定节假日（北京时间日期 'YYYY-MM-DD'）。
   cost: { offPeak: false, offPeakHolidays: [] },
-  update: { unstable: null }, // 订阅不稳定版本（beta、rc）；null = 没选过，按正在用的版本定
+  update: { unstable: null, mirror: '' }, // 订阅不稳定版本（beta、rc）；mirror = 下载镜像前缀（空 = 直连 GitHub）
   snowluma: {
     dir: 'C:\\Aurabot\\snowluma', // 主人自己下载解压到这里（EULA 不允许自动部署）
     autoStart: true, // 随 DSH 启动它（只启动主人已安装并同意过协议的副本）
@@ -569,7 +569,7 @@ export function normalize(raw) {
   c.cost.offPeak = bool(c.cost.offPeak, false)
   const rawHolidays = Array.isArray(c.cost.offPeakHolidays) ? c.cost.offPeakHolidays : String(c.cost.offPeakHolidays || '').split(/[\n,，;；\s]+/)
   c.cost.offPeakHolidays = [...new Set(rawHolidays.map(dateKey).filter(Boolean))].sort().slice(0, 60)
-  c.update = { unstable: typeof c.update?.unstable === 'boolean' ? c.update.unstable : null }
+  c.update = { unstable: typeof c.update?.unstable === 'boolean' ? c.update.unstable : null, mirror: String(c.update?.mirror || '').trim().slice(0, 300) }
   c.files.enabled = bool(c.files.enabled, true)
   c.files.maxMB = num(c.files.maxMB, 50, 1, BIG)
   c.files.imageByPath = bool(c.files.imageByPath, true)

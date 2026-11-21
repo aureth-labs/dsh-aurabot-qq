@@ -1149,7 +1149,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h('div', { className: 'ab-flex' }, h('b', null, '已更新到 v' + st.version), h('div', { className: 'ab-spacer' }), h(Btn, { small: true, kind: 'ghost', onClick: dismiss }, '知道了')),
           h('div', { style: { whiteSpace: 'pre-wrap', marginTop: 6 } }, notes)) : null,
         upd && upd.newer ? h('div', { className: 'ab-note warn' },
-          h('div', null, h('b', null, '有新版本 v' + upd.latest), '（现在是 v' + upd.current + '）。', envText ? '当前环境：' + envText + '。' : '', '更新后重启 DSH，设置、人格、记忆都会保留。'),
+          h('div', null, h('b', null, '有新版本 v' + upd.latest), '（现在是 v' + upd.current + '）。', envText ? '当前环境：' + envText + '。' : '', upd.mirrorLabel ? '下载镜像：' + upd.mirrorLabel + '（下载失败会自动回退直连）。' : '', '更新后重启 DSH，设置、人格、记忆都会保留。'),
           h('div', { className: 'ab-flex', style: { marginTop: 6 } },
             h('code', { style: { flex: '1 1 240px', fontSize: 11.5, wordBreak: 'break-all' } }, upd.command),
             h(Btn, { small: true, onClick: () => copy(upd.command) }, '复制'),
@@ -9416,6 +9416,39 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       )
     }
 
+    /** 更新下载镜像：默认直连 GitHub；国内可选 gh-proxy / ghfast，也能填自己的前缀（空 = 直连）。 */
+    function UpdateMirrorRow({ draft, setDraft }) {
+      const [presets, setPresets] = useState([])
+      const [customMode, setCustomMode] = useState(false)
+      useEffect(() => { get('/update/mirror').then((r) => { if (r && r.ok && Array.isArray(r.presets) && r.presets.length) setPresets(r.presets) }).catch(() => {}) }, [])
+      // 后端拿不到预设时用内置的同名兜底，输入框仍然能填自定义前缀
+      const list = presets.length ? presets : [
+        { id: 'gh-proxy', label: 'gh-proxy.com', prefix: 'https://gh-proxy.com/' },
+        { id: 'ghfast', label: 'ghfast.top', prefix: 'https://ghfast.top/' },
+      ]
+      const raw = String((draft.update && draft.update.mirror) || '').trim()
+      const clean = raw.replace(/\/+$/, '')
+      const matched = list.find((p) => p.prefix.replace(/\/+$/, '') === clean || p.id === clean || p.label === clean)
+      const mode = matched ? matched.id : customMode || clean ? 'custom' : 'direct'
+      const pick = (id) => {
+        if (id === 'direct') { setCustomMode(false); return setDraft(setPath(draft, 'update.mirror', '')) }
+        if (id === 'custom') { setCustomMode(true); return setDraft(setPath(draft, 'update.mirror', matched ? '' : raw)) }
+        setCustomMode(false)
+        const p = list.find((x) => x.id === id)
+        setDraft(setPath(draft, 'update.mirror', p ? p.prefix : ''))
+      }
+      const bad = mode === 'custom' && raw && !/^https?:\/\/[^\s]+$/i.test(raw)
+      return h(Fragment, null,
+        h(Row, { label: '下载镜像', hint: '默认直连 GitHub。国内连不上时可选 gh-proxy.com / ghfast.top，或填自己的镜像前缀；下载失败会自动回退直连' },
+          h('div', { className: 'ab-flex', style: { gap: 8, flexWrap: 'wrap', width: '100%' } },
+            h('select', { className: 'ab-select', 'aria-label': '更新下载镜像', value: mode, onChange: (e) => pick(e.target.value) },
+              h('option', { value: 'direct' }, '直连 GitHub（默认）'),
+              list.map((p) => h('option', { key: p.id, value: p.id }, p.label)),
+              h('option', { value: 'custom' }, '自定义镜像')),
+            mode === 'custom' ? h('input', { className: 'ab-input', style: { flex: '1 1 300px' }, value: raw, placeholder: 'https://gh-proxy.com/', onChange: (e) => { setCustomMode(true); setDraft(setPath(draft, 'update.mirror', e.target.value)) } }) : null)),
+        bad ? h('div', { className: 'ab-note warn', style: { marginTop: 6 } }, '地址要以 http(s):// 开头；格式不对时更新会按直连处理。') : null)
+    }
+
     /** 安全防护：SSRF 这类内置防护的强度。 */
     function Security({ st, draft, setDraft }) {
       const f = useField(draft, setDraft)
@@ -9424,7 +9457,8 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const unstable = typeof picked === 'boolean' ? picked : String(st.version).includes('-')
       return h('div', { className: 'ab-grid' },
         h(Card, { title: '更新推送', desc: '插件有新版本时，面板会提示并给出更新命令。' },
-          h(Row, { label: '订阅不稳定版本', hint: '打开后也会收到 beta 和 rc 测试版，能早点用上新功能，但可能有问题；关掉只收正式版' }, h(Switch, { on: unstable, onChange: (v) => setDraft(setPath(draft, 'update.unstable', v)) }))),
+          h(Row, { label: '订阅不稳定版本', hint: '打开后也会收到 beta 和 rc 测试版，能早点用上新功能，但可能有问题；关掉只收正式版' }, h(Switch, { on: unstable, onChange: (v) => setDraft(setPath(draft, 'update.unstable', v)) })),
+          h(UpdateMirrorRow, { draft, setDraft })),
         h(Card, { title: '危险命令确认', right: f.sw('security.dangerConfirm'), desc: '打开后，ta在私聊里要执行终端危险命令（删根目录、格式化、关机、下载后直接执行等）之前，会先发 QQ 私聊问你；你回复「确认」才执行，回复「取消」或 60 秒没回就拦下。默认开；只拦真正致命的命令，普通删除/构建/改文件不受影响。' }),
         h(Card, { title: 'SSRF 防护', desc: '限制 ta 下载图片、语音时能访问哪些地址 —— 防止有人用一条链接诱导 ta 去访问你电脑或内网里的服务（路由器管理页、云服务器的 169.254.169.254、本机端口之类）。' },
           h(Row, { label: '防护强度', hint: '部署在服务器上、或者群里有陌生人时，用「严格」' },

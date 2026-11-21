@@ -82,3 +82,21 @@ test('updateCommand 按分支或 Release Tag 给命令', () => {
   assert.match(updateCommand('a/b', 'main', { ref: 'v1.2.0' }), /github:a\/b#v1\.2\.0/)
   assert.match(updatePlan({ repo: 'a/b', channel: 'main', latest: '1.2.0', tag: 'v1.2.0' }).tagUrl, /releases\/tag\/v1\.2\.0$/)
 })
+
+test('配置镜像后 update/check 的命令也走镜像 tarball', async () => {
+  const { fetchImpl } = fetchOf(['1.2.0'])
+  const r = await createUpdateChecker({ pkg: pkg('1.1.0'), fetchImpl, mirror: () => 'gh-proxy' })({ force: true })
+  assert.match(r.command, /plugin --profile \S+ add https:\/\/gh-proxy\.com\/https:\/\/github\.com\/a\/b\/archive\/refs\/tags\/v1\.2\.0\.tar\.gz$/)
+})
+
+test('镜像配置变了要重新检查，不能一直用旧镜像的缓存命令', async () => {
+  const { fetchImpl, asked } = fetchOf(['1.2.0'])
+  let mirror = ''
+  const check = createUpdateChecker({ pkg: pkg('1.1.0'), fetchImpl, mirror: () => mirror })
+  const direct = await check()
+  assert.match(direct.command, /add github:a\/b#v1\.2\.0$/)
+  mirror = 'ghfast'
+  const mirrored = await check()
+  assert.match(mirrored.command, /ghfast\.top/)
+  assert.equal(asked.length, 2, '换镜像后应重新拉 Release')
+})

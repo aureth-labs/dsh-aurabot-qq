@@ -38,7 +38,7 @@ import { buildFaceIndex } from './chat/faces.js'
 import { FACE_TABLE } from './chat/face-table.js'
 import { dataDir, ensureDir } from './core/store.js'
 import { initUsage, usageReport, closeUsage } from './core/usage.js'
-import { createUpdateChecker, changelogSection, hostEnv, updatePlan, repoOf } from './core/update.js'
+import { createUpdateChecker, changelogSection, hostEnv, updatePlan, updateAttempts, runUpdateAttempts, linkInstallOf, resolveMirror, mirrorLabel, MIRROR_PRESETS, repoOf } from './core/update.js'
 import { parseCommand, runCommand, createMutes, commandList } from './chat/commands.js'
 import { isOwner, groupResponseMode } from './chat/access.js'
 import { changePermissions, changePrivateWhitelist, privatePermissionCatalog } from './chat/permission-policy.js'
@@ -2102,10 +2102,10 @@ export function apply(ctx) {
     }
   })
   // 更新：检查 GitHub 上有没有新版本；这次更新了什么
-  const checkUpdate = createUpdateChecker({ pkg: PKG, log, unstable: () => getConfig().update.unstable })
+  const checkUpdate = createUpdateChecker({ pkg: PKG, log, unstable: () => getConfig().update.unstable, mirror: () => getConfig().update.mirror })
   // 宿主环境（Windows/macOS/Linux + 桌面版/网页版）决定更新命令怎么写、发布页指向哪
   const updateEnv = hostEnv()
-  const updatePlanOf = (result) => updatePlan({ repo: result.repo || repoOf(PKG), channel: result.channel || 'main', latest: result.latest || '', tag: result.tag || '', env: updateEnv })
+  const updatePlanOf = (result) => updatePlan({ repo: result.repo || repoOf(PKG), channel: result.channel || 'main', latest: result.latest || '', tag: result.tag || '', env: updateEnv, mirror: getConfig().update.mirror })
   route('/update/check', async (req) => {
     const r = await checkUpdate({ force: query(req).force === '1' })
     if (!r || !r.ok) return { ...r, env: updateEnv }
@@ -2121,25 +2121,44 @@ export function apply(ctx) {
     if (!checked || !checked.ok || !checked.tag) return { ok: false, message: checked?.message || '还没有发布过可安装的版本，等作者发 Release 后再试' }
     if (!checked.newer) return { ok: false, message: '当前没有比已安装版本更新的 Release' }
     const channel = checked.channel === 'beta' ? 'beta' : 'main'
-    const plan = updatePlan({ repo, channel, latest: checked.latest, tag: checked.tag, env: updateEnv })
+    const mirror = getConfig().update.mirror
+    const plan = updatePlan({ repo, channel, latest: checked.latest, tag: checked.tag, env: updateEnv, mirror })
     // 本地 link 安装（开发模式）不能被 CLI 覆盖，否则会把链接换成仓库副本
-    try {
-      const pkgFile = join(process.env.DSH_PROFILE_DIR || '', 'package.json')
-      const dep = JSON.parse(readFileSync(pkgFile, 'utf8'))?.dependencies?.[String(PKG.name)]
-      if (dep && String(dep).startsWith('link:')) {
-        return { ok: false, message: '当前是本地链接安装（开发模式），自动更新会把它换成仓库副本；请用 git 更新，或手动执行下面这条命令。', command: plan.command }
-      }
-    } catch (error) {}
+    const linkDep = linkInstallOf({ profileDir: process.env.DSH_PROFILE_DIR || '', packageName: String(PKG.name) })
+    if (linkDep) {
+      return { ok: false, message: '当前是本地链接安装（开发模式），自动更新会把它换成仓库副本；请用 git 更新，或手动执行下面这条命令。', command: plan.command }
+    }
     applyingUpdate = true
     try {
-      const arg = `github:${repo}#${checked.tag}`
-      const args = ['plugin', '--profile', updateEnv.profile, 'add', arg]
-      const exec = updateExec(updateEnv, args)
-      const r = await runUpdate(exec.cmd, exec.cmdArgs, exec.env, exec.shell)
-      return { ...r, command: plan.command, env: updateEnv }
+      // 配了镜像先走镜像 tarball；失败自动回退到原来的 github: 直连，默认（没配镜像）只有直连一条。
+      const attempts = updateAttempts({ repo, channel, ref: checked.tag, profile: updateEnv.profile, mirror })
+      return await runUpdateAttempts({
+        attempts,
+        plan,
+        env: updateEnv,
+        log,
+        runAttempt: (attempt) => {
+          const exec = updateExec(updateEnv, attempt.args)
+          return runUpdate(exec.cmd, exec.cmdArgs, exec.env, exec.shell)
+        },
+      })
     } finally {
       applyingUpdate = false
     }
+  })
+  // 更新下载镜像：面板设置里读预设；POST 可直接保存（空 = 直连 GitHub）。
+  route('/update/mirror', async (req) => {
+    if (String(req?.method || 'GET').toUpperCase() === 'POST') {
+      const body = await readBody(req)
+      const raw = String(body?.mirror ?? '').trim().slice(0, 300)
+      const resolved = resolveMirror(raw)
+      if (raw && !resolved) return { ok: false, message: '镜像要填 http(s):// 开头的完整前缀，或选 gh-proxy / ghfast 预设' }
+      setConfig(mergeFromPanel(cfg, { update: { mirror: resolved } }))
+      log.info(`更新下载镜像已保存｜${resolved || '（直连 GitHub）'}`)
+      return { ok: true, mirror: resolved, resolved, mirrorLabel: mirrorLabel(resolved), message: resolved ? `已启用下载镜像 ${mirrorLabel(resolved)}` : '已恢复直连 GitHub' }
+    }
+    const current = resolveMirror(getConfig().update.mirror)
+    return { ok: true, mirror: current, resolved: current, mirrorLabel: mirrorLabel(current), presets: MIRROR_PRESETS }
   })
   route('/changelog', async () => {
     let text = ''

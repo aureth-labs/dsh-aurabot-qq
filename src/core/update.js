@@ -1,7 +1,7 @@
 // 检查更新：读 GitHub 的 Release（不是主分支 package.json）。
 // 只有真正发布过 Release / Tag 的版本才会提示，避免分支上提前写好的版本号被当成更新。
 
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
 const STAGE = { alpha: 1, beta: 2, rc: 3 }
@@ -69,19 +69,156 @@ export function hostEnv(opts = {}) {
   }
 }
 
-/** 更新命令：默认按分支；给 ref 时按具体 Release Tag 安装，避免装到分支上未发布的代码。 */
-export function updateCommand(repo, channel = 'main', opts = {}) {
-  const env = opts.env || hostEnv({ platform: opts.platform, cli: opts.cli, profile: opts.profile })
+/** 下载镜像预设：配置里可以填 id、域名，也可以填任意 http(s) 前缀；空 = 直连 GitHub。 */
+export const MIRROR_PRESETS = [
+  { id: 'gh-proxy', label: 'gh-proxy.com', prefix: 'https://gh-proxy.com/' },
+  { id: 'ghfast', label: 'ghfast.top', prefix: 'https://ghfast.top/' },
+]
+
+/** 把 config.update.mirror 的写法统一成「https://前缀/」；认不出或非法时返回空串（按直连处理）。 */
+export function resolveMirror(value) {
+  const raw = String(value || '').trim()
+  if (!raw) return ''
+  const key = raw.toLowerCase().replace(/\/+$/, '')
+  for (const preset of MIRROR_PRESETS) {
+    const names = [preset.id, preset.label, preset.prefix.replace(/\/+$/, '')]
+    if (preset.id === 'gh-proxy') names.push('ghproxy')
+    if (names.includes(key)) return preset.prefix
+  }
+  if (!/^https?:\/\/[^\s]+$/i.test(raw)) return ''
+  return raw.replace(/\/+$/, '') + '/'
+}
+
+/** 镜像在面板上的短名字：预设用 label，自定义用域名。 */
+export function mirrorLabel(value) {
+  const prefix = resolveMirror(value)
+  if (!prefix) return ''
+  const preset = MIRROR_PRESETS.find((p) => p.prefix === prefix)
+  if (preset) return preset.label
+  try { return new URL(prefix).host } catch { return prefix }
+}
+
+/** 给 GitHub 地址套上镜像前缀；已经套过的不重复套。 */
+export function mirrorUrl(url, mirror) {
+  const prefix = resolveMirror(mirror)
+  const target = String(url || '')
+  if (!prefix || !target) return target
+  return target.startsWith(prefix) ? target : prefix + target
+}
+
+/**
+ * GitHub 源码压缩包地址。`dsh plugin add` 的 plugin-manager 明确接受 http(s) 的
+ * .tgz / .tar.gz（parseInstallSpec 的 tarball 分支），Release 没传资产时用 tag 的源码包最稳。
+ */
+export function githubTarballUrl(repo, { ref = '', channel = 'main' } = {}) {
+  const kind = ref ? 'tags' : 'heads'
+  const name = String(ref || (channel === 'main' ? 'main' : channel) || 'main')
+  const safe = name.split('/').map((part) => encodeURIComponent(part)).join('/')
+  return `https://github.com/${String(repo || '').replace(/^\/+|\/+$/g, '')}/archive/refs/${kind}/${safe}.tar.gz`
+}
+
+/**
+ * 更新时依次尝试的安装命令：配了镜像先走镜像 tarball，失败再回退原来的 github: 直连；
+ * 没配镜像时和以前完全一样，只有一条 github: 命令。
+ */
+export function updateAttempts({ repo, channel = 'main', ref = '', profile = 'desktop', mirror = '' } = {}) {
+  const directSpec = `github:${repo}${ref ? '#' + ref : channel === 'main' ? '' : '#' + channel}`
+  const direct = { kind: 'direct', spec: directSpec, args: ['plugin', '--profile', profile, 'add', directSpec] }
+  const prefix = resolveMirror(mirror)
+  if (!prefix) return [direct]
+  const url = mirrorUrl(githubTarballUrl(repo, { ref, channel }), prefix)
+  return [
+    { kind: 'mirror', mirror: prefix, mirrorLabel: mirrorLabel(prefix), url, spec: url, args: ['plugin', '--profile', profile, 'add', url] },
+    direct,
+  ]
+}
+
+/**
+ * 本地 `link:` 安装保护：读 profile 的 package.json，返回这个插件被 link 的依赖值（不是 link 返回空串）。
+ * profileDir 为空、文件不存在、JSON 坏了都按「没有保护信息」处理，调用方继续正常更新流程。
+ * readFile 可注入，方便单测不依赖真实 DSH profile。
+ */
+export function linkInstallOf({ profileDir = '', packageName = '', readFile = readFileSync } = {}) {
+  if (!profileDir || !packageName) return ''
+  try {
+    const pkg = JSON.parse(readFile(join(profileDir, 'package.json'), 'utf8'))
+    const dep = pkg?.dependencies?.[packageName]
+    return typeof dep === 'string' && dep.startsWith('link:') ? dep : ''
+  } catch (error) {
+    return ''
+  }
+}
+
+/**
+ * 按顺序执行 updateAttempts 的安装尝试，直到一条成功；runAttempt 由宿主注入，
+ * 真实实现会把它转成 dsh plugin add 子进程，单元测试可以直接模拟每条命令的结果。
+ * 返回宿主 /update/apply 需要的 ok / message / output / usedMirror / fallback 字段。
+ */
+export async function runUpdateAttempts({ attempts = [], runAttempt, plan = {}, env = {}, log } = {}) {
+  if (!Array.isArray(attempts) || attempts.length === 0) return { ok: false, message: '没有可执行的更新命令', usedMirror: false, fallback: false, failures: [] }
+  if (typeof runAttempt !== 'function') throw new TypeError('runUpdateAttempts 需要 runAttempt 函数')
+  const failures = []
+  for (let i = 0; i < attempts.length; i++) {
+    const attempt = attempts[i]
+    const r = await runAttempt(attempt, i)
+    if (r && r.ok) {
+      if (i > 0) log?.warn?.('更新镜像失败，已回退直连 GitHub：' + (failures[0]?.message || '未知错误'))
+      const via = attempt.kind === 'mirror' ? `镜像 ${attempt.mirrorLabel}` : '直连 GitHub'
+      const fallback = i > 0 ? '镜像下载失败，已自动回退直连。' : ''
+      return {
+        ...r,
+        ok: true,
+        command: plan.command,
+        directCommand: plan.directCommand,
+        mirror: plan.mirror,
+        mirrorLabel: plan.mirrorLabel,
+        usedMirror: attempt.kind === 'mirror',
+        fallback: i > 0,
+        env,
+        message: fallback + r.message + `（本次走${via}）`,
+      }
+    }
+    failures.push({ kind: attempt.kind, message: r?.message || '更新命令没跑成功', output: r?.output })
+    if (i < attempts.length - 1) log?.warn?.(`更新${attempt.kind === 'mirror' ? '镜像' : '直连'}失败，尝试下一条命令：` + (r?.message || '未知错误'))
+  }
+  const last = failures[failures.length - 1] || { message: '更新命令没跑成功', output: '' }
+  const prefix = failures.length > 1 ? '镜像和直连都没成功：' : ''
+  return {
+    ok: false,
+    message: prefix + last.message,
+    output: failures.map((f) => `[${f.kind === 'mirror' ? '镜像' : '直连'}] ${String(f.output || '').slice(-1200)}`).join('\n'),
+    command: plan.command,
+    directCommand: plan.directCommand,
+    mirror: plan.mirror,
+    mirrorLabel: plan.mirrorLabel,
+    usedMirror: false,
+    fallback: false,
+    env,
+    failures,
+  }
+}
+
+function commandWithSpec(env, profile, spec) {
   const platform = env.platform || process.platform
-  const profile = env.profile || 'desktop'
   const cli = env.cli || (platform === 'win32' ? 'dsh.cmd' : 'dsh')
-  const ref = opts.ref || (channel === 'main' ? '' : channel)
-  const arg = `plugin --profile ${profile} add github:${repo}${ref ? '#' + ref : ''}`
+  const arg = `plugin --profile ${profile} add ${spec}`
   return platform === 'win32' ? `& "${cli}" ${arg}` : `"${cli}" ${arg}`
 }
 
+/** 更新命令：默认按分支；给 ref 时按具体 Release Tag 安装，避免装到分支上未发布的代码。 */
+export function updateCommand(repo, channel = 'main', opts = {}) {
+  const env = opts.env || hostEnv({ platform: opts.platform, cli: opts.cli, profile: opts.profile })
+  const profile = env.profile || opts.profile || 'desktop'
+  const attempt = updateAttempts({ repo, channel, ref: opts.ref || '', profile, mirror: opts.mirror }).at(0)
+  return commandWithSpec(env, profile, attempt.spec)
+}
+
 /** 更新计划：链接、命令、环境标签一次给全。 */
-export function updatePlan({ repo, channel = 'main', latest = '', tag = '', env = hostEnv() } = {}) {
+export function updatePlan({ repo, channel = 'main', latest = '', tag = '', env = hostEnv(), mirror = '' } = {}) {
+  const profile = env.profile || 'desktop'
+  const attempts = updateAttempts({ repo, channel, ref: tag, profile, mirror })
+  const primary = attempts[0]
+  const direct = attempts[attempts.length - 1]
   return {
     platform: env.platform,
     platformLabel: env.label,
@@ -90,7 +227,12 @@ export function updatePlan({ repo, channel = 'main', latest = '', tag = '', env 
     profile: env.profile,
     shell: env.shell,
     cli: env.cli,
-    command: updateCommand(repo, channel, { env, ref: tag }),
+    command: commandWithSpec(env, profile, primary.spec),
+    // 镜像失败时宿主会回退这条；面板上也能看到，方便手动执行。
+    directCommand: commandWithSpec(env, profile, direct.spec),
+    mirror: primary.kind === 'mirror' ? primary.mirror : '',
+    mirrorLabel: primary.kind === 'mirror' ? primary.mirrorLabel : '',
+    installUrl: primary.kind === 'mirror' ? primary.url : '',
     releaseUrl: `https://github.com/${repo}/releases`,
     tagUrl: tag ? `https://github.com/${repo}/releases/tag/${tag}` : latest ? `https://github.com/${repo}/releases/tag/v${latest}` : `https://github.com/${repo}/releases`,
   }
@@ -139,13 +281,14 @@ async function readReleases(repo, fetchImpl) {
   throw lastError || new Error('拿不到 Release 列表')
 }
 
-export function createUpdateChecker({ pkg, log, fetchImpl = fetch, unstable = () => null }) {
+export function createUpdateChecker({ pkg, log, fetchImpl = fetch, unstable = () => null, mirror = () => '' }) {
   let cache = null
   return async function check({ force = false } = {}) {
     const repo = repoOf(pkg)
     if (!repo) return { ok: false, current: pkg.version, message: '不知道从哪检查更新' }
     const subscribed = wantsUnstable(unstable(), pkg.version)
-    if (!force && cache && cache.subscribed === subscribed && Date.now() - cache.at < 6 * 3600_000) return cache.value
+    const mirrorValue = resolveMirror(typeof mirror === 'function' ? mirror() : mirror)
+    if (!force && cache && cache.subscribed === subscribed && cache.mirror === mirrorValue && Date.now() - cache.at < 6 * 3600_000) return cache.value
     try {
       const releases = await readReleases(repo, fetchImpl)
       // 没订阅只看正式版；订阅了才把 beta/rc 也算进来
@@ -162,9 +305,9 @@ export function createUpdateChecker({ pkg, log, fetchImpl = fetch, unstable = ()
         repo,
         unstable: subscribed,
         channel,
-        command: latest ? updateCommand(repo, channel, { ref: best.tag }) : '',
+        command: latest ? updateCommand(repo, channel, { ref: best.tag, mirror: mirrorValue }) : '',
       }
-      cache = { at: Date.now(), value, subscribed }
+      cache = { at: Date.now(), value, subscribed, mirror: mirrorValue }
       return value
     } catch (error) {
       log?.debug('检查更新失败：', error.message)
