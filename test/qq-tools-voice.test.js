@@ -198,3 +198,15 @@ test('当前聊天：第二条语音漏写结束标签时仍投递两条语音�
   assert.deepEqual(s.spoken, ['第一句。', '第二句。'])
   assert.deepEqual(types(s), ['record', 'record'])
 })
+
+test('群聊长语音：一个起始、四个结束，整段只投递一次；TTS 故障时只回退一次纯文字', async t => {
+  const lines=['开头。','这是一段说明。'.repeat(30),'还有这些细节。'.repeat(35),'最后是结论。']
+  const raw='<voice>'+lines.map(s=>s+'</voice>').join('')
+  for (const synthFails of [false,true]) {
+    const s=setup(t,{synthFails})
+    await s.hub.deliver('group:9',raw,{wantVoice:true,userText:'用语音介绍下这个'})
+    assert.deepEqual(s.spoken.map(x=>x.replace(/\s/g,'')),[lines.join('')])
+    assert.deepEqual(types(s),[synthFails?'text':'record'])
+    if(synthFails) assert.equal(s.calls[0].params.message[0].data.text.replace(/\s/g,''),lines.join(''))
+  }
+})
