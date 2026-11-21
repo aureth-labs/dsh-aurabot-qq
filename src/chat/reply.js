@@ -258,7 +258,7 @@ const FULLWIDTH = (s) => String(s || '').replace(/[！-～]/g, (c) => String.fro
 // 「解释格式/示例」的上下文：这类回答里的代码块/示例不该被工具删除掏空。
 const EXPLAIN_CONTEXT = /(?:例如|比如|示例|例子|举例|解释|说明|格式|写法|怎么写|怎样写|如何写|这样写|这么写|写成|教我|模板|代码如下|代码块|演示|demo|example|提示词|标签)/i
 const PROTO_ATTRS = /^(?:name|arguments?|input|id|callid|type|function|parameters?|parameter|prompt|content|text|json|args|new|old|value|tool|query|q)$/
-const PROTO_NAMES = ['functioncalls', 'functioncall', 'toolcalls', 'toolcall', 'tooloutputs', 'tooloutput', 'toolsection', 'tooluse', 'parameter', 'parameters', 'invoke', 'calls', 'call', 'prompt']
+const PROTO_NAMES = ['functioncalls', 'functioncall', 'toolcalls', 'toolcall', 'tooloutputs', 'tooloutput', 'toolsection', 'tooluse', 'parameter', 'parameters', 'invoke', 'calls', 'call', 'prompt', 'outputs', 'output', 'results', 'result', 'observations', 'observation']
 
 /** 代码围栏 / 行内代码范围：解释语境下里面的工具示例保留。 */
 function codeRanges (raw) {
@@ -484,7 +484,7 @@ function toolTextRanges (raw, { ownerPrivate = false } = {}) {
 
   // 4) 通用下划线标签：只认 tool/param/invoke 类名（<x_1>、<snake_case> 这类正常文字不删）
   // 只认协议类名和本插件已知的工具名前缀（qq_/bili_/...），避免 <x_1>、<snake_case> 这类正常文字被误删。
-  for (const match of raw.matchAll(/[<＜]\s*[\/／]?\s*(?:tool|function|invoke|param(?:eter)?|antml|dsml|arguments?|call|qq|bili|qzone|song|pet|memory|mood|sticker|diary|video|voice|contact|profile|purpose|speak|draw|image|send|get|set)[_:\s]+[a-z0-9_]+["＂]?\s*[>＞]/gi)) {
+  for (const match of raw.matchAll(/[<＜]\s*[\/／]?\s*(?:tool|function|invoke|param(?:eter)?|antml|dsml|arguments?|call|outputs?|results?|observations?|qq|bili|qzone|song|pet|memory|mood|sticker|diary|video|voice|contact|profile|purpose|speak|draw|image|send|get|set)[_:\s]+[a-z0-9_]+["＂]?\s*[>＞]/gi)) {
     if (toolTag(match[0])) continue // 已知协议标签已单独处理，这里只补通用下划线形式
     found.push({ start: match.index, end: match.index + match[0].length, kind: 'generic', paired: false })
   }
