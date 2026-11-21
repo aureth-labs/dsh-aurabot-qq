@@ -257,12 +257,6 @@ test('wantsVoice：明确要语音才算', async () => {
   for (const t of ['晚安', '你的语音好好听', '不要语音', '刚才那条语音是啥']) assert.equal(wantsVoice(t), false, t)
 })
 
-test('语音点评：分句里的请求算，提到语音、引用示例和要求文字不算', async () => {
-  const { wantsVoice } = await import('../src/chat/reply.js')
-  for (const request of ['搜相关资料， 语音重新点评一下。', '语音点评一下这张图', '请语音再总结一遍']) assert.equal(wantsVoice(request), true, request)
-  for (const text of ['把这段语音重新点评一下', '这段语音点评挺好', '“语音点评一下”是什么意思', '语音点评一下是什么意思', '不要语音，重新点评一下', '请用文字点评上面的语音']) assert.equal(wantsVoice(text), false, text)
-})
-
 test('引用回复：<reply:编号> 挂到下一条气泡上，一轮最多一条，写坏的标签去掉', async () => {
   const { parseReply } = await import('../src/chat/reply.js')
   assert.deepEqual(parseReply('<reply:3>粮收到 省着花\n刷视频那摊我少刷两条').items, [

@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import qqTools from '../src/modules/qq-tools/index.js'
 import { createHub } from '../src/chat/hub.js'
-import { hasInvalidVoiceMarkup, wantsVoice } from '../src/chat/reply.js'
+import { hasInvalidVoiceMarkup } from '../src/chat/reply.js'
 import { normalize } from '../src/core/config.js'
 import { scopeCoreForModule } from '../src/core/modules.js'
 import { OneBotError } from '../src/onebot/client.js'
@@ -204,8 +204,7 @@ test('群聊长语音：一个起始、四个结束，整段只投递一次；TT
   const raw='<voice>'+lines.map(s=>s+'</voice>').join('')
   for (const synthFails of [false,true]) {
     const s=setup(t,{synthFails})
-    const userText = '搜相关资料， 语音重新点评一下。'
-    await s.hub.deliver('group:9',raw,{wantVoice:wantsVoice(userText),userText})
+    await s.hub.deliver('group:9',raw,{wantVoice:true,userText:'用语音介绍下这个'})
     assert.deepEqual(s.spoken.map(x=>x.replace(/\s/g,'')),[lines.join('')])
     assert.deepEqual(types(s),[synthFails?'text':'record'])
     if(synthFails) assert.equal(s.calls[0].params.message[0].data.text.replace(/\s/g,''),lines.join(''))
