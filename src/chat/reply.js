@@ -663,6 +663,17 @@ function normalizeParamTags (text) {
   })
 }
 
+/** 普通回复的最后一个语音块可能漏写结束标签；只修边界明确的一行正文。 */
+function closeTrailingVoice(text) {
+  const start = text.lastIndexOf('<voice>')
+  if (start < 0) return text
+  const speech = text.slice(start + '<voice>'.length)
+  if (!speech.trim() || /[<>`\n]|\|{3,}|!\[/.test(speech)) return text
+  const before = text.slice(0, start).trimEnd()
+  if (before && !/(?:<\/voice>|\|{3,}|<reply:\s*\d+\s*>)$/.test(before)) return text
+  return hasInvalidVoiceMarkup(before) ? text : text + '</voice>'
+}
+
 /** 解析一轮回复；在拆气泡/语音前清洗，避免协议里的竖线被误作气泡分隔符。 */
 export function parseReply(text, options) {
   // 模型偶尔把「戳人」写成方括号动作（[戳了戳你：尾巴往回一收]），插件不认这种写法，
@@ -688,7 +699,7 @@ export function parseReply(text, options) {
     }
   }
   // 连续多写的竖线仍是同一个分隔符，避免 |||| 拆完残留一条 | 消息。
-  for (const bubble of raw.split(/\|{3,}/)) {
+  for (const bubble of closeTrailingVoice(raw).split(/\|{3,}/)) {
     const part = bubble.trim()
     if (!part) continue
     // 依次切出 poke / reply / voice / sticker / markdown 图片，其余是文字

@@ -191,3 +191,10 @@ test('跨群两条语音：多写一个分隔竖线不会夹带 | 消息，回�
   assert.deepEqual(types(s), ['record', 'record'])
   assert.deepEqual(s.spoken, ['第一条语音', '第二条语音'])
 })
+
+test('当前聊天：第二条语音漏写结束标签时仍投递两条语音，不补发文字', async t => {
+  const s = setup(t)
+  await s.hub.deliver('private:1', '<voice>第一句。</voice>\n<voice>第二句。')
+  assert.deepEqual(s.spoken, ['第一句。', '第二句。'])
+  assert.deepEqual(types(s), ['record', 'record'])
+})
