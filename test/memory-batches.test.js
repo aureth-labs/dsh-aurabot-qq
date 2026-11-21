@@ -32,7 +32,7 @@ function setup(t, lines, day = dateKey(new Date())) {
   } } }
   const hub = { chatLogDays: () => [...logs.keys()], chatLogOf: (d) => logs.get(d) || [], deleteChatLog: (d) => logs.delete(d) }
   const cfg = normalize({ model: { provider: 'p', model: 'm' }, memory: { keepChatlogDays: 0, keepChatlogSet: true, gistDailyBatches: 12 } })
-  const make = () => createMemoryStore({ dsh, getConfig: () => cfg, hub, log })
+  const make = (extra = {}) => createMemoryStore({ dsh, getConfig: () => cfg, hub: { ...hub, ...extra }, log })
   t.after(() => {
     if (old === undefined) delete process.env.AURABOT_DATA_DIR
     else process.env.AURABOT_DATA_DIR = old
@@ -122,4 +122,33 @@ test('单条聊天和只含机器人的批次也送去提炼，新增流水不�
   s.logs.get(s.day).push({ chatId: 'private:2', who: '朋友', text: '消息-1-结束' })
   await mem.consolidate({ includeToday: true })
   assert.deepEqual(ids(s.calls), [0, 1])
+})
+
+
+test('她有回合在跑时，后台提炼立刻让路，已完成的批次进度保留（#376）', async (t) => {
+  const lines = linesOf(1500)
+  const yesterday = dateKey(new Date(Date.now() - 86400_000))
+  const s = setup(t, lines, yesterday)
+  let busy = false
+  let mem = s.make({ busy: () => busy })
+  const first = await mem.consolidate()
+  assert.equal(first.ok, true)
+  const before = s.calls.length
+  assert.ok(before > 0 && before <= 12, '第一轮只做一部分（EXTRACT_LIMIT 上限），剩下的留着')
+  const progressAfterFirst = s.progress()
+
+  busy = true
+  const second = await mem.consolidate()
+  assert.equal(second.ok, true)
+  assert.equal(s.calls.length, before, '回合进行中不再抢模型端点')
+  assert.deepEqual(s.progress(), progressAfterFirst, '进度原样保留，下一轮从断点继续')
+
+  busy = false
+  mem = s.make({ busy: () => busy })
+  for (let i = 0; i < 5 && s.logs.has(yesterday); i++) {
+    const r = await mem.consolidate()
+    assert.equal(r.ok, true)
+  }
+  assert.deepEqual(ids(s.calls), lines.map((_, i) => i))
+  assert.equal(s.progress().offset, lines.length, '全部流水都已提炼完成')
 })

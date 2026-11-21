@@ -3122,6 +3122,24 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
   let consolidateDeferLogged = false
   let idleDeferLogged = false
   let vectorDeferLogged = false
+  let turnYieldLogged = false
+
+  /**
+   * 她正在跟人说话（聊天/工具回合进行中）：后台提炼要让路。
+   *
+   * issue #376：空闲提炼单轮最多连发 12 次模型调用，和交互回合抢同一个端点，实测把她的一轮
+   * 卡到六分钟不出字，用户只看到「她不说话了」。这里在每批模型调用前问一次 hub，
+   * 有回合在跑就立刻收手；已完成的批次已 checkpoint，下一轮 tick 从断点继续，不丢进度。
+   */
+  function turnInProgress() {
+    try { return hub?.busy?.() === true } catch { return false }
+  }
+  function noteTurnYield() {
+    if (!turnYieldLogged) {
+      log.debug?.('她有回合正在进行：后台提炼先让路，等空闲再继续（进度已保存，不会丢）')
+      turnYieldLogged = true
+    }
+  }
 
   /**
    * 整理临时记忆。
@@ -3174,6 +3192,8 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
               while (n < lines.length && (lines[n].line.forgottenAt || isIdleDone(progress, lines[n].index))) n++
               if (n >= lines.length) break
               if (batches >= EXTRACT_LIMIT) { stopped = true; break }
+              // issue #376：她正在回话/跑工具时先让路，别抢同一个模型端点把她的一轮挤死。
+              if (turnInProgress()) { noteTurnYield(); stopped = true; break }
               if (!takeBatch()) { stopped = true; budgetExhausted = true; break }
               const part = []
               let end = n
@@ -3444,6 +3464,8 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
               return line?.chatId === q.chatId && !line.forgottenAt ? [{ index, line }] : []
             })
             if (!part.length) { progressed = true; continue }
+            // issue #376：空闲提炼同样要给交互回合让路（之前已 checkpoint 的进度保留）。
+            if (turnInProgress()) { noteTurnYield(); return { ok: true, batches, yielded: true } }
             if (!takeBatch()) return { ok: true, batches }
             const version = forgetVersion
             const checkpoint = () => {
@@ -3684,6 +3706,8 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     for (const [qq, rows] of groups) {
       if (!canProfile(qq)) continue
       if (calls >= EXTRACT_LIMIT || busy || shouldDeferBackground(getConfig())) break
+      // issue #376：短期印象也是模型调用，同样不能跟交互回合抢。
+      if (turnInProgress()) { noteTurnYield(); break }
       const last = Number(rows.at(-1).t)
       const old = shortTermOf(qq)
       const switched = shortSwitch.has(qq) || rows.some((row, i) => i > 0 && Number(row.t) > (old?.through || 0) && (row.via || '') !== (rows[i - 1].via || ''))
