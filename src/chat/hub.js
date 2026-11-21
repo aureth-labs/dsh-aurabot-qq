@@ -1766,7 +1766,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       }
       text = guarded.text
     }
-    const r = parseReply(text, { ...cleaningFor(chatId), voice: opts.voice === true })
+    const r = parseReply(text, { ...cleaningFor(chatId), voice: opts.voice === true, wantVoice: opts.wantVoice === true })
     if (r.silent) return silenceTurn(chatId)
     let items = r.items
     // 分条发出的中间段（chat.everyStep）：只发她当时说的原话，不做语音转换、不补表情、不按概率改形态，

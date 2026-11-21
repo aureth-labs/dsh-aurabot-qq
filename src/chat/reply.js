@@ -663,6 +663,53 @@ function normalizeParamTags (text) {
   })
 }
 
+/** 一次解析语音边界；文字、引用、图片和表情仍交给原有流程。 */
+function voiceReplyParts(text, wantVoice) {
+  if (!/<\/?voice\s*>/i.test(text)) return [{ kind: 'text', value: text }]
+  const parts = []
+  const add = (kind, value) => {
+    if (!value.trim()) return
+    if (kind === 'text' && parts.at(-1)?.kind === 'text') parts.at(-1).value += value
+    else parts.push({ kind, value })
+  }
+  let depth = 0, start = 0, body = '', nested = false, repairTail = false, afterVoice = false
+  // 代码里的标签只是示例，不是语音指令。
+  for (const m of text.matchAll(/```[\s\S]*?(?:```|$)|`[^`\n]*(?:`|(?=\n|$))|<(\/?)voice\s*>/gi)) {
+    if (m[1] === undefined) continue
+    const span = text.slice(start, m.index)
+    start = m.index + m[0].length
+    if (!m[1]) {
+      if (depth++ === 0) {
+        add('text', span)
+        repairTail = !span.trim() || /(?:\|{3,}|<reply:\s*\d+\s*>)\s*$/.test(span)
+        body = ''; nested = false
+      } else { body += span; nested = true }
+      afterVoice = false
+    } else if (depth) {
+      body += span
+      if (--depth === 0) {
+        add(nested ? 'text' : 'voice', nested ? body : body.replace(/\|{3,}/g, '\n'))
+        afterVoice = !nested && Boolean(body.trim())
+      }
+    } else {
+      // 明确要语音时，孤立的结束标签可以标出续读正文；不跨气泡、图片或代码猜测。
+      if (wantVoice && !/[<>`]|\|{3,}|!\[/.test(span) && span.trim()) {
+        if (afterVoice) parts[parts.length - 1].value += '\n' + span.trim()
+        else add('voice', span)
+        afterVoice = true
+      } else if (span.trim()) { add('text', span); afterVoice = false }
+    }
+  }
+  const tail = text.slice(start)
+  if (!depth) add('text', tail)
+  else {
+    body += tail
+    const clearSpeech = !/[<>`]|\|{3,}|!\[/.test(body) && (wantVoice || (!nested && !body.includes('\n')))
+    add(repairTail && clearSpeech ? 'voice' : 'text', body)
+  }
+  return parts
+}
+
 /** 解析一轮回复；在拆气泡/语音前清洗，避免协议里的竖线被误作气泡分隔符。 */
 export function parseReply(text, options) {
   // 模型偶尔把「戳人」写成方括号动作（[戳了戳你：尾巴往回一收]），插件不认这种写法，
@@ -687,38 +734,43 @@ export function parseReply(text, options) {
       replyTo = ''
     }
   }
-  // 连续多写的竖线仍是同一个分隔符，避免 |||| 拆完残留一条 | 消息。
-  for (const bubble of raw.split(/\|{3,}/)) {
-    const part = bubble.trim()
-    if (!part) continue
-    // 依次切出 poke / reply / voice / sticker / markdown 图片，其余是文字
-    const re = /<poke\s*\/?>|<\/poke\s*>|<reply:\s*(\d+)\s*>|<voice>([\s\S]*?)<\/voice>|<sticker:([^>]+?)>(?:\s*<\/sticker>)?|!\[[^\]]*\]\(\s*([^)\s]+)\s*\)/g
-    let last = 0
-    let m
-    while ((m = re.exec(part)) !== null) {
-      let from = items.length
-      pushText(items, part.slice(last, m.index))
+  for (const chunk of voiceReplyParts(raw, options?.wantVoice)) {
+    if (chunk.kind === 'voice') {
+      const value = stripSilenceMarks(stripMarkdown(chunk.value))
+      const from = items.length
+      if (value) items.push({ kind: 'voice', value })
       attach(from)
-      from = items.length
-      if (m[0].startsWith('<poke')) {
-        if (!items.some((i) => i.kind === 'poke')) items.push({ kind: 'poke', value: '' })
-      } else if (m[1] !== undefined) {
-        replyTo = m[1]
-      } else if (m[2] !== undefined) {
-        const v = stripSilenceMarks(stripMarkdown(m[2]))
-        if (v) items.push({ kind: 'voice', value: v })
-      } else if (m[3] !== undefined) {
-        const v = m[3].trim()
-        if (v) items.push({ kind: 'sticker', value: v })
-      } else if (m[4] !== undefined) {
-        items.push({ kind: 'image', value: m[4] })
-      }
-      attach(from)
-      last = re.lastIndex
+      continue
     }
-    const from = items.length
-    pushText(items, part.slice(last))
-    attach(from)
+    for (const bubble of chunk.value.split(/\|{3,}/)) {
+      const part = bubble.trim()
+      if (!part) continue
+      // 依次切出 poke / reply / sticker / markdown 图片，其余是文字
+      const re = /<poke\s*\/?>|<\/poke\s*>|<reply:\s*(\d+)\s*>|<sticker:([^>]+?)>(?:\s*<\/sticker>)?|!\[[^\]]*\]\(\s*([^)\s]+)\s*\)/g
+      let last = 0
+      let m
+      while ((m = re.exec(part)) !== null) {
+        let from = items.length
+        pushText(items, part.slice(last, m.index))
+        attach(from)
+        from = items.length
+        if (m[0].startsWith('<poke')) {
+          if (!items.some((i) => i.kind === 'poke')) items.push({ kind: 'poke', value: '' })
+        } else if (m[1] !== undefined) {
+          replyTo = m[1]
+        } else if (m[2] !== undefined) {
+          const v = m[2].trim()
+          if (v) items.push({ kind: 'sticker', value: v })
+        } else if (m[3] !== undefined) {
+          items.push({ kind: 'image', value: m[3] })
+        }
+        attach(from)
+        last = re.lastIndex
+      }
+      const from = items.length
+      pushText(items, part.slice(last))
+      attach(from)
+    }
   }
   // 一轮最多引用一次，多的去掉（大多数时候正常发就好）
   let quoted = false
