@@ -4,6 +4,7 @@
 // 向量本身都只存在本机；开关默认关闭，用户主动打开才生效。
 import { createHash } from 'node:crypto'
 import { join } from 'node:path'
+import { recordRetrievalUsage } from '../core/usage.js'
 import { dataDir, readJson, writeJson } from '../core/store.js'
 import { createLocalVectorIndex } from './memory-vector-local.js'
 
@@ -149,6 +150,7 @@ export function createVectorIndex({ getConfig, log, fetchImpl = globalThis.fetch
         const response = await fetchImpl(`${c.baseUrl}/embeddings`, { method: 'POST', headers, body: JSON.stringify(body), signal: controller.signal, redirect: 'error' })
         if (!response.ok) throw new Error(`HTTP ${response.status}`)
         const json = await response.json()
+        recordRetrievalUsage('生成记忆向量', c.model, json?.usage)
         if (!current(c)) return []
         if (!Array.isArray(json?.data) || json.data.length !== texts.length) throw new Error('向量数量不符')
         const rows = [...json.data]

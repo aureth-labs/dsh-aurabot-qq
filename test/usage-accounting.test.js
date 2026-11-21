@@ -54,7 +54,8 @@ test('一次调用只记一行：适配器分片上报多个 usage 也只按最�
     { type: 'usage', usage: { inputTokens: 900, outputTokens: 50, cacheReadTokens: 800 } }, // 最终用量
     { type: 'finish', reason: { kind: 'stop' } },
   ])
-  await askModel(dsh, { system: 's', text: 't', module: 'memory', model: { provider: 'local', model: 'deepseek-v4.1-flash' } })
+  await askModel(dsh, { system: 's', text: 't', module: 'memory', usageTask: '更新人物卡', model: { provider: 'local', model: 'deepseek-v4.1-flash' } })
+  assert.equal(usage.usageReport({range:'today'}).current.byMemoryTask.find(r=>r.key==='更新人物卡').runs,1)
   const after = snap()
   assert.equal(after.runs - before.runs, 1, '一次调用只记一行')
   assert.equal(after.tokens - before.tokens, 900 + 800 + 50, '取最后一次 usage，不把中间分片也算进去')

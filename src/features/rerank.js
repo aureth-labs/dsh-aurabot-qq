@@ -2,6 +2,8 @@
 // 统一走 OpenAI 兼容的 POST {baseUrl}/rerank（硅基 BAAI/bge-reranker-v2-m3 免费）。
 // 失败 / 超时一律由调用方回退原顺序，绝不阻塞回复。
 
+import { recordRetrievalUsage } from '../core/usage.js'
+
 const DEFAULT_BASE = 'https://api.siliconflow.cn/v1'
 const DEFAULT_MODEL = 'BAAI/bge-reranker-v2-m3'
 
@@ -83,6 +85,7 @@ export function createReranker({ getConfig, log, fetchImpl = globalThis.fetch })
     if (!r.ok) throw new Error(`HTTP ${r.status}`)
     let json
     try { json = JSON.parse(raw) } catch (error) { throw new Error('重排服务返回的不是 JSON') }
+    recordRetrievalUsage('记忆检索排序', c.model, json?.usage)
     const rows = Array.isArray(json?.results) ? json.results : []
     if (!rows.length) return hits
     const scored = []
@@ -117,6 +120,7 @@ export function createReranker({ getConfig, log, fetchImpl = globalThis.fetch })
     if (!r.ok) throw new Error(`HTTP ${r.status}：${raw.slice(0, 120)}`)
     let json
     try { json = JSON.parse(raw) } catch (error) { throw new Error('重排服务返回的不是 JSON') }
+    recordRetrievalUsage('记忆检索排序', c.model, json?.usage)
     const rows = Array.isArray(json?.results) ? json.results : []
     if (!rows.length) throw new Error('没返回排序结果')
     return { model: c.model, top: rows[0]?.index ?? -1, score: Number(rows[0]?.relevance_score) || 0 }

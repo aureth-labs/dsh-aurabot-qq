@@ -1,5 +1,6 @@
 // Only provider-reported usage; no text/token estimation and no guessed gateway prices.
 import { dataDir, readJson, writeJson } from './store.js'
+import { officialCost, REFERENCE_DATE } from './official-reference.js'
 import { beijingDayKey } from './offpeak.js'
 export const KEEP_DAYS = 90
 export const DEFAULT_PRICING = { currency: '元', models: {} }
@@ -111,7 +112,7 @@ export function costOf(row, at = row?.at) {
 }
 
 function totalsOf(rows) {
-  const t = { runs: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0, cacheWriteTokens: 0, totalTokens: 0, cost: 0, unpricedCalls: 0 }
+  const t = { runs: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0, cacheWriteTokens: 0, totalTokens: 0, cost: 0, unpricedCalls: 0, officialUSD: 0, officialMissing: 0 }
   for (const r of rows) {
     const c = costOf(r)
     t.runs += count(r.runs) || 1
@@ -119,12 +120,17 @@ function totalsOf(rows) {
     t.completionTokens += count(r.out)
     t.cachedTokens += count(r.cached)
     t.cacheWriteTokens += count(r.written)
+    const usd = officialCost(r)
+    if (usd === null) t.officialMissing += count(r.runs) || 1
+    else t.officialUSD += usd
     t.cost += c.cost
     if (c.unpriced) t.unpricedCalls += count(r.runs) || 1
   }
   t.totalTokens = t.promptTokens + t.completionTokens
   t.cacheHitRate = t.promptTokens ? t.cachedTokens / t.promptTokens : null
   // An incomplete subtotal is not a total price. Unknown is never shown as free.
+  if (t.officialMissing === t.runs) t.officialUSD = null
+  t.pricedCost = t.runs > t.unpricedCalls ? t.cost : null
   if (!t.runs || t.unpricedCalls) t.cost = null
   return t
 }
@@ -181,12 +187,13 @@ export function initUsage(override) {
   saveSoon()
   return state
 }
-export function recordUsage({ module = '其他后台任务', chat = '', provider = '', model = '', usage, at = Date.now(), id = '' } = {}) {
+export function recordUsage({ module = '其他后台任务', task = '', chat = '', provider = '', model = '', usage, at = Date.now(), id = '' } = {}) {
   if (!state || !usage || !Number.isFinite(at)) return null
   const row = { at, module, chat: String(chat || ''), provider: String(provider || ''), model: String(model || ''),
     in: count(usage.inputTokens), out: count(usage.outputTokens), cached: count(usage.cacheReadTokens), written: count(usage.cacheWriteTokens) }
   const previous = id && indexed.get(id)
   if (!row.in && !row.out && !row.cached && !row.written && !previous) return null
+  if (module === '记忆' && typeof task === 'string' && task) row.task = task
   if (id) row.id = id
   if (previous) {
     // A revised settlement replaces the same billable attempt, including its timestamp.
@@ -199,6 +206,12 @@ export function recordUsage({ module = '其他后台任务', chat = '', provider
   prune()
   saveSoon()
   return row
+}
+
+// Embedding / rerank endpoints report input-only usage; the endpoint URL is not a billing provider ID.
+export function recordRetrievalUsage(task, model, usage) {
+  const tokens = usage?.prompt_tokens ?? usage?.total_tokens
+  if (count(tokens)) recordUsage({ module: '记忆', task, model, usage: { inputTokens: tokens } })
 }
 
 // Mirrors DSH's tokenUsage fold: last settlement wins within a turn/step; retry starts a new charge.
@@ -247,7 +260,7 @@ export function usageReport({ now = Date.now(), range = '7' } = {}) {
   const rowsFor = key => all.filter(r => r.at >= bounds[key][0] && r.at <= bounds[key][1])
   const rows = rowsFor(pick)
   return {
-    currency: pricing.currency || '元', days: KEEP_DAYS, range: pick, startedAt: state?.startedAt,
+    referenceDate: REFERENCE_DATE, currency: pricing.currency || '元', days: KEEP_DAYS, range: pick, startedAt: state?.startedAt,
     firstRecordAt: all.length ? all.reduce((n,r) => Math.min(n,r.at), Infinity) : null,
     writeFailed,
     ranges: Object.fromEntries([['today','today'],['yesterday','yesterday'],['last7','7'],['last30','30'],['all','all']].map(([label,key]) => [label,totalsOf(rowsFor(key))])),
@@ -255,6 +268,7 @@ export function usageReport({ now = Date.now(), range = '7' } = {}) {
       byChat: groupBy(rows.filter(r => /^(group|private):/.test(r.chat || '')), r => r.chat),
       background: totalsOf(rows.filter(r => !/^(group|private):/.test(r.chat || ''))),
       byModule: groupBy(rows, moduleOf),
+      byMemoryTask: groupBy(rows.filter(r => moduleOf(r) === '记忆'), r => r.task || '未细分'),
       byModel: groupBy(rows, r => [r.provider, r.model].filter(Boolean).join(' / ') || '未记录模型'),
     },
   }

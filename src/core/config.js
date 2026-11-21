@@ -432,8 +432,7 @@ export const DEFAULTS = {
   modules: {},
   safeMode: false, // 安全模式：自己写的模块一个都不加载（排查问题用）
   ext: {}, // 自己写的模块的设置：{ 模块id: {...} }
-  // token 用量与花费：面板「概览」里看。pricing 留空就用内置价目表（DeepSeek 官方价 + 其它厂商按 LiteLLM 价 ×7.2）；
-  // 要覆盖就写 { models: { "我的模型": { match: "^my-llm-", in: 2, out: 8, cached: 0.5 } } }（元/百万 tokens）
+  // 自定义渠道费率按渠道和完整模型名匹配，与内置的官方美元参考价分开。
   usage: { pricing: {} },
   // 联动：让别的程序、DSH 里别的会话和插件也能用她
   bridge: {
@@ -1084,7 +1083,7 @@ export function normalize(raw) {
   if (!isObj(c.ext)) c.ext = {}
   for (const k of Object.keys(c.ext)) if (!isObj(c.ext[k])) delete c.ext[k] // 传 null = 删掉这个模块的设置
   c.safeMode = bool(c.safeMode, false)
-  // 花费估算的价格表：手动填了就用手填的（手填的部分覆盖内置价），没填就用内置 DeepSeek 价
+  // 花费估算的价格表：仅用于渠道估算；留空不影响官方参考费用
   if (!isObj(c.usage)) c.usage = { pricing: {} }
   if (!isObj(c.usage.pricing)) c.usage.pricing = {}
   c.bridge.dshTools = bool(c.bridge.dshTools, false)

@@ -217,7 +217,7 @@ export async function askModel (dsh, o) {
   let widened = false
   let temperatureTried = false
   // 记用量：模块名由调用方给（模块 API 会自动带上自己的 id），没给就算后台任务
-  const onUsage = (usage) => recordUsage({ module: moduleLabel(o.module || 'background'), provider: t.provider, model: t.model, usage })
+  const onUsage = (usage) => recordUsage({ module: moduleLabel(o.module || 'background'), task: o.usageTask, provider: t.provider, model: t.model, usage })
   for (let attempt = 0; ; attempt++) {
     const params = { ...base }
     if (temperature !== undefined && !temperatureUnsupported(t.provider, t.model)) params.temperature = temperature

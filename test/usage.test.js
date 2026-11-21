@@ -90,3 +90,22 @@ test('同一次调用的最终零值可以更正先前的正值', () => {
  assert.equal(report().current.runs,1)
  assert.equal(report().current.cacheHitRate,null)
 })
+
+test('官方参考和渠道小计独立，未知不是免费，也不跨币种相加', () => {
+ u.initUsage({currency:'元', models:{'p::gateway/MiniMax-M3.1-Flash':{provider:'p',in:2,out:3,cached:0.1}}})
+ u.recordUsage({provider:'p',model:'gateway/MiniMax-M3.1-Flash',usage:{inputTokens:1e6,cacheReadTokens:1e6,outputTokens:1e6}})
+ u.recordUsage({provider:'p',model:'other',usage:{inputTokens:5}})
+ const r=report().current
+ assert.equal(r.cost,null); assert.equal(r.unpricedCalls,1); assert.equal(r.pricedCost,5.1)
+ assert.ok(Math.abs(r.officialUSD-0.765)<1e-10); assert.equal(r.officialMissing,1)
+ assert.equal(r.byModel.find(x=>x.key==='p / other').officialUSD,null)
+})
+test('记忆明细是合计的子集，不从旧的后台记录猜任务名', () => {
+ u.recordUsage({module:'其他后台任务',usage:{inputTokens:100}})
+ u.recordUsage({module:'记忆',usage:{inputTokens:30}})
+ u.recordRetrievalUsage('生成记忆向量','embed',{prompt_tokens:20,total_tokens:20})
+ for(const receipt of [null,{}, {prompt_tokens:-2}, {total_tokens:'20'}]) u.recordRetrievalUsage('生成记忆向量','embed',receipt)
+ u.closeUsage(); u.initUsage(); const r=report().current
+ assert.deepEqual(r.byMemoryTask.map(x=>[x.key,x.totalTokens]),[['未细分',30],['生成记忆向量',20]])
+ assert.equal(r.totalTokens,150); assert.equal(r.runs,3)
+})

@@ -5,6 +5,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { normalize, publicConfig, mergeFromPanel } from '../src/core/config.js'
+import { initUsage, closeUsage, usageReport } from '../src/core/usage.js'
 import { createVectorIndex } from '../src/features/memory-vector.js'
 import { buildIndex, createMemoryStore, memoryLine, search } from '../src/features/memory.js'
 import memoryModule from '../src/modules/memory/index.js'
@@ -445,4 +446,14 @@ test('错误响应只记 debug，接口失败时自动回忆仍能按关键词�
   assert.match(injected[0].text, /护士/)
   assert.equal(messages.length, 1)
   assert.ok(!messages[0].includes('秘密密钥'))
+})
+
+test('一次远程请求只计一笔；两条输入不重复计数，缓存命中不收费', async t => {
+  const s = setup(t, async (_, opt) => ({ok:true, json: async () => ({usage:{prompt_tokens:15,total_tokens:15},data:JSON.parse(opt.body).input.map((_,index)=>({index,embedding:[1,0]}))})}))
+  initUsage()
+  try {
+    const index=s.index(); await index.sync(items()); await index.queryVector('猫'); await index.queryVector('猫')
+    const [r]=usageReport({range:'all'}).current.byMemoryTask
+    assert.equal(r.key,'生成记忆向量'); assert.equal(r.runs,2); assert.equal(r.totalTokens,30)
+  } finally { closeUsage() }
 })

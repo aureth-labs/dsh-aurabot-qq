@@ -37,6 +37,7 @@ import { createMediaAccess } from './core/media.js'
 import { buildFaceIndex } from './chat/faces.js'
 import { FACE_TABLE } from './chat/face-table.js'
 import { dataDir, ensureDir } from './core/store.js'
+import { createUsageFx } from './core/usage-fx.js'
 import { initUsage, usageReport, closeUsage } from './core/usage.js'
 import { createUpdateChecker, changelogSection, hostEnv, updatePlan, repoOf } from './core/update.js'
 import { parseCommand, runCommand, createMutes, commandList } from './chat/commands.js'
@@ -1380,7 +1381,8 @@ export function apply(ctx) {
   route('/state', async () => overview())
   // token 用量与花费：今日 / 昨日 / 近 7 天 / 近 30 天，各带模块明细
   // ?range=today|yesterday|7|30|all —— 面板点哪张指标卡就按哪个区间出明细
-  route('/usage', async (req) => ({ ok: true, ...usageReport({ range: query(req).range || '7' }) }))
+  const getUsageFx = createUsageFx()
+  route('/usage', async (req) => ({ ok: true, fx: await getUsageFx(query(req).fx === 'refresh'), ...usageReport({ range: query(req).range || '7' }) }))
 
   // JSON Pointer（RFC 6901）小工具：保存回执按 /voice/enabled 这类路径逐字段确认（方案 §2.2）。
   const pointerGet = (obj, pointer) => String(pointer || '').split('/').slice(1)
