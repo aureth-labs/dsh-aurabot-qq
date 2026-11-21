@@ -39,3 +39,8 @@ test('她可以不搭理人：写进规则，整段 [沉默] 不发任何东西�
   assert.match(rulesText('private', normalize({ ownerName: '哥哥' })), /哥哥对你说的话不能这样/)
   assert.equal(parseReply('[沉默]').silent, true)
 })
+
+test('模型漏出的 output/results 信封结束标签不单独发成气泡', () => {
+  assert.deepEqual(texts(parseReply('嗯 早上球场估计空着 下午人齐了再去 </output> </results>')), ['嗯 早上球场估计空着 下午人齐了再去'])
+  assert.deepEqual(texts(parseReply('你好|||</output>|||</results>')), ['你好'])
+})
