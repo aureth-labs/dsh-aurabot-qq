@@ -4,6 +4,8 @@
 
 import { existsSync, readFileSync } from 'node:fs'
 import { textToSpeech, edgeInstalled, installEdge, voiceConverters, volcanoResourceFor, volcanoSynth } from '../../voice/tts.js'
+import { fishBalances, fishPrimary } from '../../voice/fish.js'
+import { runCloud } from '../../voice/tts.js'
 import { VOLCANO_VOICES } from '../../voice/volcano-voices.js'
 import { breezeBalance, breezeClaim, breezeSession, autoClaimOnce, breezeVoices } from '../../voice/breeze.js'
 import { createSongVoice } from '../../voice/rvc.js'
@@ -18,7 +20,7 @@ export default {
   version: '1.0.0',
   description: '发语音条：把她的话念出来（关掉后想发语音时改发文字）',
   tab: 'voice',
-  files: ['voice/tts.js', 'voice/asr.js', 'voice/rvc.js', 'voice/volcano-voices.js'],
+  files: ['voice/tts.js', 'voice/key-pool.mjs', 'voice/fish.js', 'voice/asr.js', 'voice/rvc.js', 'voice/volcano-voices.js'],
   setup(api) {
     const { hub, onebot, local, http } = api.core
 
@@ -29,6 +31,10 @@ export default {
           const file = fileOf(await local.call('tts', { text }))
           if (file && existsSync(file)) return { file, engine: 'local' }
         } catch (error) {}
+      }
+      if (voice.engine === 'fish-free' && !voice.fishApiKey) {
+        const fishApiKey = await fishPrimary(voice, () => api.dsh?.get?.('credentials'))
+        return textToSpeech(text, { ...voice, fishApiKey }, api.log)
       }
       return textToSpeech(text, voice, api.log)
     }
@@ -60,6 +66,8 @@ export default {
         return { ok: false, available: false, voices: [], message: String(error.message || error) }
       }
     })
+
+    api.route('/voice/fish-balances', () => fishBalances(api.config().voice, () => api.dsh?.get?.('credentials')))
 
     api.route('/voice/test', async (req) => {
       const b = await http.body(req)
@@ -103,9 +111,10 @@ export default {
         resourceId: String(b.resourceId || saved.resourceId || '').trim(),
         speedRatio: Number(b.speedRatio) || Number(saved.speedRatio) || 1,
       }
-      if (!c.apiKey) return { ok: false, message: '先在上面把 API Key 填上，再试听' }
+      const pool = b.keyPool ? mergeFromPanel(api.config(), { voice: { keyPools: { volcano: b.keyPool } } }).voice.keyPools.volcano : api.config().voice.keyPools?.volcano
+      if (!c.apiKey && !pool?.accounts?.some(a => a.apiKey)) return { ok: false, message: '先在上面把 API Key 填上，再试听' }
       try {
-        const file = await volcanoSynth(String(b.text || '你好呀，我是大肥鱼。这个声音你听着怎么样？'), c)
+        const file = await runCloud('volcano', c.apiKey, pool, key => volcanoSynth(String(b.text || '你好呀，我是大肥鱼。这个声音你听着怎么样？'), { ...c, apiKey: key }))
         const buf = readFileSync(file)
         return { ok: true, engine: 'volcano', mime: 'audio/mpeg', data: buf.toString('base64') }
       } catch (error) {

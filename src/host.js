@@ -180,7 +180,12 @@ export function apply(ctx) {
   const getConfig = () => cfg
   const personaMemoryRuntime = createPersonaMemoryRuntime({ getConfig })
   setSsrpMode(() => (getConfig().security && getConfig().security.ssrfMode === 'loose' ? 'loose' : 'strict'))
-  const secrets = () => { for (const k of ['webuiPassword', 'httpToken', 'wsToken']) registerSecret(cfg.snowluma[k]); registerSecret(cfg.imageGen.apiKey); for (const e of cfg.imageGen.fallbacks || []) registerSecret(e.apiKey); registerSecret(cfg.bridge.token); registerSecret(cfg.backup?.remote?.token); registerSecret(cfg.backup?.remote?.webdav?.password) } // backup 令牌/WebDAV 密码也按密钥脱敏（云备份）
+  const secrets = () => {
+    registerSecret(cfg.voice?.fishApiKey)
+    for (const pool of Object.values(cfg.voice?.keyPools || {})) {
+      for (const account of pool.accounts || []) registerSecret(account.apiKey)
+    }
+    for (const k of ['webuiPassword', 'httpToken', 'wsToken']) registerSecret(cfg.snowluma[k]); registerSecret(cfg.imageGen.apiKey); for (const e of cfg.imageGen.fallbacks || []) registerSecret(e.apiKey); registerSecret(cfg.bridge.token); registerSecret(cfg.backup?.remote?.token); registerSecret(cfg.backup?.remote?.webdav?.password) } // backup 令牌/WebDAV 密码也按密钥脱敏（云备份）
   const setConfig = (next) => {
     const before = cfg
     // 统一提交函数（方案 §2.2）：落盘 + 发布 + configRevision 递增都收敛在 commitConfig 里；
