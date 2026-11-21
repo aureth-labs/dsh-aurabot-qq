@@ -2621,6 +2621,11 @@ export function apply(ctx) {
     const b = await readBody(req)
     return { ...(await community.remove(String(b.id || ''), { purge: b.purge === true })), modules: mods.status() }
   })
+  // 一键更新：把市场里已装、有新版、当前能装的模块一次更新完；整批只刷一次模块表
+  route('/modules/community/update-all', async () => {
+    const r = await community.updateAll()
+    return { ...r, modules: mods.status() }
+  })
   // 模块市场地址：换索引源（自建索引 / 国内镜像 / 内网部署）用。留空 = 回到内置 GitHub 地址；
   // 只收 http/https，别把 file:// 之类塞进来当下载源。单一真相在 ext.market.registryUrl，
   // community.js 读取时按 config > AURABOT_REGISTRY_URL > 内置默认 的优先级解析。

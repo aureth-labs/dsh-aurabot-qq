@@ -7866,7 +7866,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const progText = (word) => (prog ? stageText() : word + '中…')
       const STAGE_BAR = { index: 10, install: 90, start: 95 }
       const progBar = prog ? h('div', { className: 'ab-card', style: { marginBottom: 12 } },
-        h('div', { className: 'ab-flex', style: { justifyContent: 'space-between' } }, h('b', null, '正在安装「' + (prog.name || prog.id) + '」'), h('span', { className: 'ab-muted ab-small' }, stageText())),
+        h('div', { className: 'ab-flex', style: { justifyContent: 'space-between' } }, h('b', null, (prog.batch ? '正在一键更新 ' + prog.batch.index + '/' + prog.batch.total + '：' : '正在安装「') + (prog.name || prog.id) + (prog.batch ? '' : '」')), h('span', { className: 'ab-muted ab-small' }, stageText())),
         h('div', { style: { height: 6, borderRadius: 3, background: 'var(--ab-foam-2)', marginTop: 8, overflow: 'hidden' } },
           h('div', { style: { height: '100%', width: (STAGE_BAR[prog.stage] || Math.max(12, 10 + percent * 0.8)) + '%', background: 'var(--ab-sea)', transition: 'width .3s' } }))) : null
       const done = async (r) => {
@@ -7891,6 +7891,18 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const list = (data && data.list) || []
       const stats = (data && data.downloads) || {}
       const counts = { all: list.length, installed: list.filter((m) => m.installed).length, update: list.filter((m) => m.update).length }
+      // 一键更新：把「可更新」的模块一次更新完。后端整批只占一个锁，单个失败不影响后面的。
+      const updateAll = async () => {
+        const n = counts.update
+        if (!n) return toast('没有可更新的模块', 'ok')
+        if (!confirm('把 ' + n + ' 个可更新的模块一起更新？\n\n批量更新期间别关 DSH；某一个失败不会影响其它的，结果会告诉你哪几个没成功。')) return
+        setBusy('update-all')
+        try {
+          const r = await post('/modules/community/update-all', {})
+          await done(r)
+          if (r.failed && r.failed.length) toast('没更新成功：' + r.failed.map((x) => x.name || x.id).join('、'), 'err')
+        } catch (e) { toast(e.message, 'err') } finally { setBusy('') }
+      }
       const word = q.trim().toLowerCase()
       const cats = [...new Set(list.map((m) => m.category).filter(Boolean))]
       // 安装量只能从 GitHub 读，读不到时热度排序不可用；最新发布/最近更新不受影响
@@ -7946,7 +7958,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h('div', { className: 'ab-flex', style: { marginTop: 8 } },
             h(Btn, { small: true, disabled: busy === 'reg', onClick: () => saveReg() }, busy === 'reg' ? '保存中…' : '保存地址'),
             h(Btn, { small: true, disabled: busy === 'reg' || regPreset === 'github', onClick: () => { setRegMode('github'); setRegUrl(regDef || ''); saveReg(regDef || '') } }, '恢复默认 GitHub 源'))),
-        h(Card, { title: '模块市场', desc: '给ta装更多本事。模块由社区提供、维护者审核后上架；它们和插件在同一进程运行，能接触账号配置，装之前看清下面列的能力。下载次数来自模块库 GitHub Releases（更新也算一次），只是热度参考。', right: h(Btn, { small: true, kind: 'ghost', onClick: () => load(true) }, '刷新') },
+        h(Card, { title: '模块市场', desc: '给ta装更多本事。模块由社区提供、维护者审核后上架；它们和插件在同一进程运行，能接触账号配置，装之前看清下面列的能力。下载次数来自模块库 GitHub Releases（更新也算一次），只是热度参考。', right: h('div', { className: 'ab-flex' },
+            counts.update ? h(Btn, { small: true, kind: 'primary', disabled: Boolean(busy), onClick: updateAll }, busy === 'update-all' ? progText('更新') : '一键更新 ' + counts.update) : null,
+            h(Btn, { small: true, kind: 'ghost', onClick: () => load(true) }, '刷新')) },
           h('div', { className: 'ab-flex' },
             h('input', { className: 'ab-input', placeholder: '搜模块', value: q, onChange: (e) => setQ(e.target.value) }),
             chip('all', '全部'), chip('installed', '已安装'), chip('update', '可更新'),

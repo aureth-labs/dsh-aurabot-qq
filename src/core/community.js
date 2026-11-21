@@ -281,7 +281,8 @@ export function createCommunity({ mods, getConfig, setConfig, log, version, aliv
     const url = String(index.assetsBase || '') + e.path
     if (!/^https:\/\//.test(url)) throw new Error('下载地址不对')
     const buf = await withRetry(async () => {
-      progress = { id: e.id, name: e.name, stage: 'download', received: 0, total: 0 }
+      // 「一键更新」时外层会先写 batch 进度，这里只改本条目的字段，别把 batch 抹掉
+      progress = { ...(progress || {}), id: e.id, name: e.name, stage: 'download', received: 0, total: 0 }
       const r = await fetcher(url, { signal: AbortSignal.timeout(120_000), redirect: 'follow' })
       if (!r.ok) throw new Error(`下载失败（HTTP ${r.status}）`)
       progress.total = Number(r.headers?.get?.('content-length')) || 0
@@ -331,11 +332,16 @@ export function createCommunity({ mods, getConfig, setConfig, log, version, aliv
     return busy
   }
 
-  /** 安装或更新。同名但不是社区装的文件夹不碰；替换内置模块要明确 confirmReplace。 */
-  const install = (id, { confirmReplace = false } = {}) => exclusive(async () => {
+  /**
+   * 安装或更新的主体（**不含并发锁**）。
+   * 「一键更新」要在同一个 exclusive 里连着跑多个，自己再包一层 exclusive 会锁死自己，
+   * 所以锁留在外层 install()，批量复用它。
+   * 同名但不是社区装的文件夹不碰；替换内置模块要明确 confirmReplace。
+   */
+  async function installNow(id, { confirmReplace = false } = {}) {
     // id 会拼进目录路径（modules/.<id>.installing → modules/<id>）：先白名单，防被篡改的索引/调用方越目录写
     if (typeof id !== 'string' || !ID_RE.test(id)) return { ok: false, message: 'id 不对' }
-    progress = { id, name: id, stage: 'index', received: 0, total: 0 }
+    progress = { ...(progress || {}), id, name: id, stage: 'index', received: 0, total: 0 }
     const index = await loadIndex({ force: true })
     const e = (index.modules || []).find((x) => x.id === id)
     if (!e || e.id !== id) return { ok: false, message: `社区库里没有「${id}」` }
@@ -350,14 +356,56 @@ export function createCommunity({ mods, getConfig, setConfig, log, version, aliv
     const why = blocked(index, e)
     if (why) return { ok: false, message: why }
     const files = readZip(await download(index, e))
-    progress = { id, name: e.name, stage: 'install', received: 0, total: 0 }
+    progress = { ...(progress || {}), id, name: e.name, stage: 'install', received: 0, total: 0 }
     place(e, files)
-    progress = { id, name: e.name, stage: 'start', received: 0, total: 0 }
+    progress = { ...(progress || {}), id, name: e.name, stage: 'start', received: 0, total: 0 }
     await mods.sync()
     const m = mods.status().find((x) => x.id === id)
     if (m?.error) return { ok: false, message: `装好了，但加载失败：${m.error}` }
     log.info(`社区模块「${e.name}」${e.version} 已安装`)
     return { ok: true, message: `「${e.name}」${e.version} 装好了` }
+  }
+
+  /** 安装或更新（带并发锁）。 */
+  const install = (id, opts) => exclusive(() => installNow(id, opts))
+
+  /**
+   * 一键更新：把「已装、索引里有新版本、当前能装」的模块挨个更新一遍。
+   * 整批只占一个 exclusive（不会和自己抢锁）；单个失败不中断后面的。
+   * 替换内置的模块在批量里直接按「已在用」处理（confirmReplace=true），不再逐个弹确认。
+   * @returns {{ok:boolean, updated:object[], failed:object[], skipped:object[], message:string}}
+   */
+  const updateAll = () => exclusive(async () => {
+    const index = await loadIndex({ force: true })
+    const entries = (index.modules || []).filter((e) => ID_RE.test(String(e.id)))
+    const targets = []
+    const skipped = []
+    for (const e of entries) {
+      const src = readSource(e.id)
+      if (!src || compareVersions(e.version, src.version) <= 0) continue // 没装 / 已是最新
+      const why = blocked(index, e)
+      if (why) { skipped.push({ id: e.id, name: e.name, message: why }); continue }
+      targets.push(e)
+    }
+    const updated = []
+    const failed = []
+    for (let i = 0; i < targets.length; i++) {
+      const e = targets[i]
+      if (!alive()) { skipped.push({ id: e.id, name: e.name, message: '插件已卸载，先停下' }); break }
+      progress = { id: e.id, name: e.name, stage: 'index', received: 0, total: 0, batch: { index: i + 1, total: targets.length } }
+      try {
+        const r = await installNow(e.id, { confirmReplace: true })
+        if (r.ok) updated.push({ id: e.id, name: e.name, version: e.version })
+        else failed.push({ id: e.id, name: e.name, message: r.message })
+      } catch (error) {
+        failed.push({ id: e.id, name: e.name, message: String(error?.message || error) })
+      }
+    }
+    if (updated.length) log.info(`模块市场一键更新：成功 ${updated.length} 个${failed.length ? `，失败 ${failed.length} 个` : ''}`)
+    const parts = [`更新了 ${updated.length} 个`]
+    if (failed.length) parts.push(`${failed.length} 个没成功`)
+    if (skipped.length) parts.push(`${skipped.length} 个跳过`)
+    return { ok: failed.length === 0, updated, failed, skipped, message: targets.length || failed.length ? parts.join('，') : '没有可更新的模块' }
   })
 
   /** 卸载时归档源码。默认也保留模块数据和设置，purge 才清掉这两项。 */
@@ -412,5 +460,5 @@ export function createCommunity({ mods, getConfig, setConfig, log, version, aliv
     return result
   }
 
-  return { progress: () => progress, registryUrl: registryUrlOf, list, install, remove, migrate, source: readSource }
+  return { progress: () => progress, registryUrl: registryUrlOf, list, install, updateAll, remove, migrate, source: readSource }
 }

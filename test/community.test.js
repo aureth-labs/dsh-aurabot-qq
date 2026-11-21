@@ -188,6 +188,34 @@ test('版本、撤回、依赖不满足不让装；更新替换旧文件', async
   assert.equal(existsSync(join(userDir(), 'demo-g', 'old.txt')), false)
 })
 
+test('一键更新：可更新的都升上去，坏的那个不中断其它的', async () => {
+  await setup([pack('upd-a', '1.0.0')]).c.install('upd-a')
+  await setup([pack('upd-b', '1.0.0')]).c.install('upd-b')
+  // upd-b 的新版本安装包里没有入口文件 → 更新会失败，但 upd-a 应该照常升上去
+  const brokenBuf = zip({ 'module.json': JSON.stringify({ id: 'upd-b', version: '1.1.0' }) })
+  const broken = {
+    buf: brokenBuf,
+    entry: { id: 'upd-b', name: 'upd-b', version: '1.1.0', api: 1, minPluginVersion: '1.0.0', requires: [], capabilities: [], path: 'upd-b/upd-b.zip', sha256: createHash('sha256').update(brokenBuf).digest('hex') },
+  }
+  const s = setup([pack('upd-a', '1.1.0'), broken])
+  const r = await s.c.updateAll()
+  assert.equal(r.updated.length, 1, JSON.stringify(r))
+  assert.equal(r.updated[0].id, 'upd-a')
+  assert.equal(r.failed.length, 1, JSON.stringify(r))
+  assert.equal(r.failed[0].id, 'upd-b')
+  assert.match(r.failed[0].message, /入口文件|装好/)
+  assert.equal(JSON.parse(readFileSync(join(userDir(), 'upd-a', '.aurabot-source.json'), 'utf8')).version, '1.1.0')
+  assert.equal(s.c.progress(), null)
+})
+
+test('一键更新：没有可更新时说人话，不报错', async () => {
+  const s = setup([pack('upd-z', '1.0.0')])
+  const r = await s.c.updateAll()
+  assert.equal(r.ok, true)
+  assert.equal(r.updated.length, 0)
+  assert.match(r.message, /没有可更新/)
+})
+
 test('替换内置要确认；卸载保留源码改动，purge 才清数据和设置', async () => {
   const p = pack('demo-h', '1.0.0')
   p.entry.replacesBuiltin = true
