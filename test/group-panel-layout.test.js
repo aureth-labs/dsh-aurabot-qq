@@ -34,13 +34,6 @@ function nodes(root) {
   return collect(expand(root))
 }
 const find = (tree, predicate) => { const n = nodes(tree).find(predicate); assert.ok(n, 'control exists'); return n }
-// Switch 展开后是 button（title 原样带过来、onClick 触发 onChange）；Row 本身没有 onChange，要点它内部的开关
-const clickSwitch = (tree, locator) => {
-  const host = find(tree, locator)
-  const inner = [host, ...nodes(host)].find(n => typeof n.props.onClick === 'function' && n !== host)
-  assert.ok(inner, 'switch button exists'); inner.props.onClick()
-}
-
 const text = node => typeof node === 'string' ? node : (node?.children || []).flat(Infinity).map(text).join('')
 
 test('按群设置包含仅旁听的群，添加和切换选中项不会开放聊天', () => {
@@ -57,22 +50,26 @@ test('按群设置包含仅旁听的群，添加和切换选中项不会开放�
   assert.ok(find(p.render(), n => n.props['aria-label'] === '群 60000006 响应模式'))
 })
 
-test('旁听只改目标名单；响应模式仍使用原有两项配置，不影响接话和人格', () => {
+test('只有不响应可切换旁听，经过 AI 和仅模块后仍记住原选择', () => {
   const p = panel(), before = structuredClone(p.draft)
-  let tree = p.render()
-  clickSwitch(tree, n => n.props.title === `群 ${G} 不响应时仍旁听`)
-  assert.deepEqual(p.draft.memory.passiveGroups, [P, G])
-  assert.deepEqual(p.draft.allow, before.allow); assert.deepEqual(p.draft.group, before.group)
-  tree = p.render()
-  // 响应模式切到「仅模块」：Select 的 combobox 按钮点开菜单后选项才能点；沙箱里直接点它的选项节点
-  const modeBtn = find(tree, n => n.props['aria-label'] === `群 ${G} 响应模式`)
-  modeBtn.props.onClick()
-  tree = p.render()
-  find(tree, n => text(n) === '仅模块' && n.props.onClick).props.onClick()
-  assert.deepEqual(p.draft.group.moduleOnlyGroups, [G])
-  assert.deepEqual(p.draft.group.overrides, before.group.overrides)
-  tree = p.render(); clickSwitch(tree, n => n.props.title === `群 ${G} 不响应时仍旁听`)
-  assert.deepEqual(p.draft.memory.passiveGroups, [P]); assert.deepEqual(p.draft.allow, before.allow)
+  const toggle = n => n.props.title === `群 ${G} 不响应时仍旁听`
+  const mode = n => n.props['aria-label'] === `群 ${G} 响应模式`
+  const choose = label => {
+    find(p.render(), mode).props.onClick()
+    find(p.render(), n => n.props.role === 'option' && text(n).includes(label)).props.onClick()
+  }
+  assert.equal(nodes(p.render()).some(toggle), false)
+  choose('不响应群消息')
+  find(p.render(), toggle).props.onClick()
+  for (const label of ['仅模块', '允许 AI 聊天']) {
+    choose(label)
+    assert.equal(nodes(p.render()).some(toggle), false)
+    assert.deepEqual(p.draft.memory.passiveGroups, [P, G])
+  }
+  choose('不响应群消息')
+  assert.equal(find(p.render(), toggle).props['aria-checked'], true)
+  find(p.render(), toggle).props.onClick()
+  assert.deepEqual(p.draft.memory.passiveGroups, [P]); assert.deepEqual(p.draft.group.overrides, before.group.overrides)
 })
 
 test('开关与概率分别修改，跟随默认与 /quiet 留下的值可见', () => {
@@ -110,18 +107,16 @@ test('页面默认展示按群设置，分区切换不修改配置，旧入口�
 })
 
 
-test('群聊通用设置是群聊里的次级入口，分区切换和返回不改配置', () => {
-  // 融合：旧三段导航换成 Seg 两段；「所有群默认」即通用设置区
+test('群聊首卡直接显示通用设置，选择群紧随其后；更多默认设置仍能打开', () => {
   const p = panel(), before = structuredClone(p.draft)
   let tree = p.render(p.Group)
-  const seg = find(tree, n => n.props.className === 'ab-seg')
-  assert.deepEqual(nodes(seg).filter(n => n.type === 'button').map(text), ['单个群', '所有群默认'])
-  find(tree, n => n.type === 'button' && text(n) === '所有群默认').props.onClick('all')
+  const headings = nodes(tree).filter(n => n.type === 'h3').map(text)
+  assert.deepEqual(headings.slice(0, 2), ['群聊通用设置', '选择群'])
+  find(p.render(p.Group), n => n.type === 'button' && text(n) === '所有群默认').props.onClick()
   tree = p.render(p.Group)
-  assert.ok(find(tree, n => text(n).includes('被叫到时怎么回')))
-  assert.ok(find(tree, n => text(n).includes('连发合并')))
-  find(tree, n => n.type === 'button' && text(n) === '单个群').props.onClick('single')
-  assert.equal(find(p.render(p.Group), n => n.type === 'button' && text(n) === '单个群').props.className, 'on')
+  const defaults = tree.children.find(n => n?.type === 'fragment')
+  assert.ok(defaults.children.some(n => n?.props?.title === '被叫到时怎么回'))
+  assert.ok(defaults.children.some(n => n?.props?.title === '一条消息怎么变成回复'))
   assert.deepEqual(p.draft, before)
 })
 

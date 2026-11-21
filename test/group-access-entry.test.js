@@ -33,11 +33,16 @@ test('群设置主入口直接跳转，旧名单默认折叠；浏览不会改�
   assert.deepEqual(p.draft.allow.private,['10000001','60000006']);assert.deepEqual(p.draft.allow.groups,before.allow.groups);assert.deepEqual(p.draft.group,before.group)
  }
 })
-test('旁听叫法对应不响应模式，沿用原名单且不影响仅模块',()=>{
- const p=fixture(),before=structuredClone(p.draft),tree=p.render('GroupOverrides')
- const toggle=find(tree,n=>n.props.title==='群 30000003 不响应时仍旁听')
- const row=find(tree,n=>n.props.label==='不响应时仍旁听')
- assert.match(row.props.hint,/仅在切换为「不响应群消息」后生效/)
- toggle.props.onChange(true)
- assert.deepEqual(p.draft.memory.passiveGroups,['30000003']);assert.deepEqual(p.draft.allow,before.allow);assert.deepEqual(p.draft.group,before.group)
+test('仅模块不显示旁听；不响应时开关紧跟模式，不改别的设置',()=>{
+ const p=fixture(),gid='30000003',title='群 '+gid+' 不响应时仍旁听'
+ let tree=p.render('GroupOverrides')
+ assert.ok(!nodes(tree).some(n=>n.props.title===title))
+ find(tree,n=>n.props.ariaLabel==='群 '+gid+' 响应模式').props.onChange('off')
+ tree=p.render('GroupOverrides')
+ const row=find(tree,n=>n.props.label==='群响应模式')
+ const [select,label]=row.children
+ assert.equal(select.props.value,'off');assert.equal(label.type,'label')
+ const before=structuredClone(p.draft)
+ find(label,n=>n.props.title===title).props.onChange(true)
+ assert.deepEqual(p.draft,{...before,memory:{...before.memory,passiveGroups:[gid]}})
 })
