@@ -15,7 +15,14 @@ const granted = new Set()
 export async function grantOwner(dir, log) {
   if (process.platform !== 'win32' || granted.has(dir)) return
   granted.add(dir)
-  await new Promise((done) => execFile('icacls', [dir, '/grant', `${userInfo().username}:(OI)(CI)F`], { windowsHide: true }, (error) => {
+  let username
+  try {
+    username = userInfo().username
+  } catch (error) {
+    log?.debug?.('无法读取当前 Windows 账号，跳过工作区授权：', error.message)
+    return
+  }
+  await new Promise((done) => execFile('icacls', [dir, '/grant', `${username}:(OI)(CI)F`], { windowsHide: true }, (error) => {
     if (error) log?.warn?.('给工作区授权失败，她可能跑不了命令：', error.message)
     done()
   }))
