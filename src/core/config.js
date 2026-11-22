@@ -560,6 +560,13 @@ function normalizePlatforms(raw, gateway) {
     }
     out.qq = qq
   }
+  // 与适配器使用相同的优先级，保留面板显式清空目录的结果。
+  const snowlumaDir = out.qq.snowlumaDir ?? out.qq.dir
+  if (snowlumaDir != null) {
+    const dir = String(snowlumaDir).trim()
+    out.qq.snowlumaDir = dir
+    out.qq.dir = dir
+  }
   return out
 }
 

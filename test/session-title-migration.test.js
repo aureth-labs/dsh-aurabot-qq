@@ -1,11 +1,57 @@
 // U1：旧版本给 system 标题重复拼平台前缀（QQ · QQ · …），启动迁移必须只修坏形状。
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHub } from '../src/chat/hub.js'
 import { createFakeDsh } from './helpers/fake-dsh.js'
+import { normalize } from '../src/core/config.js'
+
+test('创建会话时修正旧工作区标题，改名失败时仍可创建会话', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'ab-workspace-title-'))
+  const prev = process.env.AURABOT_DATA_DIR
+  process.env.AURABOT_DATA_DIR = dir
+  const cfg = normalize({ enabled: true, dryRun: true, workspaceDir: join(dir, 'workspace') })
+  const fake = createFakeDsh({ brain: async () => '收到' })
+  const warnings = []
+  const log = { debug() {}, info() {}, warn: (...args) => warnings.push(args), error() {} }
+  const hub = createHub({ dsh: fake.ctx, getConfig: () => cfg, log })
+  t.after(() => {
+    hub.dispose()
+    fake.dispose()
+    if (prev === undefined) delete process.env.AURABOT_DATA_DIR
+    else process.env.AURABOT_DATA_DIR = prev
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  const workspace = await fake.ctx.workspaceRegistry.create(cfg.workspaceDir, 'Aurabot 路 QQ')
+  let titleWriteFails = true
+  workspace.setTitle = async (title) => {
+    if (titleWriteFails) throw new Error('标题写入失败')
+    workspace.title = title
+  }
+  const createTurn = (userId) => hub.pushToSession(
+    { chatId: `private:${userId}`, kind: 'private', userId },
+    [{ type: 'text', text: '你好' }],
+    userId,
+  )
+
+  await createTurn('10001')
+  assert.equal(workspace.title, 'Aurabot 路 QQ')
+  assert.equal(workspace.sessionIds.length, 1)
+  assert.deepEqual(warnings.find(args => args[0] === '修正工作区标题失败：'), ['修正工作区标题失败：', '标题写入失败'])
+
+  titleWriteFails = false
+  await createTurn('10002')
+  assert.equal(workspace.title, 'Aurabot · QQ')
+  assert.equal(workspace.sessionIds.length, 2)
+
+  workspace.title = '自定义标题'
+  await createTurn('10003')
+  assert.equal(workspace.title, '自定义标题')
+  assert.equal(workspace.sessionIds.length, 3)
+})
 
 test('迁移旧会话标题：重复 QQ 前缀 / 非 QQ 的 QQ 前缀会被修正，正常标题不动', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'ab-title-'))

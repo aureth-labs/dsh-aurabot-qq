@@ -1,13 +1,13 @@
-# Aurabot 鈥斺€?DSH bundle patch锛堟彃浠惰嚜甯︾殑鎸傝浇澹版槑锛?
+# Aurabot —— DSH bundle patch（插件自带的挂载声明）
 #
-# 1) aurabot锛氭彃浠舵湰浣擄紙瀹夸富鍗婅竟 src/host.js + 缃戦〉鍗婅竟 client/client.js锛?
-# 2) 涓変釜 agent preset锛屽彧缁?Aurabot 鑷繁寤虹殑 QQ 浼氳瘽/瀛愭櫤鑳戒綋鐢細
-#    - aurabot-private锛氫富浜虹鑱婏紝瀹屾暣宸ュ叿 + 澶ц偉楸间汉鏍?
-#    - aurabot-private-long锛氬悓涓婏紝鍙︽寕 jobs + schedule锛堥潰鏉裤€岄暱浠诲姟妯″紡銆嶆墦寮€鏃剁敤锛岄粯璁ゅ叧锛?
-#    - aurabot-social 锛氱兢鑱?/ 鍏朵粬浜虹鑱婏紝娌℃湁浠讳綍鏈湴宸ュ叿锛坰hell / 鏂囦欢 / 缃戠粶锛夛紝鍙湁鎻掍欢鎸変細璇濇寕鐨?QQ 宸ュ叿
-#    - aurabot-subagent锛氭彃浠跺唴閮ㄥ娲剧粰瀛愭櫤鑳戒綋锛坔ub.runSubagentTurn锛夋椂鐢ㄢ€斺€斾笉甯︿汉鏍硷紝鍙甫鏈満鎿嶄綔宸ュ叿锛?
-#      瀛愮骇鎷垮畠鑷繁鐨勪换鍔′功骞叉椿锛堟墜鏈洪€涢€涚瓑锛夛紝涓嶇户鎵?QQ 浼氳瘽鐨勫伐鍏风粍鎴?
-#    浜烘牸閫氳繃鎻愮ず璇嶅彉閲?{{aurabot_persona}} 鏀惧湪绯荤粺鎻愮ず璇嶆渶鍓嶉潰锛堢敱鎻掍欢娉ㄥ唽锛岄潰鏉垮垏鎹汉鏍煎嵆鏃剁敓鏁堬級銆?
+# 1) aurabot：插件本体（宿主半边 src/host.js + 网页半边 client/client.js）
+# 2) 三个 agent preset，只给 Aurabot 自己建的 QQ 会话/子智能体用：
+#    - aurabot-private：主人私聊，完整工具 + 大肥鱼人格
+#    - aurabot-private-long：同上，另挂 jobs + schedule（面板「长任务模式」打开时用，默认关）
+#    - aurabot-social ：群聊 / 其他人私聊，没有任何本地工具（shell / 文件 / 网络），只有插件按会话挂的 QQ 工具
+#    - aurabot-subagent：插件内部委派给子智能体（hub.runSubagentTurn）时用——不带人格，只带本机操作工具，
+#      子级拿它自己的任务书干活（手机逛逛等），不继承 QQ 会话的工具组成
+#    人格通过提示词变量 {{aurabot_persona}} 放在系统提示词最前面（由插件注册，面板切换人格即时生效）。
 - insert:
     - id: aurabot
       name: dsh-aurabot-qq
@@ -15,16 +15,16 @@
       name: '@deepseek-ai/dsh-agent-preset'
       config:
         id: aurabot-private
-        name: Aurabot 路 涓讳汉绉佽亰
-        description: 澶ц偉楸煎湪 QQ 涓婂拰涓讳汉绉佽亰鏃剁敤锛氫汉鏍?+ 瀹屾暣宸ュ叿
+        name: Aurabot · 主人私聊
+        description: 大肥鱼在 QQ 上和主人私聊时用：人格 + 完整工具
         order: 60
         plugins:
           - id: persona
             name: '@deepseek-ai/dsh-persona'
             config:
               prefix: "{{aurabot_persona}}\n\n{{aurabot_rules_private}}"
-              # 浜烘牸鐙崰绯荤粺鎻愮ず璇嶏細涓嶅甫 DSH 閭ｄ竴澶ф缂栫▼鍔╂墜韬唤鍜屽伐鍏锋寚鍗楋紙瀹炴祴绉佽亰浠?1~4 鍒嗛挓涓€杞檷涓嬫潵锛夈€?
-              # 宸ュ叿鐓ф牱鎸傜潃锛屾ā鍨嬮潬宸ュ叿瀹氫箟鏈韩灏变細鐢ㄣ€?
+              # 人格独占系统提示词：不带 DSH 那一大段编程助手身份和工具指南（实测私聊从 1~4 分钟一轮降下来）。
+              # 工具照样挂着，模型靠工具定义本身就会用。
               complete: true
           - id: time-context
             name: '@deepseek-ai/dsh-time-context'
@@ -66,16 +66,16 @@
       name: '@deepseek-ai/dsh-agent-preset'
       config:
         id: aurabot-private-long
-        name: Aurabot 路 涓讳汉绉佽亰锛堥暱浠诲姟妯″紡锛?
-        description: 涓讳汉绉佽亰 + 鍚庡彴浠诲姟锛坖obs锛夊拰瀹氭椂浠诲姟锛坰chedule锛夛細闀夸换鍔¤窇瀹屼細鑷姩鍞ら啋濂瑰洖鎶?
+        name: Aurabot · 主人私聊（长任务模式）
+        description: 主人私聊 + 后台任务（jobs）和定时任务（schedule）：长任务跑完会自动唤醒她回报
         order: 62
         plugins:
           - id: persona
             name: '@deepseek-ai/dsh-persona'
             config:
               prefix: "{{aurabot_persona}}\n\n{{aurabot_rules_private}}"
-              # 浜烘牸鐙崰绯荤粺鎻愮ず璇嶏細涓嶅甫 DSH 閭ｄ竴澶ф缂栫▼鍔╂墜韬唤鍜屽伐鍏锋寚鍗楋紙瀹炴祴绉佽亰浠?1~4 鍒嗛挓涓€杞檷涓嬫潵锛夈€?
-              # 宸ュ叿鐓ф牱鎸傜潃锛屾ā鍨嬮潬宸ュ叿瀹氫箟鏈韩灏变細鐢ㄣ€?
+              # 人格独占系统提示词：不带 DSH 那一大段编程助手身份和工具指南（实测私聊从 1~4 分钟一轮降下来）。
+              # 工具照样挂着，模型靠工具定义本身就会用。
               complete: true
           - id: time-context
             name: '@deepseek-ai/dsh-time-context'
@@ -113,20 +113,20 @@
             config:
               fetch: true
               searchTimeoutMs: 60000
-          # 闀夸换鍔℃ā寮忥細鍚庡彴璺戝懡浠ゃ€佸畬鎴愬悗鑷姩鍞ら啋锛涗互鍙婁竴娆℃€?鍛ㄦ湡瀹氭椂浠诲姟
+          # 长任务模式：后台跑命令、完成后自动唤醒；以及一次性/周期定时任务
           - id: tool-jobs
             name: '@deepseek-ai/dsh-tool-jobs'
           - id: tool-schedule
             name: '@deepseek-ai/dsh-tool-schedule'
-    # 瀛愭櫤鑳戒綋涓撶敤锛氭彃浠?hub.runSubagentTurn 娲炬椿鏃舵寚瀹氾紙request.agentPreset锛夈€?
-    # 涓嶅甫浜烘牸锛圖SH 榛樿缂栫▼鍔╂墜韬唤鏇撮€傚悎鎵ц鑷冻浠诲姟涔︼級锛屽彧缁欐湰鏈烘搷浣滃伐鍏凤紱
-    # 鐖剁骇鏄?aurabot-social锛堥浂鏈湴宸ュ叿锛夛紝瀛愮骇涓嶆樉寮忔寚瀹氬氨浼氱户鎵垮畠銆佹嬁涓嶅埌 shell鈥斺€旀墜鏈轰换鍔″氨搴熶簡銆?
+    # 子智能体专用：插件 hub.runSubagentTurn 派活时指定（request.agentPreset）。
+    # 不带人格（DSH 默认编程助手身份更适合执行自足任务书），只给本机操作工具；
+    # 父级是 aurabot-social（零本地工具），子级不显式指定就会继承它、拿不到 shell——手机任务就废了。
     - id: preset-aurabot-subagent
       name: '@deepseek-ai/dsh-agent-preset'
       config:
         id: aurabot-subagent
-        name: Aurabot 路 瀛愭櫤鑳戒綋
-        description: 鎻掍欢鍐呴儴濮旀淳浠诲姟鐨勫瓙鏅鸿兘浣撶敤锛氭棤 QQ 浜烘牸锛屽甫鏈満鍛戒护涓庢枃浠跺伐鍏凤紝鑷繁鍔ㄦ墜瀹屾垚鑷冻浠诲姟
+        name: Aurabot · 子智能体
+        description: 插件内部委派任务的子智能体用：无 QQ 人格，带本机命令与文件工具，自己动手完成自足任务
         order: 59
         plugins:
           - id: time-context
@@ -164,8 +164,8 @@
       name: '@deepseek-ai/dsh-agent-preset'
       config:
         id: aurabot-social
-        name: Aurabot 路 缇よ亰
-        description: 澶ц偉楸煎湪 QQ 缇ゅ拰闄岀敓浜虹鑱婃椂鐢細浜烘牸 + 鍙湁 QQ 绀句氦宸ュ叿锛屾病鏈変换浣曠數鑴戞搷浣滆兘鍔?
+        name: Aurabot · 群聊
+        description: 大肥鱼在 QQ 群和陌生人私聊时用：人格 + 只有 QQ 社交工具，没有任何电脑操作能力
         order: 61
         plugins:
           - id: persona

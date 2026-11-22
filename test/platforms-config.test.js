@@ -10,6 +10,7 @@ test('旧字段换算出 platforms.qq（snowluma 后端）', () => {
   assert.equal(c.platforms.qq.httpUrl, 'http://127.0.0.1:3000');
   assert.equal(c.platforms.qq.wsToken, 't2');
   assert.equal(c.platforms.qq.dir, 'C:\\Aurabot\\snowluma');
+  assert.equal(c.platforms.qq.snowlumaDir, 'C:\\Aurabot\\snowluma');
   // 旧字段照常可读，行为不变
   assert.equal(c.gateway, 'snowluma');
   assert.ok(c.snowluma.httpUrl);
@@ -27,10 +28,31 @@ test('用户手写的 platforms 原样保留，不被旧字段覆盖', () => {
   assert.equal(c.platforms.feishu.appId, 'a');
 });
 
+test('platforms.qq 的旧 dir 会补成适配器字段 snowlumaDir', () => {
+  const c = normalize({ platforms: { qq: { enabled: true, backend: 'snowluma', dir: 'H:\\Projects\\SnowLuma' } } });
+  assert.equal(c.platforms.qq.snowlumaDir, 'H:\\Projects\\SnowLuma');
+  const reverse = normalize({ platforms: { qq: { enabled: true, backend: 'snowluma', snowlumaDir: 'H:\\Projects\\SnowLuma' } } });
+  assert.equal(reverse.platforms.qq.dir, 'H:\\Projects\\SnowLuma');
+});
+
 test('空配置：默认给出未启用的 qq 实例，不炸', () => {
   const c = normalize({});
   assert.equal(c.platforms.qq.enabled, false);
   assert.equal(c.platforms.qq.backend, 'snowluma');
+});
+
+test('面板替换或清空 SnowLuma 目录后，新旧字段保存同一个值', () => {
+  const current = normalize({
+    snowluma: { dir: 'legacy-install' },
+    platforms: { qq: { enabled: true, backend: 'snowluma', dir: 'migrated-install' } },
+  });
+  for (const snowlumaDir of ['new-install', '']) {
+    const next = normalize(mergeFromPanel(current, { platforms: { qq: { ...current.platforms.qq, snowlumaDir } } }));
+    assert.equal(next.platforms.qq.snowlumaDir, snowlumaDir);
+    assert.equal(next.platforms.qq.dir, snowlumaDir);
+    assert.equal(next.snowluma.dir, 'legacy-install');
+    assert.equal(normalize(next).platforms.qq.snowlumaDir, snowlumaDir);
+  }
 });
 
 test('旧版 QQ 托管默认启用，通用面板保存保留当前状态', () => {
