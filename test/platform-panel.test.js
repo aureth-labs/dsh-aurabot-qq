@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs'
 
 const client = readFileSync(new URL('../client/client.js', import.meta.url), 'utf8')
 const host = readFileSync(new URL('../src/host.js', import.meta.url), 'utf8')
+const config = readFileSync(new URL('../src/core/config.js', import.meta.url), 'utf8')
 
 test('平台页接上了 TABS、组件表和系统分组', () => {
   assert.ok(client.includes("{ id: 'platforms', label: '通讯平台' }"), 'TABS 缺通讯平台页')
@@ -39,6 +40,12 @@ test('平台卡片可折叠，状态写入配置且不触发平台重配', () =>
   assert.ok(host.includes("ui: { platformsCollapsed: getConfig().ui?.platformsCollapsed || {} }"), '平台视图没有返回折叠状态')
   assert.ok(client.includes("stopped: '未连接'"), '未连接状态仍带总开关说明')
   assert.ok(host.includes("默认 QQ 已由多平台网关托管"), '网关托管提示未改成已托管')
+  assert.ok(client.includes("snowluma.statusCommand.enabled"), '面板没有 SL 状态命令开关')
+  assert.ok(client.includes("snowluma.statusCommand.trigger"), '面板没有 SL 状态命令触发词')
+  assert.ok(host.includes('handleSnowlumaStatusCommand'), '宿主没有 SL 状态命令处理')
+  assert.ok(host.includes('merged.snowlumaManaged = true'), '迁移没有继承插件管理 SnowLuma')
+  assert.ok(config.includes('ui: { platformsCollapsed: {} }'), '折叠状态没有配置默认值')
+  assert.ok(config.includes("statusCommand: { enabled: true, trigger: '#sl' }"), 'SL 状态命令没有配置默认值')
 })
 
 test('顶部状态按主平台判断，SnowLuma/OneBot 标签只在 QQ 直连时显示', () => {

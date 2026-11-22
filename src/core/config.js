@@ -88,6 +88,8 @@ export const DEFAULTS = {
     wsUrl: '',
     httpToken: '',
     wsToken: '',
+    // 主人私聊发送触发词查看 SnowLuma/QQ 连接状态；默认开启。
+    statusCommand: { enabled: true, trigger: '#sl' },
   },
   model: { provider: '', model: '', reasoningEffort: 'low', vision: 'auto' }, // 留空 = 跟随 DSH 默认；vision: auto/on/off
   // 按聊天选模型（主人在面板「模型」页设）：私聊 QQ 号 > 群号 > 所有私聊 / 所有群默认 > 上面的全局模型；没写的一级退到下一级
@@ -895,6 +897,9 @@ export function normalize(raw) {  const c = deepMerge(DEFAULTS, raw)
 
   delete c.mood.maxInjectPerDay // 旧版的「每天最多提醒几次」，现在心情明显时每轮都会带上
   c.snowluma.webuiPort = num(c.snowluma.webuiPort, 15099, 1, 65535)
+  if (!isObj(c.snowluma.statusCommand)) c.snowluma.statusCommand = {}
+  c.snowluma.statusCommand.enabled = bool(c.snowluma.statusCommand.enabled, true)
+  c.snowluma.statusCommand.trigger = String(c.snowluma.statusCommand.trigger ?? '').trim().split(/\s+/)[0].slice(0, 32) || '#sl'
   // 老配置只有一个 consolidateAt：换成两个时间点（它 + 12 小时后）
   if (!Array.isArray(raw?.memory?.consolidateTimes) && raw?.memory?.consolidateAt) {
     const [hh, mm] = hhmm(raw.memory.consolidateAt, '04:00').split(':').map(Number)

@@ -2701,6 +2701,48 @@ export function apply(ctx, opts = {}) {
     },
   }
 
+  /**
+   * 主人私聊触发词：返回 SL/QQ 当前状态，不走模型。默认 #sl，可在 QQ详细设置关闭/改词。
+   */
+  async function handleSnowlumaStatusCommand(msg) {
+    const sc = cfg.snowluma?.statusCommand
+    if (!sc || sc.enabled !== true || !hub) return false
+    if (msg.kind !== 'private') return false
+    if (msg.platform && msg.platform !== defaultPlatform) return false
+    const trigger = String(sc.trigger || '#sl').trim()
+    const text = String(msg.text || '').trim()
+    if (!trigger || (text !== trigger && !text.startsWith(trigger + ' '))) return false
+    const ownerId = identity.owner?.() || ''
+    const senderPerson = msg.sender?.person
+    const senderAccount = String(msg.sender?.account || msg.userId || '')
+    const ownerAccount = String(identity.accountOn?.(ownerId, defaultPlatform)
+      || identity.accountsOf?.(ownerId)?.find?.((a) => a?.platform === defaultPlatform)?.account
+      || '')
+    const fromOwner = msg.sender?.isOwner === true
+      || Boolean(senderPerson && identity.isOwner?.(senderPerson))
+      || Boolean(senderAccount && ownerAccount && senderAccount === ownerAccount)
+    if (!fromOwner) return false
+    const lines = ['SL 状态']
+    try {
+      const inst = snowluma.detect()
+      lines.push(`安装：${inst.installed ? '已安装' + (inst.version ? `（v${inst.version}）` : '') : '未检测到'}`)
+      if (inst.installed) lines.push(`运行：${(await snowluma.running()) ? '运行中' : '未运行'}`)
+    } catch (error) {
+      lines.push(`检测：失败（${error?.message || error}）`)
+    }
+    const ep = endpoint()
+    lines.push(`QQ 连接：${legacyQqOwnsConnection() ? '旧版直连' : '网关托管 qq'}`)
+    lines.push(`连接状态：${legacyQqOwnsConnection() ? onebotState : (gatewayQqStatus()?.state || '未知')}`)
+    if (ep.httpUrl) lines.push(`HTTP：${ep.httpUrl}`)
+    if (ep.wsUrl) lines.push(`WebSocket：${ep.wsUrl}`)
+    try {
+      await hub.sendText(msg.chatId, lines.join('\n'))
+    } catch (error) {
+      logger.child('chat').debug?.('回复 SL 状态失败：', error?.message || error)
+    }
+    return true
+  }
+
   hub = createHub({
     localApi: local,
     dsh: ctx,
@@ -2790,7 +2832,10 @@ export function apply(ctx, opts = {}) {
     // 模块（重）启动代际：模块热重载后工具名没变、但实例换了，hub 要据此重挂工具（issue #73）
     toolsGeneration: () => (mods ? mods.generation?.() || 0 : 0),
     hooks: {
-      message: (msg) => mods.claim('message', msg),
+      message: async (msg) => {
+        if (await handleSnowlumaStatusCommand(msg)) return true
+        return mods.claim('message', msg)
+      },
       reply: (text, info) => mods.filter('reply', text, info),
       // 人格和规则的最终渲染值由 variable 在当前回合记录，发送时不重新生成。
       secrets: () => [],

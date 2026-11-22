@@ -2563,6 +2563,10 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h(Row, { label: '手动 HTTP 令牌' }, f.text('snowluma.httpToken', { type: 'password', placeholder: draft.snowluma.httpTokenSet ? '已保存' : '留空 = 自动' })),
           h(Row, { label: '手动 WS 令牌' }, f.text('snowluma.wsToken', { type: 'password', placeholder: draft.snowluma.wsTokenSet ? '已保存' : '留空 = 自动' })),
         ),
+        h(Card, { title: 'SL 状态命令', desc: '主人在 QQ 私聊里发送触发词，直接回复 SnowLuma 与 QQ 的连接状态，不调用模型。' },
+          h(Row, { label: '启用状态命令' }, f.sw('snowluma.statusCommand.enabled')),
+          h(Row, { label: '触发词', hint: '默认 #sl；只匹配消息开头，区分大小写' }, f.text('snowluma.statusCommand.trigger', { placeholder: '#sl' })),
+        ),
       )
     }
 
