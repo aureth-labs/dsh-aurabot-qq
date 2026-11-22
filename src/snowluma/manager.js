@@ -437,6 +437,22 @@ export function createSnowLumaManager({ getConfig, log, savePassword }) {
     return rows
   }
 
+  /** 读取 SnowLuma 自己的 OneBot 配置（含原生 statusCommand）。 */
+  async function readOneBotConfig(uin = getConfig().botQQ) {
+    const id = String(uin || '').trim()
+    if (!/^\d+$/.test(id)) throw new Error('机器人 QQ 号无效，读不到 SnowLuma 配置')
+    const j = await api(`/api/config/${encodeURIComponent(id)}`)
+    return j.config && typeof j.config === 'object' ? j.config : null
+  }
+
+  /** 写回 SnowLuma 配置；SnowLuma 会热重载当前会话。 */
+  async function writeOneBotConfig(config, uin = getConfig().botQQ) {
+    const id = String(uin || '').trim()
+    if (!/^\d+$/.test(id)) throw new Error('机器人 QQ 号无效，改不了 SnowLuma 配置')
+    if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('SnowLuma 配置无效')
+    return api(`/api/config/${encodeURIComponent(id)}`, { method: 'POST', body: config })
+  }
+
   const QQ_NT_HINT = '如果 QQ 是老版本（非 NT），SnowLuma 注入不了，请升级到 QQ NT 版（9.9 及以上）'
   /** 只给机器人号注入；别的号（主人的主号）碰都不碰。 */
   async function attachBot() {
@@ -606,6 +622,8 @@ export function createSnowLumaManager({ getConfig, log, savePassword }) {
     start,
     stop,
     processes,
+    readOneBotConfig,
+    writeOneBotConfig,
     /** 系统里 SnowLuma 接不了的老版 QQ（只用于提示） */
     oldQqProcesses,
     attachBot,

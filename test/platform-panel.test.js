@@ -40,12 +40,14 @@ test('平台卡片可折叠，状态写入配置且不触发平台重配', () =>
   assert.ok(host.includes("ui: { platformsCollapsed: getConfig().ui?.platformsCollapsed || {} }"), '平台视图没有返回折叠状态')
   assert.ok(client.includes("stopped: '未连接'"), '未连接状态仍带总开关说明')
   assert.ok(host.includes("默认 QQ 已由多平台网关托管"), '网关托管提示未改成已托管')
-  assert.ok(client.includes("snowluma.statusCommand.enabled"), '面板没有 SL 状态命令开关')
-  assert.ok(client.includes("snowluma.statusCommand.trigger"), '面板没有 SL 状态命令触发词')
-  assert.ok(host.includes('handleSnowlumaStatusCommand'), '宿主没有 SL 状态命令处理')
+  assert.ok(client.includes("SnowLuma 状态命令（原生）"), '面板没有 SnowLuma 原生命令设置')
+  assert.ok(client.includes("post('/snowluma/status-command/save'"), '面板没有保存 SnowLuma 原生命令')
+  assert.ok(host.includes("route('/snowluma/status-command'"), '宿主没有 SnowLuma 原生命令读取接口')
+  assert.ok(host.includes("readOneBotConfig"), '宿主没有读取 SnowLuma OneBot 配置')
+  assert.ok(host.includes("writeOneBotConfig"), '宿主没有写回 SnowLuma OneBot 配置')
   assert.ok(host.includes('merged.snowlumaManaged = true'), '迁移没有继承插件管理 SnowLuma')
   assert.ok(config.includes('ui: { platformsCollapsed: {} }'), '折叠状态没有配置默认值')
-  assert.ok(config.includes("statusCommand: { enabled: true, trigger: '#sl' }"), 'SL 状态命令没有配置默认值')
+  assert.ok(!config.includes("statusCommand: { enabled: true, trigger: '#sl' }"), 'DSH 不应另存一份 SL 状态命令配置')
 })
 
 test('顶部状态按主平台判断，SnowLuma/OneBot 标签只在 QQ 直连时显示', () => {

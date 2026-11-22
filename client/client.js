@@ -2448,6 +2448,38 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [moveTo, setMoveTo] = useState('')
       // 远端桌宠直连：对外地址的本地编辑态（null = 跟着服务端当前值显示）
       const [pubBase, setPubBase] = useState(null)
+      // SnowLuma 原生 statusCommand；不在 DSH 配置里重造一份。
+      const [slCmd, setSlCmd] = useState(null)
+      const [slCmdBusy, setSlCmdBusy] = useState(false)
+      const [slCmdError, setSlCmdError] = useState('')
+      useEffect(() => {
+        if (!sl.running) { setSlCmd(null); setSlCmdError(''); return }
+        let alive = true
+        get('/snowluma/status-command').then((r) => {
+          if (!alive) return
+          if (r.ok) { setSlCmd(r.statusCommand); setSlCmdError('') }
+          else setSlCmdError(r.message || '读取失败')
+        }).catch((error) => { if (alive) setSlCmdError(error.message || '读取失败') })
+        return () => { alive = false }
+      }, [sl.running])
+      const saveSlCmd = async () => {
+        if (!slCmd || slCmdBusy) return
+        setSlCmdBusy(true)
+        try {
+          const r = await post('/snowluma/status-command/save', { enabled: slCmd.enabled === true, trigger: slCmd.trigger })
+          if (r.ok) {
+            setSlCmd(r.statusCommand || slCmd)
+            setSlCmdError('')
+            toast(r.message || '已保存到 SnowLuma', 'ok')
+          } else {
+            toast(r.message || '保存失败', 'err')
+          }
+        } catch (error) {
+          toast(error.message || '保存失败', 'err')
+        } finally {
+          setSlCmdBusy(false)
+        }
+      }
       const conn = st.onebot.state === 'connected'
       const loadProcs = async () => { const r = await get('/snowluma/processes'); setProcs(r.list || []); setOtherProcs(r.others || []); if (!r.ok) toast(r.message) }
       const act = (p) => async () => { const r = await post(p); toast(r.message || (r.ok ? '好了' : '没成功')); reload() }
@@ -2563,10 +2595,18 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h(Row, { label: '手动 HTTP 令牌' }, f.text('snowluma.httpToken', { type: 'password', placeholder: draft.snowluma.httpTokenSet ? '已保存' : '留空 = 自动' })),
           h(Row, { label: '手动 WS 令牌' }, f.text('snowluma.wsToken', { type: 'password', placeholder: draft.snowluma.wsTokenSet ? '已保存' : '留空 = 自动' })),
         ),
-        h(Card, { title: 'SL 状态命令', desc: '主人在 QQ 私聊里发送触发词，直接回复 SnowLuma 与 QQ 的连接状态，不调用模型。' },
-          h(Row, { label: '启用状态命令' }, f.sw('snowluma.statusCommand.enabled')),
-          h(Row, { label: '触发词', hint: '默认 #sl；只匹配消息开头，区分大小写' }, f.text('snowluma.statusCommand.trigger', { placeholder: '#sl' })),
-        ),
+        h(Card, { title: 'SnowLuma 状态命令（原生）', desc: '这是 SnowLuma 自带的 statusCommand，不是 Aurabot 另写的回复。开启后由 SnowLuma 回复版本、平台和运行时长。' },
+          !sl.running
+            ? h('div', { className: 'ab-small ab-muted' }, '先启动 SnowLuma，才能读取和修改它的配置。')
+            : slCmd
+              ? h(Fragment, null,
+                h(Row, { label: '启用状态命令' }, h(Switch, { on: slCmd.enabled === true, onChange: (v) => setSlCmd({ ...slCmd, enabled: v }) })),
+                h(Row, { label: '触发词', hint: '默认 #sl；SnowLuma 按整条文本匹配，不区分大小写' },
+                  h('input', { className: 'ab-input', value: slCmd.trigger, disabled: slCmdBusy, onChange: (e) => setSlCmd({ ...slCmd, trigger: e.target.value }) })),
+                h('div', { className: 'ab-flex', style: { alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
+                  h(Btn, { small: true, kind: 'primary', disabled: slCmdBusy, onClick: saveSlCmd }, slCmdBusy ? '保存中…' : '保存到 SnowLuma'),
+                  h('span', { className: 'ab-small ab-muted' }, '开启后会同时让 SnowLuma 吞掉这条消息，避免 Aurabot 再回一遍。')))
+              : h('div', { className: 'ab-small ab-muted' }, slCmdError || '正在读取 SnowLuma 配置…')),
       )
     }
 

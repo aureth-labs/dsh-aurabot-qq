@@ -2701,48 +2701,6 @@ export function apply(ctx, opts = {}) {
     },
   }
 
-  /**
-   * 主人私聊触发词：返回 SL/QQ 当前状态，不走模型。默认 #sl，可在 QQ详细设置关闭/改词。
-   */
-  async function handleSnowlumaStatusCommand(msg) {
-    const sc = cfg.snowluma?.statusCommand
-    if (!sc || sc.enabled !== true || !hub) return false
-    if (msg.kind !== 'private') return false
-    if (msg.platform && msg.platform !== defaultPlatform) return false
-    const trigger = String(sc.trigger || '#sl').trim()
-    const text = String(msg.text || '').trim()
-    if (!trigger || (text !== trigger && !text.startsWith(trigger + ' '))) return false
-    const ownerId = identity.owner?.() || ''
-    const senderPerson = msg.sender?.person
-    const senderAccount = String(msg.sender?.account || msg.userId || '')
-    const ownerAccount = String(identity.accountOn?.(ownerId, defaultPlatform)
-      || identity.accountsOf?.(ownerId)?.find?.((a) => a?.platform === defaultPlatform)?.account
-      || '')
-    const fromOwner = msg.sender?.isOwner === true
-      || Boolean(senderPerson && identity.isOwner?.(senderPerson))
-      || Boolean(senderAccount && ownerAccount && senderAccount === ownerAccount)
-    if (!fromOwner) return false
-    const lines = ['SL 状态']
-    try {
-      const inst = snowluma.detect()
-      lines.push(`安装：${inst.installed ? '已安装' + (inst.version ? `（v${inst.version}）` : '') : '未检测到'}`)
-      if (inst.installed) lines.push(`运行：${(await snowluma.running()) ? '运行中' : '未运行'}`)
-    } catch (error) {
-      lines.push(`检测：失败（${error?.message || error}）`)
-    }
-    const ep = endpoint()
-    lines.push(`QQ 连接：${legacyQqOwnsConnection() ? '旧版直连' : '网关托管 qq'}`)
-    lines.push(`连接状态：${legacyQqOwnsConnection() ? onebotState : (gatewayQqStatus()?.state || '未知')}`)
-    if (ep.httpUrl) lines.push(`HTTP：${ep.httpUrl}`)
-    if (ep.wsUrl) lines.push(`WebSocket：${ep.wsUrl}`)
-    try {
-      await hub.sendText(msg.chatId, lines.join('\n'))
-    } catch (error) {
-      logger.child('chat').debug?.('回复 SL 状态失败：', error?.message || error)
-    }
-    return true
-  }
-
   hub = createHub({
     localApi: local,
     dsh: ctx,
@@ -2832,10 +2790,7 @@ export function apply(ctx, opts = {}) {
     // 模块（重）启动代际：模块热重载后工具名没变、但实例换了，hub 要据此重挂工具（issue #73）
     toolsGeneration: () => (mods ? mods.generation?.() || 0 : 0),
     hooks: {
-      message: async (msg) => {
-        if (await handleSnowlumaStatusCommand(msg)) return true
-        return mods.claim('message', msg)
-      },
+      message: (msg) => mods.claim('message', msg),
       reply: (text, info) => mods.filter('reply', text, info),
       // 人格和规则的最终渲染值由 variable 在当前回合记录，发送时不重新生成。
       secrets: () => [],
@@ -4844,6 +4799,47 @@ export function apply(ctx, opts = {}) {
       try { others = (await snowluma.oldQqProcesses()).filter((p) => !list.some((x) => x.pid === p.pid)) } catch (error) {}
       return { ok: true, list, others }
     } catch (error) { return { ok: false, message: error.message, list: [], others: [] } }
+  })
+  // SnowLuma 原生 statusCommand（不是 Aurabot 自己实现的命令）。
+  const snowlumaStatusCommand = (value = {}) => ({
+    enabled: value?.enabled !== false,
+    trigger: String(value?.trigger || '#sl').trim().slice(0, 32) || '#sl',
+  })
+  route('/snowluma/status-command', async () => {
+    try {
+      const config = await snowluma.readOneBotConfig(cfg.botQQ)
+      if (!config) return { ok: false, message: 'SnowLuma 没有返回 OneBot 配置' }
+      return { ok: true, statusCommand: snowlumaStatusCommand(config.statusCommand) }
+    } catch (error) {
+      return { ok: false, message: `读取 SnowLuma 配置失败：${error?.message || error}` }
+    }
+  })
+  route('/snowluma/status-command/save', async (req) => {
+    const b = await readBody(req)
+    const trigger = String(b.trigger ?? '').trim()
+    if (!trigger || trigger.length > 32 || /[\r\n]/.test(trigger)) {
+      return { ok: false, message: '触发词必须非空、单行，且不超过 32 个字符' }
+    }
+    const enabled = b.enabled === true
+    try {
+      const config = await snowluma.readOneBotConfig(cfg.botQQ)
+      if (!config) return { ok: false, message: 'SnowLuma 没有返回 OneBot 配置' }
+      const previous = config.statusCommand && typeof config.statusCommand === 'object' ? config.statusCommand : {}
+      const next = {
+        enabled,
+        trigger,
+        swallow: enabled ? true : previous.swallow === true,
+        cooldownSeconds: Number.isInteger(previous.cooldownSeconds) ? previous.cooldownSeconds : 5,
+      }
+      const result = await snowluma.writeOneBotConfig({ ...config, statusCommand: next }, cfg.botQQ)
+      return {
+        ok: true,
+        statusCommand: snowlumaStatusCommand(next),
+        message: result?.message || (enabled ? '已开启，SnowLuma 会自己回复状态' : '已关闭'),
+      }
+    } catch (error) {
+      return { ok: false, message: `保存 SnowLuma 配置失败：${error?.message || error}` }
+    }
   })
   /** 一键诊断：把「连不上 QQ」卡在哪一步逐项列出来，用户发截图就能定位。 */
   route('/snowluma/diagnose', async () => {
