@@ -11,7 +11,7 @@ const managed = readFileSync(new URL('../src/core/tools-managed.js', import.meta
 test('外置工具页接上了 TABS、Pages 和系统分组', () => {
   assert.ok(client.includes("{ id: 'tools', label: '外置工具' }"), 'TABS 缺外置工具页')
   assert.ok(client.includes('tools: Tools'), '组件表缺 tools → Tools')
-  assert.ok(client.includes("tabs: ['platforms', 'connect', 'model', 'access', 'browser', 'tools'"), '系统分组缺 tools')
+  assert.ok(client.includes("tabs: ['platforms', 'model', 'access', 'browser', 'tools'"), '系统分组缺 tools')
   assert.ok(client.includes('function Tools({ toast })'), '缺 Tools 组件')
 })
 

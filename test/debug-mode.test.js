@@ -72,7 +72,7 @@ test('面板有调试开关 / 调试对话，不会在合并上游后丢失', ()
   assert.ok(src.includes("post('/debug/session')"), '缺新建 / 打开调试会话')
   assert.ok(src.includes("post('/debug/say'"), '缺调试对话发送')
   assert.ok(src.includes('function DebugChat('), '缺调试对话组件')
-  assert.ok(src.includes('cfg.debug ? { cls: \'warn\', text: \'在线 · 调试\' }'), '状态栏没显示调试')
+  assert.ok(src.includes("text: '在线 · 调试'"), '状态栏没显示调试')
 })
 
 test('调试模式：不收表情（不往表情库里添东西）', async () => {

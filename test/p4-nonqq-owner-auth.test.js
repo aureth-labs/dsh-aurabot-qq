@@ -609,7 +609,7 @@ test('P4-4: 前端 client.js 对纯非 QQ 主人的 GlobalAccess 展示、向导
   assert.match(gaText, /主人 QQ 号（可选）/)
   assert.match(gaText, /可留空/)
 
-  // 2) AurabotPage + Overview：纯非 QQ 离线（启用但 disconnected）必须报「平台未连接」与警告；已连接才显示「在线（多平台）」
+  // 2) AurabotPage + Overview：纯非 QQ 离线（启用但 disconnected）必须按主平台报错与警告；已连接才显示在线
   const offlineSt = {
     ok: true,
     version: '1.5.0',
@@ -630,7 +630,7 @@ test('P4-4: 前端 client.js 对纯非 QQ 主人的 GlobalAccess 展示、向导
   state = [offlineSt, '', JSON.parse(JSON.stringify(nonQqCfg)), 'overview', null, false]
   const offlinePageText = textOf(vmExport.p4Test.AurabotPage())
   assert.doesNotMatch(offlinePageText, /在线（多平台）/, '纯非 QQ 平台未连接时不得误报在线')
-  assert.match(offlinePageText, /平台未连接/)
+  assert.match(offlinePageText, /没连上/)
 
   hook = 0
   state = [null, false, '7']
@@ -646,10 +646,36 @@ test('P4-4: 前端 client.js 对纯非 QQ 主人的 GlobalAccess 展示、向导
   const pageTree = vmExport.p4Test.AurabotPage()
   const pageText = textOf(pageTree)
   assert.doesNotMatch(pageText, /QQ 没连上/, '纯非 QQ 启用且已连接时状态栏不得误报「QQ 没连上」')
-  assert.match(pageText, /在线（多平台）/)
+  assert.match(pageText, /在线/)
   const subNode = collectNodes(pageTree, (n) => n.props?.className === 'ab-sub')[0]
   assert.ok(subNode)
   assert.doesNotMatch(textOf(subNode), /^QQ\s/, '无 botQQ 时副标题不应显示空 QQ 前缀')
+  assert.doesNotMatch(pageText, /SnowLuma/, 'QQ 未启用时顶部不应显示 SnowLuma 标签')
+
+  const qqGwCfg = JSON.parse(JSON.stringify(nonQqCfg))
+  qqGwCfg.legacyQqEnabled = false
+  qqGwCfg.platforms = { qq: { enabled: true, backend: 'snowluma' } }
+  const qqGwSt = {
+    ...offlineSt,
+    config: qqGwCfg,
+    platforms: [{ instance: 'qq', platform: 'qq', name: 'qq', enabled: true, legacy: false, state: 'connected' }],
+    onebot: { state: 'stopped', login: null, endpoint: {}, problem: '' },
+    snowluma: { installed: true, running: true },
+  }
+  hook = 0
+  state = [qqGwSt, '', JSON.parse(JSON.stringify(qqGwCfg)), 'overview', null, false]
+  const qqGwText = textOf(vmExport.p4Test.AurabotPage())
+  assert.match(qqGwText, /在线/, '网关 qq 已连接时顶部应在线')
+  assert.doesNotMatch(qqGwText, /QQ 没连上/, '网关 qq 已连接时不得误报 QQ 没连上')
+  assert.match(qqGwText, /SnowLuma 运行中/, 'SnowLuma 后端应显示 SL 状态')
+
+  qqGwCfg.platforms.qq.backend = 'onebot'
+  qqGwSt.config = qqGwCfg
+  hook = 0
+  state = [qqGwSt, '', JSON.parse(JSON.stringify(qqGwCfg)), 'overview', null, false]
+  const qqOnebotText = textOf(vmExport.p4Test.AurabotPage())
+  assert.match(qqOnebotText, /OneBot 已连接/, 'OneBot 后端应显示 OneBot 状态')
+  assert.doesNotMatch(qqOnebotText, /SnowLuma/, 'OneBot 后端不应显示 SnowLuma 标签')
 
   hook = 0
   state = [null, false, '7']

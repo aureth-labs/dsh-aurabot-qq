@@ -28,11 +28,13 @@ window.__ModuleLoader__.load({
         return data
       })
     }
-    const post = (p, body) =>
-      fetch(API + p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) })
+    const post = (p, body, headers) =>
+      fetch(API + p, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body || {}) })
         .then((r) => r.json())
         .then((data) => { if (!data || data.ok !== false) bustCache(); return data })
         .catch((e) => ({ ok: false, message: '连不上插件：' + e.message }))
+    const confirmBackupJournalQuarantine = () => window.confirm('将损坏的备份恢复日志移到备份文件夹以保留排查副本？')
+    const quarantineBackupJournal = () => post('/backup/recovery/quarantine', { confirmed: true }, { 'x-aurabot-backup': '1' })
     const clone = (o) => JSON.parse(JSON.stringify(o))
     const setPath = (obj, path, value) => {
       const next = clone(obj)
@@ -885,7 +887,6 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     const TABS = [
       { id: 'overview', label: '概览' },
       { id: 'platforms', label: '通讯平台' },
-      { id: 'connect', label: '连接QQ' },
       { id: 'character', label: '人格' },
       { id: 'access', label: '权限' },
       { id: 'group', label: '聊天', flag: 'group' },
@@ -926,7 +927,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       { id: 'self', label: '人设', icon: 'M12 12.5a4.25 4.25 0 1 0 0-8.5 4.25 4.25 0 0 0 0 8.5zM4.5 20.5c.9-3.6 3.9-5.5 7.5-5.5s6.6 1.9 7.5 5.5', tabs: ['character', 'group', 'speakup', 'autotelic', 'mood', 'memory', 'persona'] },
       { id: 'express', label: '表达', icon: 'M20.5 11.5a8 8 0 0 1-11.7 7.1L4 20l1.4-4.4A8 8 0 1 1 20.5 11.5zM9 13.2s1.1 1.5 3 1.5 3-1.5 3-1.5M9.5 9.6h.01M14.5 9.6h.01', tabs: ['voice', 'asr', 'stickers', 'imagegen', 'song', 'pet'] },
       { id: 'platform', label: '平台', icon: 'M3.5 6.5h17v11h-17zM10.5 9.8v4.4l3.8-2.2z', tabs: ['diary', 'bili', 'douyin', 'heybox'] },
-      { id: 'system', label: '系统', icon: 'M4 7h9M17 7h3M4 12h3M11 12h9M4 17h11M19 17h1M15 5v4M9 10v4M17 15v4', tabs: ['platforms', 'connect', 'model', 'access', 'browser', 'tools', 'security', 'backup', 'about', 'logs'] },
+      { id: 'system', label: '系统', icon: 'M4 7h9M17 7h3M4 12h3M11 12h9M4 17h11M19 17h1M15 5v4M9 10v4M17 15v4', tabs: ['platforms', 'model', 'access', 'browser', 'tools', 'security', 'backup', 'about', 'logs'] },
       { id: 'market', label: '模块', icon: 'M4 9.5 5.5 4h13L20 9.5M4 9.5a2.7 2.7 0 0 0 5.3 0 2.7 2.7 0 0 0 5.4 0 2.7 2.7 0 0 0 5.3 0M5.5 12.5V20h13v-7.5M10 20v-4.5h4V20', tabs: ['market', 'modules', 'local'] },
     ]
     // 自己写的模块：名字像逛平台的放「平台」，其余放「系统」（排在「日志」前面）
@@ -934,7 +935,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     const navGroupById = (id) => NAV_GROUPS.find((group) => group.id === id)
     const navGroupOf = (t) => NAV_GROUPS.find((g) => g.tabs.includes(t.id)) || navGroupById(t.navGroup) ||
       (t.ext && PLATFORM_EXT.test(t.label) ? NAV_GROUPS[3] : NAV_GROUPS[4])
-    const navOrder = (g, t) => { const i = g.tabs.indexOf(t.id); return i >= 0 ? i : g.tabs.length - (g.tabs.includes('logs') ? 1.5 : 0) }
+    const navOrder = (g, t) => { if (t.id === 'connect') return 1.5; const i = g.tabs.indexOf(t.id); return i >= 0 ? i : g.tabs.length - (g.tabs.includes('logs') ? 1.5 : 0) }
     const NAV_ALIAS = {
       overview: '首页 状态', tools: '外置工具 ffmpeg python uv git edge-tts', connect: 'qq 网关 snowluma onebot 登录 工作区', character: '人设 性格 设定 头像', persona: '人物 画像 小档案 群印象 梗概 时间轴 相处经验 说话方式', access: '主人 白名单 权限 群管 改资料',
       group: '群聊 插话 合并', model: 'ai 大模型 视觉 思考强度', voice: '语音 tts 说话 音色 edge', asr: '语音识别 听语音 转文字 asr 语音转文本', stickers: '表情 小黄脸 gif 商城表情',
@@ -952,14 +953,18 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         .map((g) => ({ ...g, list: tabs.filter((t) => navGroupOf(t).id === g.id).sort((a, b) => navOrder(g, a) - navOrder(g, b)) }))
         .filter((g) => g.list.length)
       const curGroup = groups.find((g) => g.list.some((t) => t.id === cur.id)) || groups[0]
-      // 记住每组最后看的那页：点分组时回到那页
+      // 记住每组最后看的那页：点分组时回到那页。临时 QQ详细设置不写入分组记忆。
       useEffect(() => {
-        if (!curGroup || last[curGroup.id] === cur.id) return
+        if (!curGroup || cur.id === 'connect' || last[curGroup.id] === cur.id) return
         const next = { ...last, [curGroup.id]: cur.id }
         setLast(next)
         try { localStorage.setItem('aurabot.navlast', JSON.stringify(next)) } catch (e) {}
       }, [cur.id])
-      const openGroup = (g) => go((g.list.find((t) => t.id === last[g.id]) || g.list[0]).id)
+      const openGroup = (g) => {
+        const remembered = last[g.id] === 'connect' ? '' : last[g.id]
+        const target = g.list.find((t) => t.id === remembered) || g.list.find((t) => t.id !== 'connect') || g.list[0]
+        if (target) go(target.id)
+      }
       const toggleFind = () => { setFind((f) => (f === null ? '' : null)); setHi(0) }
       useEffect(() => {
         const onKey = (e) => {
@@ -1039,7 +1044,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         h('div', { style: { marginTop: 6 } }, compat.message),
         h('div', { className: 'ab-flex', style: { marginTop: 8, gap: 8, flexWrap: 'wrap' } },
           h(Btn, { small: true, kind: 'primary', onClick: () => window.open(st.snowluma.downloadPage, '_blank') }, '打开下载页 ↗'),
-          h(Btn, { small: true, onClick: () => go('connect') }, '去连接页看看')))
+          h(Btn, { small: true, onClick: () => go('platforms') }, '去通讯平台看看')))
     }
 
     /** 更新提示：GitHub 上有新版本时给「跟当前系统/形态对应」的命令、链接和更新按钮；刚更新完显示一次这次更新了什么。 */
@@ -1093,7 +1098,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       useEffect(() => { loadUsage() }, [])
       const cfg = st.config
       const s = st.stats || {}
-      const { conn, qqRequired, anyExternalConnected } = platformConnectionSummary(st)
+      const { qqDirectEnabled, qqConnected, mainConnected } = platformConnectionSummary(st)
       const quick = (p, body) => async () => { const r = await post(p, body); toast(r.message || (r.ok ? '好了' : '没成功')) }
       const usageToday = usage && usage.ranges ? usage.ranges.today : null
       // 维度小表：名称在左，其余数字右对齐；金额加粗提一档
@@ -1191,8 +1196,8 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         cfg.enabled && cfg.debug ? h(Card, { title: '调试对话', desc: '在这里直接跟她说话：走她的人格和工具，但不经过 QQ、不写记忆。和左侧栏那个调试会话是同一个会话。' }, h(DebugChat, { toast })) : null,
         cfg.enabled && !cfg.debug && cfg.dryRun ? h('div', { className: 'ab-note' }, '现在是试运行：她会照常思考回复，但只写进日志，不会真的发到 QQ。注意试运行**会照常写记忆**；只想试人格、不想留痕迹请切到「调试」。') : null,
         st.outbox && st.outbox.count ? h('div', { className: 'ab-note warn' }, `网关还没就绪：已有 ${st.outbox.count} 条消息排队，连接后会自动补发。`) : null,
-        cfg.enabled && qqRequired && !conn ? h('div', { className: 'ab-note err' }, '还没连上 QQ 网关' + (st.onebot.problem ? '：' + st.onebot.problem + '。' : '。去「连接」标签看看 SnowLuma 有没有装好、启动没有。') + ' ', h('a', { href: '#', onClick: (e) => { e.preventDefault(); go('connect') } }, '去连接 →')) : null,
-        cfg.enabled && !qqRequired && !anyExternalConnected && !conn ? h('div', { className: 'ab-note err' }, '还没有已连接的通讯平台，当前无法收发消息。', ' ', h('a', { href: '#', onClick: (e) => { e.preventDefault(); go('platforms') } }, '去通讯平台 →')) : null,
+        cfg.enabled && qqDirectEnabled && !qqConnected ? h('div', { className: 'ab-note err' }, '还没连上 QQ' + (st.onebot && st.onebot.problem ? '：' + st.onebot.problem + '。' : '。') + ' 去通讯平台检查 QQ 直连配置。', ' ', h('a', { href: '#', onClick: (e) => { e.preventDefault(); go('platforms') } }, '去通讯平台 →')) : null,
+        cfg.enabled && !qqDirectEnabled && !mainConnected ? h('div', { className: 'ab-note err' }, '还没有已连接的通讯平台，当前无法收发消息。', ' ', h('a', { href: '#', onClick: (e) => { e.preventDefault(); go('platforms') } }, '去通讯平台 →')) : null,
         st.outbox && st.outbox.count ? h('div', { className: 'ab-note warn' }, `网关还没就绪：已有 ${st.outbox.count} 条消息排队，连接后会自动补发。`) : null,
         h('div', { className: 'ab-grid ab-g4' },
           [['今天收到', s.received, '📥'], ['今天发出', s.sent, '📤'], ['语音条', s.voice, '🎙️'], ['表情包', s.stickers, '😺']].map(([l, n, ic]) => h('div', { key: l, className: 'ab-card ab-stat' }, h('span', { className: 'ic', 'aria-hidden': true }, ic), h('div', { className: 'n' }, n || 0), h('div', { className: 'l' }, l))),
@@ -1527,7 +1532,21 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const hasExternalPlatform = extEnabled.length > 0
       const anyExternalConnected = extEnabled.some((x) => x.state === 'connected')
       const qqRequired = Boolean(cfg.botQQ) || !hasExternalPlatform
-      return { conn, hasExternalPlatform, anyExternalConnected, qqRequired }
+      const qqInsts = rawInsts.filter((x) => x.instance === 'qq')
+      // 默认 QQ 的“直连”包括旧版 legacy onebot 和迁移后的网关 qq；qq#2 不算主 QQ。
+      const qqDirectEnabled = qqInsts.some((x) => x.legacy || x.enabled !== false)
+        || Boolean(cfg.platforms && cfg.platforms.qq && cfg.platforms.qq.enabled !== false)
+      const qqConnected = Boolean((st && st.onebot && st.onebot.state === 'connected')
+        || qqInsts.some((x) => x.enabled !== false && x.state === 'connected'))
+      const qqInstance = qqInsts.find((x) => x.legacy) || qqInsts.find((x) => x.enabled !== false) || null
+      const qqBackend = qqDirectEnabled
+        ? String((qqInstance && qqInstance.legacy ? cfg.gateway : (cfg.platforms && cfg.platforms.qq && cfg.platforms.qq.backend)) || (cfg.gateway === 'onebot' ? 'onebot' : 'snowluma'))
+        : ''
+      const ownerPlatform = cfg.ownerPrimary && cfg.ownerPrimary.platform
+      const preferredExternal = extEnabled.find((x) => x.platform === ownerPlatform) || extEnabled[0] || null
+      const mainPlatform = qqDirectEnabled ? 'qq' : (preferredExternal && preferredExternal.platform) || ''
+      const mainConnected = qqDirectEnabled ? qqConnected : Boolean(preferredExternal && preferredExternal.state === 'connected')
+      return { conn, hasExternalPlatform, anyExternalConnected, qqRequired, qqDirectEnabled, qqConnected, qqBackend, mainPlatform, mainConnected }
     }
 
     const TOOL_STATUS = { ready: '已就绪', missing: '未找到', invalid: '不可用' }
@@ -1761,6 +1780,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [data, setData] = useState(null)
       const [busy, setBusy] = useState('')
       const [addPlatform, setAddPlatform] = useState('')
+      const [legacyReview, setLegacyReview] = useState(null)
       useEffect(() => {
         let alive = true
         const tick = () => get('/platforms').then((r) => { if (alive) setData(r) }).catch(() => {})
@@ -1770,6 +1790,28 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       }, [])
       const list = (data && data.instances) || []
       const owner = data && data.owner
+      const multiPrivate = data?.multiPrivate
+      const changeShared = async (body, action = '') => {
+        setLegacyReview(null)
+        setBusy('multi-private')
+        try {
+          const result = await post('/platforms/multi-private' + action, body)
+          toast(result.message || (result.ok ? '已更新' : '未能更新'), result.ok ? 'ok' : 'err')
+          if (result.ok) {
+            setData(current => current && { ...current, multiPrivate: result })
+            reload()
+          }
+        } finally { setBusy('') }
+      }
+      const reviewSharedHistory = async () => {
+        setBusy('multi-private')
+        try {
+          const { mode } = multiPrivate
+          const result = await post('/platforms/multi-private/legacy/prepare', { mode })
+          if (!result.ok) return toast(result.message || '无法核对旧历史', 'err')
+          setLegacyReview({ ...result, mode })
+        } finally { setBusy('') }
+      }
       const available = (data?.catalog || []).filter((c) => !list.some((x) => x.platform === c.id || x.instance === c.id))
       const add = async () => {
         if (!addPlatform) return
@@ -1857,6 +1899,65 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [importPreview, setImportPreview] = useState(null)
       const [importMsg, setImportMsg] = useState('')
       const [importBusy, setImportBusy] = useState(false)
+      const [qqMigBusy, setQqMigBusy] = useState('')
+      const [qqMigNote, setQqMigNote] = useState(null)
+      const [qqStopCheckIn, setQqStopCheckIn] = useState(0)
+      const [qqMigForm, setQqMigForm] = useState({ backend: '', wsUrl: '', httpUrl: '', wsToken: '', httpToken: '' })
+      useEffect(() => {
+        if (qqStopCheckIn > 0) {
+          const timer = setTimeout(() => setQqStopCheckIn(qqStopCheckIn - 1), 1000)
+          return () => clearTimeout(timer)
+        }
+        if (qqMigNote?.code !== 'INSTANCE_STOP_PENDING') return
+        let active = true
+        get('/platforms/qq-migration').then((status) => {
+          if (!active || !status.platforms) return
+          setData(status.platforms)
+          if (!status.pausePending && !status.recoveryWaitingForStop) setQqMigNote(null)
+        })
+        return () => { active = false }
+      }, [qqMigNote, qqStopCheckIn])
+      const qqMigration = data?.qqMigration || null
+      const qqBackupRecovery = qqMigration?.backupRecovery
+      const qqStopSince = qqMigration?.stopAttemptSince ?? qqMigration?.pauseStartedAt
+      const qqRecoveryDisabled = Boolean(qqMigBusy || qqStopCheckIn || qqMigration?.recoveryWaitingForStop)
+      const qqRecoveryWaitHint = qqStopCheckIn ? qqStopCheckIn + ' 秒后重新检查旧连接状态'
+        : qqMigration?.recoveryWaitingForStop ? '旧连接确认关闭后才能执行恢复操作' : undefined
+      const migTargetDefaults = qqMigration?.targetPlatform || {}
+      const buildQqMigPlatform = () => ({
+        backend: qqMigForm.backend || migTargetDefaults.backend || 'onebot',
+        wsUrl: qqMigForm.wsUrl !== '' ? qqMigForm.wsUrl.trim() : (migTargetDefaults.wsUrl || ''),
+        httpUrl: qqMigForm.httpUrl !== '' ? qqMigForm.httpUrl.trim() : (migTargetDefaults.httpUrl || ''),
+        ...(qqMigForm.wsToken ? { wsToken: qqMigForm.wsToken.trim() } : {}),
+        ...(qqMigForm.httpToken ? { httpToken: qqMigForm.httpToken.trim() } : {}),
+      })
+      const runQqMigAction = async (endpoint, body = {}, confirmText = '') => {
+        if (confirmText && !window.confirm(confirmText)) return
+        setQqMigBusy(endpoint)
+        try {
+          const recovery = endpoint === '/retry' || endpoint === '/rollback'
+          const r = await post('/platforms/qq-migration' + endpoint, recovery ? { ...body, retryStopPending: true } : body)
+          setQqStopCheckIn(r.code === 'INSTANCE_STOP_PENDING' ? 2 : 0)
+          setQqMigNote(r)
+          toast(r.message || (r.ok ? '操作已完成' : '操作未成功'), r.ok ? 'ok' : 'err')
+          if (r.platforms) setData(r.platforms)
+          else if (r.view) setData((cur) => (cur ? { ...cur, qqMigration: r.view } : cur))
+          else get('/platforms').then(setData).catch(() => {})
+          reload()
+        } finally { setQqMigBusy('') }
+      }
+      const quarantineQqBackupJournal = async () => {
+        if (!confirmBackupJournalQuarantine()) return
+        setQqMigBusy('backup-quarantine')
+        try {
+          const result = await quarantineBackupJournal()
+          setQqMigNote(result)
+          toast(result.message, result.ok ? 'ok' : 'err')
+          const status = await get('/platforms/qq-migration')
+          if (status.platforms) setData(status.platforms)
+          reload()
+        } finally { setQqMigBusy('') }
+      }
       const loadPeople = () => get('/platforms/people').then(setPeopleData).catch(() => {})
       useEffect(() => { loadPeople(); get('/platforms/chats').then((r) => setChats(r.list || [])).catch(() => {}) }, [])
       const people = (peopleData && peopleData.list) || []
@@ -1926,6 +2027,238 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         h(Card, { title: '通讯平台', desc: '这里列出所有已注册的平台实例。开关即时生效；填错凭证时看卡片上的状态和原因，密钥不会回显。', right: openWizard ? h(Btn, { small: true, kind: 'ghost', onClick: openWizard }, '重新走一遍设置向导') : null },
           !owner ? h('div', { className: 'ab-note warn', style: { marginBottom: 10 } }, '还没有主人。先连上一个平台，用那个账号给她发一句话，再点下面的「确认这是我」。') : null,
           h('div', { className: 'ab-small ab-muted' }, owner ? '当前主人：' + owner : '当前主人：未设置')),
+        qqMigration ? h(Card, {
+          title: '默认 QQ 托管与迁移恢复',
+          desc: '管理默认 QQ 在「旧版直连（SnowLuma / OneBot）」与「多平台网关托管（qq）」之间的切换，及异常中断时的缓冲与恢复动作。',
+          right: h('span', { className: 'ab-badge' }, qqMigration.legacyQqEnabled ? '当前：旧版直连 QQ' : '当前：网关托管 QQ'),
+        },
+          h('div', { className: 'ab-small ab-muted', style: { marginBottom: 8 } },
+            '阶段：' + (qqMigration.phaseLabel || qqMigration.phase)
+            + (qqMigration.txnId ? ' · 事务 ' + qqMigration.txnId : '')),
+          qqMigration.paused ? h('div', { className: 'ab-note warn', role: 'status', style: { marginBottom: 8 } },
+            '默认 QQ 业务已暂停。',
+            qqMigration.pausePending ? h('div', null, qqMigration.pauseReason || '正在等待旧连接关闭。',
+              qqStopSince ? (qqMigration.stopAttemptSince ? ' · 原停止任务始于 ' : ' · 开始检查于 ')
+                + new Date(qqStopSince).toLocaleTimeString() : '',
+              qqMigration.pauseAttempts ? ' · 停止检查 ' + qqMigration.pauseAttempts + ' 次' : '')
+              : qqMigration.pauseHeld ? h('div', null, '目标连接仍由迁移租约持有，等待交还。') : null,
+            qqRecoveryWaitHint ? h('div', null, qqRecoveryWaitHint + '。') : null) : null,
+          ((qqMigration.guard?.phase && qqMigration.guard.phase !== 'idle') || qqMigration.guardInvalid)
+            ? h('div', { className: 'ab-note warn', style: { marginBottom: 8 } },
+              '恢复门状态：'
+              + (qqMigration.guardPhaseLabel || (qqMigration.guard?.phase === 'corrupt-guard' || qqMigration.guardInvalid ? '恢复门状态损坏' : qqMigration.guard?.phase))
+              + (qqMigration.guard?.reason ? ' — ' + qqMigration.guard.reason : '')
+              + (qqMigration.backupJournalCorrupt ? '（请先处理损坏的备份日志）'
+                : qqMigration.guardInvalid ? '（请回滚到旧版直连）' : ''))
+            : null,
+          qqBackupRecovery ? h('div', { className: 'ab-note warn', style: { marginBottom: 8 } },
+            '损坏的备份恢复日志 ', h('code', { style: { overflowWrap: 'anywhere' } }, qqBackupRecovery.journalPath),
+            !qqBackupRecovery.canQuarantine ? h('div', null, '仍有暂存或搬移文件，请到备份页核对。') : null) : null,
+          (qqMigration.buffer?.totalCount || qqMigration.buffer?.overflowCount || qqMigration.buffer?.corruptCount)
+            ? h('div', { className: 'ab-small', style: { marginBottom: 8 } },
+              '缓冲条目：' + qqMigration.buffer.totalCount
+              + '（待处理 ' + qqMigration.buffer.pendingCount
+              + ' · 未决 ' + qqMigration.buffer.uncertainCount
+              + ' · 已收 ' + qqMigration.buffer.acceptedCount + '）'
+              + (qqMigration.buffer.overflowCount ? ' · 溢出丢弃 ' + qqMigration.buffer.overflowCount + ' 条' : '')
+              + (qqMigration.buffer.corruptCount ? ' · 损坏文件 ' + qqMigration.buffer.corruptCount + ' 个' : ''))
+            : null,
+          qqMigration.lastResolution ? h('div', { className: 'ab-small ab-muted', style: { marginBottom: 8 } },
+            '最近恢复动作：' + (qqMigration.lastResolution.action || '?')
+            + (qqMigration.lastResolution.txnId ? ' · 事务 ' + qqMigration.lastResolution.txnId : '')
+            + ' · 操作人 ' + (qqMigration.lastResolution.operator || 'panel-admin')
+            + ' · 丢弃 ' + (qqMigration.lastResolution.discardedCount ?? 0) + ' 条'
+            + (qqMigration.lastResolution.discardedMain !== undefined
+              ? '（主缓冲 ' + (qqMigration.lastResolution.discardedMain ?? qqMigration.lastResolution.discardedCount ?? 0)
+                + ' · 验号缓冲 ' + (qqMigration.lastResolution.verifyDiscarded ?? qqMigration.lastResolution.discardedVerify ?? 0) + '）'
+              : '')
+            + (qqMigration.lastResolution.verifyAccepted || qqMigration.lastResolution.verifyFiltered
+              ? ' · 验号缓冲已接收 ' + (qqMigration.lastResolution.verifyAccepted ?? 0)
+                + ' 条、已过滤 ' + (qqMigration.lastResolution.verifyFiltered ?? 0) + ' 条'
+              : '')
+            + (qqMigration.lastResolution.overflowDroppedCount ? '（溢出 ' + qqMigration.lastResolution.overflowDroppedCount + ' 条）' : '')
+            + (qqMigration.lastResolution.reason ? ' · 原因：' + qqMigration.lastResolution.reason : ''))
+            : null,
+          qqMigration.lastFailedResolution ? h('div', { className: 'ab-note warn', style: { marginBottom: 8 } },
+            '最近失败恢复动作：' + (qqMigration.lastFailedResolution.action || '?')
+            + (qqMigration.lastFailedResolution.txnId ? ' · 事务 ' + qqMigration.lastFailedResolution.txnId : '')
+            + (qqMigration.lastFailedResolution.error ? ' — ' + qqMigration.lastFailedResolution.error : ''))
+            : null,
+          qqMigration.legacyQqEnabled && qqMigration.phase === 'idle' && !qqMigration.paused && !(qqMigration.recommendedActions || []).some((a) => a === 'retry' || a === 'discard-uncertain') ? h('div', { style: { marginBottom: 10 } },
+            migTargetDefaults.source === 'legacy-direct'
+              ? h('div', { className: 'ab-note', style: { marginBottom: 8 } },
+                '已从旧版直连配置带入 OneBot 地址；目标地址仍匹配旧版直连时，留空的 Token 会自动沿用旧连接凭据。')
+              : migTargetDefaults.source === 'platforms.qq'
+                ? h('div', { className: 'ab-small ab-muted', style: { marginBottom: 8 } }, '已使用已保存的 qq 网关目标配置。')
+                : null,
+            h(Row, { label: '目标后端 (backend)' },
+              h('select', {
+                className: 'ab-select',
+                value: qqMigForm.backend || migTargetDefaults.backend || 'onebot',
+                onChange: (e) => setQqMigForm((cur) => ({ ...cur, backend: e.target.value })),
+              },
+              h('option', { value: 'onebot' }, 'OneBot v11（正向 WS / HTTP）'),
+              h('option', { value: 'snowluma' }, 'SnowLuma'))),
+            h(Row, { label: 'OneBot WS URL（必填）', hint: '必填：例 ws://127.0.0.1:3001（QQ 迁移连接与双端点验号必需，只填 HTTP URL 无法通过预检）' },
+              h('input', {
+                className: 'ab-input',
+                value: qqMigForm.wsUrl !== '' ? qqMigForm.wsUrl : (migTargetDefaults.wsUrl || ''),
+                placeholder: 'ws://127.0.0.1:3001',
+                onChange: (e) => setQqMigForm((cur) => ({ ...cur, wsUrl: e.target.value })),
+              })),
+            h(Row, { label: 'HTTP URL（可选）', hint: '例：http://127.0.0.1:3000' },
+              h('input', {
+                className: 'ab-input',
+                value: qqMigForm.httpUrl !== '' ? qqMigForm.httpUrl : (migTargetDefaults.httpUrl || ''),
+                placeholder: 'http://127.0.0.1:3000',
+                onChange: (e) => setQqMigForm((cur) => ({ ...cur, httpUrl: e.target.value })),
+              })),
+            h(Row, { label: 'WS Token（留空=沿用）' },
+              h('input', {
+                className: 'ab-input',
+                type: 'password',
+                value: qqMigForm.wsToken,
+                placeholder: migTargetDefaults.inheritLegacyCredentials
+                  ? '地址仍匹配旧版直连时沿用 token（留空=沿用）'
+                  : migTargetDefaults.wsTokenSet ? '已保存（留空=沿用原密钥）' : '留空=沿用现有或无密钥',
+                onChange: (e) => setQqMigForm((cur) => ({ ...cur, wsToken: e.target.value })),
+              })),
+            h(Row, { label: 'HTTP Token（留空=沿用）' },
+              h('input', {
+                className: 'ab-input',
+                type: 'password',
+                value: qqMigForm.httpToken,
+                placeholder: migTargetDefaults.inheritLegacyCredentials
+                  ? '地址仍匹配旧版直连时沿用 token（留空=沿用）'
+                  : migTargetDefaults.httpTokenSet ? '已保存（留空=沿用原密钥）' : '留空=沿用现有或无密钥',
+                onChange: (e) => setQqMigForm((cur) => ({ ...cur, httpToken: e.target.value })),
+              })),
+          ) : null,
+          h('div', { className: 'ab-flex', style: { gap: 8, flexWrap: 'wrap' } },
+            qqBackupRecovery?.canQuarantine
+              ? h(Btn, { small: true, disabled: Boolean(qqMigBusy || qqMigration.busy), onClick: quarantineQqBackupJournal }, '保留并隔离损坏日志')
+              : null,
+            qqMigration.backupJournalCorrupt
+              ? h(Btn, { small: true, onClick: () => go('backup') }, '打开备份恢复页')
+              : null,
+            (qqMigration.recommendedActions || []).includes('start') ? h(Fragment, null,
+              h(Btn, { small: true, disabled: Boolean(qqMigBusy), onClick: () => runQqMigAction('/preflight', { platform: buildQqMigPlatform() }) }, '迁移前预检'),
+              h(Btn, { small: true, kind: 'primary', disabled: Boolean(qqMigBusy), onClick: () => runQqMigAction('/start', { targetLegacyQqEnabled: false, platform: buildQqMigPlatform() }, '确认将默认 QQ 切换到多平台网关托管？') }, '切换到网关托管 QQ'),
+            ) : null,
+            (qqMigration.recommendedActions || []).includes('retry')
+              ? h(Btn, { small: true, kind: 'primary', disabled: qqRecoveryDisabled,
+                title: qqRecoveryWaitHint || (qqMigration.pauseHeld ? '继续处理当前缓冲，旧连接正在关闭时需稍后重试' : undefined),
+                onClick: () => runQqMigAction('/retry', { txnId: qqMigration.txnId }) }, qqMigration.pauseHeld ? '继续处理迁移缓冲' : '重试完成迁移')
+              : null,
+            (qqMigration.recommendedActions || []).includes('discard-uncertain')
+              ? h(Btn, { small: true, disabled: qqRecoveryDisabled, title: qqRecoveryWaitHint,
+                onClick: () => runQqMigAction('/discard-uncertain', { txnId: qqMigration.txnId }, '确认已查看或不需要重放未决/溢出消息，并恢复默认 QQ 运行？') }, '确认未决/溢出并恢复')
+              : null,
+            (qqMigration.recommendedActions || []).includes('rollback')
+              ? h(Btn, {
+                small: true,
+                kind: qqMigration.phase === 'idle' && !qqMigration.paused && !qqMigration.legacyQqEnabled ? undefined : 'danger',
+                disabled: qqRecoveryDisabled,
+                title: qqRecoveryWaitHint || (qqMigration.pauseHeld ? '先关闭目标连接，停机未确认时需稍后重试' : undefined),
+                onClick: () => runQqMigAction(
+                  '/rollback',
+                  qqMigration.txnId ? { txnId: qqMigration.txnId } : {},
+                  qqMigration.phase === 'idle' && !qqMigration.paused && !qqMigration.legacyQqEnabled
+                    ? '确认将默认 QQ 切回旧版直连模式？'
+                    : '确认回滚到旧版直连 QQ 并清理当前恢复门？',
+                ),
+              }, qqMigration.pauseHeld ? '关闭目标连接并回滚'
+                : qqMigration.phase === 'idle' && !qqMigration.paused && !qqMigration.legacyQqEnabled ? '切回旧版直连 QQ' : '回滚到旧版直连')
+              : null),
+          qqMigNote?.message ? h('div', { className: cx('ab-note', qqMigNote.ok ? '' : 'warn'), style: { marginTop: 8 } }, qqMigNote.message) : null,
+          qqMigration.buffer?.overflow?.droppedSamples?.length ? h('div', { style: { marginTop: 10 } },
+            h('div', { className: 'ab-small ab-muted', style: { marginBottom: 4 } },
+              '溢出未入缓冲消息样本（共 ' + qqMigration.buffer.overflow.count + ' 条，原因：' + (qqMigration.buffer.overflow.reason || 'buffer-overflow') + '）：'),
+            qqMigration.buffer.overflow.droppedSamples.map((s, idx) => h('div', { key: idx, className: 'ab-small', style: { padding: '4px 0', borderBottom: '1px solid var(--ab-line)' } },
+              h('span', { className: 'ab-badge' }, s.source || s.instance),
+              ' ', s.senderName ? s.senderName + '（' + s.senderAccount + '）：' : (s.senderAccount ? s.senderAccount + '：' : ''),
+              s.text || '（非文本或空内容）',
+              h('span', { className: 'ab-muted' }, ' · ' + (s.at ? new Date(s.at).toLocaleString() : '')))),
+          ) : null,
+          qqMigration.buffer?.entries?.filter((e) => e.status === 'uncertain' || e.status === 'pending').length ? h('div', { style: { marginTop: 10 } },
+            h('div', { className: 'ab-small ab-muted', style: { marginBottom: 4 } }, '未决 / 待确认缓冲消息：'),
+            qqMigration.buffer.entries.filter((e) => e.status === 'uncertain' || e.status === 'pending').map((e) => h('div', { key: e.seq, className: 'ab-small', style: { padding: '4px 0', borderBottom: '1px solid var(--ab-line)' } },
+              h('span', { className: 'ab-badge' }, '#' + e.seq + ' ' + e.status),
+              ' ', e.source || e.instance,
+              e.senderName ? ' · ' + e.senderName : '',
+              e.text ? '：' + e.text : '',
+              e.reason ? h('span', { className: 'ab-muted' }, '（' + e.reason + '）') : null)),
+          ) : null,
+        ) : null,
+        multiPrivate ? h(Card, {
+          title: '多平台私聊共用会话',
+          desc: '共享会话只接收主人发来的平台私聊。DSH 窗口直接输入会被拒绝，请使用普通 DSH 会话。',
+        },
+          h(Row, { label: '共用私聊会话' }, h(Switch, {
+            on: multiPrivate.enabled,
+            disabled: busy === 'multi-private' || (!multiPrivate.enabled && !multiPrivate.available),
+            onChange: () => changeShared({ enabled: !multiPrivate.enabled }),
+          })),
+          h('div', { className: 'ab-small ab-muted' }, multiPrivate.available && multiPrivate.binding
+            ? '基座及模型使用主账号 · ' + platformLabel(multiPrivate.binding.platform) + ' · ' + multiPrivate.binding.account
+            : ({
+              'host-unavailable': '当前 DSH 宿主不支持共享会话',
+              'gateway-required': '请选择经多平台网关接入的主账号。旧版直连 QQ 使用普通会话。',
+              'ambiguous-primary': '主账号对应多个候选，请明确选择平台实例及账号',
+            }[multiPrivate.reason] || '请在「权限 → 主人」设置唯一的固定主账号')),
+          h('div', { className: 'ab-small ab-muted' },
+            (multiPrivate.mode === 'debug' ? '调试' : '正式') + ' · ' + (multiPrivate.reason === 'gateway-required' ? '当前使用普通会话' : ({
+              uninitialized: '等待第一条主人私聊', active: '分支已建立', deleted: '会话已删除', paused: '会话待人工核验',
+              'pending-operation': '等待核对创建结果', 'restore-unavailable': '会话暂时无法恢复',
+            }[multiPrivate.state] || '未建立')) + (({
+              'source-missing': '（没有可继承的原会话）', 'source-unverified': '（原会话归属未核验）',
+              'source-authorization-changed': '（原会话的主人授权已变化）',
+              'source-no-completed-turn': '（原会话没有完整轮次）',
+              'legacy-prefix-changed': '（已核对的旧历史已变化）', reset: '（已从空历史开始）',
+            })[multiPrivate.emptyReason] || '') + ' · 退役会话 ' + multiPrivate.retiredCount
+              + '，' + ({ pending: '待对账', running: '正在对账', checked: '已对账', failed: '对账失败' }[multiPrivate.retiredAudit?.state] || '待对账')
+              + (multiPrivate.retiredArchivePending ? ' · 待归档 ' + multiPrivate.retiredArchivePending : '')),
+          multiPrivate.pauseReason ? h('div', { className: 'ab-note warn' }, ({
+            'candidate-history-unverified': '候选有未核验活动，已退役。请重新开始共享会话。',
+            'restored-history-unverified': '恢复时发现核验点之后有未核验记录。崩溃前已完成的轮次也可能在此范围。请在 DSH 查看原历史，并重新开始共享会话。',
+          })[multiPrivate.pauseReason]) : null,
+          multiPrivate.lastDeliveryFailure ? h('div', { className: 'ab-note warn' },
+            '最近一次' + (multiPrivate.lastDeliveryFailure.kind === 'failure-notice' ? '失败回执' : '共享回复') + '投递异常'
+            + ' · ' + platformLabel(multiPrivate.lastDeliveryFailure.platform)
+            + ' · ' + new Date(multiPrivate.lastDeliveryFailure.at).toLocaleString()
+            + ' · ' + ({
+              offline: '平台离线', 'reply-expired': '原回复凭据已失效', 'reply-limit': '原消息回复次数已用完',
+              revoked: '轮次授权已撤销', uncertain: '平台未确认送达',
+            }[multiPrivate.lastDeliveryFailure.reason] || '发送失败'),
+          ) : null,
+          multiPrivate.enabled && multiPrivate.sourceAuthorizationChanged
+            ? h('div', { className: 'ab-note warn' }, '旧历史的主人授权已失效。当前授权下可从空会话开始，原历史可在 DSH 查看。')
+            : null,
+          multiPrivate.enabled ? h('div', { className: 'ab-flex', style: { marginTop: 8, flexWrap: 'wrap', gap: 8 } },
+            h(Btn, { small: true, disabled: busy === 'multi-private', onClick: () => changeShared({ enabled: false }) }, '切回普通会话'),
+            h(Btn, { small: true, disabled: busy === 'multi-private', onClick: () => {
+              if (window.confirm('确定让下一条共享私聊从空会话开始？')) changeShared({ mode: multiPrivate.mode }, '/reset')
+            } }, '共享会话重新开始'),
+            h(Btn, { small: true, disabled: busy === 'multi-private' || !multiPrivate.available || multiPrivate.sourceAuthorizationChanged, onClick: () => {
+              if (window.confirm('确定用主账号历史重新建立共享会话？')) changeShared({ mode: multiPrivate.mode }, '/inherit')
+            } }, '重新继承主账号历史'),
+            multiPrivate.legacyHistoryAvailable ? h(Btn, {
+              small: true, disabled: busy === 'multi-private',
+              onClick: reviewSharedHistory,
+            }, multiPrivate.legacyHistoryChanged ? '重新核对已变化的旧历史' : '核对并继承旧历史') : null,
+          ) : null,
+          multiPrivate.legacyHistoryAvailable && legacyReview?.mode === multiPrivate.mode ? h('div', {
+            className: 'ab-note', style: { marginTop: 8 },
+          },
+            h('div', null, '请在 DSH 核对「' + (legacyReview.title || '旧主账号会话') + '」（会话 ID '
+              + legacyReview.sessionId + '）。确认后将重建当前共享分支，并将截至事件序号 ' + legacyReview.atSeq + ' 的历史共享给已绑定平台。'),
+            h('div', { className: 'ab-flex', style: { marginTop: 8, gap: 8 } },
+              h(Btn, { small: true, kind: 'primary', disabled: busy === 'multi-private', onClick: () =>
+                changeShared({ mode: legacyReview.mode, token: legacyReview.token, confirmed: true }, '/legacy/confirm'),
+              }, '确认归属并继承'),
+              h(Btn, { small: true, onClick: () => setLegacyReview(null) }, '取消')),
+          ) : null,
+        ) : null,
         available.length ? h(Card, { title: '添加平台', desc: '还没有配置的平台可以在这里加。添加后再填 App ID / Secret 等凭证。' },
           h('div', { className: 'ab-flex', style: { flexWrap: 'wrap' } },
             h('select', { className: 'ab-select', value: addPlatform, onChange: (e) => setAddPlatform(e.target.value) },
@@ -1944,13 +2277,23 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           title: platformLabel(inst.platform) + (inst.name && inst.name !== inst.platform ? ' · ' + inst.name : ''),
           right: h('span', { className: 'ab-flex' },
             h('i', { className: cx('ab-dot', inst.state === 'connected' ? 'ok' : inst.state === 'connecting' ? 'warn' : inst.enabled ? 'err' : '') }),
-            h('span', { className: 'ab-small ab-muted' }, inst.enabled ? inst.state : '已停用')),
+            h('span', { className: 'ab-small ab-muted' }, inst.migration?.pausePending ? '等待停止确认'
+              : inst.migration?.pauseHeld ? '迁移挂起' : inst.enabled ? inst.state : '已停用')),
         },
           h(Row, { label: '启用这个实例' }, inst.legacy
             ? h('span', { className: 'ab-small ab-muted' }, '旧版直连模式：请到「QQ 网关」页启停')
             : h(Switch, { on: Boolean(inst.enabled), disabled: busy === inst.instance, onChange: () => toggle(inst) })),
           inst.self ? h(Row, { label: '登录账号' }, h('span', null, inst.self.name ? inst.self.name + '（' + inst.self.account + '）' : inst.self.account)) : null,
           inst.detail ? h('div', { className: cx('ab-small', inst.state === 'connected' ? 'ab-muted' : 'ab-note warn'), style: { marginBottom: 8 } }, inst.detail) : null,
+          inst.instance === 'qq' && inst.migration && (inst.migration.paused || inst.migration.phase !== 'idle' || inst.migration.bufferTotal > 0 || inst.migration.overflowCount > 0 || inst.migration.corruptCount > 0)
+            ? h('div', { className: 'ab-small ab-muted', style: { marginBottom: 8 } },
+              '迁移状态：' + inst.migration.phase
+              + (inst.migration.txnId ? ' · 事务 ' + inst.migration.txnId : '')
+              + ' · 缓冲 ' + inst.migration.bufferTotal
+              + ' · 未决 ' + inst.migration.uncertainCount
+              + (inst.migration.overflowCount ? ' · 溢出 ' + inst.migration.overflowCount : '')
+              + (inst.migration.corruptCount ? ' · 损坏 ' + inst.migration.corruptCount : ''))
+            : null,
           inst.platform === 'wechat-clawbot' ? h(Fragment, null,
             h('div', { className: 'ab-note', style: { marginBottom: 8 } },
               '微信 ClawBot 优先 1:1 私聊：表情按图片降级、语音按音频文件发送、不支持拉取历史记录与群管；个人账号存在平台风控风险，请留意使用频率。'),
@@ -9534,6 +9877,14 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       }, [running])
       const call = (p, body) => fetch(API + p, { method: 'POST', headers: { 'x-aurabot-backup': '1', 'content-type': 'application/json' }, body: JSON.stringify(body || {}) }).then((r) => r.json())
       const after = (r) => { toast(r.ok ? (r.message || ('备份已导入（' + r.files + ' 个文件），重启 DSH 后换上')) : r.message, r.ok ? 'ok' : 'err'); load() }
+      const corruptJournal = s?.backupState?.state === 'backup-journal-corrupt'
+      const quarantine = async () => {
+        if (!confirmBackupJournalQuarantine()) return
+        setBusy(true)
+        try { after(await quarantineBackupJournal()) }
+        catch (error) { toast(error.message, 'err') }
+        finally { setBusy(false) }
+      }
       const upload = async (file) => {
         if (!file) return
         if (!confirm('导入「' + file.name + '」？\n\n重启 DSH 后，这台电脑上的配置、记忆、人设等会被备份里的内容替换，原来的文件留在 backups 文件夹。')) return
@@ -9553,8 +9904,14 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           s && s.list.length ? h('div', { style: { marginTop: 10 } }, s.list.slice(0, 8).map((b) => h('div', { key: b.name, className: 'ab-small' }, b.name + ' · ' + size(b.bytes)))) : null),
         h(RemoteBackup, { toast, st, onRestored: load }),
         h(Card, { title: '恢复', desc: '在新电脑上先装好 DSH 和 Aurabot，再把备份拖进来。重启 DSH 后自动换上设置和数据、重新下载市场模块、放回 QQ 会话，原来的文件留在 backups 文件夹。' },
+          corruptJournal ? h('div', { className: 'ab-note warn' },
+            '备份恢复日志损坏。'
+            + (s.backupState.canQuarantine ? '可保留日志副本并解除备份恢复阻塞。' : '仍有暂存或搬移文件，请先在本机核对备份恢复状态。'),
+            h('div', { className: 'ab-flex', style: { marginTop: 8, gap: 8, flexWrap: 'wrap' } },
+              h(Btn, { small: true, onClick: async () => { const r = await call('/backup/recovery/open'); if (!r.ok) toast(r.message, 'err') } }, '打开恢复文件夹'),
+              s.backupState.canQuarantine ? h(Btn, { small: true, disabled: busy, onClick: quarantine }, '保留并隔离损坏日志') : null)) : null,
           s && s.modules && s.modules.length ? h('div', { className: 'ab-small ab-muted', style: { marginBottom: 8 } }, '还没装回来的模块：' + s.modules.join('、') + '（下次启动再试）') : null,
-          s && s.pending ? h('div', { className: 'ab-note warn' }, '已导入 ' + s.pending.files + ' 个文件（备份于 ' + String(s.pending.createdAt || '').slice(0, 16).replace('T', ' ') + '），重启 DSH 后换上。',
+          corruptJournal ? null : s && s.pending ? h('div', { className: 'ab-note warn' }, '已导入 ' + s.pending.files + ' 个文件（备份于 ' + String(s.pending.createdAt || '').slice(0, 16).replace('T', ' ') + '），重启 DSH 后换上。',
             h('div', { style: { marginTop: 8 } }, h(Btn, { small: true, kind: 'ghost', onClick: async () => { after(await call('/backup/cancel')) } }, '取消恢复'))) : [
             h('input', { key: 'f', ref: fileRef, type: 'file', accept: '.zip', style: { display: 'none' }, onChange: (e) => { upload(e.target.files[0]); e.target.value = '' } }),
             h('div', { key: 'b', className: cx('ab-drop', over && 'over'), onClick: () => fileRef.current && fileRef.current.click(),
@@ -10206,7 +10563,10 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             localStorage.setItem('aurabot.navlast', JSON.stringify(last))
             localStorage.setItem('aurabot.persona-tab-v2', '1')
           }
-          return localStorage.getItem('aurabot.tab') || 'overview'
+          const saved = localStorage.getItem('aurabot.tab')
+          // 详细设置是临时页，不能从 localStorage 恢复；否则刷新后标签栏又冒出来。
+          if (saved === 'connect') { localStorage.removeItem('aurabot.tab'); return 'platforms' }
+          return saved || 'overview'
         } catch (e) { return 'overview' }
       })
       const [toastMsg, setToastMsg] = useState(null)
@@ -10286,7 +10646,13 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         tick()
         return () => { stopped = true; clear(); document.removeEventListener('visibilitychange', onVis) }
       }, [reload])
-      const go = (id) => { setTab(id); try { localStorage.setItem('aurabot.tab', id) } catch (e) {} }
+      const go = (id) => {
+        setTab(id)
+        try {
+          if (id === 'connect') localStorage.removeItem('aurabot.tab')
+          else localStorage.setItem('aurabot.tab', id)
+        } catch (e) {}
+      }
       // 标签多、一屏放不下：滚轮横着滚，选中的标签自动滚进视野
       const tabsRef = useRef(null)
       useEffect(() => {
@@ -10340,18 +10706,25 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         return h('div', { className: 'ab-root' }, h('div', { className: 'ab-wrap' }, err ? h('div', { className: 'ab-note err' }, '面板读不到插件：', err, '。如果刚装好插件，重启一次 DSH 试试。') : h(Empty, { icon: '🐋', text: '大肥鱼正在游过来…' })))
       }
       const cfg = st.config
-      const { conn, qqRequired, anyExternalConnected } = platformConnectionSummary(st)
+      const { qqDirectEnabled, qqConnected, qqBackend, mainConnected, mainPlatform } = platformConnectionSummary(st)
+      const mainPlatformName = mainPlatform ? platformLabel(mainPlatform) : '平台'
       const status = !cfg.enabled
         ? { cls: '', text: '休息中（总开关关着）' }
-        : qqRequired
-          ? (!conn ? { cls: 'err', text: 'QQ 没连上' } : cfg.debug ? { cls: 'warn', text: '在线 · 调试' } : cfg.dryRun ? { cls: 'warn', text: '在线 · 试运行' } : { cls: 'ok', text: '在线' })
-          : (!anyExternalConnected && !conn)
-            ? { cls: 'err', text: '平台未连接' }
-            : cfg.debug
-              ? { cls: 'warn', text: '在线 · 调试' }
-              : cfg.dryRun
-                ? { cls: 'warn', text: '在线 · 试运行' }
-                : { cls: 'ok', text: conn ? '在线' : '在线（多平台）' }
+        : !mainConnected
+          ? { cls: 'err', text: mainPlatform ? mainPlatformName + ' 没连上' : '平台未连接' }
+          : cfg.debug
+            ? { cls: 'warn', text: '在线 · 调试' }
+            : cfg.dryRun
+              ? { cls: 'warn', text: '在线 · 试运行' }
+              : { cls: 'ok', text: '在线' }
+      const sl = st.snowluma || {}
+      const backendPill = !qqDirectEnabled
+        ? null
+        : qqBackend === 'snowluma'
+          ? h('span', { className: 'ab-pill' }, 'SnowLuma ' + (sl.installed ? (sl.running ? '运行中' : '没启动') : '未安装'))
+          : qqBackend === 'onebot'
+            ? h('span', { className: 'ab-pill' }, 'OneBot ' + (qqConnected ? '已连接' : '未连接'))
+            : null
       const persona = st.personas.find((p) => p.id === cfg.persona.current)
       const props = { st, draft, setDraft: setD, toast, reload, go, openWizard: () => setWizardOpen(true), onOwnerOptions }
       const showWizard = !cfg.setupDone || wizardOpen
@@ -10385,6 +10758,11 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       }))
       const tabs = TABS.filter((t) => !TAB_MODS[t.id] || TAB_MODS[t.id].some(running))
       tabs.splice(tabs.findIndex((t) => t.id === 'logs'), 0, ...extTabs)
+      // 「QQ详细设置」是临时页：只从通讯平台的 QQ 卡片进入，离开后自动从标签栏消失。
+      if (tab === 'connect') {
+        const platformsAt = tabs.findIndex((t) => t.id === 'platforms')
+        tabs.splice(platformsAt >= 0 ? platformsAt + 1 : tabs.length, 0, { id: 'connect', label: 'QQ详细设置', navGroup: 'system' })
+      }
       const curTab = tabs.find((t) => t.id === tab) || tabs[0]
       const body = curTab.ext ? ExtPage : {
         overview: Overview, platforms: Platforms, tools: Tools, connect: Connect, character: Persona, access: Access, group: Group, model: Model, voice: Voice, asr: Asr,
@@ -10406,7 +10784,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
               h('div', { className: 'ab-sub' }, (cfg.botQQ ? 'QQ ' + cfg.botQQ + ' · ' : '') + (persona ? persona.name : '默认人格') + ' · ' + st.mood.label),
               h('div', { className: 'ab-pills' },
                 h('span', { className: 'ab-pill' }, h('i', { className: cx('ab-dot', status.cls) }), status.text),
-                h('span', { className: 'ab-pill' }, 'SnowLuma ' + (st.snowluma.installed ? (st.snowluma.running ? '运行中' : '没启动') : '未安装')),
+                backendPill,
                 h('span', { className: 'ab-pill' }, 'Aurabot v' + st.version))),
             h('div', { className: 'ab-hero-side' },
               h('div', { className: 'ab-switch-row' }, h('span', null, '总开关'), h(Switch, { on: cfg.enabled, onChange: (v) => quickToggle('enabled', v) })),

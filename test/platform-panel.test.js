@@ -9,16 +9,32 @@ const host = readFileSync(new URL('../src/host.js', import.meta.url), 'utf8')
 test('平台页接上了 TABS、组件表和系统分组', () => {
   assert.ok(client.includes("{ id: 'platforms', label: '通讯平台' }"), 'TABS 缺通讯平台页')
   assert.ok(client.includes('platforms: Platforms'), '组件表缺 platforms → Platforms')
-  assert.ok(client.includes("tabs: ['platforms', 'connect'"), '系统分组缺 platforms')
+  assert.ok(client.includes("tabs: ['platforms', 'model'"), '系统分组缺 platforms')
   assert.ok(client.includes('function Platforms({ st, draft, setDraft, toast, reload, go, openWizard })'), '缺 Platforms 组件')
 })
 
-test('连接页改名为连接QQ，外置工具排在安全防护前，向导按钮移到通讯平台', () => {
-  assert.ok(client.includes("{ id: 'connect', label: '连接QQ' }"), '连接页未改名')
-  const systemTabs = "tabs: ['platforms', 'connect', 'model', 'access', 'browser', 'tools', 'security'"
+test('连接页改成临时 QQ详细设置，只从 QQ 卡片进入，外置工具排在安全防护前', () => {
+  assert.ok(!client.includes("{ id: 'connect', label: '连接QQ' }"), '连接页仍是常驻标签')
+  assert.ok(client.includes("label: 'QQ详细设置'"), '临时页未改名为 QQ详细设置')
+  assert.ok(client.includes("if (tab === 'connect')"), '详细设置页没有临时插入逻辑')
+  assert.ok(client.includes("go('connect')"), 'QQ 卡片没有打开详细设置的入口')
+  assert.ok(client.includes("if (id === 'connect') localStorage.removeItem('aurabot.tab')"), '详细设置页不应写入持久 tab')
+  assert.ok(client.includes("if (saved === 'connect')"), '刷新时没有把临时详细设置页降级')
+  assert.equal((client.match(/go\('connect'\)/g) || []).length, 1, '详细设置页只能从 QQ 卡片进入')
+  assert.ok(client.includes("cur.id === 'connect' || last[curGroup.id]"), '导航分组不应记住临时详细设置页')
+  assert.ok(client.includes("t.id !== 'connect'"), '重新点系统分组不应自动打开详细设置页')
+  const systemTabs = "tabs: ['platforms', 'model', 'access', 'browser', 'tools', 'security'"
   assert.ok(client.includes(systemTabs), '系统页签顺序不是 tools 在 security 前')
   assert.ok(client.includes("right: openWizard ? h(Btn, { small: true, kind: 'ghost', onClick: openWizard }, '重新走一遍设置向导')"), '向导按钮未挂到通讯平台')
   assert.ok(!client.includes("right: openWizard ? h(Btn, { small: true, kind: 'ghost', onClick: openWizard }, '重新走一遍设置向导') : null }, h(GatewayChoice"), '连接页仍挂着向导按钮')
+})
+
+test('顶部状态按主平台判断，SnowLuma/OneBot 标签只在 QQ 直连时显示', () => {
+  assert.ok(client.includes('const qqDirectEnabled'), '缺少 QQ 直连判断')
+  assert.ok(client.includes('const mainConnected = qqDirectEnabled ? qqConnected'), '主平台状态未合并网关 qq')
+  assert.ok(client.includes("const backendPill = !qqDirectEnabled"), 'SnowLuma/OneBot 标签没有按 QQ 直连门控')
+  assert.ok(client.includes("'OneBot ' + (qqConnected ? '已连接' : '未连接')"), '缺少 OneBot 运行状态标签')
+  assert.ok(client.includes("'SnowLuma ' + (sl.installed"), '缺少 SnowLuma 运行状态标签')
 })
 
 test('平台页状态每 5 秒自动刷新，旧版能力提示明确', () => {
