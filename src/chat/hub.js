@@ -1138,6 +1138,15 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (!ws) {
       ws = await reg.create(dir, WORKSPACE_TITLE)
       log.info('建好了工作区「' + WORKSPACE_TITLE + '」：' + dir)
+    } else if (ws.title === WORKSPACE_TITLE.replace('·', '路') && typeof ws.setTitle === 'function') {
+      // 旧版本在 GBK 终端里创建过「Aurabot 路 QQ」；只在标题精确命中时修，
+      // 不碰主人自己改过的其他工作区标题。
+      try {
+        await ws.setTitle(WORKSPACE_TITLE)
+        log.info('已修正工作区标题：' + WORKSPACE_TITLE)
+      } catch (error) {
+        log.warn('修正工作区标题失败：', error?.message || error)
+      }
     }
     return ws
   }
@@ -1529,6 +1538,14 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   }
 
   function sharedSenderCurrent(task) {
+    if (task.proactive) {
+      const cfg = getConfig()
+      const primary = resolveSharedPrimary?.()
+      return sharedProactiveEnabled(cfg) && (cfg.debug ? 'debug' : 'live') === task.scope.mode
+        && primary?.ok && sameChat(primary.binding.chatId, task.chat.chatId)
+        && task.scope.ownerPersonId === ownerId() && task.scope.ownerAuthorizationRevision === ownerAuthorizationRevision(cfg)
+        && sharedSessions.read().routingRevision === task.routingRevision
+    }
     return task.scope.ownerPersonId === ownerId()
       && task.scope.ownerAuthorizationRevision === ownerAuthorizationRevision(getConfig())
       && identity?.lookup(task.ingress.platform, task.ingress.account) === task.scope.ownerPersonId
@@ -1716,6 +1733,72 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     return job
   }
 
+  function primaryCanSpeak(binding) {
+    const caps = gateway?.caps?.(binding.chatId)
+    return caps && caps.proactive !== 'none'
+      && gateway.instances().some(item => item.instance === binding.instance && item.state === 'connected')
+  }
+
+  function sharedProactiveEnabled(cfg) {
+    return cfg.enabled && cfg.multiPlatformPrivateSession && (!cfg.dryRun || cfg.debug)
+  }
+
+  function proactiveScope(chat, route) {
+    const cfg = getConfig()
+    if (!sharedProactiveEnabled(cfg) || !gateway || !sharedSupported()
+      || !route?.chatId || route.blocked || route.fallbackUsed || !sameChat(chat.chatId, route.chatId)) return null
+    const primary = resolveSharedPrimary?.()
+    if (!primary?.ok || !sameChat(primary.binding.chatId, route.chatId)) return null
+    if (!primaryCanSpeak(primary.binding)) return null
+    const scope = sharedScope(primary)
+    return scope.ownerAuthorizationRevision ? scope : null
+  }
+
+  async function pushProactiveToSession(chat, content, senderId = '', opts = {}) {
+    assertActive()
+    if (!getConfig().enabled) {
+      const outcome = { ok: false, error: 'Aurabot 已关闭' }
+      opts.onTurnEnd?.(outcome)
+      return outcome
+    }
+    const { route, ...ordinaryOpts } = opts
+    const scope = proactiveScope(chat, route)
+    if (!scope) return pushToSession(chat, content, senderId, ordinaryOpts)
+    const state = sharedSessions.sync(scope)
+    const task = {
+      proactive: true, chat: { ...chat, ...chatFromId(scope.binding.chatId), instance: scope.binding.instance },
+      scope, content, userText: textOf({ content }), onDelivered: opts.onDelivered,
+      routingRevision: state.routingRevision, generation: state.sessions[scope.mode].generation,
+    }
+    const current = () => !disposed && sharedSenderCurrent(task)
+      && sharedSessions.read().sessions[scope.mode].generation === task.generation
+    const job = sharedTail.then(async () => {
+      if (!current()) return
+      try {
+        if (!primaryCanSpeak(scope.binding)) return 'ordinary'
+        const selected = await sharedSessions.ensure(scope)
+        if (!current()) return
+        if (!selected.ok) return 'ordinary'
+        return await executeShared(task, scope, selected)
+      } catch (error) {
+        log.warn('共享主动搭话失败：', error.message)
+        return task.started ? { ok: false, error: error.message } : 'ordinary'
+      }
+    })
+    sharedTail = job.catch(error => log.warn('共享主动搭话失败：', error.message))
+    const result = await job
+    if (result === 'ordinary' && current()) {
+      log.info('共享分支准备失败，主动搭话使用普通会话')
+      return pushToSession(chat, content, senderId, { ...ordinaryOpts, assertAuthorized() {
+        ordinaryOpts.assertAuthorized?.()
+        if (!current()) throw new Error('主动搭话授权已变更')
+      } })
+    }
+    const outcome = result && result !== 'ordinary' ? result : { ok: false, error: '主动搭话已取消' }
+    opts.onTurnEnd?.(outcome)
+    return outcome
+  }
+
   async function runShared(task) {
     const { chat, ingress, scope } = task
     const canUseOrdinary = () => !disposed && sharedSenderCurrent(task)
@@ -1726,7 +1809,11 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const selected = await sharedSessions.ensure(latest)
     if (!canUseOrdinary()) return
     if (!selected.ok || sharedSessions.read().routingRevision !== task.routingRevision) return 'ordinary'
-    const { agent, branch } = selected
+    return executeShared(task, latest, selected)
+  }
+
+  async function executeShared(task, latest, { agent, branch }) {
+    const { chat, ingress, proactive } = task
     const key = sessionKey(branch.sessionId)
     const turn = { task, scope: latest, branch, agent, calls: new Set(), send: Promise.resolve(), reply: { text: '' } }
     sharedTurns.set(key, turn)
@@ -1745,7 +1832,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       let content = task.content
       if (hooks?.prompt) {
         try {
-          const next = await hooks.prompt(content, { chat, sessionId: branch.sessionId, senderId: ingress.account, recentMessages: [] })
+          const next = await hooks.prompt(content, { chat, sessionId: branch.sessionId, senderId: ingress?.account || '', recentMessages: [], ...(proactive && { proactive: true }) })
           if (next === null) return
           if (Array.isArray(next)) content = next
         } catch (error) { log.warn('扩展模块改写共享私聊提示失败：', error.message) }
@@ -1754,16 +1841,17 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       if (!isCurrent()) return
       const admitted = await admit(agent, cleanContent([...content, { type: 'text', text: currentTimeLine() }]))
       if (!isCurrent()) return
-      if (sharedSessions.read().routingRevision !== task.routingRevision) return 'ordinary'
+      if (sharedSessions.read().routingRevision !== task.routingRevision || (proactive && !primaryCanSpeak(latest.binding))) return 'ordinary'
       const previousSources = sourcesFor(chat.chatId)
       const sources = { ...previousSources, system: new Map(previousSources.system), memory: [], context: '', userText: task.userText }
       for (const block of admitted.filter(item => item.type === 'text')) {
         for (const range of memoryPromptRanges(block.text, { toEndOfText: true })) sources.memory.push(block.text.slice(range.start, range.end))
       }
-      const message = { id: randomUUID(), role: 'user', content: admitted, source: { kind: SOURCE_KIND, speaker: { role: 'owner', chat: 'private' } } }
+      const source = proactive ? { kind: 'aurabot-proactive', form: 'proactive', proactive: true } : { kind: SOURCE_KIND }
+      const message = { id: randomUUID(), role: 'user', content: admitted, source: { ...source, speaker: { role: 'owner', chat: 'private' } } }
       turn.message = structuredClone(message)
       turn.sources = sources
-      turnState.set(key, { lastTurn: -1, text: '', lastText: task.userText, senders: new Set([ingress.account]), platform: ingress.platform })
+      turnState.set(key, { lastTurn: -1, text: '', lastText: task.userText, senders: new Set(ingress ? [ingress.account] : []), platform: ingress?.platform || latest.binding.platform })
       if (timeout) {
         timer = setTimeout(() => {
           turn.blocked = true
@@ -1773,6 +1861,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         timer.unref?.()
       }
       await withPromptCapture(sources, async () => {
+        task.started = true
         agent.followup(message)
         await agent.whenIdle()
       })
@@ -1786,10 +1875,23 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       if (turn.verifiedSeq !== undefined && sharedAuthorized(turn)) {
         sharedLiveCheckpoints.set(branch.sessionId, { session: agent.session, seq: turn.verifiedSeq })
         try {
-          if (await dsh.sessions?.flush?.(agent.session)) {
+          if (await dsh.sessions?.flush?.(agent.session) && sharedAuthorized(turn)) {
             sharedSessions.checkpoint(latest.mode, branch.sessionId, branch.generation, turn.verifiedSeq)
           }
         } catch (error) { log.warn('共享会话检查点未持久化：', error.message) }
+      }
+      if (proactive) {
+        if (!turn.finished || !isCurrent()) return { ok: false, error: '共享主动搭话未完成' }
+        // 调试轮次的输出留在共享调试会话里。
+        if (latest.mode === 'debug') return { ok: true }
+        const canDeliver = () => isCurrent() && primaryCanSpeak(latest.binding)
+        if (!canDeliver()) return { ok: false, error: '主账号当前无法主动发送' }
+        const delivered = turn.finalText && await withPromptCapture(sources, () => deliver(chat.chatId, turn.finalText, {
+          own: true, proactive: true, proactiveCause: 'speakup', isCurrent: canDeliver,
+          userText: task.userText, onDelivered: task.onDelivered,
+        }))
+        if (delivered?.failed) log.warn('共享主动搭话投递失败')
+        return { ok: canDeliver() && !delivered?.failed }
       }
       enqueueSharedOutput(turn, turn.finalText)
       await turn.send
@@ -1799,6 +1901,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         agent.cancel({ kind: 'user' })
         await agent.whenIdle()
       }
+      if (proactive) throw error
       sharedFailure(turn)
       await turn.send
       log.warn('共享私聊轮次失败：', error.message)
@@ -1837,6 +1940,11 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   }
 
   function sharedFailure(turn) {
+    if (turn.task.proactive) {
+      turn.blocked = true
+      log.warn('共享主动搭话轮次已中止')
+      return
+    }
     if (turn.failureSent || !sharedAuthorized(turn)) return
     turn.failureSent = true
     const { chat, ingress } = turn.task
@@ -1900,7 +2008,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       const text = assistantReplyText(data.message)
       const st = turnState.get(key)
       if (st) st.text = text
-      if (getConfig().chat?.everyStep && text) {
+      if (!turn.task.proactive && getConfig().chat?.everyStep && text) {
         const previous = takeInterim(turn.reply, { turn: data.turn, step: data.step, text })
         enqueueSharedOutput(turn, previous, true)
       }
@@ -2163,7 +2271,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
                   if (fired) return
                   fired = true
                   if (!isCurrent()) return
-                  if (slowNoticeSent.has(sid)) return
+                  if (shared?.task.proactive || slowNoticeSent.has(sid)) return
                   const state = turnState.get(sid)
                   const said = fixedNotice || String(state?.toolText || state?.text || '').trim()
                   if (!said) return
@@ -2247,8 +2355,16 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
 
   // quiet：这一条是额外的（比如语音后面补发的表情），失败了不算到这一轮头上（deliver 按 failStore 里的条数判断整条有没有发出去）。
   // queueKind / queueTtlMs：网关短暂不可达时，确定没发出去的消息进入本地补发队列。
+  function gatewaySendGuard(opts) {
+    if (opts.sharedReply) return { replyGuard: opts.isCurrent }
+    if (opts.proactiveGuard) return { proactiveGuard: opts.proactiveGuard }
+  }
+
   function sharedSendOptions(chatId, opts) {
     const output = outputScope.getStore()
+    if (output?.proactiveGuard && sameChat(output.chatId, chatId)) {
+      return { ...opts, proactive: true, queueKind: 'proactive', sensitive: true, isCurrent: output.proactiveGuard, proactiveGuard: output.proactiveGuard }
+    }
     if (output?.shared && sameChat(output.chatId, chatId)) {
       const originalCheck = opts.isCurrent
       return {
@@ -2329,7 +2445,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const normSegId = normalizeChatId(chatId) || String(chatId || '')
     const addrSeg = normSegId ? parseChatId(normSegId) : null
     const isDefaultQq = isDefaultInstanceChat(normSegId)
-    const useGatewaySeg = Boolean(gateway && (sharedReply || !isDefaultQq || gateway.caps?.(normSegId) !== null || !onebot))
+    const useGatewaySeg = Boolean(gateway && (sharedReply || opts.proactiveGuard || !isDefaultQq || gateway.caps?.(normSegId) !== null || !onebot))
     // G3：有网关且由网关托管该实例时走网关（多平台、降级、补发队列统一处理）；
     // 宿主直连 OneBot 托管 qq 或无网关时保留原直连路径——见包-G3「只搬不改」。
     if (useGatewaySeg) {
@@ -2366,7 +2482,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
           sensitive: Boolean(sensitive),
           inResponseTo: responseTo,
           timeoutMs,
-        }, sharedReply ? { replyGuard: isCurrent } : undefined)
+        }, gatewaySendGuard(opts))
+        if (opts.proactiveGuard && (!sent?.messageId || sent.queued)) throw new Error('主动搭话未获得发送回执')
         if (sent?.messageId && !sent?.queued) {
           addSentId(normSegId, sent.messageId)
           rememberRecentMessage({ chatId: normSegId, messageId: sent.messageId, at: Date.now(), sender: { account: selfAccountFor(normSegId), isBot: true }, parts })
@@ -2374,7 +2491,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         bump('sent')
         if (outputScope.getStore()?.chatId === chatId) outputScope.getStore().sent++
         settleOutbound(verdict, 'sent')
-        if (opts.proactive) noteProactive(chatId, message, opts)
+        if (opts.proactive && !opts.proactiveGuard) noteProactive(chatId, message, opts)
         // 网关说「进了补发队列」时，中枢这边照旧返回 queued 形状，上层逻辑不用改
         if (sent?.queued) return { queued: true, queuedId: sent.messageId || '' }
         return { message_id: sent?.messageId ?? '', degraded: sent?.degraded }
@@ -2566,7 +2683,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       }
     }
     if (!cleaned.length || disposed || (isCurrent && !isCurrent())) return settleOutboundFailed(verdict)
-    const useGateway = Boolean(gateway && (sharedReply || !isDefaultInstanceChat(normId) || gateway.caps?.(normId) !== null || !onebot))
+    const useGateway = Boolean(gateway && (sharedReply || opts.proactiveGuard || !isDefaultInstanceChat(normId) || gateway.caps?.(normId) !== null || !onebot))
     if (!useGateway) {
       const segs = partsToSegmentsFallback(cleaned, { faceIdOf: faces?.idOf })
       if (!segs.length) return settleOutboundFailed(verdict)
@@ -2602,7 +2719,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         force: Boolean(force),
         sensitive: Boolean(sensitive),
         timeoutMs,
-      }, sharedReply ? { replyGuard: isCurrent } : undefined)
+      }, gatewaySendGuard(opts))
+      if (opts.proactiveGuard && (!sent?.messageId || sent.queued)) throw new Error('主动搭话未获得发送回执')
       if (sent?.messageId && !sent?.queued) {
         addSentId(normId, sent.messageId)
         rememberRecentMessage({ chatId: normId, messageId: sent.messageId, at: Date.now(), sender: { account: selfAccountFor(normId), isBot: true }, parts: cleaned })
@@ -2610,7 +2728,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       bump('sent')
       if (outputScope.getStore()?.chatId === chatId || outputScope.getStore()?.chatId === normId) outputScope.getStore().sent++
       settleOutbound(verdict, 'sent')
-      if (opts.proactive) noteProactive(normId, partsToSegmentsFallback(cleaned), opts)
+      if (opts.proactive && !opts.proactiveGuard) noteProactive(normId, partsToSegmentsFallback(cleaned), opts)
       if (sent?.queued) return { messageId: '', queued: true, queuedId: sent.messageId || '' }
       return { messageId: sent?.messageId ?? '', message_id: sent?.messageId ?? '', degraded: sent?.degraded }
     } catch (error) {
@@ -3043,7 +3161,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const active = currentPromptSources()
     const current = active || outputSources.get(chatId)
     const sources = current && { ...current, system: new Map(current.system), memory: [...current.memory] }
-    return outputScope.run({ chatId, sources, sent: 0, blocked: false, allowPromptEcho: false, shared: opts.shared }, () => deliverWithEnginePolicy(chatId, text, opts))
+    return outputScope.run({ chatId, sources, sent: 0, blocked: false, allowPromptEcho: false, shared: opts.shared,
+      proactiveGuard: opts.proactive && opts.isCurrent }, () => deliverWithEnginePolicy(chatId, text, opts))
   }
 
   /**
@@ -3168,7 +3287,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const sentTexts = [] // 实际成功发出的文字/语音正文：桥接与返回值只认这些，没发出去的话不能算说过
     await failStore.run(failures, async () => {
       for (let i = 0; i < items.length; i++) {
-        if (disposed || (opts.shared && !opts.shared.isCurrent())) return
+        if (disposed || (opts.shared && !opts.shared.isCurrent()) || (opts.isCurrent && !opts.isCurrent())) return
         const it = items[i]
         const selected = it.replyTo ? refs[it.replyTo] : (!explicit && i === firstSendable ? opts.autoReply : null)
         const replyId = selected?.mid
@@ -3195,7 +3314,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         if (i < items.length - 1 && !opts.simulate) await pause(bubbleDelay(items[i + 1].kind === 'text' ? items[i + 1].value : '') * mood().delay)
       }
     })
-    if (disposed || (opts.shared && !opts.shared.isCurrent())) return
+    if (disposed || (opts.shared && !opts.shared.isCurrent()) || (opts.isCurrent && !opts.isCurrent())) return
     if (outputScope.getStore().blocked && !outputScope.getStore().sent) return silenceTurn(chatId)
     if (opts.simulate) return items
     // 一条都没发出去：不记流水，她没说出口的话不能算说过
@@ -3211,7 +3330,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       try { opts.onDelivered() } catch (error) { log.warn('发送回执处理出错：', error.message) }
     }
     const said = itemsToLine(items, (q) => stickers.match(q))
-    logChat(chatId, 'bot', said, '', { interaction: [...interacted] })
+    logChat(chatId, 'bot', said, '', { interaction: [...interacted], ...(opts.proactiveCause && { proactive: opts.proactiveCause }) })
     // 不是这个聊天自己那一轮发的（主人在私聊里让她去群里说、扩展模块代发）：记下来，下次这个聊天交给她时告诉她自己说过什么。
     // 只记实际发出去的文本（sentTexts），且试运行（dryRun）没真发也不记——她没说出口的话不能算说过（#211 review）。
     if (!opts.own && sentTexts.length && !cfg.dryRun) saidElsewhere.set(chatId, [...(saidElsewhere.get(chatId) || []), { at: Date.now(), text: sentTexts.join(' ').slice(0, 300) }].slice(-5))
@@ -6401,6 +6520,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     sendSegments: trackQqSend(sendSegments),
     sendParts: trackQqSend(sendParts),
     pushToSession: (chat, ...args) => withDefaultQqWork(chat?.chatId, () => pushToSession(chat, ...args), rejectPausedQq),
+    pushProactiveToSession: (chat, ...args) => withDefaultQqWork(chat?.chatId, () => pushProactiveToSession(chat, ...args), rejectPausedQq),
     receiveOwnerMessage: (chatId, ...args) => withDefaultQqWork(chatId, () => receiveOwnerMessage(chatId, ...args), rejectPausedQq),
     get titleFilter() { return titleFilter },
     runSystemTurn,

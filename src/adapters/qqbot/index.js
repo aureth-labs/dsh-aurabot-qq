@@ -1196,7 +1196,8 @@ export function createQqbotAdapter(options = {}) {
      * 出站：parts → /v2/users|groups/{openid}/messages。
      * inResponseTo 就是 msg_id（或 event_id）——本平台的被动回复凭证。
      */
-    async send(message, { replyGuard } = {}) {
+    async send(message, { replyGuard, proactiveGuard } = {}) {
+      const guard = replyGuard || proactiveGuard
       const currentCaps = caps()
       const kind = message?.chat?.kind === 'group' ? 'group' : 'private'
       const chatId = String(message?.chat?.id ?? '')
@@ -1263,7 +1264,7 @@ export function createQqbotAdapter(options = {}) {
       }
 
       let lastId = ''
-      const beforeDispatch = replyGuard && (() => assertReplyCurrent(replyGuard, instance, Boolean(lastId)))
+      const beforeDispatch = guard && (() => assertReplyCurrent(guard, instance, Boolean(lastId)))
       const replyAs = cfg.replyAs === 'event_id' ? 'event_id' : 'msg_id'
       try {
         for (const item of messages) {

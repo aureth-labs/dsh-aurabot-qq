@@ -437,14 +437,16 @@ test('Bridge 共享回复只在内存等待，外部取走之前撤销时丢弃'
     let current = true
     const shared = adapter.send({ ...msg, inResponseTo: 'original' }, { replyGuard: () => current })
     const rejected = assert.rejects(shared, { code: 'reply-revoked', certainty: 'not-sent' })
+    const proactive = adapter.send(msg, { proactiveGuard: () => current })
+    const proactiveRejected = assert.rejects(proactive, { code: 'reply-revoked', certainty: 'not-sent' })
     const ordinary = adapter.send(msg)
-    assert.equal(adapter.__bridge.queueLength(), 2)
+    assert.equal(adapter.__bridge.queueLength(), 3)
     const stored = JSON.parse(readFileSync(adapter.__bridge.pendingFile(), 'utf8'))
     assert.equal(stored.items.length, 1)
     assert.equal(stored.items[0].inResponseTo, undefined)
     current = false
     const res = await call(ctx, '/outbound', {})
-    await rejected
+    await Promise.all([rejected, proactiveRejected])
     assert.equal(res.statusCode, 200)
     assert.equal(res.payload.message.inResponseTo, undefined)
     await call(ctx, '/ack', { id: res.payload.message.id, ok: true, messageId: 'ordinary-done' })

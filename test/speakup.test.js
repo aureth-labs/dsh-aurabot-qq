@@ -26,6 +26,26 @@ function setup(hubState, speakUp = {}) {
 }
 const min = 60_000
 
+test('主人搭话和追话把已选路由交给共享入口', async () => {
+  const calls = []
+  const { s, pushed } = setup({
+    pushProactiveToSession: async (...args) => calls.push(args),
+    lastBotToOwner: { text: '晚饭吃了吗？' },
+  })
+  await s.fire()
+  await s.fire('追话', { nudge: true })
+  assert.equal(pushed.length, 0)
+  assert.equal(calls.length, 2)
+  for (const [chat, content, sender, opts] of calls) {
+    assert.equal(chat.chatId, 'private:' + OWNER)
+    assert.equal(sender, '')
+    assert.equal(opts.route.chatId, chat.chatId)
+    assert.equal(opts.route.blocked, false)
+    assert.equal(content[0].type, 'text')
+  }
+  assert.match(calls[1][1][0].text, /轻轻追一句/)
+})
+
 test('默认打开，只找主人私聊', () => {
   const c = normalize({}).speakUp
   assert.equal(c.enabled, true)

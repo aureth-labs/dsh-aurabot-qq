@@ -823,10 +823,14 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
    * 唯一的出站口。顺序照 CONTRACTS §七：
    * 规范化地址 → 查实例 → 被动回复三检查 → 按 caps 降级 → 平台端 send → 失败分类 → 入队。
    */
-  async function send(message = {}, { replyGuard } = {}) {
+  async function send(message = {}, { replyGuard, proactiveGuard } = {}) {
+    const guard = replyGuard || proactiveGuard
     const chatId = normalizeChatId(message.chatId)
     if (!chatId) throw makeSendError('not-sent', 'bad-chat-id', String(message.chatId || ''), `认不出的地址：${message.chatId}`)
     const addr = parseChatId(chatId)
+    if (proactiveGuard && (replyGuard || message.inResponseTo)) {
+      throw makeSendError('not-sent', 'bad-send-options', addr.instance, '主动发送的守卫只能用于无入站回复凭据的消息')
+    }
     if (isHeld(addr.instance)) throw heldError(addr.instance)
     const run = runs.get(addr.instance)
 
@@ -838,7 +842,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
     if (run.state !== 'connected' || !capsNow) {
       const error = makeSendError('not-sent', 'offline', addr.instance, `实例 ${addr.instance} 未连接`)
       // whoami 不符等「实例自己不会恢复」的情况：入队没有意义（重连还是同一个错账号），直接拒
-      if (run.dead || replyGuard) throw error
+      if (run.dead || guard) throw error
       const queued = outbox.add(message, { instance: addr.instance })
       if (queued.ok) return { messageId: '', degraded: [], queued: true }
       throw error
@@ -919,7 +923,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
     }
 
     // 调平台端
-    if (replyGuard && !replyGuard()) {
+    if (guard && !guard()) {
       throw makeSendError('not-sent', 'reply-revoked', addr.instance, '该轮回复已撤销')
     }
     try {
@@ -930,12 +934,12 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
         inResponseTo: effectiveProactive ? undefined : effectiveInResponseTo,
         timeoutMs: message.timeoutMs,
         ext: message.ext,
-      }, replyGuard ? { replyGuard } : undefined)
+      }, replyGuard ? { replyGuard } : proactiveGuard ? { proactiveGuard } : undefined)
       bumpReplyCount(addr.instance, effectiveProactive ? null : effectiveInResponseTo)
       return { messageId: result.messageId, degraded: [...d.degraded, ...extraDegraded] }
     } catch (error) {
       const sendError = toSendError(error, addr.instance)
-      if (isNotSent(sendError) && !replyGuard && isCurrentRun(run) && !isHeld(run.instance)) {
+      if (isNotSent(sendError) && !guard && isCurrentRun(run) && !isHeld(run.instance)) {
         // 确定没发出去且不含媒体 → 入队；媒体消息入不了队 → 原样抛出
         const queued = outbox.add({ ...message, parts: d.parts, replyTo: d.replyTo }, { instance: addr.instance })
         if (queued.ok) return { messageId: '', degraded: d.degraded, queued: true }

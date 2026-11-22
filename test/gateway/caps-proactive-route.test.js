@@ -107,6 +107,29 @@ test('repliesPerMessage=2：第三条文字并进第二条，不丢内容', asyn
   // 窗口过后第四条按主动消息（replyWindowMs 内没新入站则仍被动——这里在窗口内，计数已满则并流继续成立）
 })
 
+test('主动搭话守卫要求独立投递，发送失败后不入补发队列', async () => {
+  const factory = fakeFactory({ id: 'fake', caps: { repliesPerMessage: 1, replyWindowMs: 60_000 } })
+  const { gateway } = makeGateway({ platforms: { fake: { enabled: true } }, adapters: [factory] })
+  await gateway.sync()
+  const adapter = factory.get(1)
+  const message = { chatId: 'fake:private:10001', kind: 'proactive', parts: [{ type: 'text', text: '打招呼' }] }
+  const proactiveGuard = () => true
+  try {
+    await assert.rejects(gateway.send(message, { replyGuard: () => true, proactiveGuard }), { code: 'bad-send-options' })
+    adapter.pushInbound({ messageId: 'in-1', parts: [{ type: 'text', text: '在吗' }] })
+    await assert.rejects(gateway.send({ ...message, inResponseTo: 'in-1' }, { proactiveGuard }), { code: 'bad-send-options' })
+    assert.equal(adapter.sent.length, 0)
+
+    adapter.failNext('not-sent', 'proactive-limit')
+    await assert.rejects(gateway.send(message, { proactiveGuard }), { code: 'proactive-limit' })
+    assert.equal(gateway.outbox.status().count, 0)
+    assert.ok((await gateway.send(message, { proactiveGuard })).messageId)
+    assert.equal(adapter.sent.at(-1).payload.inResponseTo, undefined)
+  } finally {
+    await gateway.stopAll()
+  }
+})
+
 test('ctx.route：挂的路径能收到请求；实例停掉后同路径 404', async () => {
   const a = fakeFactory({ id: 'fake' })
   const cfg = { platforms: { fake: { enabled: true } } }

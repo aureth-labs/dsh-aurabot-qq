@@ -452,6 +452,242 @@ it('queues two platforms on one DSH session and preserves reply credentials for 
   }
 }, 15_000)
 
+it('routes owner speakup through ordinary, fallback, live shared and normalized debug sessions', async () => {
+  const h = await harness({ responses: [
+    textResponse('普通 QQ 搭话'), textResponse('备用飞书搭话'), textResponse('收到飞书消息'),
+    toolCallResponse('proactive-tool', 'speakup_probe', {}), textResponse('第一条主动消息'),
+    textResponse('无法投递的消息'), textResponse('投递前失去主动能力'), textResponse('调试搭话'), textResponse(''),
+    () => { throw new Error('模型生成失败') }, 'hang', 'hang',
+  ] })
+  vi.stubEnv('AURABOT_DATA_DIR', h.cwd)
+  const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() }
+  const identity = createIdentity({ dataDir: join(h.cwd, 'identity'), log })
+  const owner = identity.claimOwner('qq', '10001')
+  identity.link('feishu', 'owner_f', owner, 'owner')
+  let cfg = normalize({
+    enabled: true, dryRun: false, ownerPersonId: owner, ownerQQ: '10001',
+    ownerAuthorization: { owner, revision: '11111111-2222-4333-8444-555555555555' },
+    ownerPrimary: { platform: 'qq', instance: 'qq', account: '10001', fallback: true },
+    platforms: { qq: { enabled: true }, feishu: { enabled: true } },
+    workspaceDir: h.cwd, merge: { enabled: false }, voice: { enabled: false }, stickers: { enabled: false }, chat: { thinkingGuard: { enabled: false } },
+  })
+  const gateway = createGateway({ config: cfg, dataDir: (...path) => join(h.cwd, ...path), identity, log })
+  const qq = makeFakeAdapter({ id: 'qq', caps: { proactive: 'free' } })
+  const feishu = makeFakeAdapter({ id: 'feishu' })
+  gateway.register(() => qq)
+  gateway.register(() => feishu)
+  await gateway.sync()
+  let created = 0
+  const newAgent = async () => {
+    const sessionId = SessionId('proactive-' + (++created))
+    await h.ctx.agentLoop.create(sessionId, { provider: 'mock', model: 'mock' }, { cwd: h.cwd })
+    return { sessionId }
+  }
+  h.ctx.provide('sessionController', {
+    create: newAgent, fork: newAgent, rename: vi.fn(),
+    resolveAgent: async id => ({ agent: h.ctx.agents.get(id) }),
+  } as never)
+  h.ctx.workspaceRegistry.list = () => [{ id: 'workspace', path: h.cwd }]
+  const prompts: string[] = []
+  let allowOrdinary = false
+  const sendHook = vi.fn()
+  const tool = vi.fn(async () => [{ type: 'text', text: '允许' }])
+  const hub = createHub({
+    dsh: h.ctx, getConfig: () => cfg, log, gateway, identity,
+    resolveSharedPrimary: () => fixedSharedPrimary({ cfg, identity, instances: gateway.instances() }),
+    hooks: {
+      prompt(content, ctx) {
+        prompts.push(ctx.sessionId)
+        return allowOrdinary || ctx.proactive || ctx.senderId === 'owner_f' ? content : null
+      },
+      send: sendHook,
+    },
+    buildTools: () => [defineContentToolFixture({ name: 'speakup_probe', description: 'probe', parameters: {}, execute: tool })],
+  })
+  const off = h.ctx.on('session/event', hub.onSessionEvent)
+  const delivered = vi.fn()
+  const ended = vi.fn()
+  const sessionFile = join(h.cwd, 'sessions.json')
+  const readMap = async () => JSON.parse(await readFile(sessionFile, 'utf8'))
+  const push = (chatId = 'qq:private:10001', route = {}) => hub.pushProactiveToSession({
+    chatId, kind: 'private', platform: chatId.split(':')[0], userId: chatId.split(':')[2],
+  }, [{ type: 'text', text: '系统主动搭话' }], '', { route: { chatId, ...route }, onDelivered: delivered, onTurnEnd: ended })
+  try {
+    gateway.noteSeen(owner, 'feishu:private:owner_f', Date.now())
+    expect(gateway.routeTo(owner)).toBe('feishu:private:owner_f')
+    cfg.multiPlatformPrivateSession = true
+    cfg.enabled = false
+    await expect(push()).resolves.toMatchObject({ ok: false })
+    expect(prompts).toEqual([])
+    expect(h.adapter.requests).toEqual([])
+    expect(qq.sent).toEqual([])
+    expect(feishu.sent).toEqual([])
+    cfg.enabled = true
+    ended.mockClear()
+    cfg.multiPlatformPrivateSession = false
+    expect(hub.sharedStatus().state).toBe('uninitialized')
+    const ordinaryBaseline = (await readMap()).multiPrivate.sessions.live
+    allowOrdinary = true
+    await push()
+    await vi.waitFor(() => expect(ended).toHaveBeenCalledTimes(1))
+    expect(ended.mock.lastCall?.[0]).toMatchObject({ ok: true })
+    expect(delivered).toHaveBeenCalledTimes(1)
+    expect(qq.sent.map(x => x.payload)).toMatchObject([
+      { chat: { kind: 'private', id: '10001' }, parts: [{ type: 'text', text: '普通 QQ 搭话' }] },
+    ])
+    expect(feishu.sent).toEqual([])
+    expect(JSON.stringify(h.ctx.sessions.get(SessionId(prompts[0]))?.deriveMessages())).toContain('系统主动搭话')
+    expect((await readMap()).multiPrivate.sessions.live).toEqual(ordinaryBaseline)
+    allowOrdinary = false
+    cfg.multiPlatformPrivateSession = true
+    cfg.dryRun = true
+    await push()
+    cfg.dryRun = false
+    await push(undefined, { blocked: true })
+    hub.refreshSharedConfig()
+    const liveBeforeFallback = (await readMap()).multiPrivate.sessions.live
+    qq.disconnect()
+    expect(cfg.ownerPrimary.fallback).toBe(true)
+    expect(gateway.instances().find(instance => instance.instance === 'qq')?.state).toBe('disconnected')
+    const fallback = gateway.routeTo(owner)
+    expect(fallback).toBe('feishu:private:owner_f')
+    allowOrdinary = true
+    await push(fallback!, { fallbackUsed: true })
+    await vi.waitFor(() => expect(ended).toHaveBeenCalledTimes(2))
+    expect(ended.mock.lastCall?.[0]).toMatchObject({ ok: true })
+    expect(delivered).toHaveBeenCalledTimes(2)
+    expect(feishu.sent.map(x => x.payload)).toMatchObject([
+      { chat: { kind: 'private', id: 'owner_f' }, parts: [{ type: 'text', text: '备用飞书搭话' }] },
+    ])
+    expect(qq.sent).toHaveLength(1)
+    expect(JSON.stringify(h.ctx.sessions.get(SessionId(prompts.at(-1)!))?.deriveMessages())).toContain('系统主动搭话')
+    expect(prompts.at(-1)).not.toBe(prompts[0])
+    expect((await readMap()).multiPrivate.sessions.live).toEqual(liveBeforeFallback)
+    allowOrdinary = false
+    qq.reconnect()
+    const cap = vi.spyOn(gateway, 'caps').mockReturnValueOnce({ proactive: 'none' } as never)
+    await push()
+    cap.mockRestore()
+    expect(prompts).toHaveLength(5)
+    expect(hub.sharedStatus().state).toBe('uninitialized')
+    expect(delivered).toHaveBeenCalledTimes(2)
+    const map = await readMap()
+    map.multiPrivate.sessions.live.state = 'paused'
+    await writeFile(sessionFile, JSON.stringify(map))
+    await push()
+    expect(prompts.at(-1)).toBe(prompts[0])
+    expect(hub.sharedStatus().state).toBe('paused')
+    // Start from an empty shared branch so this fixture needs no persisted parent.
+    hub.resetShared(['live', 'debug'], 'empty')
+    let inbound: Promise<unknown> | undefined
+    const stop = gateway.onMessage(message => { inbound = hub.onGatewayMessage(message) })
+    try {
+      feishu.pushInbound({ messageId: 'recent-feishu', chat: { kind: 'private', id: 'owner_f' },
+        sender: { account: 'owner_f' }, parts: [{ type: 'text', text: '从飞书接续会话' }] })
+      await vi.waitFor(() => expect(inbound).toBeDefined())
+      await inbound
+    } finally { stop() }
+    await push()
+    expect(tool).toHaveBeenCalledTimes(1)
+    expect(delivered).toHaveBeenCalledTimes(3)
+    expect(qq.sent.map(x => x.payload.inResponseTo)).toEqual([undefined, undefined])
+    const live = prompts.at(-1)
+    const failedSend = vi.spyOn(gateway, 'send').mockRejectedValueOnce(new Error('发送失败'))
+    await push()
+    expect(ended.mock.calls.at(-1)?.[0]).toMatchObject({ ok: false })
+    expect(delivered).toHaveBeenCalledTimes(3)
+    expect(failedSend).toHaveBeenCalledTimes(1)
+    failedSend.mockRestore()
+
+    // The primary was eligible through generation and lost proactive capability during send preparation.
+    const send = vi.spyOn(gateway, 'send')
+    const requestsBeforeCapsChange = h.adapter.requests.length
+    const endsBeforeCapsChange = ended.mock.calls.length
+    sendHook.mockClear()
+    sendHook.mockImplementationOnce(() => { qq.setCaps({ proactive: 'none' }) })
+    try {
+      await expect(push()).resolves.toMatchObject({ ok: false })
+      expect(sendHook).toHaveBeenCalledTimes(1)
+      expect(send).not.toHaveBeenCalled()
+      expect(ended).toHaveBeenCalledTimes(endsBeforeCapsChange + 1)
+      expect(ended.mock.lastCall?.[0]).toMatchObject({ ok: false })
+      expect(h.adapter.requests).toHaveLength(requestsBeforeCapsChange + 1)
+      expect(delivered).toHaveBeenCalledTimes(3)
+      expect(qq.sent).toHaveLength(2)
+      expect(feishu.sent).toHaveLength(2)
+      expect(gateway.outbox.status().count).toBe(0)
+    } finally {
+      send.mockRestore()
+      qq.setCaps({ proactive: 'free' })
+    }
+
+    cfg = normalize({ ...cfg, debug: true })
+    expect(cfg.dryRun).toBe(true)
+    hub.refreshSharedConfig()
+    await push()
+    const debug = prompts.at(-1)!
+    expect(debug).not.toBe(live)
+    expect((await readMap()).multiPrivate.sessions.debug.sessionId).toBe(debug)
+    expect((await readMap()).multiPrivate.sessions.live.sessionId).toBe(live)
+    const debugEvents = h.ctx.sessions.get(SessionId(debug))?.snapshotEvents()
+    expect(debugEvents).toContainEqual(expect.objectContaining({
+      type: 'user/message', data: expect.objectContaining({ source: expect.objectContaining({ kind: 'aurabot-proactive' }) }),
+    }))
+    expect(JSON.stringify(debugEvents)).toContain('调试搭话')
+    expect(ended.mock.lastCall?.[0]).toMatchObject({ ok: true })
+    expect(delivered).toHaveBeenCalledTimes(3)
+    expect(qq.sent).toHaveLength(2)
+    cfg = normalize({ ...cfg, debug: false, dryRun: false })
+    hub.refreshSharedConfig()
+
+    const endsBeforeSilence = ended.mock.calls.length
+    const requestsBeforeSilence = h.adapter.requests.length
+    await expect(push()).resolves.toEqual({ ok: true })
+    expect(h.adapter.requests).toHaveLength(requestsBeforeSilence + 1)
+    expect(ended).toHaveBeenCalledTimes(endsBeforeSilence + 1)
+    expect(ended.mock.lastCall).toEqual([{ ok: true }])
+    expect(delivered).toHaveBeenCalledTimes(3)
+    expect(qq.sent).toHaveLength(2)
+    expect(feishu.sent).toHaveLength(2)
+    const requestsBeforeFailure = h.adapter.requests.length
+    await push()
+    expect(ended.mock.lastCall?.[0]).toMatchObject({ ok: false })
+    expect(h.adapter.requests).toHaveLength(requestsBeforeFailure + 1)
+
+    const interrupt = async (change: () => void) => {
+      const requests = h.adapter.requests.length
+      const outcomes = ended.mock.calls.length
+      const pending = push()
+      try {
+        await vi.waitFor(() => expect(h.adapter.requests).toHaveLength(requests + 1), { timeout: 5000 })
+      } finally { change() }
+      await expect(pending).resolves.toMatchObject({ ok: false })
+      expect(ended).toHaveBeenCalledTimes(outcomes + 1)
+      expect(h.adapter.requests).toHaveLength(requests + 1)
+    }
+    await interrupt(() => {
+      cfg.multiPlatformPrivateSession = false
+      hub.refreshSharedConfig()
+    })
+    cfg.multiPlatformPrivateSession = true
+    hub.refreshSharedConfig()
+    // The cancelled turn is beyond the previous checkpoint. Use a fresh branch for the reset scenario.
+    hub.resetShared(['live'], 'empty')
+    await interrupt(() => hub.resetShared(['live'], 'empty'))
+    expect(hub.sharedStatus().state).toBe('uninitialized')
+    expect((await readMap()).multiPrivate.retiredSessions[prompts.at(-1)!]).toMatchObject({ mode: 'live' })
+    expect(delivered).toHaveBeenCalledTimes(3)
+    expect(qq.sent).toHaveLength(2)
+    expect(feishu.sent.map(x => x.payload.inResponseTo)).toEqual([undefined, 'recent-feishu'])
+    expect(gateway.outbox.status().count).toBe(0)
+  } finally {
+    off()
+    hub.dispose()
+    await gateway.stopAll()
+    identity.close?.()
+  }
+}, 30_000)
+
 it('forks only the confirmed legacy prefix with the real DSH controller and restores the same child from disk', async () => {
   const root = await mkdtemp(join(tmpdir(), 'aurabot-dsh-fork-'))
   vi.stubEnv('AURABOT_DATA_DIR', root)
@@ -557,6 +793,14 @@ it('forks only the confirmed legacy prefix with the real DSH controller and rest
     host.trackOutput()
     await host.send('qq', 'fork-qq', '共享中的 QQ 消息')
     await host.send('wx', 'fork-wx', '共享中的微信消息')
+    const delivered = vi.fn()
+    const ended = vi.fn()
+    const primaryChat = { chatId: 'private:10001', kind: 'private', userId: '10001' }
+    await host.hub.pushProactiveToSession(primaryChat, [{ type: 'text', text: '主动搭话专用提示' }], '', {
+      route: { chatId: 'qq:private:10001' }, onDelivered: delivered, onTurnEnd: ended,
+    })
+    expect(ended.mock.calls).toEqual([[{ ok: true }]])
+    expect(delivered).toHaveBeenCalledTimes(1)
     const { sessionId: childId, verifiedThroughSeq } = (await readMap()).multiPrivate.sessions.live
     const child = ctx.sessions.get(childId)!
     expect((await readMap()).multiPrivate.sessions.live).toMatchObject({ state: 'active', baseSessionId: sourceId })
@@ -567,7 +811,12 @@ it('forks only the confirmed legacy prefix with the real DSH controller and rest
     expect(child.eventAt(verifiedThroughSeq)).toMatchObject({ type: 'turn/end', data: { reason: { kind: 'completed' } } })
     expect(JSON.stringify(host.adapter.requests.at(-1)?.messages)).toContain('已核对的旧 QQ 历史')
     expect(JSON.stringify(host.adapter.requests.at(-1)?.messages)).not.toContain('核对后追加的普通私聊')
-    expect(host.qq.sent.map(record => record.payload.inResponseTo)).toEqual(['fork-qq'])
+    expect(child.snapshotEvents()).toContainEqual(expect.objectContaining({
+      type: 'user/message', data: expect.objectContaining({ source: {
+        kind: 'aurabot-proactive', form: 'proactive', proactive: true, speaker: { role: 'owner', chat: 'private' },
+      } }),
+    }))
+    expect(host.qq.sent.map(record => record.payload.inResponseTo)).toEqual(['fork-qq', undefined])
     expect(host.wx.sent.map(record => record.payload.inResponseTo)).toEqual(['fork-wx'])
 
     await host.close()
@@ -585,17 +834,24 @@ it('forks only the confirmed legacy prefix with the real DSH controller and rest
     const restoredMessages = JSON.stringify(host.adapter.requests.at(-1)?.messages)
     expect(restoredMessages).toContain('共享中的 QQ 消息')
     expect(restoredMessages).toContain('共享中的微信消息')
+    expect(restoredMessages).toContain('主动搭话专用提示')
     const recoveredMap = await readMap()
     expect(recoveredMap.multiPrivate.sessions.live).toMatchObject({ sessionId: childId, state: 'active' })
     const recoveredCheckpoint = recoveredMap.multiPrivate.sessions.live.verifiedThroughSeq
     expect(recoveredCheckpoint).toBeGreaterThan(verifiedThroughSeq)
     expect(host.hub.sharedStatus().legacyHistoryAvailable).toBe(false)
 
-    // Reproduce the durable state where DSH flushed the completed turn but Aurabot's checkpoint was not yet saved.
+    const unverifiedText = '崩溃前完成但核验点未落盘的主动搭话'
+    await host.hub.pushProactiveToSession(primaryChat, [{ type: 'text', text: unverifiedText }], '', {
+      route: { chatId: 'qq:private:10001' },
+    })
+    const proactiveCheckpoint = (await readMap()).multiPrivate.sessions.live.verifiedThroughSeq
+    expect(proactiveCheckpoint).toBeGreaterThan(recoveredCheckpoint)
+
+    // Keep DSH's persisted proactive turn and rewind only Aurabot's checkpoint to the preceding turn.
     await host.close()
     await ctx.fiber.dispose()
     host = undefined
-    recoveredMap.multiPrivate.sessions.live.verifiedThroughSeq = verifiedThroughSeq
     await writeFile(sessionsPath, JSON.stringify(recoveredMap))
     ctx = new Context()
     host = await start(ctx)
@@ -604,14 +860,24 @@ it('forks only the confirmed legacy prefix with the real DSH controller and rest
     await host.send('wx', 'unverified-recovery', retryText)
     expect(host.hub.sharedStatus()).toMatchObject({ state: 'paused', pauseReason: 'restored-history-unverified' })
     const pausedChild = ctx.sessions.get(childId)!
-    expect(pausedChild.eventAt(recoveredCheckpoint)).toMatchObject({
+    expect(pausedChild.eventAt(proactiveCheckpoint)).toMatchObject({
       type: 'turn/end', data: { reason: { kind: 'completed' } },
     })
+    expect(pausedChild.snapshotEvents().filter(event => event.seq > recoveredCheckpoint)).toContainEqual(expect.objectContaining({
+      type: 'user/message', data: expect.objectContaining({
+        source: expect.objectContaining({ kind: 'aurabot-proactive' }),
+        content: expect.arrayContaining([{ type: 'text', text: unverifiedText }]),
+      }),
+    }))
     expect(JSON.stringify(pausedChild.deriveMessages())).not.toContain(retryText)
+    await vi.waitFor(() => expect(host?.adapter.requests).toHaveLength(1))
+    const ordinaryMessages = JSON.stringify(host.adapter.requests[0].messages)
+    expect(ordinaryMessages).toContain(retryText)
+    expect(ordinaryMessages).not.toContain(unverifiedText)
+    expect(host.qq.sent).toEqual([])
     expect((await readMap()).multiPrivate.sessions.live).toMatchObject({
-      sessionId: childId, verifiedThroughSeq,
+      sessionId: childId, verifiedThroughSeq: recoveredCheckpoint,
     })
-
     host.hub.resetShared(['live'], 'empty')
     await vi.waitFor(async () => {
       expect((await readMap()).multiPrivate.retiredSessions[childId].archiveState).toBe('archived')

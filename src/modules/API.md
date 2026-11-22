@@ -405,7 +405,7 @@ return function Panel({ settings, save, toast }) {
 
 提炼输出用 `follow_up: { at: 'YYYY-MM-DD HH:mm', question }`，本地明确日期保留原时间，只有日期则安排晚上 20 点；日期拿不准按原话后 3 天。`update` / `outdated` 用旧事实 id，有结果写 `follow_up: null`，尚无结果省略字段以保留次数和排程。沿用事实去重，重复提炼不重置次数；过时、忘掉、删除时连带清理，未完成的跟进暂不参与细节压缩。面板取消沿用 `memory.update(id, { followUp: null })`，该接口不接受创建跟进。
 
-主动模块共用 `memory.dueFollowUp(qq, now?)`（只返回最早到期的一件，检查记忆开关、本人来源、白名单、有效期和喜恶）与 `memory.markFollowUpAsked(id, now?)`（只在实际发出后调用；问后延期 3 天、7 天，第三次清掉）。主动搭话用 `hub.pushToSession` 的可选 `onDelivered` 回执，在实际发出文字或语音后记数；沉默、试运行、拦截、失败不记数。目的引擎只在模块开启时收集同一件到期素材，权重由 `purpose/engine.js` 的 `FOLLOW_UP_WEIGHT` 定义，不复制进目的目标或待续清单。两条路径都沿用各自的清醒时段、次数与间隔闸门，禁言和讨厌的人跳过。
+主动模块共用 `memory.dueFollowUp(qq, now?)`（只返回最早到期的一件，检查记忆开关、本人来源、白名单、有效期和喜恶）与 `memory.markFollowUpAsked(id, now?)`（只在实际发出后调用；问后延期 3 天、7 天，第三次清掉）。内置 `speakup` 通过 `hub.pushProactiveToSession` 向主人搭话，主账号路由和共享私聊设置共同决定使用哪个会话。好友搭话走 `hub.pushToSession`。两者都在 `onDelivered` 确认文字或语音实际发出后记数。目的引擎只在模块开启时收集同一件到期素材，权重由 `purpose/engine.js` 的 `FOLLOW_UP_WEIGHT` 定义，不复制进目的目标或待续清单。两条路径都沿用各自的清醒时段、次数与间隔闸门，禁言和讨厌的人跳过。
 
 聊天中枢需要的时候会去找 `stickers`（发表情、偷表情）、`voice`（发语音）、`mood`（心情影响表情 / 语音频率）、`memory`（群聊插话判断）。
 这几个被关掉，对应的事就不做（想发语音时改发文字）；被替换，就用你的——所以替换时**导出的函数名要和上表一样**。

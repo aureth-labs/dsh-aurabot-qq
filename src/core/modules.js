@@ -582,6 +582,7 @@ export function scopeCoreForModule(core, id, compat = null) {
     const hasSubagent = typeof core.hub.subagentFor === 'function'
     scopedHub = {}
     for (const name of Object.getOwnPropertyNames(core.hub)) {
+      if (name === 'pushProactiveToSession' && id !== 'speakup') continue
       if (hasSubagent && (name === 'runSubagentTurn' || name === 'subagentFor')) continue
       if (name === 'setLegacyQqTransport' || name === 'setDefaultQqTransportPaused' || name === 'isDefaultQqTransportIdle') continue
       const d = Object.getOwnPropertyDescriptor(core.hub, name)

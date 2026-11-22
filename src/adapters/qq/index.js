@@ -622,7 +622,8 @@ export function createQqAdapter(options = {}) {
    * 出站主路径。
    * 失败分类的全部来源是 src/onebot/client.js 的 transport / uncertain（见 errors.js）。
    */
-  async function send(message = {}, { replyGuard } = {}) {
+  async function send(message = {}, { replyGuard, proactiveGuard } = {}) {
+    const guard = replyGuard || proactiveGuard
     const cfg = config()
     const chat = message?.chat || {}
     const parts = Array.isArray(message?.parts) ? message.parts : []
@@ -644,7 +645,7 @@ export function createQqAdapter(options = {}) {
     const timeoutMs = Math.max(1, Number(message.timeoutMs) || 15000)
     let messageId = ''
     let dispatched = false
-    const beforeDispatch = replyGuard && (() => assertReplyCurrent(replyGuard, instance, dispatched))
+    const beforeDispatch = guard && (() => assertReplyCurrent(guard, instance, dispatched))
     const dispatch = async (action, params) => {
       beforeDispatch?.()
       const result = await call(action, params, { timeoutMs, retries: 0, beforeDispatch })

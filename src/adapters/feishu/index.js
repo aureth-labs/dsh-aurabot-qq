@@ -1631,7 +1631,8 @@ export function createFeishuAdapter(options = {}) {
      * 出站。一条飞书消息只能带一种 msg_type，多段拆成多次调用；
      * 超长文本按 maxTextChars 分条；媒体先上传换 key；语音只有 opus 才发成语音条。
      */
-    async send(message = {}, { replyGuard } = {}) {
+    async send(message = {}, { replyGuard, proactiveGuard } = {}) {
+      const guard = replyGuard || proactiveGuard
       if (!running || !connected) throw sendError('not-sent', 'offline', instance, '飞书平台端未连接')
       const cfg = config()
       const chat = message.chat || {}
@@ -1680,7 +1681,7 @@ export function createFeishuAdapter(options = {}) {
 
       let lastMessageId = ''
       let dispatched = false
-      const beforeDispatch = replyGuard && (() => assertReplyCurrent(replyGuard, instance, dispatched))
+      const beforeDispatch = guard && (() => assertReplyCurrent(guard, instance, dispatched))
       for (const item of sends) {
         beforeDispatch?.()
         // 需要先上传的媒体：网关只给 parts，不带 key

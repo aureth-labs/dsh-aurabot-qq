@@ -431,7 +431,11 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory, identity, 
       ? `【系统提醒，不是${owner}说的话】你刚才跟${owner}说「${String(hub.lastBotToOwner?.text || '').slice(-60)}」，${owner}已经 ${idle} 分钟没回了。可以轻轻追一句（比如「人呢」「睡着啦？」，或者换个话题），别催、别抱怨；觉得${owner}在忙就只回 [沉默]。`
       : `【系统提醒，不是${owner}说的话】你已经 ${idle > 600 ? '很久' : idle + ' 分钟'}没和${owner}私聊了，想主动找${owner}说点什么。这次的由头可以是：${angle}。优先用手里真实的素材（最近做过的事、记忆里的、聊天流水里能查到的），没有真实素材就别硬找，也不要编；用你自己的口气，一两句就好，别用模板、别解释为什么来找；实在不想说就只回 [沉默]。`
     log.info(`主动搭话（${reason}）`)
-    await hub.pushToSession({ chatId: targetChat, kind: 'private', platform: addr?.platform || '', instance: addr?.instance || '', userId: addr?.id || '', nickname: owner }, [{ type: 'text', text: [prompt, followUpHint(followUp)].filter(Boolean).join('\n') }], '', followUpReceipt(followUp))
+    const chat = { chatId: targetChat, kind: 'private', platform: addr?.platform || '', instance: addr?.instance || '', userId: addr?.id || '', nickname: owner }
+    const content = [{ type: 'text', text: [prompt, followUpHint(followUp)].filter(Boolean).join('\n') }]
+    const receipt = followUpReceipt(followUp)
+    if (hub.pushProactiveToSession) return hub.pushProactiveToSession(chat, content, '', { ...receipt, route })
+    await hub.pushToSession(chat, content, '', receipt)
   }
 
   const friendPersonId = (target) => (target ? (identity?.lookup?.(target.platform, target.id) || '') : '')

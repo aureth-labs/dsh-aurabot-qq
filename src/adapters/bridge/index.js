@@ -557,13 +557,14 @@ export function createBridgeAdapter(options = {}) {
      *  4) 已被取走但没回执 → unknown 'no-ack'（拿不准，绝不重发）
      * 另外：外部程序回 ack ok:false → not-sent（用它报的 code）。
      */
-    async send(message = {}, { replyGuard } = {}) {
+    async send(message = {}, { replyGuard, proactiveGuard } = {}) {
+      const guard = replyGuard || proactiveGuard
       if (!running || !connected) throw sendError('not-sent', 'offline', instance, 'bridge 平台端未连接')
       if (!message.inResponseTo && caps.proactive === 'none') {
         throw sendError('not-sent', 'proactive-not-allowed', instance, '这个接入端只允许被动回复（proactive=none）')
       }
       if (replyGuard && !message.inResponseTo) throw sendError('not-sent', 'missing-reply-id', instance, '缺少原入站消息编号')
-      assertReplyCurrent(replyGuard, instance)
+      assertReplyCurrent(guard, instance)
       const parts = message.parts || []
       if (!parts.length) throw sendError('not-sent', 'nothing-to-send', instance, '没有可发送的内容')
       if (!message.chat || (message.chat.kind !== 'private' && message.chat.kind !== 'group')) {
@@ -587,7 +588,7 @@ export function createBridgeAdapter(options = {}) {
         parts,
         replyTo: message.replyTo,
         inResponseTo: message.inResponseTo,
-        replyGuard,
+        replyGuard: guard,
         enqueuedAt: clock(),
         takenAt: null,
         timer: null,
@@ -640,7 +641,7 @@ export function createBridgeAdapter(options = {}) {
         }
 
         queue.push(item)
-        if (!replyGuard) savePending()
+        if (!guard) savePending()
         notifyWaiters()
       })
     },

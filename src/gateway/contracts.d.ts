@@ -212,6 +212,8 @@ export interface SendResult {
 export interface OutboundSendOptions {
   /** 绑定当前轮次。使用原入站凭据，每次平台提交、分段和重试前复核，异步准备后也须复核。 */
   replyGuard?: () => boolean
+  /** 主动搭话的授权检查，仅在当前轮次内投递。与 replyGuard 和 inResponseTo 互斥。 */
+  proactiveGuard?: () => boolean
 }
 
 /**

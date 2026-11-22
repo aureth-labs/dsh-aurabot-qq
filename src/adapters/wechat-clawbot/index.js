@@ -1325,7 +1325,8 @@ export function createWechatClawbotAdapter(options = {}) {
 
     whoami: async () => ({ account: self.account, name: self.name }),
 
-    async send(message, { replyGuard } = {}) {
+    async send(message, { replyGuard, proactiveGuard } = {}) {
+      const guard = replyGuard || proactiveGuard
       if (!running || !connected || stopped || sessionExpired) {
         throw createSendError('not-sent', sessionExpired ? 'session-expired' : 'not-connected', instance,
           sessionExpired ? '微信 ClawBot 会话已过期（-14），请重新扫码登录' : 'wechat-clawbot 尚未连接')
@@ -1435,7 +1436,7 @@ export function createWechatClawbotAdapter(options = {}) {
 
       let lastMessageId = ''
       for (const entry of itemsToSend) {
-        assertReplyCurrent(replyGuard, instance, Boolean(lastMessageId))
+        assertReplyCurrent(guard, instance, Boolean(lastMessageId))
         let item = entry.item
         if (!item && entry.kind === 'image') {
           const uploaded = await prepareOutboundMedia(entry.media, UPLOAD_MEDIA_TYPE.IMAGE, toUserId, timeoutMs, '图片')
@@ -1456,7 +1457,7 @@ export function createWechatClawbotAdapter(options = {}) {
           item = buildFileItem(uploaded, entry.media)
         }
 
-        assertReplyCurrent(replyGuard, instance, Boolean(lastMessageId))
+        assertReplyCurrent(guard, instance, Boolean(lastMessageId))
         const clientId = `wx-${randomUUID().replace(/-/g, '').slice(0, 16)}`
         let r
         try {
