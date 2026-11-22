@@ -10,8 +10,8 @@
 //      不能让一次探测失败把整张能力表打成 false。
 //   3. 探测结果按网关版本缓存到本实例数据目录的 caps.json，下次启动先用缓存、连上再复探。
 //   4. **绝不发真消息、绝不改真资料**：只做只读调用，或者用「一定被拒」的参数去问
-//      「这个动作存在吗」（改资料那几项用超长的昵称/签名和空头像，任何实现都会先拒掉，
-//      真被接受了也改不动东西——见 MUTATING_PROBES 的注释）。
+//      「这个动作存在吗」。改昵称/签名/头像属于写动作，有些网关会先截断再保存，
+//      所谓「一定被拒」的参数并不安全，因此启动探测完全不调用这三个动作。
 //
 // 判定「不支持」的办法：各家对「没有这个动作」的措辞不统一（SnowLuma 回 retcode 1404，
 // NapCat 回「不支持的API」，go-cqhttp 回 "unknown action"……），所以先看 retcode 1404/404，
@@ -81,8 +81,7 @@ const UNSUPPORTED_TEXT = /不支持|未实现|未找到(该)?(动作|接口|api)
  * 一次失败的调用 → 'unsupported' | 'unknown' | 'exists'。
  *   unsupported：对面明确说没这个动作
  *   unknown    ：超时 / 连不上 / 读不懂（不能据此下结论）
- *   exists     ：动作在，只是参数/权限不对（改资料用超长参数、戳一戳用不存在的号，
- *                失败本来就是预期结果）
+ *   exists     ：动作在，只是参数/权限不对（戳一戳用不存在的号，失败本来就是预期结果）
  */
 export function classifyProbeError(error) {
   const retcode = Number(error?.data?.retcode)
@@ -95,23 +94,11 @@ export function classifyProbeError(error) {
   return 'exists'
 }
 
-/** 超长字符串：用来「问存在性但一定被拒」，不会真的改动资料。 */
-const TOO_LONG = 'aurabot-probe-'.padEnd(400, 'x')
-
 /**
- * 会改数据的动作的探针参数。设计原则：返回 true 只说明「动作存在」，绝不能让对面真改掉东西。
- *   - set_qq_profile / set_self_longnick：昵称/签名超长（QQ 侧长度校验先拒）；
- *   - set_qq_avatar：空 base64（不是合法图片，解码就失败）；
- *   - upload_*_file：空 file（必然 file not found）；
- *   - send_poke / set_input_status / delete_msg / get_msg：目标号填 0，不存在；
- *   - set_msg_emoji_like：message_id 0。
- * 这些都是各实现里「参数校验先于动作」的地方，所以既能证明动作存在，又碰不到真数据。
+ * 改资料动作（set_qq_profile / set_self_longnick / set_qq_avatar）不在探测表里：
+ * 有些网关会先把超长签名截断再保存，空头像也可能被接受。启动探测阶段绝不调用写动作。
+ * 这些动作由 profile 模块在主人明确授权后调用；能力探测只放行，不验证参数。
  */
-const MUTATING_PROBES = {
-  profile_nickname: () => ({ nickname: TOO_LONG }),
-  profile_avatar: () => ({ file: 'base64://' }),
-  longnick: () => ({ longNick: TOO_LONG }),
-}
 
 /**
  * 探针表。params 是对象或 (bag) => 对象（用前面探到的群号/好友号当目标）。
@@ -146,10 +133,8 @@ export const PROBE_TABLE = [
   { name: 'upload_group_file', action: 'upload_group_file', params: (bag) => ({ group_id: firstGroup(bag), file: '', name: '' }), cap: 'file', label: '发群文件' },
   { name: 'upload_private_file', action: 'upload_private_file', params: (bag) => ({ user_id: firstFriend(bag), file: '', name: '' }), label: '发私聊文件' },
 
-  // ── 改资料（本包要求的探针；参数见 MUTATING_PROBES，改不动真数据）──
-  { name: 'profile_nickname', action: 'set_qq_profile', params: MUTATING_PROBES.profile_nickname, label: '改昵称' },
-  { name: 'profile_avatar', action: 'set_qq_avatar', params: MUTATING_PROBES.profile_avatar, label: '改头像' },
-  { name: 'longnick', action: 'set_self_longnick', params: MUTATING_PROBES.longnick, label: '改个性签名' },
+  // 改资料三个动作不在启动探测里：见文件开头的说明，避免探测本身修改账号资料。
+  // 它们由 profile 模块在主人明确授权后调用。
 
   // ── 空间（只用只读的列表接口，绝不发说说）──
   { name: 'qzone_list', action: 'get_qzone_msg_list', params: () => ({ num: 1 }), label: '空间说说列表' },
@@ -221,7 +206,7 @@ function historyParams(bag) {
 }
 
 /**
- * 跑一遍探测。**只读**（除 MUTATING_PROBES 那些「一定被拒」的探针）。
+ * 跑一遍探测。**只读**：不调用改昵称/签名/头像等会修改账号资料的写动作。
  * @param {(action: string, params?: any, opts?: object) => Promise<any>} call 客户端的 call
  * @param {{ log?: object, timeoutMs?: number, table?: any[] }} [opts]
  * @returns {Promise<{
@@ -258,7 +243,7 @@ export async function probeGateway(call, { log, timeoutMs = PROBE_TIMEOUT_MS, ta
         exists = 'unknown'
         detail = String(error?.data?.message || error?.message || '探测结果不明')
       } else {
-        exists = true // 动作存在，只是参数/权限不对：改资料用超长参数、戳一戳用不存在的号，失败是预期
+        exists = true // 动作存在，只是参数/权限不对：例如戳一戳用不存在的号，失败是预期
         detail = String(error?.data?.message || error?.message || '调用失败（动作存在）')
       }
     }
@@ -347,8 +332,10 @@ export function capsFromProbes(entries) {
 /**
  * 探测结果里有哪些动作可用（native() 的白名单用）。
  * 只硬编码 OneBot v11 的**标准动作**：探测失败也不该把「发消息 / 查资料」这条路堵死。
- * 扩展动作（send_poke、set_input_status、delete_msg、set_qq_profile……）**必须探到才放行**，
+ * 扩展动作（send_poke、set_input_status、delete_msg……）**必须探到才放行**，
  * 这正是能力探测的意义：模块调 native 时能得到「当前网关不支持 X」的明确答复。
+ * 例外：改资料的三个写动作不在启动期探测（会改真账号），这里预放行；
+ * 是否真的支持由 profile 模块调用时的错误判断，不支持会返回 unsupported-action。
  * 注：收藏表情写动作（add/modify/delete_custom_face）不在启动期主动写探测，当 fetch_custom_face 存在时
  * 先伴随放行，并在运行期遇到 unsupported 响应时由 native() 即时懒降级剔除。
  */
@@ -359,7 +346,7 @@ export function supportedActions(probe) {
     set.add('modify_custom_face')
     set.add('delete_custom_face')
   }
-  for (const a of ['send_private_msg', 'send_group_msg', 'send_msg', 'get_login_info', 'get_version_info', 'get_status', 'get_friend_list', 'get_group_list', 'get_group_info', 'get_group_member_info', 'get_group_member_list', 'get_stranger_info', 'can_send_image', 'can_send_record', 'set_group_ban', 'set_group_whole_ban', 'set_group_kick', 'set_group_special_title', '_send_group_notice']) set.add(a)
+  for (const a of ['send_private_msg', 'send_group_msg', 'send_msg', 'get_login_info', 'get_version_info', 'get_status', 'get_friend_list', 'get_group_list', 'get_group_info', 'get_group_member_info', 'get_group_member_list', 'get_stranger_info', 'can_send_image', 'can_send_record', 'set_group_ban', 'set_group_whole_ban', 'set_group_kick', 'set_group_special_title', '_send_group_notice', 'set_qq_profile', 'set_self_longnick', 'set_qq_avatar']) set.add(a)
   return set
 }
 

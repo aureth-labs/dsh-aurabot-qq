@@ -214,8 +214,11 @@ test('探测先查 get_version_info，再逐个试探扩展动作', async () => 
   await waitProbed(adapter)
   const actions = client.calls.map((c) => c.action)
   assert.ok(actions.includes('get_version_info'), '必须先查 get_version_info')
-  for (const action of ['get_group_msg_history', 'get_group_file_url', 'send_poke', 'set_input_status', 'set_qq_avatar', 'get_qzone_msg_list', 'fetch_custom_face', 'fetch_ptt_text']) {
+  for (const action of ['get_group_msg_history', 'get_group_file_url', 'send_poke', 'set_input_status', 'get_qzone_msg_list', 'fetch_custom_face', 'fetch_ptt_text']) {
     assert.ok(actions.includes(action), `缺少探针：${action}`)
+  }
+  for (const action of ['set_qq_profile', 'set_qq_avatar', 'set_self_longnick']) {
+    assert.ok(!actions.includes(action), `启动探测绝不能调用改资料动作：${action}`)
   }
   await adapter.stop()
 })
@@ -328,16 +331,10 @@ test('探测绝不发消息、不动群管理、不改真资料', async () => {
   await waitProbed(adapter)
   const forbidden = ['send_private_msg', 'send_group_msg', 'send_msg', 'send_qzone_msg',
     'add_custom_face', 'delete_custom_face', 'modify_custom_face',
-    'set_group_ban', 'set_group_kick', 'set_group_whole_ban', '_send_group_notice']
+    'set_group_ban', 'set_group_kick', 'set_group_whole_ban', '_send_group_notice',
+    'set_qq_profile', 'set_qq_avatar', 'set_self_longnick']
   const hit = client.calls.filter((c) => forbidden.includes(c.action)).map((c) => c.action)
   assert.deepEqual(hit, [], `探测期间不许做这些动作：${hit.join(', ')}`)
-
-  // 改资料的探针必须带「一定被拒」的参数：超长昵称 + 空头像
-  const profile = client.calls.find((c) => c.action === 'set_qq_profile')
-  assert.ok(profile, '要有 set_qq_profile 探针')
-  assert.ok(String(profile.params.nickname || '').length > 60, '昵称要超长，宁可被拒也不能真改')
-  const avatar = client.calls.find((c) => c.action === 'set_qq_avatar')
-  assert.equal(avatar.params.file, 'base64://', '头像只能给空图')
   await adapter.stop()
 })
 
@@ -753,11 +750,10 @@ test('caps() 返回副本（网关叠 config.caps 时改不到内部状态）', 
   assert.equal(Object.isFrozen(CAPS_CONSERVATIVE), true, '保守能力表要冻结，防止别处误改')
 })
 
-test('supportedActions 永远含标准动作（探测失败也不能堵死发消息）', () => {
+test('supportedActions 永远含标准动作，且改资料写动作不依赖危险探测', () => {
   const set = supportedActions({ supported: [] })
   for (const a of ['send_private_msg', 'send_group_msg', 'get_login_info', 'get_version_info']) assert.ok(set.has(a))
-  assert.equal(set.has('set_qq_profile'), false)
-  assert.equal(supportedActions({ supported: ['set_qq_profile'] }).has('set_qq_profile'), true)
+  for (const a of ['set_qq_profile', 'set_self_longnick', 'set_qq_avatar']) assert.ok(set.has(a))
 })
 
 // ═════════════════════════ 9. SnowLuma 子模块 ═════════════════════════
