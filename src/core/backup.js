@@ -5,7 +5,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { open, mkdir, readdir, rename, rm } from 'node:fs/promises'
-import { constants, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { constants, copyFileSync, cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { crc32, deflateRawSync, inflateRawSync } from 'node:zlib'
 import { homedir } from 'node:os'
 import { dirname, join, parse, relative } from 'node:path'
@@ -15,6 +15,15 @@ import { captureMemoryBackup, MEMORY_FILES, readMemoryDatabase } from '../featur
 import { captureIdentityBackup, IDENTITY_FILE, IDENTITY_FILES } from '../gateway/identity-store.js'
 import { createIdentity } from '../gateway/identity.js'
 import { enumeratePeopleFromState } from '../features/memory.js'
+import {
+  BACKUP_JOURNAL_FILE,
+  LOCAL_RECOVERY_STATE_PATHS,
+  bumpDataEpoch,
+  findActiveMigrationTxns,
+  readDataEpoch,
+  readJsonSafe,
+  writeJsonAtomicFsync,
+} from './qq-gateway-migration.js'
 
 const MANIFEST = 'aurabot-backup.json'
 const SCHEMA = 1
@@ -34,7 +43,7 @@ const GATEWAY_IDENTITY_FILES = IDENTITY_FILES.map((name) => 'gateway/' + name)
 const RESULT_FILE = '.restore-result.json'
 const REBUILD_NOTICE = '身份表是重建的，非 QQ 平台的绑定需要重新做'
 let cachedRestoreResult = null
-const SKIP = ['backups', '.restore', '.restore-sessions', '.restore-pending.json', '.restore-modules.json', RESULT_FILE, 'logs', 'tmp', 'voice-cache', 'archive-cache', 'douyin/edge-profile']
+const SKIP = ['backups', '.restore', '.restore-sessions', '.restore-pending.json', '.restore-modules.json', RESULT_FILE, 'logs', 'tmp', 'voice-cache', 'archive-cache', 'douyin/edge-profile', ...LOCAL_RECOVERY_STATE_PATHS]
 // 仅配置备份：媒体不进包，但保留体积很小的聊天流水和当前工作区 DSH 会话
 const CONFIG_ONLY_SKIP = ['imagegen', 'stickers', 'bili-shots', 'douyin']
 const skipped = (rel) => SKIP.some((s) => rel === s || rel.startsWith(s + '/')) || rel.split('/').includes('node_modules') || rel.endsWith('.tmp') || rel === 'memory.sqlite-shm' || rel === `gateway/${IDENTITY_FILE}-shm` || rel.startsWith('memory.sqlite.migrating')
@@ -412,6 +421,7 @@ let restoreInProgress = false
 
 async function withRestoreStage(run) {
   if (restoreInProgress) throw new Error('另一个备份正在暂存')
+  if (readBackupRestoreJournal()?.corrupt) throw new Error('备份恢复日志损坏，请先核对并处理日志')
   restoreInProgress = true
   try { return await run() } finally { restoreInProgress = false }
 }
@@ -461,6 +471,13 @@ function publishStage(data, job) {
 }
 
 async function stageBackup(path, received) {
+  if (findActiveMigrationTxns(dataDir()).length) {
+    throw Object.assign(new Error('默认 QQ 正在迁移中，暂不允许暂存备份恢复'), { code: 'QQ_MIGRATION_ACTIVE' })
+  }
+  const activeJournal = readBackupRestoreJournal(dataDir())
+  if (activeJournal && (activeJournal.state === 'moving' || activeJournal.state === 'moved')) {
+    throw Object.assign(new Error('备份恢复正在进行中，暂不允许重新暂存'), { code: 'BACKUP_RESTORE_ACTIVE' })
+  }
   const flags = constants.O_RDONLY | (constants.O_NONBLOCK ?? 0) | (received ? (constants.O_NOFOLLOW ?? 0) : 0)
   const fh = await open(path, flags)
   let data
@@ -562,15 +579,19 @@ function moveChecked(source, file, destination, rel, directory = false) {
   return { rel, key: moved.key }
 }
 
-function runRestoreMoves(run) {
+function runRestoreMoves(run, { onStep = null } = {}) {
   const moved = []
   const move = (source, file, destination, rel, directory = false) => {
+    const step = { source, file, destination, rel, directory }
+    onStep?.('before-move', step)
     const placed = moveChecked(source, file, destination, rel, directory)
     moved.push({ source, file, destination, placed, directory })
+    onStep?.('after-move', step, placed)
   }
   try {
     run(move)
   } catch (error) {
+    if (error?.code === 'SIMULATED_CRASH') throw error
     const failed = []
     for (const step of moved.reverse()) {
       try { moveChecked(step.destination, step.placed, step.source, step.file.rel, step.directory) }
@@ -671,12 +692,226 @@ export function lastRestoreResult(root = dataDir()) {
   return cachedRestoreResult
 }
 
+export function readBackupRestoreJournal(root = dataDir()) {
+  const file = join(root, BACKUP_JOURNAL_FILE)
+  if (!existsSync(file)) return null
+  const j = readJsonSafe(file, null)
+  if (!j || typeof j !== 'object' || Array.isArray(j) || j.corrupt
+    || !['prepared', 'moving', 'moved', 'committed', 'rolled-back'].includes(j.state)) {
+    return { version: 1, state: 'corrupt', corrupt: true }
+  }
+  return j
+}
+
+/** 区分备份恢复是「未开始搬移」还是「搬移途中中断 / 已搬待提交」，供启动恢复门决策。 */
+export function inspectBackupRestoreState(root = dataDir()) {
+  const journal = readBackupRestoreJournal(root)
+  const pending = readJsonSafe(join(root, '.restore-pending.json'), null)
+  if (journal) {
+    if (journal.corrupt || journal.state === 'corrupt') {
+      return { state: 'backup-journal-corrupt', corrupt: true, journal, pending, canQuarantine: !hasRestoreArtifacts(root) && !restoreInProgress }
+    }
+    if (journal.state === 'moving') {
+      return { state: 'backup-moving', journal, pending }
+    }
+    if (journal.state === 'moved') {
+      return { state: 'backup-moved', journal, pending }
+    }
+  }
+  if (pending) {
+    return { state: 'backup-not-started', journal, pending }
+  }
+  return { state: 'idle', journal, pending: null }
+}
+
+function hasRestoreArtifacts(root) {
+  try {
+    return readdirSync(root).some((name) => name === '.restore' || name === '.restore-sessions'
+      || name === '.restore-pending.json' || name.startsWith('.restore-stage-') || name.startsWith('.restore-apply-'))
+  } catch {
+    return true
+  }
+}
+
+/** 保留损坏的本机日志供排查。还有暂存或搬移文件时，保留原恢复状态。 */
+export function quarantineCorruptBackupJournal(root = dataDir()) {
+  const state = inspectBackupRestoreState(root)
+  if (state.state !== 'backup-journal-corrupt') {
+    throw Object.assign(new Error('当前没有损坏的备份恢复日志'), { code: 'BACKUP_JOURNAL_NOT_CORRUPT' })
+  }
+  if (!state.canQuarantine) {
+    throw Object.assign(new Error('仍有备份恢复文件，请先在本机核对恢复状态'), { code: 'BACKUP_RESTORE_FILES_PRESENT' })
+  }
+  const data = dataBoundary(root)
+  const { info, key } = checkPath(data, BACKUP_JOURNAL_FILE)
+  if (!info) throw unsafePath(BACKUP_JOURNAL_FILE)
+  const savedName = `backup-restore-journal.corrupt-${randomUUID()}.json`
+  moveChecked(data, { rel: BACKUP_JOURNAL_FILE, key }, data, 'backups/' + savedName)
+  return savedName
+}
+
+function finalizeMovedRestore(root, data, journal, { onStep = null, homeRoot = dshHome() } = {}) {
+  if (journal.hasSessions) {
+    try {
+      if (checkPath(data, '.restore-sessions', { directory: true }).info) removeChecked(data, '.restore-sessions', true)
+    } catch {}
+  }
+  try {
+    if (checkPath(data, '.restore', { directory: true }).info) removeChecked(data, '.restore', true)
+  } catch {}
+  let identityRebuilt = false
+  let rebuiltPeople = 0
+  let notice = ''
+  if (journal.restoreMemory && !journal.restoreIdentity) {
+    rebuiltPeople = rebuildIdentityFromRestoredMemory(root)
+    identityRebuilt = true
+    notice = REBUILD_NOTICE
+  }
+  syncRestoredOwnerPersonId(root)
+  onStep?.('before-epoch', journal)
+  const epochRes = bumpDataEpoch(root, journal.txnId)
+  journal.dataEpoch = epochRes.epoch
+  writeJsonAtomicFsync(join(root, BACKUP_JOURNAL_FILE), journal)
+  onStep?.('after-epoch', journal)
+
+  cachedRestoreResult = {
+    files: Number(journal.fileCount) || 0,
+    memoryRestored: Boolean(journal.restoreMemory),
+    identityRestored: Boolean(journal.restoreIdentity),
+    identityRebuilt,
+    rebuiltPeople,
+    notice,
+  }
+  if (notice) writeFileSync(join(root, RESULT_FILE), JSON.stringify(cachedRestoreResult, null, 2))
+  else rmSync(join(root, RESULT_FILE), { force: true })
+
+  journal.state = 'committed'
+  writeJsonAtomicFsync(join(root, BACKUP_JOURNAL_FILE), journal)
+  onStep?.('committed', journal)
+  if (journal.job) {
+    try { removeChecked(data, journal.job, true) } catch {}
+  }
+  rmSync(join(root, BACKUP_JOURNAL_FILE), { force: true })
+  return Number(journal.fileCount) || 0
+}
+
+function movePlainWithExdevFallback(fromPath, toPath) {
+  mkdirSync(dirname(toPath), { recursive: true })
+  try {
+    renameSync(fromPath, toPath)
+  } catch (error) {
+    if (error?.code !== 'EXDEV') throw error
+    if (lstatSync(fromPath).isDirectory()) {
+      cpSync(fromPath, toPath, { recursive: true, force: false, errorOnExist: true, verbatimSymlinks: true })
+      rmSync(fromPath, { recursive: true, force: true })
+    } else {
+      copyFileSync(fromPath, toPath, constants.COPYFILE_EXCL)
+      rmSync(fromPath)
+    }
+  }
+}
+
+/**
+ * 恢复在文件搬移阶段中断的备份：
+ * - state='moving' 支持 action='rollback'，按持久化 undo 列表逆序退回原数据；
+ * - state='moved' 支持 action='continue'，补齐身份重建与 epoch 提交。
+ */
+export function recoverBackupRestore(root = dataDir(), { action = 'rollback', homeRoot = dshHome() } = {}) {
+  const journalFile = join(root, BACKUP_JOURNAL_FILE)
+  const journal = readBackupRestoreJournal(root)
+  if (!journal) return { ok: true, state: 'idle' }
+  const data = dataBoundary(root)
+
+  if (journal.state === 'prepared' || journal.state === 'committed' || journal.state === 'rolled-back') {
+    if (journal.job) { try { removeChecked(data, journal.job, true) } catch {} }
+    rmSync(journalFile, { force: true })
+    return { ok: true, state: 'idle' }
+  }
+
+  if (journal.state === 'moved') {
+    if (action !== 'continue') {
+      throw Object.assign(new Error('备份文件已全部替换，仅支持继续完成提交'), { code: 'BACKUP_RESTORE_ALREADY_MOVED', journal })
+    }
+    const files = finalizeMovedRestore(root, data, journal, { homeRoot })
+    return { ok: true, state: 'committed', files }
+  }
+
+  if (journal.state === 'moving') {
+    if (action !== 'rollback') {
+      throw Object.assign(new Error('搬移中断状态仅支持回滚到原数据'), { code: 'BACKUP_ROLLBACK_REQUIRED', journal })
+    }
+    const undoList = Array.isArray(journal.undo) ? [...journal.undo].reverse() : null
+    if (!undoList || journal.ambiguous) {
+      throw Object.assign(new Error('撤销日志不完整或状态不明，需人工核对恢复'), { code: 'BACKUP_ROLLBACK_AMBIGUOUS', journal })
+    }
+    let reverted = 0
+    for (const step of undoList) {
+      const srcRoot = step.srcKind === 'home' ? homeRoot : root
+      const destRoot = step.destKind === 'home' ? homeRoot : root
+      const fromPath = join(srcRoot, step.fromRel)
+      const toPath = join(destRoot, step.toRel)
+      const hasFrom = existsSync(fromPath)
+      const hasTo = existsSync(toPath)
+      try {
+        if (!hasFrom && hasTo) {
+          movePlainWithExdevFallback(toPath, fromPath)
+          reverted++
+        } else if (hasFrom && hasTo) {
+          // 跨卷复制在删源文件前崩溃：源文件仍完整，清掉目标上的半成品。
+          rmSync(toPath, { recursive: step.directory, force: true })
+          reverted++
+        } else if (!hasFrom && !hasTo && step.done) {
+          throw new Error(`撤销条目缺失源与目标：${step.fromRel} -> ${step.toRel}`)
+        }
+      } catch (error) {
+        journal.ambiguous = true
+        journal.rollbackError = error?.message || String(error)
+        writeJsonAtomicFsync(journalFile, journal)
+        throw Object.assign(new Error(`备份回滚失败，数据完整性无法确认：${journal.rollbackError}`), {
+          code: 'BACKUP_ROLLBACK_AMBIGUOUS',
+          journal,
+          cause: error,
+        })
+      }
+    }
+    journal.state = 'rolled-back'
+    writeJsonAtomicFsync(journalFile, journal)
+    if (journal.job) { try { removeChecked(data, journal.job, true) } catch {} }
+    rmSync(journalFile, { force: true })
+    return { ok: true, state: 'rolled-back', reverted }
+  }
+
+  throw Object.assign(new Error(`未知备份恢复日志状态：${journal.state}`), { code: 'BACKUP_ROLLBACK_AMBIGUOUS', journal })
+}
+
 /** 启动时、读配置之前应用暂存备份。 */
-export function applyPendingRestore(now = Date.now(), { root: customRoot = '' } = {}) {
+export function applyPendingRestore(now = Date.now(), { root: customRoot = '', onStep = null } = {}) {
   if (restoreInProgress) throw new Error('另一个备份正在暂存')
   const root = customRoot || dataDir()
   if (!existsSync(root)) return 0
   const data = dataBoundary(root)
+  const journalFile = join(root, BACKUP_JOURNAL_FILE)
+  const existingJournal = readBackupRestoreJournal(root)
+  if (existingJournal) {
+    if (existingJournal.corrupt || existingJournal.state === 'corrupt') {
+      throw Object.assign(new Error('备份恢复日志已损坏，需先人工确认或清理'), {
+        code: 'BACKUP_JOURNAL_CORRUPT',
+        journal: existingJournal,
+      })
+    }
+    if (existingJournal.state === 'moving') {
+      throw Object.assign(new Error('备份恢复在文件搬移途中中断，需先完成恢复或回滚'), {
+        code: 'BACKUP_RESTORE_MOVING',
+        journal: existingJournal,
+      })
+    }
+    if (existingJournal.state === 'moved') {
+      return finalizeMovedRestore(root, data, existingJournal, { onStep })
+    }
+    if (existingJournal.job) { try { removeChecked(data, existingJournal.job, true) } catch {} }
+    rmSync(journalFile, { force: true })
+  }
+
   const pendingRel = '.restore-pending.json'
   const pending = checkPath(data, pendingRel)
   if (!pending.info) return 0
@@ -707,10 +942,31 @@ export function applyPendingRestore(now = Date.now(), { root: customRoot = '' } 
   const configText = finalConfig(data, config.file, info, root, sessions?.target, { restoreIdentity })
   const job = '.restore-apply-' + randomUUID() + '.tmp'
   mkdirSync(checkPath(data, job, { directory: true }).path, { mode: 0o700 })
+  const txnId = randomUUID()
+  const journal = {
+    version: 1,
+    txnId,
+    state: 'prepared',
+    keep,
+    job,
+    restoreMemory,
+    restoreIdentity,
+    hasSessions: Boolean(sessions),
+    fileCount: files.length,
+    undo: [],
+    dataEpoch: readDataEpoch(root).epoch,
+    startedAt: now,
+  }
   let keepJob = false
+  let keepJournal = false
   try {
+    writeJsonAtomicFsync(journalFile, journal)
+    onStep?.('prepared', journal)
     if (configText !== null) config.file = preparedFile(data, job + '/config.json', configText)
     const modules = info.market?.length ? preparedFile(data, job + '/modules.json', JSON.stringify(info.market)) : null
+    journal.state = 'moving'
+    writeJsonAtomicFsync(journalFile, journal)
+    onStep?.('moving', journal)
     runRestoreMoves((move) => {
       const saveOriginal = (rel) => {
         const current = originals.get(rel)
@@ -736,31 +992,41 @@ export function applyPendingRestore(now = Date.now(), { root: customRoot = '' } 
       }
       // 最后移走待恢复标记，之后的清理失败不改变已提交的恢复结果。
       move(data, { rel: pendingRel, key: pending.key }, data, job + '/committed.json')
+    }, {
+      onStep(evt, step) {
+        if (evt === 'before-move') {
+          const entry = {
+            srcKind: step.source === data ? 'data' : 'home',
+            destKind: step.destination === data ? 'data' : 'home',
+            fromRel: step.file.rel,
+            toRel: step.rel,
+            directory: Boolean(step.directory),
+            done: false,
+          }
+          journal.undo.push(entry)
+          writeJsonAtomicFsync(journalFile, journal)
+          onStep?.('before-move', { journal, step: entry })
+        } else if (evt === 'after-move') {
+          const last = journal.undo[journal.undo.length - 1]
+          if (last) last.done = true
+          writeJsonAtomicFsync(journalFile, journal)
+          onStep?.('after-move', { journal, step: last })
+        }
+      },
     })
-    if (sessions) removeChecked(data, '.restore-sessions', true)
-    removeChecked(data, '.restore', true)
-    let identityRebuilt = false
-    let rebuiltPeople = 0
-    let notice = ''
-    if (restoreMemory && !restoreIdentity) {
-      rebuiltPeople = rebuildIdentityFromRestoredMemory(root)
-      identityRebuilt = true
-      notice = REBUILD_NOTICE
-    }
-    syncRestoredOwnerPersonId(root)
-    cachedRestoreResult = {
-      files: files.length,
-      memoryRestored: restoreMemory,
-      identityRestored: restoreIdentity,
-      identityRebuilt,
-      rebuiltPeople,
-      notice,
-    }
-    if (notice) writeFileSync(join(root, RESULT_FILE), JSON.stringify(cachedRestoreResult, null, 2))
-    else rmSync(join(root, RESULT_FILE), { force: true })
-    return files.length
+    journal.state = 'moved'
+    writeJsonAtomicFsync(journalFile, journal)
+    onStep?.('moved', journal)
+    return finalizeMovedRestore(root, data, journal, { onStep })
   } catch (error) {
-    keepJob = error.code === 'RESTORE_ROLLBACK_FAILED'
+    const crashed = error?.code === 'SIMULATED_CRASH' || error?.code === 'RESTORE_ROLLBACK_FAILED'
+    keepJob = crashed || journal.state === 'moved' || journal.state === 'committed'
+    keepJournal = crashed || journal.state === 'moved'
+    if (!keepJournal) {
+      journal.state = 'rolled-back'
+      try { writeJsonAtomicFsync(journalFile, journal) } catch {}
+      rmSync(journalFile, { force: true })
+    }
     throw error
   } finally {
     if (!keepJob) removeChecked(data, job, true)
@@ -797,6 +1063,10 @@ export function setPendingModules(list) {
 
 export function cancelRestore() {
   if (restoreInProgress) throw new Error('另一个备份正在暂存')
+  const j = readBackupRestoreJournal(dataDir())
+  if (j && (j.corrupt || j.state === 'moving' || j.state === 'moved')) {
+    throw Object.assign(new Error('备份搬移正在恢复或待确认，禁止直接取消暂存'), { code: 'BACKUP_RESTORE_ACTIVE' })
+  }
   rmSync(stageDir(), { recursive: true, force: true })
   rmSync(sessionStage(), { recursive: true, force: true })
   rmSync(pendingFile(), { force: true })

@@ -583,6 +583,7 @@ export function scopeCoreForModule(core, id, compat = null) {
     scopedHub = {}
     for (const name of Object.getOwnPropertyNames(core.hub)) {
       if (hasSubagent && (name === 'runSubagentTurn' || name === 'subagentFor')) continue
+      if (name === 'setLegacyQqTransport' || name === 'setDefaultQqTransportPaused' || name === 'isDefaultQqTransportIdle') continue
       const d = Object.getOwnPropertyDescriptor(core.hub, name)
       if (!d) continue
       if (typeof d.get === 'function') {
@@ -610,22 +611,26 @@ export function scopeCoreForModule(core, id, compat = null) {
     }
   }
   const scopedOnebot = compat
-    ? new Proxy(core.onebot || {}, {
-      get(t, key, r) {
+    ? new Proxy({}, {
+      get(_target, key) {
         if (key === 'state') return compat.qqState()
         if (key === 'call') return (action, params, opts) => {
+          compat.assertDefaultQqAvailable?.()
           compat.requireQqNative('api.core.onebot.call')
           return compat.callQq(action, params, opts)
         }
-        const v = Reflect.get(t, key, r)
-        if (typeof v === 'function') {
+        const value = core.onebot?.[key]
+        if (typeof value === 'function') {
           return (...args) => {
+            compat.assertDefaultQqAvailable?.()
             compat.requireQqNative(`api.core.onebot.${String(key)}`)
-            return v.apply(t, args)
+            const current = core.onebot
+            const method = current?.[key]
+            if (typeof method !== 'function') throw new Error('默认 QQ 当前由多平台网关托管，旧版直连接口不可用')
+            return method.apply(current, args)
           }
         }
-        if (v === undefined && typeof key === 'string') return undefined
-        return v
+        return value
       },
     })
     : null
@@ -660,6 +665,13 @@ export function scopeCoreForModule(core, id, compat = null) {
       if (key === 'outbound') return undefined
       return Reflect.get(target, key, recv)
     },
+    getOwnPropertyDescriptor(target, key) {
+      const descriptor = Reflect.getOwnPropertyDescriptor(target, key)
+      if (descriptor?.configurable && (key === 'hub' || (key === 'onebot' && scopedOnebot))) {
+        return { configurable: true, enumerable: descriptor.enumerable, writable: false, value: key === 'hub' ? scopedHub : scopedOnebot }
+      }
+      return descriptor
+    },
     getPrototypeOf() { return null }, // 摸原型拿回原始 hub 的路也堵死（三审 #177）
   })
 }
@@ -668,6 +680,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
   const log = logger.child('modules')
   const builtinDefs = new Map(builtins.map((d) => [d.id, d]))
   const live = new Map() // id → 运行中的模块（见 start）
+  const everStarted = new Set() // 曾成功启动过：重启时补一条“已恢复”，首次启动不刷屏
   const errors = new Map() // id → { message, at }  启动失败 / 加载失败
   const routes = new Map() // 完整路径 → { id, handler }
   const listeners = new Map() // 事件名 → [{ id, fn }]
@@ -714,6 +727,9 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
         set.add(String(st.platform))
       }
     }
+    // 回滚到旧版直连后 platforms.qq 可能保持 enabled=false，
+    // 但默认 QQ 实际仍由 legacy onebot 持有；模块仍应视为 QQ 已启用。
+    if (core.legacyQqEnabled === true) set.add('qq')
     // 仅核心单测（既没配 platforms 也没注入网关）沿用 QQ 默认
     if (!hasPlatMap && !core.gateway) set.add('qq')
     return set
@@ -830,6 +846,11 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       if (p !== 'qq') throw new Error(`非 QQ 会话「${chatId}」不支持 ${label}，请改用 api.sendParts`)
     }
   }
+  const assertDefaultQqAvailable = () => {
+    if (core.defaultQqTransportPaused) {
+      throw Object.assign(new Error('默认 QQ 正在切换连接托管，暂时不可用'), { status: 503, code: 'qq-ownership-paused' })
+    }
+  }
   const nativeCall = (rec, id, platform, action, params, opts) => {
     const p = String(platform || '').trim()
     if (!p) throw new Error('api.native 需要指定 platform')
@@ -843,12 +864,17 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       const matches = gw.instances().filter((st) => st?.platform === p && st.enabled && !(hasPlatMap && st.instance in plats && plats[st.instance]?.enabled === false))
       if (!matches.length) throw new Error(`平台「${p}」未启用`)
       const target = matches.find((st) => st.caps !== null) || matches[0]
+      if (p === 'qq' && target.instance === 'qq') assertDefaultQqAvailable()
       if (target.caps !== null) return gw.native(target.instance, action, params, opts)
       // G3 共存回退：宿主直接连着 core.onebot，而 gw 尚未同步启动 qq adapter
-      if (p === 'qq' && core.onebot?.call && qqEnabled()) return core.onebot.call(action, params, opts)
+      if (p === 'qq' && core.onebot?.call && qqEnabled()) {
+        assertDefaultQqAvailable()
+        return core.onebot.call(action, params, opts)
+      }
       throw new Error(`平台「${p}」尚未就绪，native 不可用`)
     }
     if (p === 'qq' && core.onebot?.call) {
+      assertDefaultQqAvailable()
       if (!qqEnabled()) throw new Error('平台「qq」未启用')
       return core.onebot.call(action, params, opts)
     }
@@ -982,7 +1008,8 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     // 模块摸不到原始 runSubagentTurn / subagentFor）；core 本体用 Proxy 转发，
     // getPrototypeOf 也掐断，防 getPrototypeOf(api.core).hub 绕回原始入口。
     const scopedCore = scopeCoreForModule(core, id, {
-      qqState: getQqState,
+      qqState: () => core.defaultQqTransportPaused ? 'stopped' : getQqState(),
+      assertDefaultQqAvailable,
       requireQqNative: (label) => requireQqCompatFor(rec, id, label),
       requireQqSend: (chatId) => requireQqCompatFor(rec, id, 'api.core.hub.sendSegments', chatId),
       callQq: (action, params, opts) => nativeCall(rec, id, 'qq', action, params, opts),
@@ -1158,6 +1185,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       ask: writable('ask', (opts) => core.ask(typeof opts === 'string' ? { text: opts, module: id } : { ...opts, module: id })),
       think: writable('think', (prompt, opts = {}) => core.hub.runSystemTurn(`ext-${id}`, opts.title || def.name || id, String(prompt), opts)),
       onebot: writable('onebot', (action, params, opts) => {
+        assertDefaultQqAvailable()
         requireQqCompatFor(rec, id, 'api.onebot')
         return nativeCall(rec, id, 'qq', action, params, opts)
       }),
@@ -1272,6 +1300,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     if (disposed) return
     const id = def.id
     const rec = { id, def, source: 'builtin', platforms: modulePlatforms(def), exports: null, offs: [], tools: [], contexts: [], rules: [], commands: [], dshTools: [], errors: [], startedAt: Date.now() }
+    const restored = everStarted.has(id)
     live.set(id, rec)
     skipped.delete(id)
     generation++ // 内置模块（重）启动也换代际：会话里的工具要在下一轮重挂
@@ -1281,6 +1310,8 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       if (r && typeof r.then === 'function') throw new Error('内置模块的 setup 要同步返回')
       registerToolAliases(rec)
       rec.exports = r ?? {}
+      everStarted.add(id)
+      if (restored) log.info(`模块「${def.name || id}」已恢复`)
     } catch (error) {
       stop(id, { quiet: true })
       errors.set(id, { message: String(error.message || error).slice(0, 800), at: Date.now(), source: 'builtin' })

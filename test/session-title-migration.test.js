@@ -30,7 +30,7 @@ test('迁移旧会话标题：重复 QQ 前缀 / 非 QQ 的 QQ 前缀会被修�
     try {
       const result = await hub.migrateLegacyTitles()
       const saved = JSON.parse(readFileSync(join(dir, 'sessions.json'), 'utf8'))
-      assert.equal(saved.chats['system:bili'].title, 'QQ · 刷B站')
+      assert.equal(saved.chats['system:bili'].title, 'B站 · 刷B站')
       assert.equal(saved.chats['system:diary'].title, 'QQ · 空间日记')
       assert.equal(saved.chats['feishu:private:ou_owner'].title, '飞书 · 主人私聊')
       assert.equal(saved.chats['wechat-clawbot:private:wxu_owner'].title, '微信 ClawBot 私聊 · 微信主人')

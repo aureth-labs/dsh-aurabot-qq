@@ -101,7 +101,7 @@ export function createBili({ getConfig, hub, memory, log, dsh, api: injected, vi
   }
 
   async function think(prompt) {
-    return hub.runSystemTurn('bili', 'QQ · 刷B站', `【刷 B 站，不是聊天，这一轮不会发到聊天里】\n${prompt}`, { timeoutMs: 180000 })
+    return hub.runSystemTurn('bili', 'B站 · 刷B站', `【刷 B 站，不是聊天，这一轮不会发到聊天里】\n${prompt}`, { timeoutMs: 180000, titleMode: 'full' })
   }
 
   /** 这一轮搜什么：她自己的兴趣 + 记忆里你喜欢的东西 + 面板里填的关键词，让她挑 3 个。 */

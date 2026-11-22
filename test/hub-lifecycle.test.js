@@ -150,6 +150,112 @@ function setup(t, { cfg = config(), brain = async () => '', hooks, buildTools, s
   return { hub, fake, calls, identity }
 }
 
+test('默认 QQ 热切换时暂停入口，解绑旧直连和补发队列，保留其他 QQ 实例', async (t) => {
+  const pendingHook = deferred()
+  const entered = deferred()
+  t.after(() => pendingHook.resolve())
+  let holdSend = true
+  const queued = []
+  const rejected = new OneBotError('send_private_msg', { message: 'offline' }, { transport: true })
+  const oldOnebot = {
+    async call(action) {
+      if (action === 'send_private_msg') throw rejected
+      return {}
+    },
+  }
+  const legacyOutbox = { add(item) { queued.push(item); return { ok: true, id: 'legacy-queue' } } }
+  const { hub, fake } = setup(t, {
+    cfg: config({ dryRun: false }),
+    onebot: oldOnebot,
+    outbox: legacyOutbox,
+    hooks: {
+      async send(segments, { chatId }) {
+        if (holdSend && chatId === CHAT) {
+          entered.resolve()
+          await pendingHook.promise
+        }
+        return segments
+      },
+    },
+  })
+  const gatewayCalls = []
+  hub.setGateway({
+    caps: () => null,
+    toParts: () => [{ type: 'text', text: '发送' }],
+    async send(message) {
+      gatewayCalls.push(message.chatId)
+      return { messageId: 'gateway-message' }
+    },
+  })
+
+  const send = hub.sendText(CHAT, '排队')
+  await entered.promise
+  assert.equal(hub.isDefaultQqTransportIdle(), false, '独立发送钩子也属于在途业务')
+  holdSend = false
+  pendingHook.resolve()
+  assert.equal((await send).queued, true)
+  assert.equal(hub.isDefaultQqTransportIdle(), true)
+  assert.equal(queued.length, 1)
+
+  hub.setDefaultQqTransportPaused(true)
+  assert.equal(await hub.sendText(CHAT, '不可发送'), null)
+  await assert.rejects(hub.receiveOwnerMessage(CHAT, { text: '不可排队' }), { code: 'qq-ownership-paused', status: 503 })
+  await hub.onMessage(event())
+  assert.equal(fake.turns.length, 0)
+  assert.ok(await hub.sendText(`qq#2:private:${OWNER}`, '其他实例可用'))
+  assert.equal(queued.length, 1)
+
+  hub.setLegacyQqTransport({ onebot: null, outbox: null })
+  hub.setDefaultQqTransportPaused(false)
+  assert.ok(await hub.sendText(CHAT, '网关接续'))
+  assert.deepEqual(gatewayCalls, [`qq#2:private:${OWNER}`, `qq:private:${OWNER}`])
+  assert.equal(queued.length, 1)
+
+  hub.setLegacyQqTransport({ onebot: oldOnebot, outbox: legacyOutbox })
+  assert.equal((await hub.sendText(CHAT, '回滚后走直连')).queued, true)
+  assert.equal(queued.length, 2)
+})
+
+test('模块保留的 OneBot 动作在重新绑定时读取实时托管权', async () => {
+  const { scopeCoreForModule } = await import('../src/core/modules.js')
+  const starts = []
+  const oldOnebot = { start() { starts.push('old') } }
+  let current = oldOnebot
+  let paused = false
+  const host = {
+    hub: {
+      setLegacyQqTransport() {},
+      setDefaultQqTransportPaused() {},
+      isDefaultQqTransportIdle() {},
+    },
+    get onebot() { return current },
+  }
+  const scoped = scopeCoreForModule(host, 'example', {
+    qqState: () => paused ? 'stopped' : 'connected',
+    requireQqNative: () => {},
+    assertDefaultQqAvailable: () => { if (paused) throw new Error('暂停') },
+    callQq() { return 'gateway' },
+  })
+  const restart = scoped.onebot.start
+  const call = scoped.onebot.call
+  paused = true
+  assert.throws(() => restart(), /暂停/)
+  assert.throws(() => call('get_login_info'), /暂停/)
+  current = null
+  paused = false
+  assert.throws(() => restart(), /旧版直连接口不可用/)
+  assert.equal(call('get_login_info'), 'gateway')
+  assert.equal(scoped.hub.setLegacyQqTransport, undefined)
+  assert.equal(scoped.hub.setDefaultQqTransportPaused, undefined)
+  assert.equal(scoped.hub.isDefaultQqTransportIdle, undefined)
+  assert.equal(Object.getOwnPropertyDescriptor(scoped, 'hub').value.setLegacyQqTransport, undefined)
+  assert.deepEqual(starts, [])
+
+  current = { start() { starts.push('new') } }
+  restart()
+  assert.deepEqual(starts, ['new'])
+})
+
 test('同一会话连续重载两轮：工具、上下文、限制全部清理，并读取新主人状态和新表情', { timeout: 20000 }, async (t) => {
   const data = mkdtempSync(join(root, 'host-'))
   process.env.AURABOT_DATA_DIR = data

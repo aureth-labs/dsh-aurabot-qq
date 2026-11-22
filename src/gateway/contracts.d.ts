@@ -196,7 +196,7 @@ export interface OutboundMessage {
   note: string
   /** 总开关关着也发（命令回复） */
   force?: boolean
-  /** 日志里不记正文 */
+  /** 日志里不记正文，且不进入持久化补发队列 */
   sensitive?: boolean
   timeoutMs?: number
 }
@@ -207,6 +207,11 @@ export interface SendResult {
   degraded: string[]
   /** 这次没有真发出去而是进了补发队列 */
   queued?: boolean
+}
+
+export interface OutboundSendOptions {
+  /** 绑定当前轮次。使用原入站凭据，每次平台提交、分段和重试前复核，异步准备后也须复核。 */
+  replyGuard?: () => boolean
 }
 
 /**
@@ -293,6 +298,8 @@ export type ConnState = 'unconfigured' | 'connecting' | 'connected' | 'disconnec
 
 export interface AdapterContext {
   instance: Instance
+  /** 实例由迁移租约启动，完成迁移验号前禁止业务。 */
+  migrationHeld?: boolean
   /** 这个实例在 config.platforms 里的那一段（已去掉 enabled） */
   config(): Record<string, any>
   emit(message: AdapterInbound): void
@@ -319,6 +326,7 @@ export type FetchRequest =
   | { kind: 'member'; chat: { kind: ChatKind; id: string }; account: string }
   | { kind: 'members'; chat: { kind: ChatKind; id: string } }
   | { kind: 'chats' }
+  | { kind: 'contacts' }
 
 export interface FetchedMessage {
   messageId: string
@@ -361,6 +369,11 @@ export interface FetchedForwardResult {
   messages: FetchedMessage[]
 }
 
+export interface FetchedContactsResult {
+  /** 好友为空时返回空数组。QQ 网关不支持此查询时抛 contacts-unavailable。 */
+  friends: { user_id: number | string; nickname?: string; remark?: string }[]
+}
+
 export interface PlatformAdapter {
   id: Platform
   name: string
@@ -371,16 +384,25 @@ export interface PlatformAdapter {
   settings: any[]
   start(ctx: AdapterContext): Promise<void>
   stop(): Promise<void>
+  /** 参与迁移租约时必需。等待旧连接退出，无法确认、超时或 signal 中止时应拒绝。 */
+  stopAndWait?(options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<void>
+  /** 参与迁移租约时必需。同步独立确认关闭且无法重连，原停止任务不得再影响后续启动。 */
+  confirmStopped?(): boolean
   /** 连上后核对「登录的是不是配置里的那个机器人」。不是就由网关断开这个实例 */
   whoami(): Promise<{ account: string; name: string }>
+  /** QQ 迁移核对已配置的 HTTP 与实际 WS 连接，成功后固定验号所用端点。 */
+  verifyMigrationIdentity?(expectedAccount: string): Promise<{ account: string; name: string }>
+  /** 检查迁移核对过的端点与连接仍然有效。 */
+  isMigrationIdentityCurrent?(): boolean
   /**
    * 网关已经按 caps 降级过，parts 里只会有这个平台声明支持的类型。
    * 失败必须抛 SendError；抛别的错误网关一律当 'unknown' 处理。
    */
-  send(message: { chat: { kind: ChatKind; id: string }; parts: Part[]; replyTo?: string; inResponseTo?: string; timeoutMs?: number; ext?: Record<string, unknown> }): Promise<{ messageId: string }>
+  send(message: { chat: { kind: ChatKind; id: string }; parts: Part[]; replyTo?: string; inResponseTo?: string; timeoutMs?: number; ext?: Record<string, unknown> }, options?: OutboundSendOptions): Promise<{ messageId: string }>
   fetch?(request: FetchRequest & { kind: 'message' }): Promise<FetchedMessage>
   fetch?(request: FetchRequest & { kind: 'forward' }): Promise<FetchedForwardResult>
   fetch?(request: FetchRequest & { kind: 'history' }): Promise<FetchedHistoryPage>
+  fetch?(request: FetchRequest & { kind: 'contacts' }): Promise<FetchedContactsResult>
   fetch?(request: FetchRequest): Promise<any>
   /**
    * 把本平台的原生消息格式转成 parts。QQ 端用它接住旧接口 sendSegments 传进来的 OneBot 消息段，
@@ -417,12 +439,24 @@ export interface InstanceStatus {
   caps: Caps | null
 }
 
+export interface GatewayInstanceLease {
+  startHeld(): Promise<InstanceStatus>
+  /** 等待当前连接完成验号，仍保持迁移挂起。 */
+  whenReady(options?: { timeoutMs?: number }): Promise<InstanceStatus>
+  /** 在配置提交前同步复核当前租约、连接和验号结果。 */
+  isReady(): boolean
+  stop(): Promise<void>
+  release(): Promise<void>
+}
+
 /** G1 实现。中枢、模块内核、面板只通过它和平台打交道。 */
 export interface Gateway {
   /** 注册一种平台。只有内置平台端和声明了 platform 能力的平台模块可以调用 */
   register(factory: () => PlatformAdapter): () => void
   /** 按 config.platforms 启停实例；配置变了再调一次，只动有变化的实例 */
   sync(): Promise<void>
+  /** 迁移持有租约期间，常规 sync 不接管这个实例。 */
+  acquireLease(instance: Instance, options: { config: InstanceConfig & { enabled: true } }): Promise<GatewayInstanceLease>
   instances(): InstanceStatus[]
 
   onMessage(fn: (message: InboundMessage) => void): () => void
@@ -440,7 +474,7 @@ export interface Gateway {
    * 'not-sent' 且可入队的进补发队列。总开关、试运行、清洗、send 钩子仍由中枢在调用前做。
    * 实例没启用时抛 SendError('not-sent')。
    */
-  send(message: OutboundMessage): Promise<SendResult>
+  send(message: OutboundMessage, options?: OutboundSendOptions): Promise<SendResult>
   caps(chatIdOrInstance: string): Caps | null
   /** 必选方法（Step 0B 在网关实现）：返回目标聊天或实例当前 14 项 L2 布尔表；实例未连接、不存在或 caps === null 时全为 false */
   features(chatIdOrInstance: string): Record<Feature, boolean>
@@ -448,6 +482,7 @@ export interface Gateway {
   fetch(chatIdOrInstance: string, request: FetchRequest & { kind: 'message' }): Promise<FetchedMessage>
   fetch(chatIdOrInstance: string, request: FetchRequest & { kind: 'forward' }): Promise<FetchedForwardResult>
   fetch(chatIdOrInstance: string, request: FetchRequest & { kind: 'history' }): Promise<FetchedHistoryPage>
+  fetch(chatIdOrInstance: string, request: FetchRequest & { kind: 'contacts' }): Promise<FetchedContactsResult>
   fetch(chatIdOrInstance: string, request: FetchRequest): Promise<any>
   native(instance: Instance, action: string, params?: any, opts?: { timeoutMs?: number }): Promise<any>
   /** 只读暴露实例的群管理能力对象（实例未连接或未实现时返回 null，避免模块直接摸 adapter 对象） */
@@ -461,7 +496,7 @@ export interface Gateway {
   noteSeen(person: PersonId, chatId: ChatId, at: number): void
 
   identity: Identity
-  outbox: { status(): { count: number; oldestAt: number }; flush(instance?: Instance): Promise<{ sent: number; dropped: number; left: number }> }
+  outbox: { status(instance?: Instance): { count: number; oldestAt: number }; flush(instance?: Instance): Promise<{ sent: number; dropped: number; left: number }> }
 }
 
 // ───────────────────────── 9. 配置 ─────────────────────────

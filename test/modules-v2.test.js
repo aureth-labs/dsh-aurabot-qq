@@ -485,6 +485,35 @@ test('QQ 关闭时或 G3 未同步共存下的旧口强失败与回退', async (
   assert.equal(g3Api.caps('qq:private:10001').voice, 'native')
 })
 
+test('默认 QQ 热切换期间拒绝其 native 动作与直连回退，同平台其他实例仍可用', async (t) => {
+  let api
+  const seen = []
+  const defaultQq = { instance: 'qq', platform: 'qq', enabled: true, state: 'connected', caps: {} }
+  const extraQq = { instance: 'qq#2', platform: 'qq', enabled: true, state: 'connected', caps: {} }
+  const gateway = {
+    instances: () => [defaultQq, extraQq],
+    native: (instance) => { seen.push(instance); return instance },
+  }
+  const { core, mods } = makeHarness(t, {
+    cfgPatch: { platforms: { qq: { enabled: true }, 'qq#2': { enabled: true } } },
+    builtins: [{ id: 'switch-qq', api: 2, platforms: ['qq'], setup(value) { api = value } }],
+    gateway,
+    onebot: { call() { seen.push('legacy') } },
+  })
+  await mods.boot()
+  core.defaultQqTransportPaused = true
+  assert.throws(() => api.onebot('get_login_info'), { code: 'qq-ownership-paused' })
+  assert.throws(() => api.native('qq', 'get_login_info'), { code: 'qq-ownership-paused' })
+  defaultQq.caps = null
+  assert.equal(await api.native('qq', 'get_login_info'), 'qq#2')
+  extraQq.caps = null
+  assert.throws(() => api.native('qq', 'get_login_info'), { code: 'qq-ownership-paused' })
+  core.defaultQqTransportPaused = false
+  defaultQq.caps = {}
+  assert.equal(await api.native('qq', 'get_login_info'), 'qq')
+  assert.deepEqual(seen, ['qq#2', 'qq'])
+})
+
 test('QQ 内置模块收到 unsupported-action 时给出清晰失败提示而不崩溃', async (t) => {
   const { gateway } = makeTestGateway(t, {
     platforms: { qq: { enabled: true } },
@@ -512,4 +541,14 @@ test('QQ 内置模块收到 unsupported-action 时给出清晰失败提示而不
   const r2 = await adminTool.execute({ action: 'ban', group_id: '123456', user_id: '10000099', minutes: 5 })
   assert.equal(r2.ok, false)
   assert.match(r2.message, /不支持/)
+})
+
+test('旧版 QQ 仍持有连接时，platforms.qq.enabled=false 也不会让 QQ 模块停用', async (t) => {
+  const s = makeHarness(t, {
+    cfgPatch: { platforms: { qq: { enabled: false } } },
+    builtins: [qqApiDef],
+  })
+  assert.equal(s.mods.activePlatforms().includes('qq'), false)
+  s.core.legacyQqEnabled = true
+  assert.ok(s.mods.activePlatforms().includes('qq'))
 })

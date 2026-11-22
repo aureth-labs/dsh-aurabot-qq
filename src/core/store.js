@@ -1,6 +1,7 @@
 // 数据目录、JSON 读写（UTF-8 无 BOM、先写临时文件再改名）。
 
-import { readFileSync, writeFileSync, mkdirSync, renameSync, existsSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import { closeSync, fsyncSync, openSync, readFileSync, writeFileSync, writeSync, mkdirSync, renameSync, existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 
@@ -34,6 +35,24 @@ export function writeJson(file, value) {
   const tmp = `${file}.tmp-${process.pid}`
   writeFileSync(tmp, JSON.stringify(value, null, 2), 'utf8')
   renameSync(tmp, file)
+}
+
+/** 原子写入 JSON 并对临时文件执行 fsync，避免进程崩溃留下截断内容。 */
+export function writeJsonAtomicFsync(filePath, data, { mode = 0o600 } = {}) {
+  ensureDir(dirname(filePath))
+  const tmp = `${filePath}.tmp-${process.pid}-${randomUUID().slice(0, 8)}`
+  const payload = Buffer.from(JSON.stringify(data, null, 2), 'utf8')
+  const fd = openSync(tmp, 'w', mode)
+  try {
+    let offset = 0
+    while (offset < payload.length) {
+      offset += writeSync(fd, payload, offset, payload.length - offset)
+    }
+    fsyncSync(fd)
+  } finally {
+    closeSync(fd)
+  }
+  renameSync(tmp, filePath)
 }
 
 export { existsSync }

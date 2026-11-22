@@ -88,7 +88,7 @@
 | 主动消息，平台 `proactive='none'` | 不调平台端，抛 `SendError('not-sent', code: 'proactive-not-allowed')`，不入队 |
 
 3. 失败分类（`SendError.certainty`）是防重复发送的根基，定义见类型注释。拿不准就是 `'unknown'`。**谁守：G2、F1；G1 的测试包对每个平台端都验这一条。**
-4. 补发队列只收 `'not-sent'`，且只收不含媒体的消息（沿用 `outbox.js` 现在的规则）。有效期按 `SendKind`。实例重新连上时网关自动补发这个实例名下的。**谁守：G1。**
+4. 补发队列只收 `'not-sent'` 中无媒体、无敏感标记的消息。有效期按 `SendKind`。实例重新连上时网关自动补发这个实例名下的。**谁守：G1。**
 5. 补发成功的消息要回到中枢留痕（流水、`sentIds`），这是 #327 的修法，在网关这一层一次解决。**谁守：G1 提供回调，G3 接上。**
 
 ## 八、能力表
@@ -102,6 +102,7 @@
    - 网关在调平台端之前检查：没有 `inResponseTo` 且 `proactive='none'` → 抛 `SendError('not-sent', code:'proactive-not-allowed')`；带了但已超过 `replyWindowMs` → 当主动消息处理，同样按 `proactive` 判断。**谁守：G1。**
    - `repliesPerMessage > 0` 时，网关把同一个 `inResponseTo` 下超出条数的文字合并进最后一条允许的消息里，不丢内容。**谁守：G1。**
    - 这类失败不进补发队列（过了时限补发也没用）。**谁守：G1。**
+   - 带 `replyGuard` 的共享回复使用原 `inResponseTo` 投递。网关在调用适配器前复核授权，回复窗口或额度失效时结束发送。内置适配器在每次分段发送、异步准备后继续发送及传输重试前复核授权。微信 ClawBot 按原消息和聊天匹配凭据。Bridge 在外部程序取到回复前复核，带守卫的回复仅在内存中等待。授权撤销后取消尚未交付的内容，已交给平台或 Bridge 客户端的内容按原发送语义结算。
    - 中枢要主动找人之前查 `gateway.routeTo(person)`，它已经排除了 `proactive='none'` 的平台；`limited` 的平台额度由平台端自己记，超了抛 `'not-sent'`。**谁守：G3。**
 5. 靠回调地址收事件的平台用 `ctx.route()` 挂路径。验签在平台端，验不过不 `emit`。**谁守：各平台端。**
 6. **L2 细粒度功能表（`Feature`，共 14 项）**：
@@ -145,6 +146,9 @@
    - 写一个平台端目录（`src/adapters/<id>/`），实现 `PlatformAdapter`。内置平台都这么做。
    - 平台模块：模块清单声明 `platform` 能力，在 `setup` 里 `gateway.register()`。两个以上内置端跑稳、契约定稿后开放。
    - 不写代码：让外部程序连「通用接入端」（F4），按一份简单的 JSON 协议收发。适合自建平台、脚本、临时接个什么东西。
+8. **默认 QQ 迁移令牌与端点继承。** `POST /platforms/qq-migration/start` 接收 `token`、`wsToken` 和 `httpToken`，既可放在请求顶层，也可放在 `platform` 中，以 `platform` 内显式提供的值为准。缺省、空串或空白字符串沿用现值，`null` 清除对应字段。清除某个独立端点令牌后，该端点仍可继承统一令牌。提供新的统一令牌时，只有同一请求中提供新值的独立端点令牌才继续覆盖它。目标 `wsUrl/httpUrl` 缺省时，按“已保存 `platforms.qq` → 旧版直连 `endpoint()`”回退；只有目标端点仍匹配旧版直连时，缺省令牌才自动沿用旧连接凭据。**谁守：U1、QQ 平台端。**
+9. **QQ 迁移停机。** 参与网关迁移的源和目标适配器必须提供 `stopAndWait` 和 `confirmStopped`，能力不足时拒绝分配迁移租约。`paused` 表示正式收发暂停，`pausePending` 表示还在等待关闭确认，`pauseHeld` 表示目标连接仍由迁移租约持有并等待交还。`stopAttemptSince` 是网关中未返回的适配器停止任务的开始时间，使用毫秒时间戳，无此任务时为 `null`。原停止任务一直未返回时，适配器可以独立确认旧连接已关闭且无法重连，网关据此完成原停止流程。**谁守：G1、U1、QQ 平台端。**
+10. **QQ 恢复请求的一次停机复查。** `/platforms/qq-migration/retry` 和 `/platforms/qq-migration/rollback` 接收 `retryStopPending: true`。若遇到停机尚未确认，宿主在同一请求内等待两秒，并在事务、配置修订、恢复门和数据代际仍匹配后复查一次。状态已变化时返回 `RECOVERY_STATE_CHANGED`。**谁守：U1。**
 
 ## 九、平台独有的本事
 

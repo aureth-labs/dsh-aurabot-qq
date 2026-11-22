@@ -185,6 +185,13 @@ cd dsh-aurabot-qq
 npm test        # 单元测试 + 假 DSH 宿主/模拟 OneBot 的端到端测试
 ```
 
+多平台私聊使用真实 DSH 验证分叉、归档、恢复和轮次校验。使用已安装测试依赖的目标 DSH 源码目录运行。发布支持共享私聊的版本前，运行 `test:release`，它要求真实宿主、类型检查和全量测试全部通过。
+
+```bash
+npm run test:host-compat -- "/path/to/deepseek-harness"
+npm run test:release -- "/path/to/deepseek-harness"
+```
+
 ```
 src/host.js            插件入口（宿主半边）：核心 + 面板接口 /aurabot/api/*
 src/core/modules.js    模块内核：加载、开关、替换、热重载、出错隔离

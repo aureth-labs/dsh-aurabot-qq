@@ -3,7 +3,7 @@
 //   发：DSH 会话一轮结束 → 取最终正文 → 拆条 / 语音 / 表情 → 发回原来的 QQ 会话
 // 每个 QQ 会话一个 DSH 会话，统一放在「Aurabot · QQ」工作区，主人可以在 DSH 侧栏点开看、插手。
 
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, renameSync, existsSync, readdirSync, rmSync, statSync, unlinkSync } from 'node:fs'
 import { basename, isAbsolute, join, relative, resolve } from 'node:path'
@@ -33,6 +33,7 @@ import { createFaces, textToSegments, stripFaceTags, splitSpeakable } from './fa
 import { expandMentions, hasMention } from './mentions.js'
 import { cleanContent, cleanText } from '../core/text.js'
 import { createRecentMedia } from './recent-media.js'
+import { verifyPersistedInboxMessage } from '../core/qq-gateway-migration.js'
 import { createTitleFilter } from './title-filter.js'
 import { takeInterim, reasoningOf, rescueFromThinking } from './steps.js'
 import { guardOutgoing, codeFenceInstruction } from './guard.js'
@@ -46,6 +47,10 @@ import { currentTimeLine } from './time-context.js'
 import { SESSION_BACKOFF, isSessionBackoff } from './session-backoff.js'
 import { recordUsage, moduleLabel, moduleOfTool } from '../core/usage.js'
 import { normalizeChatId, parseChatId, sameChat, formatChatId } from '../gateway/address.js'
+import { sessionRouteFor } from '../gateway/shared-private-route.js'
+import { createDedupe } from '../gateway/dedupe.js'
+import { createSharedPrivateSessions, selectSharedBase, sharedQuietHistory, sharedRetiredAuditPage, SHARED_MODES } from './shared-private-sessions.js'
+import { isSharedHostContext, registerSharedTurnGuard } from './shared-turn-guard.js'
 
 // QQ 会话的工作区目录，第一次收到消息时自动创建。面板「连接」页能改（config.workspaceDir，#32）；
 // 没填就用环境变量 AURABOT_WORKSPACE，再没有：老安装沿用 C:\Aurabot\qq-chats，新安装放在用户目录下（不用往 C 盘根目录写）
@@ -106,8 +111,12 @@ export function reallySent (r) {
   return id !== undefined && id !== null && id !== '' && !String(id).startsWith('sim-')
 }
 
-export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, buildTools, contextProviders, onActivity, memoryScore, onMemoryCommand, onCommand, isMuted, dislikes, random = Math.random, moodEffects, localApi, hooks, availableModels, toolsGeneration, capabilitiesOf, gateway: initialGateway = null, identity = null, handover = null, platformLabel: platformLabelInjected = null, routeOwner: routeOwnerInjected = null, resolveOwnerRoute: resolveOwnerRouteInjected = null, onOwnerAccountLinked = null }) {
+export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, buildTools, contextProviders, onActivity, memoryScore, onMemoryCommand, onCommand, isMuted, dislikes, random = Math.random, moodEffects, localApi, hooks, availableModels, toolsGeneration, capabilitiesOf, gateway: initialGateway = null, identity = null, handover = null, platformLabel: platformLabelInjected = null, routeOwner: routeOwnerInjected = null, resolveOwnerRoute: resolveOwnerRouteInjected = null, onOwnerAccountLinked = null, resolveSharedPrimary = null, isDefaultQqTransportPaused: isDefaultQqTransportPausedInjected = null }) {
   let gateway = initialGateway
+  let legacyTransportGeneration = 0
+  let defaultQqPaused = false
+  let defaultQqWork = 0
+  const isTransportPaused = () => Boolean(defaultQqPaused || (typeof isDefaultQqTransportPausedInjected === 'function' && isDefaultQqTransportPausedInjected()))
   const ownerRef = () => identity
   const ownerId = () => identity?.owner?.() || null
   const defaultPlatform = () => parseChatId('private:0')?.platform || ''
@@ -121,6 +130,48 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const addr = parseChatId(norm)
     if (!addr || addr.platform !== def) return false
     return !addr.instance || addr.instance === def
+  }
+  const isDefaultQqPaused = (chatId) => isTransportPaused() && Boolean(chatId) && isDefaultInstanceChat(chatId)
+
+  async function withDefaultQqWork(chatId, run, paused = () => null) {
+    if (!chatId || !isDefaultInstanceChat(chatId)) return run()
+    if (isTransportPaused()) return paused()
+    defaultQqWork++
+    try { return await run() } finally { defaultQqWork-- }
+  }
+
+  function trackQqSend(send) {
+    return (chatId, ...args) => withDefaultQqWork(chatId, () => send(chatId, ...args), () => settleOutboundFailed(args.at(-1)?.outboundVerdict))
+  }
+
+  function trackQqEvent(handle) {
+    return (event, ...args) => {
+      const scoped = event?.__gateway
+      const groupId = event?.group_id
+      const chatId = scoped?.chatId || event?.chatId || formatChatId({
+        instance: scoped?.instance || event?.instance || event?.platform || defaultPlatform(),
+        kind: groupId ? 'group' : 'private',
+        id: String(groupId || event?.user_id || '0'),
+      })
+      return withDefaultQqWork(chatId, () => handle(event, ...args))
+    }
+  }
+
+  function rejectPausedQq() {
+    throw Object.assign(new Error('默认 QQ 正在切换连接托管，暂时不可用'), { status: 503, code: 'qq-ownership-paused' })
+  }
+
+  // 长期持有的 QQ 辅助对象只能调用构造时所属的连接，切换后即使保留引用也会失效。
+  function scopedLegacyOnebot() {
+    const client = onebot
+    const generation = legacyTransportGeneration
+    if (typeof client?.call !== 'function') return null
+    return {
+      async call(...args) {
+        if (isTransportPaused() || generation !== legacyTransportGeneration) return rejectPausedQq()
+        return client.call(...args)
+      },
+    }
   }
   const platformLabelOf = (platform) => {
     if (typeof platformLabelInjected === 'function') {
@@ -194,6 +245,93 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   const mapFile = () => dataDir('sessions.json')
   const map = () => readJson(mapFile(), () => ({ chats: {} }))
   const saveMap = (m) => writeJson(mapFile(), m)
+  const sharedTurns = new Map()
+  const sharedListeners = []
+  const sharedSourceRevisions = new Map()
+  const sharedDedupe = createDedupe({ log })
+  const sharedManaged = new Set()
+  const sharedArchiveJobs = new Map()
+  const sharedLiveCheckpoints = new Map()
+  const sharedDeliveryFailures = new Map()
+  const legacyHistoryTickets = new Map()
+  let sharedAudit = { state: 'pending' }
+  let sharedAuditCursor = ''
+  const sharedAuditPriority = new Set()
+  let sharedAuditTimer
+  let sharedTail = Promise.resolve()
+  function indexSharedOwnership(data) {
+    sharedManaged.clear()
+    if (!data) return
+    for (const sid of Object.keys(data.retiredSessions)) sharedManaged.add(sessionKey(sid))
+    for (const mode of SHARED_MODES) {
+      for (const sid of [data.sessions[mode]?.sessionId, data.pendingOperations[mode]?.sessionId]) {
+        if (sid) sharedManaged.add(sessionKey(sid))
+      }
+    }
+  }
+  if (resolveSharedPrimary) indexSharedOwnership(map().multiPrivate)
+  const sharedSessions = createSharedPrivateSessions({
+    read: map, write: data => { saveMap(data); indexSharedOwnership(data.multiPrivate) }, log,
+    onRetired: sid => {
+      sharedLiveCheckpoints.delete(sid)
+      sharedDeliveryFailures.delete(sid)
+      sharedAuditPriority.add(sid)
+      queueMicrotask(() => { void archiveSharedRetired(sid) })
+    },
+    fork: async (sid, legacyPrefix) => {
+      if (!legacyPrefix) return controller().fork({ sessionId: sid })
+      let snapshot
+      try {
+        snapshot = await observeLegacyPrefix(sid, legacyPrefix.atSeq)
+      } catch (error) {
+        if (error?.code === 'SESSION_QUERY_SESSION_NOT_FOUND') {
+          throw Object.assign(new Error('旧主账号会话已删除'), { code: 'session/not-found' })
+        }
+        throw Object.assign(new Error('暂时无法读取旧主账号会话'), { code: 'shared/source-unavailable', cause: error })
+      }
+      if (!snapshot || snapshot.prefix.fingerprint !== legacyPrefix.fingerprint) {
+        throw Object.assign(new Error('已核对的历史片段已变化'), { code: 'shared/legacy-prefix-changed' })
+      }
+      return controller().fork({ sessionId: sid, atSeq: legacyPrefix.atSeq })
+    },
+    create: async (preset) => controller().create({ workspaceId: (await ensureWorkspace()).id, agentPreset: preset }),
+    recover: async (sid, workspaceId) => {
+      const registry = dsh.workspaceRegistry || dsh.get('workspaceRegistry')
+      const workspace = registry?.get?.(workspaceId)
+      if (!workspace?.attachSession) throw new Error('原工作区不可用')
+      if (!workspace.sessionIds.includes(sid)) await workspace.attachSession(sid)
+    },
+    rename: (sid, mode) => renameSessionTitle(sid, '多平台 · 主人私聊' + (mode === 'debug' ? '（调试）' : '')),
+    verifyCandidate: async (sid, { baseSessionId, legacyPrefix }) => {
+      const agent = await resolveAgent(sid)
+      await agent.whenIdle()
+      if (legacyPrefix) {
+        const count = legacyPrefix.atSeq + 1
+        if (agent.session.header.parentSession !== baseSessionId || agent.session.inheritedEventCount !== count
+          || historyFingerprint(agent.session.snapshotEvents().slice(0, count)) !== legacyPrefix.eventsFingerprint) return null
+      }
+      const point = sharedQuietHistory(agent.session)
+      return point && !agent.inbox.nextTurn.length && agent.inbox.nextStep.every(isSharedHostContext) ? { agent, ...point } : null
+    },
+    restore: async (branch) => {
+      let agent
+      try {
+        agent = await resolveAgent(branch.sessionId)
+      } catch (error) {
+        if (await sharedSessionDeleted(branch.sessionId)) throw Object.assign(new Error('共享会话已删除'), { code: 'shared/session-deleted' })
+        throw error
+      }
+      await agent.whenIdle()
+      const livePoint = sharedLiveCheckpoints.get(branch.sessionId)
+      const verifiedSeq = livePoint?.session === agent.session ? livePoint.seq : branch.verifiedThroughSeq
+      if (!sharedQuietHistory(agent.session, verifiedSeq)) {
+        throw Object.assign(new Error('共享会话有未核验的记录'), { code: 'shared/history-unverified' })
+      }
+      const registry = dsh.workspaceRegistry || dsh.get('workspaceRegistry')
+      if (registry?.archivedSessionIds.includes(branch.sessionId)) await registry.unarchiveSession(branch.sessionId)
+      return agent
+    },
+  })
   const memoryCutoffs = map().memoryCutoffs || {}
   const memoryResetAt = (qq) => Number(memoryCutoffs[qq]) || 0
   function chatMemoryCutoff(chatId, uid) {
@@ -297,19 +435,22 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   let friendsAt = 0
   let friendsPending = null
   function refreshFriends() {
-    if (typeof onebot?.call !== 'function') return Promise.resolve()
+    if (isTransportPaused() || typeof onebot?.call !== 'function') return Promise.resolve()
     if (friendsPending) return friendsPending
     if (Date.now() - friendsAt < 300_000) return Promise.resolve()
     friendsAt = Date.now()
-    friendsPending = (async () => {
+    const generation = legacyTransportGeneration
+    const client = onebot
+    const task = (async () => {
       try {
-        const result = await onebot.call('get_friend_list', {}, { timeoutMs: 3000, retries: 0 })
+        const result = await client.call('get_friend_list', {}, { timeoutMs: 3000, retries: 0 })
         const list = Array.isArray(result) ? result : result?.friends
-        if (!Array.isArray(list)) return
+        if (!Array.isArray(list) || generation !== legacyTransportGeneration) return
         friendIds.clear()
         for (const friend of list) if (friend?.user_id) friendIds.add(String(friend.user_id))
       } catch (error) { log.debug?.('暂时取不到 QQ 好友列表：', error.message) }
-    })().finally(() => { friendsPending = null })
+    })().finally(() => { if (friendsPending === task) friendsPending = null })
+    friendsPending = task
     return friendsPending
   }
   const VOICE_TTL = 30 * 60_000
@@ -430,7 +571,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     next.then(done, done)
     return next
   }
-  const faces = createFaces({ onebot, log }) // QQ 系统表情：<face:名字> ↔ 编号
+  let faces = createFaces({ onebot: scopedLegacyOnebot(), log }) // QQ 系统表情：<face:名字> ↔ 编号
   // 主动贴表情：看到消息就可能贴一个，跟「回不回复」无关——她可以只窥屏、不出声。
   // 概率跟 stickers.autoChance 同源（reactChance 留空即完全跟随），同样吃心情系数；
   // 每个会话每小时有上限（reactMaxPerHour），免得在热闹的群里变成刷屏。
@@ -487,7 +628,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       log.debug?.('贴表情失败：', error?.message || error)
     }
   }
-  const titleFilter = createTitleFilter({ getConfig, onebot, log }) // 勾选的群里，头衔是某个词的成员（别的机器人）不理
+  let titleFilter = createTitleFilter({ getConfig, onebot: scopedLegacyOnebot(), log }) // 勾选的群里，头衔是某个词的成员（别的机器人）不理
   const groupMembers = new Map() // groupId → { at, list }  群成员（真 @ 时按名字找人，缓存 10 分钟）
   const noticesFor = new Map() // chatId → [一句话]  下次交给她时带上的群事件（撤回、禁言、进群……）
   const saidElsewhere = new Map() // chatId → [{ at, text }]  别处安排她在这里发的话，下次这个聊天交给她时补进去
@@ -1045,6 +1186,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const systemPrefix = `${label} · `
     // 模块自带「QQ · 」前缀时不要再拼一层，否则工作区里会显示成「QQ · QQ · 主动搭话…」
     if (chat.kind === 'system') {
+      if (chat.titleMode === 'full') return String(chat.title || '后台')
       const t = cleanLegacyTitle(String(chat.title || '后台'), plat)
       return t.startsWith(systemPrefix) ? t : systemPrefix + t
     }
@@ -1076,7 +1218,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (forceDebug) mm.titleMigration = 1
     for (const [chatId, rec] of Object.entries(mm.chats || {})) {
       const platform = parseChatId(chatId)?.platform || defaultPlatform()
-      const base = cleanLegacyTitle(rec.title, platform)
+      const base = chatId === 'system:bili' && /^(?:QQ\s*[·・]\s*)+刷B站$/.test(rec.title || '')
+        ? 'B站 · 刷B站' : cleanLegacyTitle(rec.title, platform)
       const wasBad = Boolean(base && base !== rec.title)
       if (wasBad) {
         rec.title = base
@@ -1177,6 +1320,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   }
 
   async function createSessionNow(chat, level, turnToken) {
+    const privateOwner = chat.kind === 'private' && isOwnerPrivateChat(ownerRef(), chat.chatId)
+      ? { ownerPersonId: ownerId(), ownerAuthorizationRevision: ownerAuthorizationRevision(getConfig()) } : null
     const ws = await ensureWorkspace()
     const workspacePath = workspaceDirOf(getConfig())
     checkTurn(chat.chatId, turnToken)
@@ -1224,7 +1369,14 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       if (!sessions[prevMode]) sessions[prevMode] = prev.sessionId
     }
     sessions[mode] = sid
-    m.chats[chat.chatId] = { ...prev, sessionId: sid, mode, sessions, preset, level, createdAt: Date.now(), title }
+    const boundOwner = privateOwner && privateOwner.ownerPersonId === ownerId()
+      && privateOwner.ownerAuthorizationRevision === ownerAuthorizationRevision(getConfig()) && isOwnerPrivateChat(ownerRef(), chat.chatId)
+    const sessionOwners = { ...prev.sessionOwners }
+    sessionOwners[mode] = boundOwner ? { sessionId: sid, ...privateOwner } : { sessionId: sid, unverified: true }
+    m.chats[chat.chatId] = {
+      ...prev, sessionId: sid, mode, sessions, preset, level, createdAt: Date.now(), title,
+      ...(chat.kind === 'private' ? { sessionOwners } : {}),
+    }
     saveMap(m)
     log.info(`为 ${chat.chatId} 新建了 DSH 会话 ${sid.slice(-8)}（${preset}${debug ? '，调试' : ''}）`)
     return sid
@@ -1239,17 +1391,512 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     throw Object.assign(new Error(e?.message || '恢复会话失败'), { code: e?.code })
   }
 
+  function sharedOwns(sid) {
+    return sharedManaged.has(sessionKey(sid))
+  }
+
+  async function sharedSessionDeleted(sid) {
+    const query = dsh.get('sessionQuery')
+    if (!query?.observeSession) return false
+    try {
+      const observed = await query.observeSession(sid)
+      observed[Symbol.dispose]?.()
+      return false
+    } catch (error) {
+      if (error.code === 'SESSION_QUERY_SESSION_NOT_FOUND') return true
+      throw error
+    }
+  }
+
+  function archiveSharedRetired(sid) {
+    if (disposed) return Promise.resolve()
+    if (sharedArchiveJobs.has(sid)) return sharedArchiveJobs.get(sid)
+    const task = Promise.resolve().then(async () => {
+      if (disposed || !sharedSessions.read().retiredSessions[sid]) return
+      const registry = dsh.workspaceRegistry || dsh.get('workspaceRegistry')
+      if (!registry?.archiveSession) throw new Error('DSH 没有提供归档接口')
+      if (!registry.archivedSessionIds?.includes(sid)) await registry.archiveSession(sid)
+      if (Array.isArray(registry.archivedSessionIds) && !registry.archivedSessionIds.includes(sid)) {
+        throw new Error('DSH 尚未确认会话已归档')
+      }
+      if (!disposed) sharedSessions.markRetiredArchive(sid, 'archived')
+    }).catch(error => {
+      log.debug('共享退役会话归档失败：', error.message)
+      try {
+        if (!disposed) sharedSessions.markRetiredArchive(sid, 'failed')
+      } catch (saveError) {
+        log.warn('无法记录共享会话归档失败：', saveError.message)
+      }
+    }).finally(() => sharedArchiveJobs.delete(sid))
+    sharedArchiveJobs.set(sid, task)
+    return task
+  }
+
+  async function auditSharedRetired() {
+    if (disposed || sharedAudit.state === 'running') return
+    const { ids, nextCursor } = sharedRetiredAuditPage(sharedSessions.read().retiredSessions, sharedAuditCursor, sharedAuditPriority)
+    sharedAudit = { state: 'running' }
+    let failed = false
+    for (const id of ids) {
+      if (disposed) return
+      sharedAuditPriority.delete(id)
+      try {
+        if (await sharedSessionDeleted(id)) {
+          if (!disposed) sharedSessions.removeRetired(id)
+          continue
+        }
+        if (sharedSessions.read().retiredSessions[id]?.archiveState !== 'archived') await archiveSharedRetired(id)
+      } catch (error) {
+        failed = true
+        log.debug('共享退役会话对账失败：', error.message)
+      }
+    }
+    sharedAuditCursor = nextCursor
+    sharedAudit = { state: failed ? 'failed' : 'checked', at: Date.now() }
+  }
+
+  function sharedSupported() {
+    if (!sharedListeners.length) return false
+    try {
+      return typeof controller().fork === 'function' && typeof dsh.agents?.get === 'function'
+        && Boolean(dsh.get('sessionProjections'))
+    } catch { return false }
+  }
+
+  function sharedScope(primary = resolveSharedPrimary?.()) {
+    const cfg = getConfig()
+    const binding = primary?.ok ? primary.binding : null
+    const chat = binding ? chatFromId(binding.chatId) : null
+    const level = chat ? levelFor(cfg, chat, ownerRef()) : ''
+    return {
+      enabled: cfg.multiPlatformPrivateSession === true && Boolean(gateway) && sharedSupported(),
+      ownerPersonId: ownerId() || '', ownerAuthorizationRevision: ownerAuthorizationRevision(cfg),
+      binding, level, preset: chat ? presetForChat(chat, level) : '',
+      mode: cfg.debug ? 'debug' : 'live',
+    }
+  }
+
+  function sharedRouting(chat, ingress) {
+    if (!gateway || !ingress || !getConfig().multiPlatformPrivateSession || !sharedSupported()) return null
+    const primary = resolveSharedPrimary()
+    const route = sessionRouteFor(chat, { cfg: getConfig(), identity, primary, ingress })
+    if (route.kind !== 'multi-private') return null
+    const scope = sharedScope(primary)
+    return scope.ownerAuthorizationRevision ? scope : null
+  }
+
+  function sharedAuthorized(turn) {
+    if (disposed || turn.revoked || !sharedSenderCurrent(turn.task)) return false
+    return sharedSessions.read().sessions[turn.scope.mode].generation === turn.branch.generation
+  }
+
+  function sharedSenderCurrent(task) {
+    return task.scope.ownerPersonId === ownerId()
+      && task.scope.ownerAuthorizationRevision === ownerAuthorizationRevision(getConfig())
+      && identity?.lookup(task.ingress.platform, task.ingress.account) === task.scope.ownerPersonId
+      && task.sourceRevision === (sharedSourceRevisions.get(task.sourceKey) || 0)
+  }
+
+  function invalidateSharedSource(platform, account) {
+    const key = JSON.stringify([platform, account])
+    sharedSourceRevisions.set(key, (sharedSourceRevisions.get(key) || 0) + 1)
+    for (const [sid, failure] of sharedDeliveryFailures) {
+      if (failure.sourceKey === key) sharedDeliveryFailures.delete(sid)
+    }
+    const data = map()
+    let changed = false
+    for (const [chatId, entry] of Object.entries(data.chats)) {
+      const addr = parseChatId(chatId)
+      if (addr?.kind !== 'private' || addr.platform !== platform || addr.id !== account) continue
+      entry.sessionOwners = Object.fromEntries(SHARED_MODES.map(mode => [
+        mode, { sessionId: entry.sessions?.[mode] || ((entry.mode || 'live') === mode ? entry.sessionId : ''), unverified: true },
+      ]))
+      changed = true
+    }
+    if (changed) saveMap(data)
+    refreshSharedConfig()
+  }
+
+  function refreshSharedConfig() {
+    if (!resolveSharedPrimary || (!getConfig().multiPlatformPrivateSession && !map().multiPrivate)) return
+    sharedSessions.sync(sharedScope())
+    for (const turn of sharedTurns.values()) {
+      if (!sharedAuthorized(turn)) {
+        turn.revoked = true
+        turn.agent.cancel({ kind: 'user' })
+      }
+    }
+  }
+
+  function resetShared(modes = SHARED_MODES, policy) {
+    sharedSessions.reset(modes, policy)
+    for (const turn of sharedTurns.values()) {
+      if (!modes.includes(turn.scope.mode)) continue
+      turn.revoked = true
+      turn.agent.cancel({ kind: 'user' })
+    }
+  }
+
+  function historyFingerprint(value) {
+    // DSH reconstructs headers and events on cold reads, potentially with a
+    // different property order from the live log.
+    const canonical = JSON.stringify(value, (_key, data) => {
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return data
+      return Object.fromEntries(Object.keys(data).sort().map(key => [key, data[key]]))
+    })
+    return createHash('sha256').update(canonical).digest('hex')
+  }
+
+  async function observeLegacyPrefix(sessionId, atSeq) {
+    const query = dsh.get('sessionQuery')
+    if (!query?.observeSession) throw new Error('当前 DSH 无法读取旧会话')
+    const observation = await query.observeSession(sessionId)
+    try {
+      const completed = atSeq === undefined
+        ? observation.events.findLast(event => event.type === 'turn/end' && event.data?.reason?.kind === 'completed')
+        : observation.events[atSeq]
+      if (completed?.type !== 'turn/end' || completed.data?.reason?.kind !== 'completed') return null
+      const { header } = observation
+      if (header.id !== sessionId || header.origin || header.parentSession || !header.cwd || header.delegationDepth) return null
+      const eventsFingerprint = historyFingerprint(observation.events.slice(0, completed.seq + 1))
+      const fingerprint = historyFingerprint([{ ...header, delegationDepth: 0 }, eventsFingerprint])
+      return { prefix: { atSeq: completed.seq, fingerprint, eventsFingerprint }, header }
+    } finally { observation[Symbol.dispose]?.() }
+  }
+
+  function legacyHistorySource(mode, scope = { ...sharedScope(), mode }, data = map()) {
+    if (!scope.enabled || !scope.binding || !scope.ownerAuthorizationRevision) return null
+    const { legacy, legacyPrefix } = selectSharedBase(data.chats, scope)
+    if (!legacy || sharedOwns(legacy.sessionId)) return null
+    if (legacyPrefix && data.multiPrivate?.sessions[mode]?.emptyReason !== 'legacy-prefix-changed') return null
+    return { scope, legacy, legacyPrefix, routingRevision: data.multiPrivate?.routingRevision, cwd: workspaceDirOf(getConfig()) }
+  }
+
+  function sameLegacySource(first, second) {
+    return second && first.legacy.sessionId === second.legacy.sessionId && first.legacy.chatId === second.legacy.chatId
+      && first.scope.ownerPersonId === second.scope.ownerPersonId
+      && first.scope.ownerAuthorizationRevision === second.scope.ownerAuthorizationRevision
+      && first.scope.level === second.scope.level && first.scope.preset === second.scope.preset
+      && first.legacyPrefix?.fingerprint === second.legacyPrefix?.fingerprint
+      && first.routingRevision === second.routingRevision && first.cwd === second.cwd
+      && sameChat(first.scope.binding.chatId, second.scope.binding.chatId)
+  }
+
+  async function prepareLegacyHistory(mode) {
+    const target = legacyHistorySource(mode)
+    if (!target) return { ok: false, message: '没有可供核对的旧主账号会话' }
+    if (target.legacyPrefix) {
+      const previous = await observeLegacyPrefix(target.legacy.sessionId, target.legacyPrefix.atSeq)
+      if (previous?.prefix.fingerprint === target.legacyPrefix.fingerprint) {
+        return { ok: false, message: '此前核对的历史仍然有效，可以使用「重新继承主账号历史」' }
+      }
+    }
+    const snapshot = await observeLegacyPrefix(target.legacy.sessionId)
+    if (!snapshot || !sameLegacySource(target, legacyHistorySource(mode))
+      || (snapshot.header.agentPreset && snapshot.header.agentPreset !== target.scope.preset)) {
+      return { ok: false, message: '旧主账号会话不存在、没有完整轮次或已变化' }
+    }
+    const registry = dsh.workspaceRegistry || dsh.get('workspaceRegistry')
+    const normPath = path => process.platform === 'win32' ? resolve(path).toLowerCase() : resolve(path)
+    const expected = normPath(target.cwd)
+    const belongsToWorkspace = registry?.list?.().some(ws =>
+      normPath(ws.path) === expected && ws.sessionIds?.includes(target.legacy.sessionId))
+    if (!belongsToWorkspace && normPath(snapshot.header.cwd) !== expected) {
+      return { ok: false, message: '旧会话未关联到当前 Aurabot 工作区' }
+    }
+    const token = randomUUID()
+    legacyHistoryTickets.set(mode, { ...target, token, prefix: snapshot.prefix, expiresAt: Date.now() + 5 * 60_000 })
+    return {
+      ok: true, token, sessionId: target.legacy.sessionId,
+      title: target.legacy.title, atSeq: snapshot.prefix.atSeq,
+    }
+  }
+
+  async function confirmLegacyHistory(mode, token) {
+    const ticket = legacyHistoryTickets.get(mode)
+    if (!ticket || ticket.token !== token) return { ok: false, message: '旧历史核对已失效，请重新打开' }
+    legacyHistoryTickets.delete(mode)
+    if (ticket.expiresAt < Date.now() || !sameLegacySource(ticket, legacyHistorySource(mode))) {
+      return { ok: false, message: '旧会话或主人绑定已变化，请重新核对' }
+    }
+    const snapshot = await observeLegacyPrefix(ticket.legacy.sessionId, ticket.prefix.atSeq)
+    if (!snapshot || snapshot.prefix.fingerprint !== ticket.prefix.fingerprint || !sameLegacySource(ticket, legacyHistorySource(mode))) {
+      return { ok: false, message: '已核对的旧历史已变化，请重新核对' }
+    }
+    const data = map()
+    const entry = data.chats[ticket.legacy.chatId]
+    entry.sessionOwners = { ...entry.sessionOwners, [mode]: {
+      sessionId: ticket.legacy.sessionId, ownerPersonId: ticket.scope.ownerPersonId,
+      ownerAuthorizationRevision: ticket.scope.ownerAuthorizationRevision, legacyPrefix: ticket.prefix,
+    } }
+    saveMap(data)
+    resetShared([mode], 'inherit')
+    return { ok: true, message: '已登记核对结果，下一轮将继承这段旧历史' }
+  }
+
+  function sharedStatus(mode = getConfig().debug ? 'debug' : 'live') {
+    const primary = resolveSharedPrimary?.()
+    const reason = !gateway || primary?.reason === 'gateway-required' ? 'gateway-required'
+      : sharedSupported() ? primary?.reason : 'host-unavailable'
+    const available = !reason && primary?.ok && Boolean(ownerAuthorizationRevision(getConfig()))
+    const data = sharedSessions.read()
+    const scope = { ...sharedScope(primary), mode }
+    const snapshot = available ? map() : null
+    const review = snapshot && legacyHistorySource(mode, scope, snapshot)
+    const branch = data.sessions[mode]
+    const delivery = data.ownerAuthorizationRevision === scope.ownerAuthorizationRevision
+      ? sharedDeliveryFailures.get(branch.sessionId)?.status : undefined
+    return {
+      enabled: getConfig().multiPlatformPrivateSession === true, available: Boolean(available), mode,
+      binding: primary?.binding, reason,
+      state: data.pendingOperations[mode] ? 'pending-operation' : branch.state,
+      emptyReason: branch.emptyReason, pauseReason: branch.pauseReason,
+      lastDeliveryFailure: delivery,
+      legacyHistoryAvailable: Boolean(review),
+      legacyHistoryChanged: Boolean(review?.legacyPrefix),
+      sourceAuthorizationChanged: Boolean(snapshot
+        && selectSharedBase(snapshot.chats, scope).reason === 'source-authorization-changed'),
+      retiredCount: Object.keys(data.retiredSessions).length,
+      retiredArchivePending: Object.values(data.retiredSessions).filter(record => record.archiveState !== 'archived').length,
+      retiredAudit: sharedAudit,
+    }
+  }
+
+  function queueShared(task) {
+    if (!sharedDedupe.seen(task.ingress.instance, task.ingress.messageId)) return
+    task.sourceKey = JSON.stringify([task.ingress.platform, task.ingress.account])
+    task.sourceRevision = sharedSourceRevisions.get(task.sourceKey) || 0
+    const state = sharedSessions.sync(task.scope)
+    task.generation = state.sessions[task.scope.mode].generation
+    task.routingRevision = state.routingRevision
+    const job = sharedTail.then(async () => {
+      if (await runShared(task) === 'ordinary') return task.fallback(() => !disposed && sharedSenderCurrent(task)
+        && sharedSessions.read().sessions[task.scope.mode].generation === task.generation)
+    })
+    sharedTail = job.catch(error => log.warn('共享私聊失败：', error.message))
+    return job
+  }
+
+  async function runShared(task) {
+    const { chat, ingress, scope } = task
+    const canUseOrdinary = () => !disposed && sharedSenderCurrent(task)
+      && sharedSessions.read().sessions[scope.mode].generation === task.generation
+    if (!canUseOrdinary()) return
+    const latest = sharedRouting(chat, ingress)
+    if (!latest || latest.mode !== scope.mode || sharedSessions.read().routingRevision !== task.routingRevision) return 'ordinary'
+    const selected = await sharedSessions.ensure(latest)
+    if (!canUseOrdinary()) return
+    if (!selected.ok || sharedSessions.read().routingRevision !== task.routingRevision) return 'ordinary'
+    const { agent, branch } = selected
+    const key = sessionKey(branch.sessionId)
+    const turn = { task, scope: latest, branch, agent, calls: new Set(), send: Promise.resolve(), reply: { text: '' } }
+    sharedTurns.set(key, turn)
+    const isCurrent = () => sharedTurns.get(key) === turn && sharedAuthorized(turn) && !turn.blocked
+    const timeout = turnMaxMs()
+    let timer
+    try {
+      const primaryChat = chatFromId(latest.binding.chatId)
+      const target = await resolveTarget(primaryChat)
+      if (!isCurrent()) return
+      if (sharedSessions.read().routingRevision !== task.routingRevision) return 'ordinary'
+      if (target && !applyModel(agent, target)) return 'ordinary'
+      if (target) sessionTarget.set(key, target)
+      mount(agent, chat, latest.level, turn)
+      running.set(chat.chatId, key)
+      let content = task.content
+      if (hooks?.prompt) {
+        try {
+          const next = await hooks.prompt(content, { chat, sessionId: branch.sessionId, senderId: ingress.account, recentMessages: [] })
+          if (next === null) return
+          if (Array.isArray(next)) content = next
+        } catch (error) { log.warn('扩展模块改写共享私聊提示失败：', error.message) }
+      }
+      content = await dropUnseenImages(primaryChat, content, target)
+      if (!isCurrent()) return
+      const admitted = await admit(agent, cleanContent([...content, { type: 'text', text: currentTimeLine() }]))
+      if (!isCurrent()) return
+      if (sharedSessions.read().routingRevision !== task.routingRevision) return 'ordinary'
+      const previousSources = sourcesFor(chat.chatId)
+      const sources = { ...previousSources, system: new Map(previousSources.system), memory: [], context: '', userText: task.userText }
+      for (const block of admitted.filter(item => item.type === 'text')) {
+        for (const range of memoryPromptRanges(block.text, { toEndOfText: true })) sources.memory.push(block.text.slice(range.start, range.end))
+      }
+      const message = { id: randomUUID(), role: 'user', content: admitted, source: { kind: SOURCE_KIND, speaker: { role: 'owner', chat: 'private' } } }
+      turn.message = structuredClone(message)
+      turn.sources = sources
+      turnState.set(key, { lastTurn: -1, text: '', lastText: task.userText, senders: new Set([ingress.account]), platform: ingress.platform })
+      if (timeout) {
+        timer = setTimeout(() => {
+          turn.blocked = true
+          agent.cancel({ kind: 'user' })
+          sharedFailure(turn)
+        }, timeout)
+        timer.unref?.()
+      }
+      await withPromptCapture(sources, async () => {
+        agent.followup(message)
+        await agent.whenIdle()
+      })
+      clearTimeout(timer)
+      if (!turn.finished) {
+        turn.blocked = true
+        const pending = agent.inbox.nextTurn.find(item => item.id === message.id)
+        if (pending) agent.inbox.remove(message.id)
+        sharedFailure(turn)
+      }
+      if (turn.verifiedSeq !== undefined && sharedAuthorized(turn)) {
+        sharedLiveCheckpoints.set(branch.sessionId, { session: agent.session, seq: turn.verifiedSeq })
+        try {
+          if (await dsh.sessions?.flush?.(agent.session)) {
+            sharedSessions.checkpoint(latest.mode, branch.sessionId, branch.generation, turn.verifiedSeq)
+          }
+        } catch (error) { log.warn('共享会话检查点未持久化：', error.message) }
+      }
+      enqueueSharedOutput(turn, turn.finalText)
+      await turn.send
+    } catch (error) {
+      turn.blocked = true
+      if (turn.message) {
+        agent.cancel({ kind: 'user' })
+        await agent.whenIdle()
+      }
+      sharedFailure(turn)
+      await turn.send
+      log.warn('共享私聊轮次失败：', error.message)
+    } finally {
+      clearTimeout(timer)
+      stopTyping(key)
+      clearSlowNotices(key)
+      slowNoticeSent.delete(key)
+      turnState.delete(key)
+      if (running.get(chat.chatId) === key) running.delete(chat.chatId)
+      const rec = mounted.get(key)
+      if (rec) unmount(rec)
+      mounted.delete(key)
+      sharedTurns.delete(key)
+    }
+  }
+
+  function noteSharedDeliveryFailure(turn, kind, error) {
+    const reason = sharedDeliveryFailureReason(error)
+    if (sharedAuthorized(turn)) {
+      sharedDeliveryFailures.set(turn.branch.sessionId, {
+        sourceKey: turn.task.sourceKey,
+        status: { at: Date.now(), platform: turn.task.ingress.platform, kind, reason },
+      })
+    }
+    return `共享私聊投递异常（${kind}，${reason}）`
+  }
+
+  function sharedDeliveryFailureReason(error) {
+    if (error?.certainty === 'unknown') return 'uncertain'
+    if (error?.code === 'offline' || error?.code === 'not-connected') return 'offline'
+    if (error?.code === 'reply-window-expired' || error?.code === 'no-context-token') return 'reply-expired'
+    if (error?.code === 'reply-limit') return 'reply-limit'
+    if (error?.code === 'reply-revoked') return 'revoked'
+    return 'send-failed'
+  }
+
+  function sharedFailure(turn) {
+    if (turn.failureSent || !sharedAuthorized(turn)) return
+    turn.failureSent = true
+    const { chat, ingress } = turn.task
+    turn.send = turn.send.then(() => sendText(chat.chatId, '当前共享会话未能完成这次回复，请重新发送这条消息。', undefined, [], undefined, {
+      inResponseTo: ingress.messageId, isCurrent: () => sharedAuthorized(turn), sharedReply: true, sensitive: true,
+      quiet: true, onSharedDeliveryError: error => noteSharedDeliveryFailure(turn, 'failure-notice', error),
+    })).catch(error => log.warn('共享私聊失败回执发送失败：', sharedDeliveryFailureReason(error)))
+  }
+
+  function enqueueSharedOutput(turn, text, interim = false) {
+    if (!text || turn.blocked) return
+    const { chat, ingress, wantVoice, userText } = turn.task
+    const isCurrent = () => !turn.blocked && sharedAuthorized(turn)
+    turn.send = turn.send.then(() => isCurrent() && withPromptCapture(turn.sources, () => deliver(chat.chatId, text, {
+      interim, wantVoice, userText, own: true, shared: {
+        messageId: ingress.messageId, isCurrent,
+        onDeliveryError: error => noteSharedDeliveryFailure(turn, 'reply', error),
+      },
+    }))).catch(error => log.warn('共享私聊回复发送失败：', sharedDeliveryFailureReason(error)))
+  }
+
+  function onSharedSessionEvent(key, event) {
+    const turn = sharedTurns.get(key)
+    const data = event?.data
+    if (!turn || turn.dshTurn === undefined || data?.turn !== turn.dshTurn || !sharedAuthorized(turn)) return
+    if (event.type === 'turn/end') {
+      turn.finished = true
+      if (turn.admitted) turn.verifiedSeq = event.seq
+      if (data.reason?.kind !== 'completed' || !turn.admitted || turn.blocked) {
+        turn.blocked = true
+        sharedFailure(turn)
+        return
+      }
+      let text = turn.reply.text
+      if (text && getConfig().chat?.replyMarker?.enabled) {
+        const marked = extractMarkedReply(text)
+        if (!marked.found) return sharedFailure(turn)
+        text = stripMarkers(marked.text)
+      }
+      turn.finalText = text
+      return
+    }
+    if (!turn.admitted || turn.blocked) return
+    if (event.type === 'tool/call') {
+      const id = data.callId ?? data.id
+      if (id) turn.calls.add(id)
+      turn.lastTool = data.name
+    }
+    if (event.type === 'assistant/message' && !data.interrupted) {
+      if (data.usage) {
+        const target = sessionTarget.get(key)
+        const chatId = turn.task.chat.chatId
+        try {
+          recordUsage({
+            module: (turn.lastTool && moduleOfTool(turn.lastTool)) || moduleLabel(chatId),
+            chat: chatId, provider: target?.provider || '', model: target?.model || '', usage: data.usage, at: event.time,
+          })
+        } catch (error) { log.debug('共享会话用量记录失败：', error.message) }
+        turn.lastTool = null
+      }
+      const text = assistantReplyText(data.message)
+      const st = turnState.get(key)
+      if (st) st.text = text
+      if (getConfig().chat?.everyStep && text) {
+        const previous = takeInterim(turn.reply, { turn: data.turn, step: data.step, text })
+        enqueueSharedOutput(turn, previous, true)
+      }
+      turn.reply.text = text || (getConfig().chat?.everyStep ? turn.reply.text : '')
+    }
+  }
+
+  /**
+   * 默认 QQ 的会话键：旧版裸键 private:/group: 与网关规范键 qq:private:/qq:group: 视为同一间房。
+   * 旧键存在时优先复用旧键（迁移后能接回原会话）；没有旧键才用当前传入形式。
+   */
+  function sessionStorageKey(chatId) {
+    const raw = String(chatId || '')
+    const norm = normalizeChatId(raw)
+    const addr = norm ? parseChatId(norm) : null
+    if (!addr || addr.platform !== defaultPlatform() || addr.instance !== defaultPlatform()) return raw
+    const legacy = `${addr.kind}:${addr.id}`
+    const chats = map().chats
+    if (chats[legacy]) return legacy
+    if (chats[norm]) return norm
+    return raw
+  }
+
   /** 拿到这个 QQ 会话对应的活 agent（没有就建，权限档位变了就换新会话）。 */
   async function agentFor(chat, turnToken, assertMemoryCurrent) {
     checkTurn(chat.chatId, turnToken)
-    const failure = sessionFailure(chat.chatId)
-    if (failure && Date.now() < failure.until) throw backoffError(chat.chatId, failure)
+    const storageKey = sessionStorageKey(chat.chatId)
+    const failure = sessionFailure(storageKey)
+    if (failure && Date.now() < failure.until) throw backoffError(storageKey, failure)
     const cfg = getConfig()
     // 后台会话默认 social（没工具）；要「主人私聊」那档（完整权限 + 她本人预设）时显式传 level: 'full'
     const level = chat.kind === 'system' ? (chat.level || (chat.noTools ? 'chat' : 'social')) : levelFor(cfg, chat, ownerRef())
     // 复用键是 entry.preset（resolved 后的值）：presetId 变了 preset 就变，自然触发一次重建（预期行为）
     const preset = presetForChat(chat, level)
-    const entry = map().chats[chat.chatId]
+    const entry = map().chats[storageKey]
     // 调试和正式用不同的会话：不然切回正式时，调试期间那些对话还在上下文里，等于被她“记住”了。
     const mode = cfg.debug ? 'debug' : 'live'
     const sameLevel = Boolean(entry && entry.preset === preset && entry.level === level)
@@ -1296,7 +1943,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     // 切回某个模式时也要把「当前会话」写回映射，否则投递守卫会把它当旧会话
     if (sid) {
       const mm = map()
-      const rec = mm.chats[chat.chatId] || {}
+      const rec = mm.chats[storageKey] || {}
       const baseTitle = titleFor(chat)
       const wantedTitle = titleForMode(chat, mode)
       // 旧版本把 system 标题重复拼过平台前缀，或把非 QQ 会话标成「QQ · …」；
@@ -1316,7 +1963,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
           log.debug(`会话 ${sid.slice(-8)} 改标题失败：${error.message}`)
         }
       }
-      mm.chats[chat.chatId] = {
+      mm.chats[storageKey] = {
         ...rec,
         sessionId: sid,
         mode,
@@ -1334,18 +1981,18 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     assertMemoryCurrent?.()
     const want = keyOf(target)
     const m = map()
-    if (want && m.chats[chat.chatId]) {
+    if (want && m.chats[storageKey]) {
       applyModel(agent, target)
-      if (m.chats[chat.chatId].model !== want) {
-        m.chats[chat.chatId].model = want
+      if (m.chats[storageKey].model !== want) {
+        m.chats[storageKey].model = want
         saveMap(m)
-        log.info(`${chat.chatId} 的模型切到 ${want}`)
+        log.info(`${storageKey} 的模型切到 ${want}`)
       }
     }
-    sessionToChat.set(sessionKey(sid), chat.chatId)
+    sessionToChat.set(sessionKey(sid), storageKey)
     if (target) sessionTarget.set(sessionKey(sid), { provider: target.provider, model: target.model })
     mount(agent, chat, level)
-    sessionFailures.delete(chat.chatId)
+    sessionFailures.delete(storageKey)
     return { agent, sessionId: sid, level }
   }
 
@@ -1421,20 +2068,21 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
    * 慢工具提示是她提前说的一句话，不是普通 sendText：要走和最终回复一样的解析，
    * 这样 <sticker:…> 会真的发表情，不会把标签原样发到 QQ。
    */
-  async function sendSlowNotice(chatId, text, isCurrent) {
+  async function sendSlowNotice(chatId, text, isCurrent, inResponseTo) {
     const parsed = parseReply(text, cleaningFor(chatId))
     if (parsed.silent) return
+    const options = { isCurrent, inResponseTo, sharedReply: Boolean(inResponseTo), sensitive: Boolean(inResponseTo) }
     for (const item of parsed.items) {
       if (!isCurrent()) return
       if (item.kind === 'text') {
-        await sendText(chatId, item.value, undefined, [], undefined, { isCurrent })
+        await sendText(chatId, item.value, undefined, [], undefined, options)
       } else if (item.kind === 'sticker') {
-        await sendSticker(chatId, item.value)
+        await sendSticker(chatId, item.value, undefined, undefined, options)
       }
     }
   }
 
-  function mount(agent, chat, level) {
+  function mount(agent, chat, level, shared = null) {
     assertActive()
     const sid = sessionKey(agent.session?.id ?? agent.id)
     const tools = level !== 'chat' && typeof buildTools === 'function' ? buildTools({ chat, level, sessionId: sid }) : []
@@ -1468,7 +2116,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
               ...base,
               async execute(args, exec) {
                 let fired = false
-                const isCurrent = () => !disposed && running.has(chat.chatId)
+                const isCurrent = shared
+                  ? () => sharedTurns.get(sid) === shared && sharedAuthorized(shared) && !shared.blocked && !shared.finished
+                  : () => !disposed && running.has(chat.chatId)
                 const timer = setTimeout(() => {
                   slowTimers.delete(timer)
                   if (fired) return
@@ -1480,7 +2130,10 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
                   if (!said) return
                   slowNoticeSent.add(sid)
                   if (!fixedNotice && state) { state.toolText = ''; state.text = '' } // 已经提前发了，turn/end 不再重复
-                  sendSlowNotice(chat.chatId, said, isCurrent).catch((error) => log.debug('慢工具提示没发出去：', error.message))
+                  if (shared) {
+                    shared.send = shared.send.then(() => sendSlowNotice(chat.chatId, said, isCurrent, shared.task.ingress.messageId))
+                      .catch((error) => log.debug('慢工具提示没发出去：', error.message))
+                  } else sendSlowNotice(chat.chatId, said, isCurrent).catch((error) => log.debug('慢工具提示没发出去：', error.message))
                 }, 1500)
                 slowTimers.set(timer, sid)
                 timer.unref?.()
@@ -1555,14 +2208,29 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
 
   // quiet：这一条是额外的（比如语音后面补发的表情），失败了不算到这一轮头上（deliver 按 failStore 里的条数判断整条有没有发出去）。
   // queueKind / queueTtlMs：网关短暂不可达时，确定没发出去的消息进入本地补发队列。
+  function sharedSendOptions(chatId, opts) {
+    const output = outputScope.getStore()
+    if (output?.shared && sameChat(output.chatId, chatId)) {
+      const originalCheck = opts.isCurrent
+      return {
+        ...opts, sharedReply: true, sensitive: true, inResponseTo: output.shared.messageId,
+        isCurrent: () => output.shared.isCurrent() && (!originalCheck || originalCheck()),
+        onSharedDeliveryError: output.shared.onDeliveryError,
+      }
+    }
+    return opts
+  }
+
   async function sendSegments(chatId, message, note, opts = {}) {
-    const { force = false, isCurrent = null, throwOnError = false, timeoutMs, quiet = false, queueKind = 'reply', queueTtlMs, sensitive = false, proactive = false, inResponseTo = '' } = opts
+    if (isDefaultQqPaused(chatId)) return settleOutboundFailed(opts.outboundVerdict)
+    opts = sharedSendOptions(chatId, opts)
+    const { force = false, isCurrent = null, throwOnError = false, timeoutMs, quiet = false, queueKind = 'reply', queueTtlMs, sensitive = false, sharedReply = false, proactive = false, inResponseTo = '' } = opts
     const caps = gateway?.caps?.(chatId) || null
     const lastIn = lastInbound.get(chatId)
     const responseTo = inResponseTo || (!proactive && lastIn
       && (!caps?.replyWindowMs || Date.now() - lastIn.at < caps.replyWindowMs) ? lastIn.id : '')
     if (proactive && caps?.proactive === 'none') return null
-    if (disposed) return null
+    if (disposed || (sharedReply && (!gateway || !inResponseTo || !isCurrent))) return null
     // 出口层第二道保险：模块直接调 scopedHub.sendSegments/sendImage/sendFile/sendFile 时也要过门闸。
     // 只认带 sourceModule（模块发起）或 enginePolicy（引擎路径）的请求；hub 内部发送不带这两个标记，行为不变。
     // outboundVerdict：逻辑入口（sendText / deliver）已经判过了，这里不重复判，但由真实出口处结算。
@@ -1599,7 +2267,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     }
     // 钩子可能重新写入工具标记；最终网关出口仍使用同一份清洗。
     message = cleanOutboundSegments(message, cleaning)
-    if (!message.length || disposed || (isCurrent && !isCurrent())) return settleOutboundFailed(verdict)
+    if (!message.length || disposed || isDefaultQqPaused(chatId) || (isCurrent && !isCurrent())) return settleOutboundFailed(verdict)
     const cap = captureStore.getStore()
     if (cap) {
       cap.push({ chatId, note, message })
@@ -1621,7 +2289,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const params = tgt.kind === 'group' ? { group_id: Number(tgt.id), message } : { user_id: Number(tgt.id), ...(sourceGroupId ? { group_id: Number(sourceGroupId) } : {}), message }
     const normSegId = normalizeChatId(chatId) || String(chatId || '')
     const addrSeg = normSegId ? parseChatId(normSegId) : null
-    const useGatewaySeg = Boolean(gateway && (addrSeg?.platform !== defaultPlatform() || gateway.caps?.(normSegId) !== null || !onebot))
+    const isDefaultQq = isDefaultInstanceChat(normSegId)
+    const useGatewaySeg = Boolean(gateway && (sharedReply || !isDefaultQq || gateway.caps?.(normSegId) !== null || !onebot))
     // G3：有网关且由网关托管该实例时走网关（多平台、降级、补发队列统一处理）；
     // 宿主直连 OneBot 托管 qq 或无网关时保留原直连路径——见包-G3「只搬不改」。
     if (useGatewaySeg) {
@@ -1658,7 +2327,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
           sensitive: Boolean(sensitive),
           inResponseTo: responseTo,
           timeoutMs,
-        })
+        }, sharedReply ? { replyGuard: isCurrent } : undefined)
         if (sent?.messageId && !sent?.queued) {
           addSentId(normSegId, sent.messageId)
           rememberRecentMessage({ chatId: normSegId, messageId: sent.messageId, at: Date.now(), sender: { account: selfAccountFor(normSegId), isBot: true }, parts })
@@ -1673,15 +2342,21 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       } catch (error) {
         // 入队/补发已经由网关负责，这里不再自己入队（避免重复补发）
         bump('errors')
-        const detail = sensitive ? '敏感命令回执发送失败' : error.message
+        const detail = (sharedReply && opts.onSharedDeliveryError?.(error)) || (sensitive ? '敏感命令回执发送失败' : error.message)
         log.warn(`发到 ${chatId} 失败（网关）：`, detail)
         settleOutbound(verdict, 'failed')
         if (throwOnError || !quiet) throw error
         return null
       }
     }
+    if (!onebot || (addrSeg?.platform === defaultPlatform() && !isDefaultQq) || (gateway && !isDefaultQq)) {
+      return settleOutboundFailed(verdict)
+    }
+    const client = onebot
+    const queue = outbox
+    const generation = legacyTransportGeneration
     try {
-      const r = await onebot.call(action, params, timeoutMs ? { timeoutMs } : undefined)
+      const r = await client.call(action, params, timeoutMs ? { timeoutMs } : undefined)
       if (r && r.message_id !== undefined) {
         addSentId(normSegId || chatId, r.message_id)
         const { parts: sentParts } = segmentsToGatewayParts(message)
@@ -1697,8 +2372,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     } catch (error) {
       // 网关预热/短暂不可达：确定没发出去的消息放进补发队列，连上后按 TTL 补发。
       // 超时（uncertain）不入队，避免同一条消息发两次。
-      if (!sensitive && outbox && isDefiniteFailure(error)) {
-        const q = outbox.add({ action, params, chatId, note, kind: queueKind, ttlMs: queueTtlMs })
+      if (!sensitive && queue && generation === legacyTransportGeneration && !isDefaultQqPaused(chatId) && isDefiniteFailure(error)) {
+        const q = queue.add({ action, params, chatId, note, kind: queueKind, ttlMs: queueTtlMs })
         if (q.ok) {
           log.warn(`发到 ${chatId} 时网关还没就绪，已排队补发：${note || error.message}`)
           return { queued: true, queuedId: q.id }
@@ -1824,8 +2499,10 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
    * 统一多平台出站发送：接收平台无关的 Part[]，经清洗与门闸后经 gateway.send（无网关时对默认平台退回 sendSegments）。
    */
   async function sendParts(chatId, parts, opts = {}) {
-    const { force = false, isCurrent = null, throwOnError = false, timeoutMs, quiet = false, queueKind = 'reply', queueTtlMs, sensitive = false, note = '', replyTo, inResponseTo, replyId } = opts
-    if (disposed) return null
+    if (isDefaultQqPaused(chatId)) return settleOutboundFailed(opts.outboundVerdict)
+    opts = sharedSendOptions(chatId, opts)
+    const { force = false, isCurrent = null, throwOnError = false, timeoutMs, quiet = false, queueKind = 'reply', queueTtlMs, sensitive = false, sharedReply = false, note = '', replyTo, inResponseTo, replyId } = opts
+    if (disposed || (sharedReply && (!gateway || !inResponseTo || !isCurrent))) return null
     let verdict = opts.outboundVerdict || null
     if (wantsOutbound(opts)) {
       verdict = passOutbound({ chatId, note, sourceModule: opts.sourceModule, enginePolicy: opts.enginePolicy, cause: opts.cause, itemId: opts.itemId, kind: 'segments' })
@@ -1850,8 +2527,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       }
     }
     if (!cleaned.length || disposed || (isCurrent && !isCurrent())) return settleOutboundFailed(verdict)
-    const defaultPlatform = parseChatId('private:0')?.platform
-    const useGateway = Boolean(gateway && (addr.platform !== defaultPlatform || gateway.caps?.(normId) !== null || !onebot))
+    const useGateway = Boolean(gateway && (sharedReply || !isDefaultInstanceChat(normId) || gateway.caps?.(normId) !== null || !onebot))
     if (!useGateway) {
       const segs = partsToSegmentsFallback(cleaned, { faceIdOf: faces?.idOf })
       if (!segs.length) return settleOutboundFailed(verdict)
@@ -1887,7 +2563,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         force: Boolean(force),
         sensitive: Boolean(sensitive),
         timeoutMs,
-      })
+      }, sharedReply ? { replyGuard: isCurrent } : undefined)
       if (sent?.messageId && !sent?.queued) {
         addSentId(normId, sent.messageId)
         rememberRecentMessage({ chatId: normId, messageId: sent.messageId, at: Date.now(), sender: { account: selfAccountFor(normId), isBot: true }, parts: cleaned })
@@ -1900,7 +2576,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       return { messageId: sent?.messageId ?? '', message_id: sent?.messageId ?? '', degraded: sent?.degraded }
     } catch (error) {
       bump('errors')
-      const detail = sensitive ? '敏感命令回执发送失败' : error.message
+      const detail = (sharedReply && opts.onSharedDeliveryError?.(error)) || (sensitive ? '敏感命令回执发送失败' : error.message)
       log.warn(`发到 ${normId} 失败（网关）：`, detail)
       settleOutbound(verdict, 'failed')
       if (throwOnError || !quiet) throw error
@@ -2021,6 +2697,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
    * 戳一戳也不产生消息、不占发言额度，硬塞进治理只会让「回敬一下」也被拦，反而伤手感。
    */
   async function pokeBack(chatId) {
+    if (isDefaultQqPaused(chatId)) return
     const cfg = getConfig()
     const norm = normalizeChatId(chatId) || String(chatId || '')
     const addr = parseChatId(norm)
@@ -2101,7 +2778,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
 
   /** 发送文件：走网关统一 file Part（多平台）或默认协议原生上传。file 可以是本机绝对路径、网址或 base64://。 */
   async function sendFile(chatId, file, name) {
-    if (disposed) return null
+    if (disposed || isDefaultQqPaused(chatId)) return null
     const cfg = getConfig()
     const normId = normalizeChatId(chatId) || String(chatId || '')
     const addr = parseChatId(normId)
@@ -2144,14 +2821,16 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       ? { group_id: Number(tgt.id), file: src, name: label }
       : { user_id: Number(tgt.id), file: src, name: label }
     const srcLabel = external ? (src.startsWith('base64://') ? 'base64' : '外部地址') : size < 1024 ? size + ' B' : Math.round(size / 1024) + ' KB'
+    const client = onebot
+    const generation = legacyTransportGeneration
     try {
-      const r = await onebot.call(action, params, { timeoutMs: FILE_TIMEOUT_MS })
+      const r = await client.call(action, params, { timeoutMs: FILE_TIMEOUT_MS })
       if (disposed) return null
       bump('sent')
       log.info(`${chatId}：发文件「${label}」（${srcLabel}）`)
       return r
     } catch (error) {
-      if (disposed) return null
+      if (disposed || isTransportPaused() || generation !== legacyTransportGeneration) return null
       // 只有明确失败时才回落：超时或断线可能已经发出，再发会重复。
       const canRetryBase64 = isDefiniteFailure(error) && !external && size <= Math.min(FILE_BASE64_MAX, maxBytes)
       if (!canRetryBase64) {
@@ -2161,7 +2840,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       }
       try {
         const b64 = 'base64://' + readFileSync(src).toString('base64')
-        const r = await onebot.call(action, { ...params, file: b64 }, { timeoutMs: FILE_TIMEOUT_MS })
+        const r = await client.call(action, { ...params, file: b64 }, { timeoutMs: FILE_TIMEOUT_MS })
         if (disposed) return null
         bump('sent')
         log.info(`${chatId}：发文件「${label}」（网关看不到本机路径，改走 base64）`)
@@ -2211,6 +2890,10 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         note: `[表情] ${item.name || item.md5.slice(0, 8)}`,
         throwOnError: Boolean(opts.throwOnError),
         quiet: Boolean(opts.quiet),
+        isCurrent: opts.isCurrent,
+        inResponseTo: opts.inResponseTo,
+        sensitive: opts.sensitive,
+        sharedReply: opts.sharedReply,
       })
       if (!r || (Array.isArray(r.degraded) && r.degraded.includes('sticker dropped'))) return false
       stickers.markUsed?.(item.md5)
@@ -2321,7 +3004,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const active = currentPromptSources()
     const current = active || outputSources.get(chatId)
     const sources = current && { ...current, system: new Map(current.system), memory: [...current.memory] }
-    return outputScope.run({ chatId, sources, sent: 0, blocked: false, allowPromptEcho: false }, () => deliverWithEnginePolicy(chatId, text, opts))
+    return outputScope.run({ chatId, sources, sent: 0, blocked: false, allowPromptEcho: false, shared: opts.shared }, () => deliverWithEnginePolicy(chatId, text, opts))
   }
 
   /**
@@ -2446,7 +3129,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const sentTexts = [] // 实际成功发出的文字/语音正文：桥接与返回值只认这些，没发出去的话不能算说过
     await failStore.run(failures, async () => {
       for (let i = 0; i < items.length; i++) {
-        if (disposed) return
+        if (disposed || (opts.shared && !opts.shared.isCurrent())) return
         const it = items[i]
         const selected = it.replyTo ? refs[it.replyTo] : (!explicit && i === firstSendable ? opts.autoReply : null)
         const replyId = selected?.mid
@@ -2473,7 +3156,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         if (i < items.length - 1 && !opts.simulate) await pause(bubbleDelay(items[i + 1].kind === 'text' ? items[i + 1].value : '') * mood().delay)
       }
     })
-    if (disposed) return
+    if (disposed || (opts.shared && !opts.shared.isCurrent())) return
     if (outputScope.getStore().blocked && !outputScope.getStore().sent) return silenceTurn(chatId)
     if (opts.simulate) return items
     // 一条都没发出去：不记流水，她没说出口的话不能算说过
@@ -2508,6 +3191,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
 
   function onSessionEvent(session, event) {
     const key = sessionKey(session && session.id)
+    if (sharedOwns(session?.id)) return onSharedSessionEvent(key, event)
     // 回合结束时内存映射可能已空（刚重启），退回持久化的映射，别把这一轮丢了（#159）。
     // 中间段也一样要兜底：重启后第一段正文可能早于 turn/end 到达，拿不到 chatId 就整段丢了。
     const chatId = sessionToChat.get(key) || chatOfSession(key)
@@ -3585,8 +4269,11 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   }
 
   /** G3/F2：网关入站（与 onMessage 并列的入口；走同一套后续逻辑） */
-  async function onGatewayMessage(m) {
-    if (disposed || !m) return
+  async function onGatewayMessage(m, opts = {}) {
+    if (disposed || !m) {
+      await opts.migrationReceipt?.onVerified?.({ status: 'filtered', reason: 'disposed-or-empty' })
+      return
+    }
     try { gateway?.noteSeen?.(m.sender.person, m.chatId, Number(m.at) || Date.now()) } catch {}
     if (m.chat?.kind === 'group' && m.chat?.title && m.chatId) {
       const title = String(m.chat.title).trim()
@@ -3608,6 +4295,12 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       })
     }
     const event = inboundToOneBotEvent(m)
+    const ingress = m.sender?.account && m.messageId && m.sender?.isOwner ? {
+      chatId: m.chatId, platform: m.platform, instance: m.instance, account: String(m.sender.account), messageId: String(m.messageId),
+    } : null
+    if (sharedRouting({ chatId: m.chatId }, ingress)) {
+      return onMessage(event, { ingress, deferredHandover: true, ...opts })
+    }
     // F2：新平台第一次私聊，带一段从别处来的交接摘要（只对主人、只做一次）。
     if (handover && m.chat?.kind === 'private' && m.platform && m.platform !== defaultPlatform()) {
       try {
@@ -3615,11 +4308,16 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         if (context) event.message = [{ type: 'text', data: { text: context } }, ...event.message]
       } catch (error) { log.warn('生成交接摘要失败：', error.message) }
     }
-    return onMessage(event)
+    return onMessage(event, opts)
   }
 
-  async function onMessage(event) {
-    if (disposed) return
+  async function onMessage(event, { ingress = null, deferredHandover = false, migrationReceipt = null, allowPausedReplay = false } = {}) {
+    const settleFiltered = async (reason) => {
+      if (migrationReceipt?.onVerified) {
+        await migrationReceipt.onVerified({ status: 'filtered', reason })
+      }
+    }
+    if (disposed) return settleFiltered('disposed')
     const gw = event.__gateway
     const msgPlatform = gw?.platform || defaultPlatform()
     const rawCid = gw?.chatId || (event.message_type === 'group' ? `group:${event.group_id}` : `private:${event.user_id}`)
@@ -3644,8 +4342,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       msg.sender = { ...(msg.sender || {}), person: gw.person, isOwner: gw.isOwner }
     }
     // F2：收不到群里非 @ 消息的平台，只处理被叫到的消息，不建立群缓冲和群记忆。
-    if (msg.kind === 'group' && gateway?.caps?.(msg.chatId)?.listenAllInGroup === false && !msg.mentionedMe) return
-    if (parseSelf && msg.userId === parseSelf) return
+    if (msg.kind === 'group' && gateway?.caps?.(msg.chatId)?.listenAllInGroup === false && !msg.mentionedMe) return settleFiltered('group-not-mentioned')
+    if (parseSelf && msg.userId === parseSelf) return settleFiltered('self-echo')
     if (!gw && msg.messageId && msg.messageId !== '0') {
       const { parts: inParts } = segmentsToGatewayParts(segmentsOf(event))
       rememberRecentMessage({
@@ -3665,8 +4363,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const fromOwner = Boolean(onCommand && msgIsOwner)
     const ownerRevision = fromOwner ? revisionOf(cfg) : ''
     // 按群头衔过滤：这条当没看见（不进群聊上下文、不触发回复，@ 她、主人命令也一样）
-    if (msg.kind === 'group' && await titleFilter.shouldIgnore(event)) return
-    if (disposed || wasCleared()) return
+    if (msg.kind === 'group' && await titleFilter.shouldIgnore(event)) return settleFiltered('title-filtered')
+    if (disposed || wasCleared()) return settleFiltered('disposed-or-cleared')
     bump('received')
 
     // 群里的每条消息都记进缓冲（给上下文和「群里在不在聊」用）
@@ -3680,7 +4378,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       groupBuf.set(msg.groupId, buf)
     }
 
-    if (await handleBindCodeCommand(msg)) return
+    if (await handleBindCodeCommand(msg)) return settleFiltered('bind-code-command')
 
     const allowed = checkAllowed(cfg, msg, ownerRef())
     if (msg.kind === 'private' && (allowed.allowed || event.sub_type === 'friend')) {
@@ -3713,7 +4411,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     }
     if (!allowed.allowed) {
       log.debug(`忽略 ${msg.chatId}（${allowed.reason}）`)
-      return
+      return settleFiltered(allowed.reason || 'not-allowed')
     }
     if (isDefaultInstanceChat(msg.chatId, msg.platform) && (!gateway || gateway.caps?.(msg.chatId) === null)) {
       await refreshFriends()
@@ -3759,30 +4457,30 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
           sensitiveCommand = '主人命令 /' + name
           return ownerStillCurrent()
         }, ownerStillCurrent)
-        if (disposed || (sensitiveCommand && !ownerStillCurrent())) return
+        if (disposed || (sensitiveCommand && !ownerStillCurrent())) return settleFiltered('disposed-or-unauthorized')
         if (reply) {
           log.info(sensitiveCommand || `QQ 命令 ${msg.text.trim().slice(0, 30)} → ${reply.split('\n')[0]}`)
           await sendSegments(msg.chatId, [{ type: 'text', data: { text: reply } }], sensitiveCommand || reply.slice(0, 60), {
             force: true, sensitive: Boolean(sensitiveCommand), isCurrent: sensitiveCommand ? ownerStillCurrent : null,
           })
-          return
+          return settleFiltered('owner-command')
         }
-        if (sensitiveCommand || reply === '') return
+        if (sensitiveCommand || reply === '') return settleFiltered('owner-command')
       } catch (error) {
-        if (disposed || (sensitiveCommand && !ownerStillCurrent())) return
+        if (disposed || (sensitiveCommand && !ownerStillCurrent())) return settleFiltered('disposed-or-unauthorized')
         const detail = sensitiveCommand || error.message
         log.warn('执行命令出错：', detail)
         const text = sensitiveCommand ? '命令没执行成功' : '命令没执行成功：' + detail
         await sendSegments(msg.chatId, [{ type: 'text', data: { text } }], '命令出错', {
           force: true, sensitive: Boolean(sensitiveCommand), isCurrent: sensitiveCommand ? ownerStillCurrent : null,
         })
-        return
+        return settleFiltered('owner-command-error')
       }
     }
-    if (wasCleared()) return
+    if (wasCleared()) return settleFiltered('cleared')
     if (!getConfig().enabled) {
       log.info(`总开关关着，收到 ${msg.chatId} 的消息但不处理：${msg.text.slice(0, 30)}`)
-      return
+      return settleFiltered('disabled')
     }
 
     if (msg.kind === 'private' && onMemoryCommand) {
@@ -3792,14 +4490,14 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (isMuted?.(msg.chatId)) {
       log.debug(`${msg.chatId}：主人让她闭嘴中，不回`)
       logIncoming()
-      return
+      return settleFiltered('muted')
     }
     const dislikeChance = Math.max(0, Math.min(1, Number(cfg.memory?.dislikeSilence ?? 0.85) || 0))
     if (dislikeChance > 0 && !msgIsOwner && dislikes?.(msg.userId) && random() < dislikeChance) {
       logIncoming()
       onActivity?.({ kind: 'silent', chatId: msg.chatId, text: msg.text, nickname: msg.nickname })
       log.debug(`${msg.chatId}：不想搭理，安静看着`)
-      return
+      return settleFiltered('dislike-silence')
     }
 
     // 群里的语音：先异步转写，结果补进 groupBuf。以前只有「这一条要回」时才转，
@@ -3824,15 +4522,15 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (hooks?.message) {
       try {
         if (await hooks.message({ ...msg, raw: event })) {
-          if (disposed) return
+          if (disposed) return settleFiltered('disposed')
           logIncoming()
-          return
+          return settleFiltered('hook-handled')
         }
       } catch (error) {
         log.warn('扩展模块处理消息出错：', error.message)
       }
     }
-    if (disposed || wasCleared()) return
+    if (disposed || wasCleared()) return settleFiltered('disposed-or-cleared')
 
     // 贴表情和「回不回复」分家：她可以只看不说话，顺手给这条消息贴一个表情。
     // 放在群聊「要不要插话」的判定之前，所以不回复也会贴；闭嘴（isMuted）时不贴。
@@ -3885,13 +4583,13 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
           log.warn('扩展模块改群聊决定出错：', error.message)
         }
       }
-      if (disposed) return
+      if (disposed) return settleFiltered('disposed')
       if (!decision.reply) {
         log.debug(`群 ${msg.groupId}：不回（${decision.reason}）`)
         logIncoming()
         // 已经有一段在等她回：这条也算进去（她回的时候能看到），但不单独再触发一次
         if (pending.has(msg.chatId)) await addGroupImages(msg, groupEntry)
-        return
+        return settleFiltered(decision.reason || 'group-no-reply')
       }
       groupEntry.direct = Boolean(msg.messageId && msg.messageId !== '0' && msg.userId && (msg.mentioned || quotedBot))
       mode = decision.mode
@@ -3944,7 +4642,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       const qImgs = await quoteImages(quoted, Math.min(2, 4 - imgs.length))
       for (const c of qImgs) content.push(c)
     }
-    if (disposed || wasCleared()) return
+    if (disposed || wasCleared()) return settleFiltered('disposed-or-cleared')
     logIncoming(text)
     lastChatAt = now
     if (msg.kind === 'private' && msgIsOwner) {
@@ -3957,7 +4655,27 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (msg.kind === 'private') touchPrivateAt(msg.chatId || (msg.platform ? `${msg.platform}:private:${msg.userId}` : `private:${msg.userId}`), now)
     onActivity?.({ kind: 'in', chatId: msg.chatId, userId: msg.userId, nickname: msg.nickname, text, direct: msg.kind === 'private' || msg.mentioned || mode === 'must', owner: msgIsOwner })
 
-    enqueue({ chatId: msg.chatId, platform: msg.platform, kind: msg.kind, userId: msg.userId, groupId: msg.groupId, nickname: msg.nickname, sender: msg.sender }, content, msg.userId, wantsVoice(msg.text), mode, { stickerPick })
+    const chat = { chatId: msg.chatId, platform: msg.platform, kind: msg.kind, userId: msg.userId, groupId: msg.groupId, nickname: msg.nickname, sender: msg.sender }
+    const wantVoice = wantsVoice(msg.text)
+    const ordinary = async (valid = () => true) => {
+      const original = [...content]
+      if (deferredHandover && handover && msg.platform !== defaultPlatform()) {
+        try {
+          const context = await handover.contextFor(gw?.person, msg.platform, msg.chatId)
+          if (context) original.unshift({ type: 'text', text: context })
+        } catch (error) { log.warn('生成交接摘要失败：', error.message) }
+      }
+      if (!disposed && !wasCleared() && valid()) {
+        const res = enqueue(chat, original, msg.userId, wantVoice, mode, { stickerPick, migrationReceipt, allowPausedReplay })
+        // 普通入站维持原异步投递语义（避免阻塞慢工具/卸载测试）；仅迁移回放带 migrationReceipt 时等待落盘回执。
+        if (migrationReceipt) return res
+        return
+      }
+      return settleFiltered('cancelled')
+    }
+    const scope = (!gw || deferredHandover) && sharedRouting(chat, ingress)
+    if (scope) return queueShared({ scope, chat, ingress, wantVoice, content, userText: text, fallback: ordinary })
+    return ordinary()
   }
 
   /** 把消息里的「[合并转发]」换成里面的聊天记录，里面的图片并进这条消息一起给她看。 */
@@ -4261,9 +4979,14 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (extra.stickerPick) p.stickerPick = (p.stickerPick || 0) + extra.stickerPick
     if (senderId) p.senders.add(String(senderId))
     p.wantVoice = p.wantVoice || wantVoice
+    if (extra.migrationReceipt) {
+      if (!Array.isArray(p.migrationReceipts)) p.migrationReceipts = []
+      p.migrationReceipts.push(extra.migrationReceipt)
+    }
+    if (extra.allowPausedReplay) p.allowPausedReplay = true
     pending.set(chat.chatId, p)
     clearTimeout(p.timer)
-    if (!m.enabled) return flush(chat.chatId)
+    if (!m.enabled || extra.migrationReceipt) return flush(chat.chatId)
     // 群里大家一来一回说得慢，多等一会儿把一段话攒齐
     const group = chat.kind === 'group'
     const wait = (group ? m.groupWaitSec : m.waitSec) * 1000
@@ -4293,6 +5016,10 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       p.wantVoice ||= next.wantVoice
       p.stickerPick = (p.stickerPick || 0) + (next.stickerPick || 0)
       if ((RANK[next.mode] || 3) > (RANK[p.mode] || 3)) p.mode = next.mode
+      if (Array.isArray(next.migrationReceipts)) {
+        p.migrationReceipts = [...(p.migrationReceipts || []), ...next.migrationReceipts]
+      }
+      if (next.allowPausedReplay) p.allowPausedReplay = true
     }
     p.waiting = false
     p.timer = null
@@ -4314,9 +5041,20 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       const query = p.texts.map((t) => t.replace(/^【[^】]*私聊】[^：]*：/, '')).join('\n')
       const [first, ...rest] = [...p.senders]
       try {
-        await pushToSession(p.chat, content, first, { wantVoice: p.wantVoice, extraSenders: rest, queryText: query, steer: true, turnToken: busyTurns.get(chatId) })
+        await pushToSession(p.chat, content, first, {
+          wantVoice: p.wantVoice,
+          extraSenders: rest,
+          queryText: query,
+          steer: true,
+          turnToken: busyTurns.get(chatId),
+          migrationReceipts: p.migrationReceipts,
+          allowPausedReplay: p.allowPausedReplay,
+        })
       } catch (error) {
         if (isSessionBackoff(error)) { retainSessionMessages(chatId, p, content); return }
+        for (const r of p.migrationReceipts || []) {
+          try { await r?.onVerified?.({ status: 'uncertain', reason: error?.message || 'steer-failed' }) } catch {}
+        }
         bump('errors')
         log.error(`插话进 DSH 失败（${chatId}）：`, error.message)
       }
@@ -4371,13 +5109,27 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       const [first, ...rest] = [...p.senders]
       // 私聊：检索记忆时去掉「【飞书私聊】某某(...)：」这个头
       const query = p.query ?? p.texts.map((t) => t.replace(/^【[^】]*私聊】[^：]*：/, '')).join('\n')
-      await pushToSession(p.chat, content, first, { wantVoice: p.wantVoice, extraSenders: rest, queryText: query, speakers: p.speakers, autoReply: p.autoReply, turnToken, archiveMessages: p.archiveMessages, directRequester: p.directRequester })
+      await pushToSession(p.chat, content, first, {
+        wantVoice: p.wantVoice,
+        extraSenders: rest,
+        queryText: query,
+        speakers: p.speakers,
+        autoReply: p.autoReply,
+        turnToken,
+        archiveMessages: p.archiveMessages,
+        directRequester: p.directRequester,
+        migrationReceipts: p.migrationReceipts,
+        allowPausedReplay: p.allowPausedReplay,
+      })
     } catch (error) {
       if (isSessionBackoff(error)) {
         retainSessionMessages(chatId, p, content)
         busy.delete(chatId)
         clearRunning(chatId)
         return
+      }
+      for (const r of p.migrationReceipts || []) {
+        try { await r?.onVerified?.({ status: 'uncertain', reason: error?.message || 'push-failed' }) } catch {}
       }
       release(chatId, turnToken)
       bump('errors')
@@ -4423,14 +5175,20 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (chat.kind !== 'private' || !cfg.enabled || cfg.dryRun || typing.has(key)) return
     const cid = normalizeChatId(chat.chatId) || String(chat.chatId || '')
     const addr = cid ? parseChatId(cid) : null
-    if (!isDefaultInstanceChat(cid, chat.platform)) return
+    if (!isDefaultInstanceChat(cid, chat.platform) || isDefaultQqPaused(cid)) return
     const caps = gateway?.caps?.(cid)
     if (caps && caps.typing === false) return
     const feats = caps !== null ? gateway?.features?.(cid) : null
     if (feats && !feats['chat.typing']) return
     const uid = String(chat.userId || addr?.id || '')
     if (!/^\d+$/.test(uid) || typeof onebot?.call !== 'function') return
-    const ping = () => { if (!disposed) onebot.call('set_input_status', { user_id: Number(uid), event_type: 1 }, { timeoutMs: 5000 }).catch(() => {}) }
+    const client = onebot
+    const generation = legacyTransportGeneration
+    const ping = () => {
+      if (!disposed && !isTransportPaused() && generation === legacyTransportGeneration) {
+        client.call('set_input_status', { user_id: Number(uid), event_type: 1 }, { timeoutMs: 5000 }).catch(() => {})
+      }
+    }
     ping()
     const started = Date.now()
     const t = setInterval(() => {
@@ -4652,15 +5410,23 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   }
 
   /** 模型明确不支持看图：硬塞图片块会让整轮请求被拒（她就一个字都回不了），改成一行文字提示。 */
-  async function dropUnseenImages(chat, content) {
+  async function dropUnseenImages(chat, content, target) {
     const count = content.filter((c) => c?.type === 'image').length
-    if (!count || (await canSeeFor(chat)) !== false) return content
+    if (!count) return content
+    const vision = getConfig().model?.vision
+    const visible = target && vision !== 'off' && vision !== 'on'
+      ? await modelVision(dsh, target.provider, target.model) : await canSeeFor(chat)
+    if (visible !== false) return content
     log.debug(`模型不支持看图：${chat.chatId} 的 ${count} 张图换成文字提示`)
     return [...content.filter((c) => c?.type !== 'image'), { type: 'text', text: `（这里有 ${count} 张图片，你现在的模型看不了图，只能知道有这么回事）` }]
   }
 
   async function pushToSession(chat, content, senderId, opts = {}) {
     assertActive(); opts.assertAuthorized?.()
+    if (!opts.allowPausedReplay && isDefaultQqPaused(chat.chatId)) return rejectPausedQq()
+    const migrationReceipts = Array.isArray(opts.migrationReceipts)
+      ? opts.migrationReceipts.filter(Boolean)
+      : (opts.migrationReceipt ? [opts.migrationReceipt] : [])
     const turnToken = opts.turnToken
     const onTurnEnd = typeof opts.onTurnEnd === 'function' ? opts.onTurnEnd : null
     checkTurn(chat.chatId, turnToken)
@@ -4700,6 +5466,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         const next = await hooks.prompt(content, { chat, sessionId, senderId, prevText, ...opts, recentMessages })
         if (next === null) {
           log.info(`${chat.chatId}：扩展模块决定这次不交给她`)
+          for (const r of migrationReceipts) {
+            await r.onVerified?.({ status: 'filtered', sessionId, messageId: '', reason: 'prompt-hook-filtered' })
+          }
           if (!opts.steer) release(chat.chatId, turnToken) // 插话被拦下时，当前这一轮还在跑，不能放开
           return
         }
@@ -4794,14 +5563,61 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     }
     turnState.set(key, st)
     outputSources.set(chat.chatId, sources)
-    if (steer) {
-      log.info(`${chat.chatId}：她还在忙，这句直接插进当前这一轮（steer）`)
-      await withPromptCapture(sources, () => agent.steer(message))
-    } else {
-      st.turnToken = turnToken
-      busySessions.set(chat.chatId, key)
-      markRunning(chat.chatId, key)
-      await withPromptCapture(sources, () => agent.followup(message))
+    const baselineSeq = Number.isInteger(agent?.session?.seq) && agent.session.seq >= 0 ? agent.session.seq : 0
+    for (const r of migrationReceipts) {
+      await r.onBeforeDispatch?.({ sessionId, messageId: message.id, baselineSeq })
+    }
+    try {
+      if (steer) {
+        log.info(`${chat.chatId}：她还在忙，这句直接插进当前这一轮（steer）`)
+        await withPromptCapture(sources, () => agent.steer(message))
+      } else {
+        st.turnToken = turnToken
+        busySessions.set(chat.chatId, key)
+        markRunning(chat.chatId, key)
+        await withPromptCapture(sources, () => agent.followup(message))
+      }
+    } catch (error) {
+      for (const r of migrationReceipts) {
+        try {
+          await r.onVerified?.({
+            status: 'uncertain',
+            sessionId,
+            messageId: message.id,
+            baselineSeq,
+            reason: error?.message || 'followup-failed',
+          })
+        } catch {}
+      }
+      throw error
+    }
+    if (migrationReceipts.length) {
+      let flushOk = false
+      let flushReason = ''
+      if (dsh?.sessions && typeof dsh.sessions.flush === 'function') {
+        try {
+          await dsh.sessions.flush(agent.session)
+          flushOk = true
+        } catch (error) {
+          flushReason = error?.message || 'flush-failed'
+        }
+      } else {
+        flushReason = 'missing-session-flush'
+      }
+      const proof = flushOk
+        ? await verifyPersistedInboxMessage(dsh, { sessionId, baselineSeq, messageId: message.id })
+        : { ok: false, reason: flushReason }
+      for (const r of migrationReceipts) {
+        await r.onVerified?.({
+          status: proof.ok ? 'accepted' : 'uncertain',
+          sessionId,
+          messageId: message.id,
+          baselineSeq,
+          seq: proof.seq,
+          reason: proof.ok ? '' : (proof.reason || 'inbox-event-not-persisted'),
+        })
+      }
+      return
     }
     try {
       if (dsh.sessions && typeof dsh.sessions.flush === 'function') await dsh.sessions.flush(agent.session)
@@ -4813,6 +5629,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const owner = ownerId()
     const validate = () => {
       assertActive(); assertAuthorized()
+      if (isDefaultQqPaused(chatId)) return rejectPausedQq()
       const cfg = getConfig()
       if (!cfg.enabled || !owner || ownerId() !== owner) throw Object.assign(new Error('请先启用 Aurabot 并配置主人身份'), { status: 503, code: 'not_ready' })
       const addr = parseChatId(String(chatId))
@@ -4970,10 +5787,10 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
    *  是否真生效由 presetForChat 决定（noTools 压过它 + 主人的 ext.autotelic.presetIdOverride 开关）。
    *  model：可选 { provider, model, reasoningEffort? }。给了就这个 system 会话从本轮起用指定模型
    *  （只动这个后台会话，不改 DSH 全局默认；轻活想用便宜模型的模块走这个口）。 */
-  async function runSystemTurn(name, title, prompt, { timeoutMs = 180000, noTools = false, key: scope = '', presetId = '', level: levelName = '', model = null } = {}) {
+  async function runSystemTurn(name, title, prompt, { timeoutMs = 180000, noTools = false, key: scope = '', presetId = '', level: levelName = '', model = null, titleMode } = {}) {
     // presetId（P0.4）：后台会话点名用哪个 preset（如 aurabot-autotelic）。默认 undefined 行为完全不变；
     // 是否真生效由 presetForChat 决定（noTools 压过它 + 主人的 ext.autotelic.presetIdOverride 开关）。
-    const chat = { chatId: systemChatId(name, scope), kind: 'system', title, noTools: !!noTools, presetId: String(presetId || ''), level: String(levelName || '') }
+    const chat = { chatId: systemChatId(name, scope), kind: 'system', title, titleMode, noTools: !!noTools, presetId: String(presetId || ''), level: String(levelName || '') }
     assertActive()
     if (systemStarting.has(chat.chatId)) throw new Error('这个后台会话的上一轮还没结束')
     systemStarting.add(chat.chatId)
@@ -5080,6 +5897,10 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
 
   function chatOfSession(sessionId) {
     const key = sessionKey(sessionId)
+    if (sharedOwns(sessionId)) {
+      const turn = sharedTurns.get(key)
+      return turn?.admitted && !turn.blocked && !turn.finished && sharedAuthorized(turn) ? turn.task.chat.chatId : ''
+    }
     const live = sessionToChat.get(key)
     if (live) return live
     // 重启后会话还没被第一条消息唤醒时，内存映射是空的：退回持久化的 聊天→会话 映射（#90 兜底要用）
@@ -5098,6 +5919,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
    * 会收到同一个 DSH 进程里所有会话的工具调用，得能把它们区分开。
    */
   function isOwnedSession(sessionId) {
+    if (sharedOwns(sessionId)) return true
     if (chatOfSession(sessionId)) return true
     // 刚挂上还没落盘时 chatOfSession 查不到，再看一眼 mounted
     return mounted.has(sessionKey(sessionId))
@@ -5148,6 +5970,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       return { ok: false, message: '该私聊正在回复，请等这轮结束后再清理' }
     }
     const cutoff = Date.now()
+    if (resolveSharedPrimary && map().multiPrivate && isOwnerPrivateChat(ownerRef(), chatId)) resetShared()
     resetChat(chatId, { memoryResetAt: cutoff })
     clearTimeout(pending.get(chatId)?.timer)
     pending.delete(chatId)
@@ -5173,6 +5996,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
 
   /** 重新开始：把现有的 QQ 会话都归档（侧栏里还能找回），下一条消息起开新会话。 */
   function resetSessions() {
+    if (resolveSharedPrimary && (getConfig().multiPlatformPrivateSession || map().multiPrivate)) resetShared()
     const reg = dsh.workspaceRegistry || dsh.get('workspaceRegistry')
     const m = map()
     let n = 0
@@ -5227,6 +6051,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     let n = 0
     for (const rec of [...mounts]) {
       if (!rec || !rec.agent || !rec.chat) continue
+      if (sharedOwns(rec.agent.session?.id)) continue
       try {
         mount(rec.agent, rec.chat, rec.level)
         n++
@@ -5357,6 +6182,13 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   function dispose() {
     if (disposed) return
     disposed = true
+    clearInterval(sharedAuditTimer)
+    legacyHistoryTickets.clear()
+    sharedLiveCheckpoints.clear()
+    sharedDeliveryFailures.clear()
+    sharedAuditPriority.clear()
+    for (const turn of sharedTurns.values()) turn.agent.cancel({ kind: 'user' })
+    for (const off of sharedListeners.splice(0)) off()
     // 三审 #177：常驻的子智能体父级 agent 一并置空——插件重装/重启后下次 spawn 重新建，
     // 别攥着旧句柄不放（旧的父会话交给 DSH 自己的会话回收去清）。
     subagentParentAgent = null
@@ -5392,8 +6224,78 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     recentMedia.dispose()
   }
 
+  function isDefaultQqTransportIdle() {
+    if (disposed || defaultQqWork) return false
+    for (const map of [pending, busyTurns, running, sendChain]) {
+      for (const chatId of map.keys()) if (isDefaultInstanceChat(chatId)) return false
+    }
+    for (const key of sessionCreating.keys()) {
+      if (isDefaultInstanceChat(key.slice(0, key.lastIndexOf(':')))) return false
+    }
+    for (const turn of sharedTurns.values()) {
+      if (isDefaultInstanceChat(turn.task?.chat?.chatId)) return false
+    }
+    return true
+  }
+
+  function setDefaultQqTransportPaused(paused) {
+    defaultQqPaused = paused === true
+    if (defaultQqPaused) for (const key of typing.keys()) stopTyping(key)
+  }
+
+  function setLegacyQqTransport({ onebot: nextOnebot = null, outbox: nextOutbox = null } = {}) {
+    if (onebot === nextOnebot && outbox === nextOutbox) return
+    legacyTransportGeneration++
+    onebot = nextOnebot
+    outbox = nextOnebot ? nextOutbox : null
+    for (const key of typing.keys()) stopTyping(key)
+    friendIds.clear()
+    friendsAt = 0
+    friendsPending = null
+    faces = createFaces({ onebot: scopedLegacyOnebot(), log })
+    titleFilter = createTitleFilter({ getConfig, onebot: scopedLegacyOnebot(), log })
+  }
+
+  if (resolveSharedPrimary && typeof dsh.on === 'function') {
+    const activeFor = agent => sharedTurns.get(sessionKey(agent?.session?.id || agent?.id))
+    sharedListeners.push(registerSharedTurnGuard(dsh, {
+      lookup: agent => sharedOwns(agent?.session?.id) ? (activeFor(agent)?.message ? activeFor(agent) : null) : undefined,
+      isAuthorized: turn => !turn.blocked && sharedAuthorized(turn),
+      onAccepted: turn => {
+        turn.admitted = true
+        startTyping(sessionKey(turn.branch.sessionId), turn.task.chat)
+      },
+      onRejected: turn => {
+        turn.blocked = true
+        sharedFailure(turn)
+      },
+    }))
+    sharedListeners.push(dsh.on('agent/inbox/claimed', ({ agent, message, turn }) => {
+      const active = activeFor(agent)
+      if (active?.message?.id === message.id && active.dshTurn === undefined) active.dshTurn = turn
+    }))
+    sharedListeners.push(dsh.on('tools/pre-execute', async (exec, next) => {
+      if (!sharedOwns(exec.agent?.session?.id)) return next()
+      const active = activeFor(exec.agent)
+      const allowed = () => active?.admitted && !active.blocked && !active.finished && sharedAuthorized(active) && active.calls.has(exec.rootCallId || exec.callId)
+      const deny = { kind: 'deny', reason: '工具调用不属于已核验的共享私聊轮次。' }
+      if (!allowed()) return deny
+      const decision = await next()
+      return allowed() ? decision : deny
+    }, { prepend: true }))
+    sharedAuditTimer = setInterval(() => void auditSharedRetired(), 15 * 60_000)
+    if (Object.keys(sharedSessions.read().retiredSessions).length) queueMicrotask(() => void auditSharedRetired())
+    sharedAuditTimer.unref?.()
+  }
+
   return {
     dispose,
+    refreshSharedConfig,
+    invalidateSharedSource,
+    resetShared,
+    sharedStatus,
+    prepareLegacyHistory,
+    confirmLegacyHistory,
     // 给模块用的出站清洗（和 QQ 投递同一套：工具标记 + 提示词复读 + 格式变体）。
     cleanOutbound: (chatId, text) => cleanOutboundText(String(text ?? ''), cleaningFor(chatId)),
     // 仅关闭本中枢持有的短期媒体缓存，迟到的事件不能重新写入。
@@ -5409,9 +6311,11 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     stickerOf,
     capture,
     simulateTurn,
-    onMessage,
+    onMessage: trackQqEvent(onMessage),
     /** G3：网关入站入口。收到 InboundMessage 走这条；未装网关时等价于不接线，行为不变。 */
-    onGatewayMessage,
+    onGatewayMessage: trackQqEvent(onGatewayMessage),
+    /** 迁移期专用回放入口：即使默认 QQ 仍处于迁移暂停期，也仅允许由迁移事务按序回放缓冲消息并拿回持久化回执。 */
+    deliverMigrationInbound: (m, migrationReceipt) => onGatewayMessage(m, { migrationReceipt, allowPausedReplay: true }),
     onGatewayRecall: (chatIdOrHint, messageId) => evictMessageCaches(chatIdOrHint, messageId),
     selfAccountFor,
     gatewayMediaBytes,
@@ -5438,28 +6342,28 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         log.debug?.('补发留痕失败：', error?.message || error)
       }
     },
-    onPoke,
-    onGroupFile,
+    onPoke: trackQqEvent(onPoke),
+    onGroupFile: trackQqEvent(onGroupFile),
     onSessionEvent,
     /** 主动贴表情（内部实现，导出给回归测试用：#216 review 要求 dry-run 有测试兜底） */
     maybeReact,
-    deliver,
-    sendText,
+    deliver: trackQqSend(deliver),
+    sendText: trackQqSend(sendText),
     // 主动发言出站门闸的注入点（宿主装配时用；不注入则完全惰性）
     setOutboundGuard,
     // 引擎路径（deliver 的 opts.enginePolicy）策略源解析器注入点（不注入则 deliver 行为不变）
     setOutboundEngineResolver,
-    sendVoice,
-    sendVoiceFile,
-    sendFile,
-    sendSticker,
-    sendImage,
+    sendVoice: trackQqSend(sendVoice),
+    sendVoiceFile: trackQqSend(sendVoiceFile),
+    sendFile: trackQqSend(sendFile),
+    sendSticker: trackQqSend(sendSticker),
+    sendImage: trackQqSend(sendImage),
     checkSendableFile,
-    sendSegments,
-    sendParts,
-    pushToSession,
-    receiveOwnerMessage,
-    titleFilter,
+    sendSegments: trackQqSend(sendSegments),
+    sendParts: trackQqSend(sendParts),
+    pushToSession: (chat, ...args) => withDefaultQqWork(chat?.chatId, () => pushToSession(chat, ...args), rejectPausedQq),
+    receiveOwnerMessage: (chatId, ...args) => withDefaultQqWork(chatId, () => receiveOwnerMessage(chatId, ...args), rejectPausedQq),
+    get titleFilter() { return titleFilter },
     runSystemTurn,
     systemSessionCooldown,
     sessionHealth: () => [...sessionFailures.keys()].map((chatId) => ({ chatId, ...sessionFailure(chatId) })).filter((row) => row.message),
@@ -5467,7 +6371,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     subagentFor,
     turnSendersAllOwner,
     turnDirectFromOwner,
-    onNotice,
+    onNotice: trackQqEvent(onNotice),
     turnHasOwner,
     turnSenders,
     resetChat,
@@ -5527,5 +6431,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     get selfId() { return selfId },
     groupNames,
     setGateway: (gw) => { gateway = gw || null },
+    isDefaultQqTransportIdle,
+    setDefaultQqTransportPaused,
+    setLegacyQqTransport,
   }
 }

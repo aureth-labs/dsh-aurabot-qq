@@ -3,9 +3,12 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { readFile, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { createOutbox, hasMedia } from '../../src/gateway/outbox.js'
-import { makeGateway, fakeFactory } from './helpers.js'
+import { fakeFactory, makeGateway, makeTempRoot } from './helpers.js'
+import { makeSendError } from '../../src/gateway/errors.js'
 
 const msg = (over = {}) => ({
   chatId: 'fake:private:10001',
@@ -13,6 +16,56 @@ const msg = (over = {}) => ({
   kind: 'reply',
   note: '测试消息',
   ...over,
+})
+
+test('outbox 拒绝保存敏感消息，并过滤以前落盘的敏感消息', async () => {
+  const file = join(makeTempRoot(), 'outbox.json')
+  const expiresAt = Date.now() + 60_000
+  await writeFile(file, JSON.stringify([
+    { id: 'sensitive', instance: 'fake', expiresAt, message: msg({ sensitive: true }) },
+    { id: 'ordinary', instance: 'fake', expiresAt, message: msg() },
+  ]))
+  const box = createOutbox({ file })
+  assert.equal(box.add(msg({ sensitive: true }), { instance: 'fake' }).ok, false)
+  assert.deepEqual(box.list().map(item => item.id), ['ordinary'])
+  assert.deepEqual(JSON.parse(await readFile(file, 'utf8')).map(item => item.id), ['ordinary'])
+})
+
+test('带轮次守卫的回复保留入站凭据，授权失效或发送失败时不进入延迟发送', async (t) => {
+  let now = 100_000
+  const fake = fakeFactory({ id: 'fake', caps: { repliesPerMessage: 1, replyWindowMs: 1000 } })
+  const { gateway } = makeGateway({ platforms: { fake: { enabled: true } }, adapters: [fake], now: () => now })
+  t.after(() => gateway.stopAll())
+  await gateway.sync()
+  const adapter = fake.get(1)
+  const admit = id => adapter.pushInbound({
+    messageId: id, at: now, chat: { kind: 'private', id: '10001' }, sender: { account: '10001' },
+    parts: [{ type: 'text', text: '本地测试' }],
+  })
+  const guarded = { replyGuard: () => true }
+  const byCode = code => error => error.certainty === 'not-sent' && error.code === code
+  admit('live')
+  await assert.rejects(gateway.send(msg({ inResponseTo: 'live' }), { replyGuard: () => false }), byCode('reply-revoked'))
+  assert.equal(adapter.sent.length, 0)
+  await gateway.send(msg({ inResponseTo: 'live' }), guarded)
+  assert.deepEqual(adapter.sent.map(item => item.payload.inResponseTo), ['live'])
+  await assert.rejects(gateway.send(msg({ inResponseTo: 'live' }), guarded), byCode('reply-limit'))
+
+  admit('late')
+  now += 1001
+  await assert.rejects(gateway.send(msg({ inResponseTo: 'late' }), guarded), byCode('reply-window-expired'))
+  await assert.rejects(gateway.send(msg(), guarded), byCode('reply-window-expired'))
+
+  admit('offline')
+  adapter.disconnect()
+  await assert.rejects(gateway.send(msg({ inResponseTo: 'offline' }), guarded), byCode('offline'))
+  assert.equal(gateway.outbox.status().count, 0)
+  adapter.reconnect()
+  admit('not-sent')
+  adapter.send = async () => { throw makeSendError('not-sent', 'offline', 'fake', '测试发送失败') }
+  await assert.rejects(gateway.send(msg({ inResponseTo: 'not-sent' }), guarded), byCode('offline'))
+  assert.equal(gateway.outbox.status().count, 0)
+  assert.equal(adapter.sent.length, 1)
 })
 
 test('outbox：只收不含媒体的消息（text/mention/face 之外有别的类型就拒）', () => {

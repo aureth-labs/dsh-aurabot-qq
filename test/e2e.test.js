@@ -462,8 +462,10 @@ test('合并转发：她能看到转发里的聊天记录', async () => {
   ] }
   const before = fake.turns.length
   mock.push(grp('558', '805', [{ type: 'at', data: { qq: BOT } }, { type: 'text', data: { text: ' 你看看这个' } }, { type: 'forward', data: { id: 'fw1' } }], '寄件人'))
-  await until(() => fake.turns.length > before)
-  const t = fake.turns.at(-1).userText
+  const turn = await until(() => fake.turns.slice(before).find(item =>
+    item.source?.speaker?.chat === 'group' && item.userText.includes('你看看这个')), 20000)
+  await until(() => !api.hub.stats().busy, 20000)
+  const t = turn.userText
   assert.match(t, /合并转发的聊天记录（2 条）/)
   assert.match(t, /转发甲：转发里的话甲/)
   assert.match(t, /转发乙：转发里的话乙/)
@@ -1488,13 +1490,17 @@ test('来源章标明说话人：主人 owner，别人 guest，后台任务 none
   const last = async (push, match) => {
     const n = fake.turns.length
     push()
-    const hit = await until(() => fake.turns.slice(n).find((t) => match(t)), 8000)
+    const hit = await until(() => fake.turns.slice(n).find((t) => match(t)), 20000)
+    await until(() => !api.hub.stats().busy, 20000)
     return hit.source
   }
   assert.deepEqual((await last(() => mock.push(priv(OWNER, text('来源章私聊测试'))), (t) => String(t.userText || '').includes('来源章私聊测试'))).speaker, { role: 'owner', chat: 'private' })
   assert.deepEqual((await last(() => mock.push(grp('557', OWNER, [{ type: 'at', data: { qq: BOT } }, { type: 'text', data: { text: ' 来源章群主测试' } }], '主人')), (t) => String(t.userText || '').includes('来源章群主测试'))).speaker, { role: 'owner', chat: 'group' })
   assert.deepEqual((await last(() => mock.push(grp('557', '999', [{ type: 'at', data: { qq: BOT } }, { type: 'text', data: { text: ' 来源章群友测试' } }], '群友')), (t) => String(t.userText || '').includes('来源章群友测试'))).speaker, { role: 'guest', chat: 'group' })
-  assert.deepEqual((await last(() => api.hub.runSystemTurn('source-test', '来源章', '来源章后台任务', { timeoutMs: 5000 }).catch(() => {}), (t) => String(t.userText || '').includes('来源章后台任务'))).speaker, { role: 'none' })
+  const before = fake.turns.length
+  await api.hub.runSystemTurn('source-test', '来源章', '来源章后台任务', { timeoutMs: 20000 })
+  const systemTurn = fake.turns.slice(before).find(t => t.userText.includes('来源章后台任务'))
+  assert.deepEqual(systemTurn?.source?.speaker, { role: 'none' })
 })
 
 test('DSH 要授权时合并成一条通知到主人 QQ（整个 DSH，不只 Aurabot 工作区）（#136）', async () => {

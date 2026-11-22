@@ -54,6 +54,7 @@ export async function startMockOneBot({ selfId = '20000002', token = 'mock-token
   function handle(action, params) {
     switch (action) {
       case 'get_login_info': return { user_id: Number(selfId), nickname: state.selfProfile.nickname }
+      case 'get_friend_list': return state.friends ?? null
       case 'set_qq_profile': state.selfProfile.nickname = params.nickname; return null
       case 'set_self_longnick': state.selfProfile.long_nick = params.longNick; return null
       case 'upload_private_file':

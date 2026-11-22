@@ -2,7 +2,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { normalizeChatEfforts } from '../chat/effort-command.js'
-import { dataDir, readJson, writeJson } from './store.js'
+import { dataDir, readJson, writeJson, writeJsonAtomicFsync } from './store.js'
 import { DEFAULT_GROUP_POLICY } from '../chat/group-policy.js'
 import { LEVELS, PROFILE_PERM_KEYS, PROFILE_PERM_LEVELS, profilePermDefault, resolveFriendTarget } from '../chat/access.js'
 import { normalizeChatModels } from '../chat/chat-model.js'
@@ -13,6 +13,7 @@ import { DEFAULT_TIER_DAYS } from '../features/memory-rules.js'
 
 export const DEFAULTS = {
   enabled: false, // 总开关：关着一句都不发
+  legacyQqEnabled: true, // 默认 QQ 仍由旧版直连托管，由 QQ 迁移流程切换。
   dryRun: true, // 试运行：只记日志不真发
   debug: false, // 调试：不真发 + 不写记忆/流水，只在日志里看（和试运行互斥）
   setupDone: false, // 首次使用向导走完了没有
@@ -22,6 +23,7 @@ export const DEFAULTS = {
   ownerPersonId: '', // 只读系统字段：身份库认领的主人 PersonId（由宿主同步，面板不可改）
   ownerName: '主人',
   ownerLevel: 'full', // full | social | chat
+  multiPlatformPrivateSession: false,
   ownerPrimary: {
     mode: 'fixed', // 'fixed'（固定主账号）| 'recent'（跟随最近私聊平台）
     platform: '',
@@ -597,6 +599,7 @@ function normalizeOwnerPrimary(raw) {
 
 export function normalize(raw) {  const c = deepMerge(DEFAULTS, raw)
   c.enabled = bool(c.enabled, false)
+  c.legacyQqEnabled = bool(c.legacyQqEnabled, true)
   c.dryRun = bool(c.dryRun, true)
   c.debug = bool(c.debug, false)
   if (c.debug) c.dryRun = true
@@ -618,6 +621,7 @@ export function normalize(raw) {  const c = deepMerge(DEFAULTS, raw)
   c.model.vision = c.model.vision === 'on' || c.model.vision === 'off' ? c.model.vision : 'auto'
   c.setupDone = bool(c.setupDone, false)
   c.ownerLevel = LEVELS.includes(c.ownerLevel) ? c.ownerLevel : 'full'
+  c.multiPlatformPrivateSession = c.multiPlatformPrivateSession === true
   c.ownerPrimary = normalizeOwnerPrimary(c.ownerPrimary)
   c.longTasks = bool(c.longTasks, true)
   c.subagentBackground = bool(c.subagentBackground, false)
@@ -1107,7 +1111,10 @@ export function normalize(raw) {  const c = deepMerge(DEFAULTS, raw)
 
 // 面板里不回传原文的字段：路径（几层都行）
 const SECRETS = [['snowluma', 'webuiPassword'], ['snowluma', 'httpToken'], ['snowluma', 'wsToken'], ['imageGen', 'apiKey'], ['voice', 'asrApi', 'apiKey'], ['memory', 'vector', 'apiKey'], ['memory', 'rerank', 'apiKey'], ['song', 'neteaseCookie'], ['bili', 'cookie'], ['bili', 'sessdata'], ['bili', 'biliJct'], ['heybox', 'cookie'], ['bridge', 'token'], ['voice', 'volcano', 'apiKey'], ['voice', 'breeze', 'key'], ['voice', 'breeze', 'password'], ['voice', 'minimax', 'apiKey'], ['backup', 'remote', 'token'], ['backup', 'remote', 'webdav', 'password']]
-const PLATFORM_SECRET_KEYS = ['botToken', 'appSecret', 'clientSecret', 'encryptKey', 'verificationToken', 'botSecret', 'secret', 'token']
+export const PLATFORM_SECRET_KEYS = Object.freeze([
+  'botToken', 'appSecret', 'clientSecret', 'encryptKey', 'verificationToken', 'botSecret',
+  'secret', 'token', 'httpToken', 'wsToken',
+])
 // 扩展模块设置里的密码类字段（模块加载时登记）：['ext', 模块id, 字段]
 const extraSecrets = new Map()
 export function registerSecretField(path) { extraSecrets.set(path.join('\u0000'), path) }
@@ -1187,6 +1194,19 @@ const FILE = () => dataDir('config.json')
 
 /** 在某次更新里新增、会替她公开发东西的功能。以后再加这类功能，把配置键名加到这里。 */
 export const OPT_IN_ON_UPDATE = ['qzoneSocial', 'bili', 'douyin']
+
+/** 读取未经 normalize() 的原始配置文件对象，供迁移快照保留键存在性。 */
+export function readRawConfig() {
+  const raw = readJson(FILE(), {})
+  return isObj(raw) ? raw : {}
+}
+
+/** 原子 + fsync 写入原始配置对象（不经 normalize 重写多余字段），供迁移提交与精确回滚。 */
+export function writeRawConfigAtomic(rawObj) {
+  if (!isObj(rawObj)) throw new Error('原始配置必须是对象')
+  writeJsonAtomicFsync(FILE(), rawObj)
+  return loadConfig()
+}
 
 export function loadConfig() {
   const raw = readJson(FILE(), {})
@@ -1318,6 +1338,10 @@ export function mergeFromPanel(current, incoming) {
   next.douyin.owner = { ...next.douyin.owner, ...Object.fromEntries(['secUid', 'uid', 'nickname', 'confirmedInput'].map((k) => [k, current.douyin?.owner?.[k] ?? ''])) }
   // 联动密钥只由插件生成，面板不能改
   next.bridge.token = current.bridge?.token || ''
+  // 默认 QQ 的托管状态由迁移流程切换。
+  next.legacyQqEnabled = bool(current.legacyQqEnabled, true)
+  // 共享会话由通讯平台专用接口校验宿主能力后写入。
+  next.multiPlatformPrivateSession = current.multiPlatformPrivateSession === true
   // 主人身份编号仅由宿主按身份库同步，面板不可篡改
   next.ownerPersonId = typeof current?.ownerPersonId === 'string' || typeof current?.ownerPersonId === 'number'
     ? String(current.ownerPersonId).trim()
@@ -1377,6 +1401,32 @@ const LEGACY_NEUTRAL_KEYS = [
 export function isLegacyQQEnabled(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false
   return raw.enabled === true || raw.platforms?.qq?.enabled === true
+}
+
+/** 供 QQ 迁移快照/恢复使用的关键标量与对象字段定义（集中在 config.js，满足 I3 单一定义约束）。 */
+export const QQ_SNAPSHOT_SCALAR_KEYS = Object.freeze([
+  'enabled',
+  'botQQ',
+  'ownerQQ',
+  'ownerPersonId',
+  'multiPlatformPrivateSession',
+])
+export const QQ_SNAPSHOT_OBJECT_KEYS = Object.freeze(['gateway', 'snowluma', 'ownerPrimary'])
+
+/** 提取参与 QQ 托管 revision 判定的配置字段切片。 */
+export function qqOwnershipConfigSnapshot(c) {
+  return [
+    c?.enabled,
+    c?.legacyQqEnabled,
+    c?.gateway,
+    c?.botQQ,
+    c?.ownerQQ,
+    c?.ownerPersonId,
+    c?.platforms?.qq,
+    c?.ownerPrimary,
+    c?.snowluma,
+    c?.multiPlatformPrivateSession,
+  ]
 }
 
 /** 提取旧配置中与平台/网关/鉴权无关的可迁移字段；排除网关、SnowLuma 密码/令牌及凭据。 */

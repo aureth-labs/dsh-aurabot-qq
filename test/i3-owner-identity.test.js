@@ -55,7 +55,10 @@ test('I3 静态审计：src/ 中仅 config.js 与 host.js 启动迁移允许出�
       if (/\bownerQQ\b/.test(line)) hits.push({ rel, lineNo: idx + 1, line })
     })
   }
-  const unexpected = hits.filter((h) => h.rel !== 'src/core/config.js' && !(h.rel === 'src/host.js' && h.lineNo >= 155 && h.lineNo <= 190))
+  const hostLines = readFileSync(join(SRC, 'host.js'), 'utf8').split(/\r?\n/)
+  const startupAnchor = hostLines.findIndex((line) => line.includes('// 启动迁移（I4/I3 就地升级点）')) + 1
+  assert.ok(startupAnchor > 0, 'src/host.js 必须保留启动迁移锚点')
+  const unexpected = hits.filter((h) => h.rel !== 'src/core/config.js' && !(h.rel === 'src/host.js' && h.lineNo >= startupAnchor && h.lineNo <= startupAnchor + 25))
   assert.deepEqual(unexpected, [], `发现未清扫的 ownerQQ 引用：\n${unexpected.map((h) => `${h.rel}:${h.lineNo}: ${h.line}`).join('\n')}`)
   assert.ok(hits.some((h) => h.rel === 'src/core/config.js'))
   assert.ok(hits.some((h) => h.rel === 'src/host.js'))

@@ -23,6 +23,8 @@
 // 并进它一起发；挂起到点独自发出，绝不会丢内容。这样「第三条并进第二条」且总数不超限。
 // 主动消息 / 被动回复三检查的失败（proactive-not-allowed 等）一律不入补发队列。
 
+import { once } from 'node:events'
+import { isDeepStrictEqual } from 'node:util'
 import { normalizeChatId, parseChatId, formatChatId } from './address.js'
 import { makeSendError, isNotSent, toSendError } from './errors.js'
 import { renderParts } from './render.js'
@@ -61,7 +63,7 @@ export function mergeCaps(adapterCaps, userCaps, instance, log = noopLog) {
  * @param {() => number=} opts.now 时钟（测试注入以验证过期）
  * @param {number=} opts.replyHoldMs 被动回复合并的挂起时长（默认 300）
  */
-export function createGateway({ config, dataDir, http, identity, log, now = Date.now, replyHoldMs = 300, isExternalInstance = null } = {}) {
+export function createGateway({ config, dataDir, http, identity, log, now = Date.now, replyHoldMs = 300, isExternalInstance = null, isPausedInstance = null } = {}) {
   if (!identity || typeof identity.resolve !== 'function' || typeof identity.accountOn !== 'function') {
     throw new Error('createGateway 需要一个实现 Identity 形状的对象（identity.resolve / accountOn 等）；测试可传内存假实现，I1 合并后换真的')
   }
@@ -72,6 +74,8 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
   const factories = new Map() // 平台端 id → factory
   const probes = new Map() // 平台端 id → 首个 adapter（只读 settings/caps 给面板）
   const runs = new Map() // 实例名 → runtime
+  const leases = new Map() // 迁移期间实例的启动权不属于普通 sync
+  const leaseBuffers = new Map() // 实例名 → held 期间磁盘缓冲接收器
   const idle = new Map() // 实例名 → { state, detail }（配置了但没跑起来的状态记录）
   const msgSubs = new Set()
   const evtSubs = new Set()
@@ -98,14 +102,27 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
 
   // ───────────────────────── 实例运行时 ─────────────────────────
 
+  const isCurrentRun = (run) => runs.get(run.instance) === run && !run.stopping
+  const isHeld = (instance) => leases.has(instance)
+  const isExternallyOwned = (instance) => typeof isExternalInstance === 'function' && isExternalInstance(instance)
+  const isPausedOwned = (instance) => typeof isPausedInstance === 'function' && isPausedInstance(instance)
+  const heldError = (instance) => makeSendError('not-sent', 'migration-held', instance, '实例迁移期间暂停业务')
+  const businessState = (instance, state) => {
+    if (isHeld(instance)) return state === 'connected' ? 'connecting' : state
+    if (isPausedOwned(instance)) return 'stopped'
+    return state
+  }
+
   function statusOf(run) {
+    const held = isHeld(run.instance)
+    const paused = !held && isPausedOwned(run.instance)
     return {
       instance: run.instance,
       platform: run.platform,
       name: run.name,
-      enabled: true,
-      state: run.state,
-      detail: run.detail,
+      enabled: !paused,
+      state: businessState(run.instance, run.state),
+      detail: held ? '实例迁移期间暂停业务' : paused ? '实例已暂停等待恢复确认' : run.detail,
       self: run.self,
       caps: cloneCaps(run.caps),
       settings: run.adapter?.settings || [],
@@ -124,14 +141,14 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
     }
   }
 
-  function handleInbound(run, message) {
+  function materializeInbound(run, message) {
     // 去重：实例 + messageId（CONTRACTS §六.3）
-    if (!dedupe.seen(run.instance, message.messageId)) return
+    if (!dedupe.seen(run.instance, message.messageId)) return null
     recordArrival(run.instance, message.messageId, message.at)
     const chatId = formatChatId({ instance: run.instance, platform: run.platform, kind: message.chat.kind, id: message.chat.id })
     if (!chatId) {
       logger.warn(`实例 ${run.instance} 推来的消息拼不出地址（chat=${JSON.stringify(message.chat)}），已丢弃`)
-      return
+      return null
     }
     if (message.chat?.kind === 'private' && message.sender?.account) {
       router.noteAccountInstance(run.instance, run.platform, message.sender.account, message.at)
@@ -139,7 +156,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
     const person = identity.resolve(run.platform, message.sender.account, message.sender.alt ? { alt: message.sender.alt } : undefined)
     const { text, wakeText } = renderParts(message.parts)
     const mentionsOthers = (Array.isArray(message.parts) ? message.parts : []).some((p) => p?.type === 'mention' && p.account !== 'all')
-    const inbound = {
+    return {
       v: 1,
       instance: run.instance,
       platform: run.platform,
@@ -158,20 +175,54 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
       wakeText,
       mentionsOthers,
     }
+  }
+
+  function materializeEvent(run, event) {
+    const chatId = event?.chat ? formatChatId({ instance: run.instance, platform: run.platform, kind: event.chat.kind, id: event.chat.id }) : undefined
+    return { ...event, instance: run.instance, platform: run.platform, chatId }
+  }
+
+  function handleInbound(run, message) {
+    if (!isCurrentRun(run)) return
+    if (isHeld(run.instance)) {
+      const buffer = leaseBuffers.get(run.instance)
+      if (buffer?.pushInbound) {
+        const res = buffer.pushInbound({ instance: run.instance, platform: run.platform, message })
+        if (res && res.ok === false) {
+          logger.warn(`实例 ${run.instance} 迁移缓冲已满或已关闭（${res.reason}），暂停迁移交还`)
+        }
+      }
+      return
+    }
+    if (isPausedOwned(run.instance)) return
+    const inbound = materializeInbound(run, message)
+    if (!inbound) return
     for (const fn of msgSubs) {
       try { fn(inbound) } catch (error) { logger.warn('onMessage 订阅者出错：', error?.message || error) }
     }
   }
 
   function handleEvent(run, event) {
-    const chatId = event?.chat ? formatChatId({ instance: run.instance, platform: run.platform, kind: event.chat.kind, id: event.chat.id }) : undefined
-    const wrapped = { ...event, instance: run.instance, platform: run.platform, chatId }
+    if (!isCurrentRun(run)) return
+    if (isHeld(run.instance)) {
+      const buffer = leaseBuffers.get(run.instance)
+      if (buffer?.pushEvent) {
+        const res = buffer.pushEvent({ instance: run.instance, platform: run.platform, event })
+        if (res && res.ok === false) {
+          logger.warn(`实例 ${run.instance} 迁移缓冲已满或已关闭（${res.reason}），暂停迁移交还`)
+        }
+      }
+      return
+    }
+    if (isPausedOwned(run.instance)) return
+    const wrapped = materializeEvent(run, event)
     for (const fn of evtSubs) {
       try { fn(wrapped) } catch (error) { logger.warn('onEvent 订阅者出错：', error?.message || error) }
     }
   }
 
   function emitCapsChanged(instanceName, { platform, state, caps }) {
+    state = businessState(instanceName, state)
     const features = effectiveFeaturesFor(state, caps)
     const sig = featuresSignature(state, features)
     if (capsSnapshots.get(instanceName) === sig) return
@@ -209,12 +260,16 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
   }
 
   function handleState(run, state, detail) {
+    if (runs.get(run.instance) !== run) return
+    run.connectionGeneration++
+    if (isHeld(run.instance)) run.self = null
     run.state = state
     run.detail = detail
+    run.connectionChanges.dispatchEvent(new Event('change'))
     logState(run, state, detail)
     notifyState(run)
     emitCapsChanged(run.instance, { platform: run.platform, state: run.state, caps: run.caps })
-    if (state === 'connected') void postConnect(run)
+    if (state === 'connected' && isCurrentRun(run) && !isHeld(run.instance)) void postConnect(run)
   }
 
   function notifyState(run) {
@@ -226,8 +281,9 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
 
   /** 连上之后：核对 whoami（不符即断开），然后自动补发该实例名下的队列 */
   async function postConnect(run) {
+    const generation = run.connectionGeneration
     const ok = await verifyWhoami(run)
-    if (!ok) return
+    if (!ok || !isCurrentRun(run) || isHeld(run.instance) || run.connectionGeneration !== generation) return
     try {
       await flushQueue(run.instance)
     } catch (error) {
@@ -237,10 +293,14 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
 
   /** 连上后核对「登录的是不是配置里的那个机器人」。不符 → 断开该实例并报状态。 */
   async function verifyWhoami(run) {
+    const generation = run.connectionGeneration
+    const stillConnected = () => isCurrentRun(run) && !isHeld(run.instance)
+      && run.connectionGeneration === generation && run.state === 'connected'
     let me = null
     try {
       me = await run.adapter.whoami()
     } catch (error) {
+      if (!stillConnected()) return false
       run.state = 'disconnected'
       run.detail = `whoami 失败：${error?.message || error}`
       logState(run, run.state, run.detail)
@@ -248,6 +308,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
       emitCapsChanged(run.instance, { platform: run.platform, state: run.state, caps: run.caps })
       return false
     }
+    if (!stillConnected()) return false
     run.self = me
     const cfg = run.rawConfig || {}
     const expected = cfg.selfId ?? cfg.account ?? cfg.selfAccount
@@ -271,8 +332,13 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
 
   function registerRoute(run, path, handler) {
     const full = `/platform/${run.instance}${String(path || '/')}`
-    routes.set(full, handler)
-    const unregHttp = http && typeof http.route === 'function' ? http.route(full, handler) : null
+    const receive = (req, res) => {
+      if (isCurrentRun(run) && !isHeld(run.instance)) return handler(req, res)
+      res.statusCode = 503
+      res.end()
+    }
+    routes.set(full, receive)
+    const unregHttp = http && typeof http.route === 'function' ? http.route(full, receive) : null
     const unreg = () => {
       routes.delete(full)
       if (typeof unregHttp === 'function') unregHttp()
@@ -301,6 +367,12 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
 
   // ───────────────────────── 实例启停（sync） ─────────────────────────
 
+  function requireMigrationStopSupport(adapter) {
+    if (typeof adapter.stopAndWait !== 'function' || typeof adapter.confirmStopped !== 'function') {
+      throw Object.assign(new Error(`平台端 ${adapter.id} 缺少迁移所需的停机确认能力`), { code: 'MIGRATION_STOP_UNSUPPORTED' })
+    }
+  }
+
   function adapterIdOf(instanceName, cfg) {
     const prefix = prefixOf(instanceName)
     const specified = cfg?.adapter
@@ -314,6 +386,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
   function makeCtx(run, rawConfig) {
     const ctx = {
       instance: run.instance,
+      migrationHeld: isHeld(run.instance),
       config: () => {
         const { enabled, adapter, caps, behavior, ...rest } = rawConfig || {}
         return rest
@@ -322,6 +395,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
       emitEvent: (event) => handleEvent(run, event),
       state: (state, detail) => handleState(run, state, detail),
       capsChanged: () => {
+        if (!isCurrentRun(run)) return
         run.caps = mergeCaps(run.adapter.caps(), rawConfig?.caps, run.instance, logger)
         emitCapsChanged(run.instance, { platform: run.platform, state: run.state, caps: run.caps })
       },
@@ -351,6 +425,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
       idle.set(instanceName, { state: 'stopped', detail: `平台端工厂出错：${error?.message || error}` })
       return
     }
+    if (isHeld(instanceName)) requireMigrationStopSupport(adapter)
     const cfgJson = JSON.stringify(rawConfig)
     const run = {
       instance: instanceName,
@@ -362,6 +437,8 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
       rawConfig,
       cfgJson,
       state: 'unconfigured',
+      connectionGeneration: 0,
+      connectionChanges: new EventTarget(),
       detail: undefined,
       self: null,
       caps: null,
@@ -375,6 +452,11 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
     try {
       await adapter.start(ctx)
     } catch (error) {
+      if (isHeld(instanceName)) {
+        try { await stopInstance(instanceName, '迁移实例启动失败', { waitForStop: true }) } catch (stopError) {
+          throw new AggregateError([error, stopError], '迁移实例启动失败且尚未确认停止')
+        }
+      }
       unregisterRoutes(run)
       runs.delete(instanceName)
       idle.set(instanceName, { state: 'stopped', detail: `启动失败：${error?.message || error}` })
@@ -389,9 +471,23 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
     }
   }
 
-  async function stopInstance(instanceName, reason) {
+  async function stopInstance(instanceName, reason, { waitForStop = false, signal } = {}) {
+    signal?.throwIfAborted()
     const run = runs.get(instanceName)
     if (!run) return
+    // 曾经超时的实例必须等到停止得到确认，普通 sync 也不能提前移除它。
+    waitForStop ||= run.stopping
+    if (waitForStop) {
+      requireMigrationStopSupport(run.adapter)
+      signal ??= AbortSignal.timeout(5500)
+    }
+    const previousStop = run.stopAttempt
+    const alreadyStopped = previousStop?.confirmed || (previousStop?.pending && run.adapter.confirmStopped() === true)
+    if (previousStop?.pending && !alreadyStopped) {
+      throw Object.assign(new Error(`实例 ${instanceName} 的停止任务尚未结束`), { code: 'INSTANCE_STOP_PENDING', retryable: true })
+    }
+    run.stopping = true
+    run.connectionChanges.dispatchEvent(new Event('change'))
     unregisterRoutes(run)
     // 挂起中的被动回复直接丢弃（过时限补发没有意义）
     for (const [key, p] of Array.from(pendingReplies)) {
@@ -400,10 +496,31 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
         pendingReplies.delete(key)
       }
     }
+    let onAbort
     try {
-      await run.adapter.stop()
+      if (waitForStop && !alreadyStopped) {
+        const cancelled = new Promise((_, reject) => {
+          onAbort = () => reject(signal.reason)
+          signal.addEventListener('abort', onAbort, { once: true })
+        })
+        // 网关可以结束本次等待，但原停止任务未结束前不能再次调用适配器。
+        const attempt = { since: now(), pending: true, confirmed: false }
+        run.stopAttempt = attempt
+        const stop = Promise.resolve().then(() => {
+          signal.throwIfAborted()
+          return run.adapter.stopAndWait({ signal })
+        }).then(() => {
+          attempt.confirmed = true
+        }).finally(() => {
+          attempt.pending = false
+        })
+        await Promise.race([stop, cancelled])
+      } else if (!waitForStop) await run.adapter.stop()
     } catch (error) {
+      if (waitForStop) throw error
       logger.warn(`实例 ${instanceName} 停止出错：`, error?.message || error)
+    } finally {
+      if (onAbort) signal.removeEventListener('abort', onAbort)
     }
     logState(run, 'stopped', reason || '实例已停止')
     runs.delete(instanceName)
@@ -417,6 +534,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
     const desired = platformsConfig()
     // 停掉：被移除 / disabled / 配置变了
     for (const [instanceName, run] of Array.from(runs)) {
+      if (isHeld(instanceName)) continue
       const want = desired[instanceName]
       const wantJson = want ? JSON.stringify(want) : null
       if (!want || want.enabled === false || wantJson !== run.cfgJson) {
@@ -424,11 +542,17 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
       }
     }
     for (const [instanceName, want] of Object.entries(desired)) {
+      if (isHeld(instanceName)) continue
       if (!want || want.enabled === false) {
         if (!runs.has(instanceName) && !idle.has(instanceName)) idle.set(instanceName, { state: 'stopped', detail: '实例已停用' })
         continue
       }
-      if (typeof isExternalInstance === 'function' && isExternalInstance(instanceName)) {
+      if (isPausedOwned(instanceName)) {
+        if (runs.has(instanceName)) await stopInstance(instanceName, '等待恢复确认，暂不启动', { waitForStop: true })
+        idle.set(instanceName, { state: 'stopped', detail: '等待恢复确认，暂不启动', cfgJson: JSON.stringify(want) })
+        continue
+      }
+      if (isExternallyOwned(instanceName)) {
         if (runs.has(instanceName)) await stopInstance(instanceName, '由宿主直连托管')
         idle.set(instanceName, { state: 'connected', detail: '由宿主直连托管', cfgJson: JSON.stringify(want) })
         continue
@@ -438,11 +562,170 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
     }
   }
 
-  /** 按 config.platforms 启停实例；只动有变化的实例（串行化防并发 sync 误杀启动中的实例） */
-  function sync() {
-    const next = syncTail.then(syncOnce, syncOnce)
+  function serializeLifecycle(operation) {
+    const next = syncTail.then(operation)
     syncTail = next.catch(() => {})
     return next
+  }
+
+  /** 按 config.platforms 启停实例；只动有变化且未被迁移接管的实例。 */
+  function sync() {
+    return serializeLifecycle(syncOnce)
+  }
+
+  async function acquireLease(instance, { config: rawConfig, buffer = null } = {}) {
+    if (typeof instance !== 'string' || !formatChatId({ instance, kind: 'private', id: '0' })) {
+      throw new TypeError('迁移租约需要有效的实例名')
+    }
+    if (!rawConfig || typeof rawConfig !== 'object' || Array.isArray(rawConfig) || rawConfig.enabled !== true) {
+      throw new TypeError('迁移租约需要已启用的目标配置')
+    }
+    const snapshot = structuredClone(rawConfig)
+    return serializeLifecycle(() => {
+      if (isHeld(instance)) throw new Error(`实例 ${instance} 已有迁移租约`)
+      const source = runs.get(instance)?.adapter
+      if (source) requireMigrationStopSupport(source)
+      const target = probes.get(adapterIdOf(instance, snapshot).id)
+      if (target) requireMigrationStopSupport(target)
+      let readiness = null
+      let preparation = null
+      const lease = {
+        startHeld: () => withLease(async () => {
+          if (runs.has(instance)) throw new Error(`实例 ${instance} 已在运行`)
+          await startInstance(instance, snapshot)
+          if (!runs.has(instance)) throw new Error(`迁移实例 ${instance} 未能启动`)
+          return statusOf(runs.get(instance))
+        }),
+        whenReady: (options) => {
+          if (!preparation) {
+            readiness = null
+            preparation = prepare(options).finally(() => { preparation = null })
+          }
+          return preparation
+        },
+        isReady: () => readiness !== null && hasCurrentProof(readiness),
+        setBuffer: (nextBuf) => withLease(() => {
+          if (nextBuf) leaseBuffers.set(instance, nextBuf)
+          else leaseBuffers.delete(instance)
+        }),
+        materializeInbound: (message) => {
+          const run = runs.get(instance)
+          if (!run || !isCurrentRun(run) || leases.get(instance) !== lease) return null
+          return materializeInbound(run, message)
+        },
+        materializeEvent: (event) => {
+          const run = runs.get(instance)
+          if (!run || !isCurrentRun(run) || leases.get(instance) !== lease) return null
+          return materializeEvent(run, event)
+        },
+        stop: () => withLease(() => stopInstance(instance, '迁移停止实例', { waitForStop: true })),
+        release: () => withLease(() => {
+          const run = runs.get(instance)
+          if (run) {
+            const persisted = platformsConfig()[instance]
+            if (run.stopping || isExternallyOwned(instance) || !isDeepStrictEqual(run.rawConfig, persisted)) {
+              throw new Error(`实例 ${instance} 未满足交还条件`)
+            }
+            if (!readiness || readiness.run !== run || !hasCurrentProof(readiness)) {
+              throw new Error(`实例 ${instance} 未完成当前连接验号，不能交还`)
+            }
+            // 普通 sync 的比较使用其正式配置的序列化顺序。
+            run.cfgJson = JSON.stringify(persisted)
+          }
+          const buffer = leaseBuffers.get(instance)
+          if (run && buffer && typeof buffer.canRelease === 'function') {
+            const check = buffer.canRelease()
+            if (!check.ok) {
+              const err = new Error(`实例 ${instance} 迁移缓冲尚未排空、已溢出或已损坏（${check.reason}），不能交还`)
+              err.code = check.reason === 'buffer-corrupt'
+                ? 'MIGRATION_BUFFER_CORRUPT'
+                : check.reason === 'buffer-overflow'
+                  ? 'MIGRATION_BUFFER_OVERFLOW'
+                  : 'MIGRATION_BUFFER_NOT_DRAINED'
+              throw err
+            }
+          }
+          buffer?.close?.()
+          leases.delete(instance)
+          leaseBuffers.delete(instance)
+          if (run) {
+            notifyState(run)
+            emitCapsChanged(instance, run)
+            for (const [key, pending] of pendingReplies) {
+              if (pending.instance === instance) flushPendingReply(key)
+            }
+            void flushQueue(instance).catch((error) => {
+              logger.warn(`实例 ${instance} 交还后的补发出错：`, error?.message || error)
+            })
+          }
+        }),
+      }
+      function withLease(operation) {
+        return serializeLifecycle(() => {
+          if (leases.get(instance) !== lease) throw new Error(`实例 ${instance} 的迁移租约已释放`)
+          return operation()
+        })
+      }
+      function hasCurrentProof({ run, generation, strict }) {
+        return leases.get(instance) === lease && isCurrentRun(run) && run.state === 'connected'
+          && run.connectionGeneration === generation
+          && (!strict || run.adapter.isMigrationIdentityCurrent() === true)
+      }
+      async function prepare({ timeoutMs = 10000 } = {}) {
+        if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new TypeError('验号等待时间必须为正数')
+        const run = await withLease(() => runs.get(instance))
+        if (!run || !isCurrentRun(run)) throw new Error(`迁移实例 ${instance} 尚未运行`)
+        run.self = null
+        const controller = new AbortController()
+        let timer
+        const deadline = new Promise((_, reject) => {
+          timer = setTimeout(() => {
+            const error = new Error(`迁移实例 ${instance} 验号等待超时`)
+            reject(error)
+            controller.abort(error)
+          }, timeoutMs)
+        })
+        async function verify() {
+          while (isCurrentRun(run) && run.state !== 'connected') {
+            await once(run.connectionChanges, 'change', { signal: controller.signal })
+          }
+          if (!isCurrentRun(run)) throw new Error(`迁移实例 ${instance} 已停止`)
+          const generation = run.connectionGeneration
+          const strict = run.platform === 'qq' || run.adapter.id === 'qq'
+          const expected = String(run.rawConfig.selfId ?? run.rawConfig.account ?? run.rawConfig.selfAccount ?? '').trim()
+          if (strict && (!expected || typeof run.adapter.verifyMigrationIdentity !== 'function'
+            || typeof run.adapter.isMigrationIdentityCurrent !== 'function')) {
+            throw new Error(`迁移实例 ${instance} 缺少目标账号或双端点验号能力`)
+          }
+          const self = strict ? await run.adapter.verifyMigrationIdentity(expected) : await run.adapter.whoami()
+          if (typeof self?.account !== 'string' || !self.account.trim() || (expected && self.account !== expected)) {
+            throw new Error(`迁移实例 ${instance} 登录账号与目标不一致`)
+          }
+          return { run, generation, strict, self }
+        }
+        try {
+          const verified = await Promise.race([verify(), deadline])
+          if (!hasCurrentProof(verified)) throw new Error(`迁移实例 ${instance} 验号后连接已变化`)
+          run.caps = mergeCaps(run.adapter.caps(), run.rawConfig.caps, instance, logger)
+          run.self = { account: verified.self.account, name: String(verified.self.name ?? '') }
+          readiness = verified
+          return statusOf(run)
+        } finally {
+          clearTimeout(timer)
+        }
+      }
+      leases.set(instance, lease)
+      if (buffer) leaseBuffers.set(instance, buffer)
+      else leaseBuffers.delete(instance)
+      const run = runs.get(instance)
+      if (run) {
+        run.connectionGeneration++
+        run.self = null
+        notifyState(run)
+        emitCapsChanged(instance, run)
+      }
+      return Object.freeze(lease)
+    })
   }
 
   // 记住每份配置的 JSON（sync 的「只动有变化」判据）
@@ -464,7 +747,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
   async function flushQueue(onlyInstance) {
     return outbox.flush(async (item) => {
       const run = runs.get(item.instance)
-      if (!run || run.state !== 'connected') {
+      if (!run || !isCurrentRun(run) || run.state !== 'connected') {
         throw makeSendError('not-sent', 'offline', item.instance, `实例 ${item.instance} 未连接`)
       }
       const chatId = normalizeChatId(item.message.chatId)
@@ -478,14 +761,14 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
         timeoutMs: item.message.timeoutMs,
         ext: item.message.ext,
       })
-    }, onlyInstance)
+    }, onlyInstance, (item) => !isHeld(item.instance))
   }
 
   // ───────────────────────── 被动回复合并 ─────────────────────────
 
   function flushPendingReply(key) {
     const pending = pendingReplies.get(key)
-    if (!pending) return
+    if (!pending || isHeld(pending.instance)) return
     pendingReplies.delete(key)
     clearTimeout(pending.timer)
     void deliverPending(pending, key)
@@ -495,7 +778,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
     const run = runs.get(pending.instance)
     const chatId = normalizeChatId(pending.chatId)
     const addr = chatId ? parseChatId(chatId) : null
-    if (!run || !addr || run.state !== 'connected') {
+    if (!run || !isCurrentRun(run) || isHeld(pending.instance) || !addr || run.state !== 'connected') {
       logger.warn(`挂起中的被动回复发不出去，丢弃：${pending.note || pending.chatId}`)
       return
     }
@@ -540,21 +823,22 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
    * 唯一的出站口。顺序照 CONTRACTS §七：
    * 规范化地址 → 查实例 → 被动回复三检查 → 按 caps 降级 → 平台端 send → 失败分类 → 入队。
    */
-  async function send(message = {}) {
+  async function send(message = {}, { replyGuard } = {}) {
     const chatId = normalizeChatId(message.chatId)
     if (!chatId) throw makeSendError('not-sent', 'bad-chat-id', String(message.chatId || ''), `认不出的地址：${message.chatId}`)
     const addr = parseChatId(chatId)
+    if (isHeld(addr.instance)) throw heldError(addr.instance)
     const run = runs.get(addr.instance)
 
     // 查实例：没启用 / 不存在 → not-sent，不入队（没有可以重连的实例）
-    if (!run) {
+    if (!run || !isCurrentRun(run)) {
       throw makeSendError('not-sent', 'offline', addr.instance, `实例 ${addr.instance} 不存在或未启用`)
     }
     const capsNow = run.caps
     if (run.state !== 'connected' || !capsNow) {
       const error = makeSendError('not-sent', 'offline', addr.instance, `实例 ${addr.instance} 未连接`)
       // whoami 不符等「实例自己不会恢复」的情况：入队没有意义（重连还是同一个错账号），直接拒
-      if (run.dead) throw error
+      if (run.dead || replyGuard) throw error
       const queued = outbox.add(message, { instance: addr.instance })
       if (queued.ok) return { messageId: '', degraded: [], queued: true }
       throw error
@@ -575,6 +859,9 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
     if (message.inResponseTo && capsNow.replyWindowMs > 0) {
       if (arrivalAt == null || now() - arrivalAt > capsNow.replyWindowMs) windowExpired = true
     }
+    if (replyGuard && (!message.inResponseTo || windowExpired)) {
+      throw makeSendError('not-sent', 'reply-window-expired', addr.instance, '原入站消息的回复凭据已失效')
+    }
     const proactive = !message.inResponseTo || windowExpired
 
     // 按 caps 降级（可能抛 nothing-to-send / too-large / proactive-not-allowed —— 这些不入队）
@@ -591,6 +878,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
     if (key && limit > 0) {
       const count = replyCounts.get(key) || 0
       if (count >= limit) {
+        if (replyGuard) throw makeSendError('not-sent', 'reply-limit', addr.instance, '原入站消息的回复次数已用完')
         // 被动回复额度已经用完。QQ 官方等平台仍允许主动消息；优先把余下内容
         // 作为一条主动消息发出，避免合并定时器到点后被平台端拒绝、整段丢失。
         if (capsNow.proactive === 'none') {
@@ -600,7 +888,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
         effectiveInResponseTo = undefined
         effectiveProactive = true
         extraDegraded.push('reply limit reached: sent as proactive')
-      } else {
+      } else if (!replyGuard) {
         const pending = pendingReplies.get(key)
         if (pending && pending.chatId === chatId) {
           // 超出条数的文字并进最后一条允许的消息里，不丢内容
@@ -631,6 +919,9 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
     }
 
     // 调平台端
+    if (replyGuard && !replyGuard()) {
+      throw makeSendError('not-sent', 'reply-revoked', addr.instance, '该轮回复已撤销')
+    }
     try {
       const result = await run.adapter.send({
         chat: { kind: addr.kind, id: addr.id },
@@ -639,12 +930,12 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
         inResponseTo: effectiveProactive ? undefined : effectiveInResponseTo,
         timeoutMs: message.timeoutMs,
         ext: message.ext,
-      })
+      }, replyGuard ? { replyGuard } : undefined)
       bumpReplyCount(addr.instance, effectiveProactive ? null : effectiveInResponseTo)
       return { messageId: result.messageId, degraded: [...d.degraded, ...extraDegraded] }
     } catch (error) {
       const sendError = toSendError(error, addr.instance)
-      if (isNotSent(sendError)) {
+      if (isNotSent(sendError) && !replyGuard && isCurrentRun(run) && !isHeld(run.instance)) {
         // 确定没发出去且不含媒体 → 入队；媒体消息入不了队 → 原样抛出
         const queued = outbox.add({ ...message, parts: d.parts, replyTo: d.replyTo }, { instance: addr.instance })
         if (queued.ok) return { messageId: '', degraded: d.degraded, queued: true }
@@ -667,19 +958,51 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
     },
 
     sync,
+    acquireLease,
+    stopAttemptSince(instance) {
+      const attempt = runs.get(instance)?.stopAttempt
+      return attempt?.pending ? attempt.since : null
+    },
+    pauseInstance(instance, reason = '默认实例暂停托管', { forceReleaseLease = false, heldLease = null, signal } = {}) {
+      return serializeLifecycle(async () => {
+        signal?.throwIfAborted()
+        if (isHeld(instance) && !forceReleaseLease && leases.get(instance) !== heldLease) return false
+        await stopInstance(instance, reason, { waitForStop: true, signal })
+        if (forceReleaseLease && isHeld(instance)) {
+          leaseBuffers.get(instance)?.close?.()
+          leases.delete(instance)
+          leaseBuffers.delete(instance)
+        }
+        idle.set(instance, { state: 'stopped', detail: reason })
+        return !runs.has(instance)
+      })
+    },
 
     /**
      * 停掉全部实例（宿主 dispose / 插件卸载时调）。
      * 平台端的重连定时器、长轮询、HTTP 回调路由都必须在这里收掉，否则宿主关了进程还不退出。
      */
-    async stopAll() {
-      await syncTail.catch(() => {})
-      for (const instanceName of Array.from(runs.keys())) {
-        await stopInstance(instanceName, '网关已停止')
-      }
-      for (const [instanceName, want] of Object.entries(platformsConfig())) {
-        if (!runs.has(instanceName)) idle.set(instanceName, { state: 'stopped', detail: '网关已停止' })
-      }
+    stopAll() {
+      return serializeLifecycle(async () => {
+        const errors = []
+        for (const instanceName of Array.from(runs.keys())) {
+          try {
+            await stopInstance(instanceName, '网关已停止', { waitForStop: isHeld(instanceName) })
+          } catch (error) {
+            errors.push(error)
+          }
+        }
+        for (const instanceName of leases.keys()) {
+          if (!runs.has(instanceName)) {
+            leases.delete(instanceName)
+            leaseBuffers.delete(instanceName)
+          }
+        }
+        for (const instanceName of Object.keys(platformsConfig())) {
+          if (!runs.has(instanceName)) idle.set(instanceName, { state: 'stopped', detail: '网关已停止' })
+        }
+        if (errors.length) throw new AggregateError(errors, '网关实例尚未全部停止')
+      })
     },
 
     /** 已注册的平台端目录；面板用它发现还没配置的平台（如飞书）。 */
@@ -700,13 +1023,14 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
           continue
         }
         const record = idle.get(instanceName)
+        const paused = isPausedOwned(instanceName)
         list.push({
           instance: instanceName,
           platform: prefixOf(instanceName),
           name: instanceName,
-          enabled: Boolean(want?.enabled),
-          state: record?.state || (want?.enabled ? 'stopped' : 'stopped'),
-          detail: record?.detail || (want?.enabled ? '尚未启动' : '实例已停用'),
+          enabled: !paused && Boolean(want?.enabled),
+          state: paused ? 'stopped' : (record?.state || 'stopped'),
+          detail: paused ? (record?.detail || '实例已暂停等待恢复确认') : (record?.detail || (want?.enabled ? '尚未启动' : '实例已停用')),
           self: null,
           caps: null,
           settings: probes.get(prefixOf(instanceName))?.settings || [],
@@ -738,9 +1062,9 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
           fn({
             instance: run.instance,
             platform: run.platform,
-            state: run.state,
+            state: businessState(run.instance, run.state),
             caps: cloneCaps(run.caps),
-            features: effectiveFeaturesFor(run.state, run.caps),
+            features: effectiveFeaturesFor(businessState(run.instance, run.state), run.caps),
           })
         } catch (error) {
           logger.warn('onCapsChanged 订阅者出错：', error?.message || error)
@@ -763,12 +1087,14 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
 
     features(chatIdOrInstance) {
       const { run } = resolveTarget(chatIdOrInstance)
-      return effectiveFeaturesFor(run?.state, run?.caps)
+      return effectiveFeaturesFor(businessState(run?.instance, run?.state), run?.caps)
     },
 
     async fetch(chatIdOrInstance, request) {
       const { run, addr } = resolveTarget(chatIdOrInstance)
-      if (!run || run.state !== 'connected') throw makeSendError('not-sent', 'offline', String(chatIdOrInstance), '实例未连接')
+      const instance = addr?.instance || parseChatId(chatIdOrInstance)?.instance || chatIdOrInstance
+      if (isHeld(instance)) throw heldError(instance)
+      if (!run || !isCurrentRun(run) || run.state !== 'connected') throw makeSendError('not-sent', 'offline', String(chatIdOrInstance), '实例未连接')
       if (typeof run.adapter.fetch !== 'function') throw new Error(`平台端 ${run.platform} 没有实现 fetch`)
       let req = request
       if (req?.kind === 'message') {
@@ -788,16 +1114,37 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
     },
 
     async native(instance, action, params, opts) {
+      if (isHeld(instance)) throw heldError(instance)
       const run = runs.get(instance)
-      if (!run || !platformsConfig()[instance]?.enabled) throw new Error(`实例 ${instance} 未启用，native 不可用`)
+      if (!run || !isCurrentRun(run) || !platformsConfig()[instance]?.enabled) throw new Error(`实例 ${instance} 未启用，native 不可用`)
       if (typeof run.adapter.native !== 'function') throw new Error(`平台端 ${run.platform} 没有实现 native`)
       return run.adapter.native(action, params, opts)
     },
 
     groupAdmin(chatIdOrInstance) {
       const { run } = resolveTarget(chatIdOrInstance)
-      if (!run || !platformsConfig()[run.instance]?.enabled || run.state !== 'connected') return null
-      return run.adapter?.groupAdmin || null
+      if (!run || !isCurrentRun(run) || isHeld(run.instance) || !platformsConfig()[run.instance]?.enabled || run.state !== 'connected') return null
+      const capability = run.adapter.groupAdmin
+      if (!capability) return null
+      // 调用者可能在迁移开始之前取得了能力对象，每次调用仍要核对运行状态。
+      const check = () => {
+        if (isHeld(run.instance)) throw heldError(run.instance)
+        if (!isCurrentRun(run)) throw makeSendError('not-sent', 'offline', run.instance, '实例已停止')
+      }
+      const guarded = {
+        get supportedActions() { return capability.supportedActions },
+        set supportedActions(actions) { capability.supportedActions = actions },
+      }
+      for (const key of ['getBotState', 'getGroupInfo', 'listMembers', 'muteMember', 'unmuteMember', 'kickMember']) {
+        if (typeof capability[key] === 'function') guarded[key] = async (...args) => {
+          check()
+          return capability[key](...args)
+        }
+      }
+      if (typeof capability.observedGroups === 'function') {
+        guarded.observedGroups = () => isCurrentRun(run) && !isHeld(run.instance) ? capability.observedGroups() : []
+      }
+      return guarded
     },
 
     toParts(chatIdOrInstance, nativeMessage) {
@@ -816,7 +1163,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
 
     identity,
     outbox: {
-      status: () => outbox.status(),
+      status: (instance) => outbox.status(instance),
       flush: (instance) => flushQueue(instance),
     },
 

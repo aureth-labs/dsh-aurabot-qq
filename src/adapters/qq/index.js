@@ -31,6 +31,7 @@ import { fromOneBotEvent, toAdapterEvent, segmentsToParts, toParts as partsOf } 
 import { buildParts } from './outbound.js'
 import { createNative } from './native.js'
 import { makeSendError, toSendError } from './errors.js'
+import { assertReplyCurrent } from '../../gateway/errors.js'
 import {
   CAPS_CONSERVATIVE, FILE_MAX_BYTES, cacheMatchesGateway, capsFromProbes, classifyProbeError,
   probeGateway, readCapsCache, supportedActions, writeCapsCache,
@@ -38,6 +39,7 @@ import {
 import { createSnowlumaSidecar, snowlumaEnabled } from './snowluma.js'
 
 const MAX_LOCAL_MEDIA_BYTES = 50 * 1024 * 1024
+const MIGRATION_LOGIN_TIMEOUT_MS = 4500
 const SENSITIVE_MEDIA_NAME_RE = /^(?:outbox|caps|config|settings|webui|onebot|identity|secret|token|credential|auth|cookie|session|keystore|env)(?:[._-]|$)/i
 const BLOCKED_MEDIA_EXTS = new Set([
   '.json', '.jsonc', '.json5', '.db', '.sqlite', '.sqlite3', '.wal', '.shm', '.log',
@@ -122,6 +124,10 @@ export function createQqAdapter(options = {}) {
   let ctx = null
   let running = false
   let connected = false
+  let startGeneration = 0
+  let connectionGeneration = 0
+  let stopping = null
+  let stopPending = false
   let client = options.client || null
   let sidecar = null // SnowLuma 控制器（只有 backend=snowluma 才有）
   let caps = { ...CAPS_CONSERVATIVE, features: { ...CAPS_CONSERVATIVE.features } }
@@ -131,6 +137,9 @@ export function createQqAdapter(options = {}) {
   let selfId = '' // 机器人自己的号：@自己 要判定成 mentionedMe
   let probing = false
   let unbindClient = null
+  let migrationConnection = false
+  let migrationAccount = ''
+  let migrationTransport = null
   const downgradedUnsupported = new Set()
 
   const fsImpl = options.fs || null // 测试注入的假 fs（决定 caps.json 走哪）
@@ -281,10 +290,30 @@ export function createQqAdapter(options = {}) {
     return result
   }
 
+  function isMigrationIdentityCurrent() {
+    return Boolean(running && connected && migrationTransport?.isCurrent())
+  }
+
+  function reconnectChangedMigrationEndpoint() {
+    if (!running || !connected || !migrationTransport || migrationTransport.isCurrent()) return
+    migrationTransport = null
+    ctx.state('disconnected', 'QQ 网关端点已变化，正在重新核对')
+    client.restart()
+  }
+
   /** 走一次动作（统一 unwrap + 统一错误形状）。 */
   const call = (action, params, opts) => {
     if (!client) return Promise.reject(makeSendError('not-sent', 'offline', instance, 'QQ 网关客户端还没建'))
-    return Promise.resolve(client.call(action, params, opts)).then(unwrap)
+    if (!migrationConnection) return Promise.resolve(client.call(action, params, opts)).then(unwrap)
+    if (!isMigrationIdentityCurrent()) {
+      reconnectChangedMigrationEndpoint()
+      return Promise.reject(makeSendError('not-sent', 'migration-identity-unverified', instance, 'QQ 网关连接尚未通过迁移身份核对'))
+    }
+    return migrationTransport.call(action, params, opts).then(unwrap).catch(error => {
+      if (error?.code !== 'ONEBOT_TRANSPORT_CHANGED') throw error
+      reconnectChangedMigrationEndpoint()
+      throw makeSendError('not-sent', 'migration-identity-unverified', instance, 'QQ 网关连接或端点已变更，请重新核对')
+    })
   }
 
   /** 建生产用的 OneBot 客户端（复用 src/onebot/client.js，不重写连接层）。 */
@@ -313,15 +342,28 @@ export function createQqAdapter(options = {}) {
     }
   }
 
-  function onClientState(state, detail) {    if (!running || !ctx) return
+  function onClientState(state, detail) {
+    if (!running || !ctx) return
     if (state === 'connected') {
       if (connected) return // 已经处理过这次连上（避免 start 里与回调重复触发 afterConnect）
       connected = true
+      const generation = ++connectionGeneration
+      if (migrationConnection) {
+        if (!migrationAccount) ctx.state('connected') // 首次由租约主动核对，业务仍挂起。
+        else void verifyMigrationIdentity(migrationAccount).then(() => {
+          if (generation === connectionGeneration && isMigrationIdentityCurrent()) ctx.state('connected')
+        }).catch(() => {
+          if (running && generation === connectionGeneration) ctx.state('disconnected', 'QQ 网关重连后身份核对失败')
+        })
+        return
+      }
       ctx.state('connected')
       void afterConnect()
       return
     }
+    connectionGeneration++
     connected = false
+    migrationTransport = null
     // 客户端自己的状态词（connecting/disconnected/unconfigured/stopped）与契约的 ConnState 不完全重合，
     // 这里只翻译契约里有的三个值，stopped 交给平台端的 stop() 报，避免「停了又报一次 stopped」。
     if (state === 'connecting') ctx.state('connecting')
@@ -332,6 +374,10 @@ export function createQqAdapter(options = {}) {
   function onClientEvent(event) {
     // 停完就不许再 emit（CONTRACTS 第六节第 3 条、adapter-kit 用例 5）
     if (!running || !ctx) return
+    if (migrationConnection && !isMigrationIdentityCurrent()) {
+      reconnectChangedMigrationEndpoint()
+      return
+    }
     try {
       if (event?.post_type === 'message') {
         const inbound = fromOneBotEvent(event, { selfId, faceName: options.faceName })
@@ -472,6 +518,50 @@ export function createQqAdapter(options = {}) {
 
   // ───────────────────────── 连接后 ─────────────────────────
 
+  function loginIdentity(info) {
+    const account = String(info?.user_id ?? info?.uin ?? '')
+    return { account, name: String(info?.nickname ?? info?.name ?? account) }
+  }
+
+  async function verifyMigrationIdentity(expectedAccount) {
+    const expected = String(expectedAccount ?? '').trim()
+    if (!running || !connected || !expected || typeof client?.captureTransport !== 'function') {
+      throw makeSendError('not-sent', 'migration-identity-unverified', instance, '缺少可核对的 QQ 迁移连接或目标帐号')
+    }
+    if (migrationAccount && migrationAccount !== expected) {
+      throw makeSendError('not-sent', 'migration-identity-mismatch', instance, '迁移连接的目标 QQ 帐号已变化')
+    }
+    migrationConnection = true
+    migrationTransport = null
+    const generation = connectionGeneration
+    const transport = client.captureTransport()
+    const loadIdentity = async (kind, label) => {
+      let identity
+      try {
+        const info = await transport.call('get_login_info', {}, { transport: kind, timeoutMs: MIGRATION_LOGIN_TIMEOUT_MS, retries: 0 })
+        identity = loginIdentity(unwrap(info))
+      } catch {
+        throw makeSendError('not-sent', 'migration-identity-unverified', instance, `未能核对 QQ ${label} 端点的登录帐号`)
+      }
+      if (identity.account !== expected) {
+        throw makeSendError('not-sent', 'migration-identity-mismatch', instance, `QQ ${label} 端点的登录帐号与迁移目标不一致`)
+      }
+      return identity
+    }
+    const [identity] = await Promise.all([
+      loadIdentity('ws', 'WebSocket'),
+      ...(transport.hasHttp ? [loadIdentity('http', 'HTTP')] : []),
+    ])
+    if (!running || !connected || generation !== connectionGeneration || !transport.isCurrent()) {
+      throw makeSendError('not-sent', 'migration-identity-unverified', instance, 'QQ 网关连接或端点已变更，请重新核对')
+    }
+    migrationAccount = expected
+    migrationTransport = transport
+    selfId = identity.account
+    void runProbe().catch(error => log().warn?.('能力探测失败，继续按最保守的能力表运行：', error?.message || error))
+    return identity
+  }
+
   /**
    * 读登录信息（whoami 的实际实现）。放在这里而不是直接调 adapter.whoami()：
    * afterConnect 拿的是闭包里的函数，adapter 对象还没构造完（下面的对象字面量里才定义 whoami）。
@@ -479,12 +569,12 @@ export function createQqAdapter(options = {}) {
    */
   async function loginInfo() {
     if (!client) throw makeSendError('not-sent', 'offline', instance, 'QQ 网关未连接')
+    const generation = connectionGeneration
+    const guarded = migrationConnection
     try {
-      const info = await call('get_login_info', {}, { timeoutMs: 10000, retries: 0 })
-      const account = String(info?.user_id ?? info?.uin ?? '')
-      const name = String(info?.nickname ?? info?.name ?? account)
-      if (account) selfId = account
-      return { account, name }
+      const identity = loginIdentity(await call('get_login_info', {}, { timeoutMs: 10000, retries: 0 }))
+      if (identity.account && generation === connectionGeneration && guarded === migrationConnection) selfId = identity.account
+      return identity
     } catch (error) {
       throw toSendError(error, { instance, isDefiniteFailure })
     }
@@ -492,19 +582,22 @@ export function createQqAdapter(options = {}) {
 
   async function afterConnect() {
     if (!running) return
+    const generation = connectionGeneration
+    const current = () => running && !migrationConnection && generation === connectionGeneration
     // ① 核对登录的是不是配置里的那个机器人；顺带拿到 selfId（@自己 要用）
     let me = null
     try {
       me = await loginInfo()
-      selfId = String(me?.account || '')
     } catch (error) {
       log().warn?.('连上了但读不到登录信息：', error?.message || error)
     }
-    if (!running) return
+    if (!current()) return
+    if (me) selfId = me.account
     // ② SnowLuma 场景：核对登录的号（不是机器人号就撤销注入、断开）
-    if (sidecar && selfId) {
+    if (sidecar && me?.account) {
       try {
-        const ok = await sidecar.confirmLogin(selfId)
+        const ok = await sidecar.confirmLogin(me.account)
+        if (!current()) return
         if (!ok) {
           log().warn?.('登录的号不是机器人号，已断开这个实例')
           try { client?.stop() } catch (inner) {}
@@ -529,7 +622,7 @@ export function createQqAdapter(options = {}) {
    * 出站主路径。
    * 失败分类的全部来源是 src/onebot/client.js 的 transport / uncertain（见 errors.js）。
    */
-  async function send(message = {}) {
+  async function send(message = {}, { replyGuard } = {}) {
     const cfg = config()
     const chat = message?.chat || {}
     const parts = Array.isArray(message?.parts) ? message.parts : []
@@ -550,6 +643,14 @@ export function createQqAdapter(options = {}) {
     })
     const timeoutMs = Math.max(1, Number(message.timeoutMs) || 15000)
     let messageId = ''
+    let dispatched = false
+    const beforeDispatch = replyGuard && (() => assertReplyCurrent(replyGuard, instance, dispatched))
+    const dispatch = async (action, params) => {
+      beforeDispatch?.()
+      const result = await call(action, params, { timeoutMs, retries: 0, beforeDispatch })
+      dispatched = true
+      return result
+    }
 
     try {
       // ① 文件：走 upload_private_file / upload_group_file（和 hub.js sendFile 同一条路）
@@ -563,7 +664,7 @@ export function createQqAdapter(options = {}) {
         const params = kind === 'group'
           ? { group_id: Number(targetId), file: up.file, name: up.name || 'file' }
           : { user_id: Number(targetId), file: up.file, name: up.name || 'file' }
-        const r = await call(action, params, { timeoutMs, retries: 0 })
+        const r = await dispatch(action, params)
         uploaded.push({ action, name: up.name || 'file', id: r?.file_id })
       }
 
@@ -577,7 +678,7 @@ export function createQqAdapter(options = {}) {
           : { user_id: Number(targetId), message: outSegments }
         // 群里的戳一戳要靠 send_poke 单独发；私聊的 poke 段直接算进消息里（对面网关自己认）
         if (outSegments.length) {
-          const r = await call(action, params, { timeoutMs, retries: 0 })
+          const r = await dispatch(action, params)
           messageId = String(r?.message_id ?? '')
         }
       }
@@ -586,8 +687,9 @@ export function createQqAdapter(options = {}) {
       if (pokes.length) {
         try {
           // 群里要带 group_id；私聊只有 user_id
-          await call('send_poke', kind === 'group' ? { group_id: Number(targetId), user_id: 0 } : { user_id: Number(targetId) }, { timeoutMs, retries: 0 })
+          await dispatch('send_poke', kind === 'group' ? { group_id: Number(targetId), user_id: 0 } : { user_id: Number(targetId) })
         } catch (error) {
+          if (error?.code === 'reply-revoked') throw error
           degraded.push('poke dropped')
           log().debug?.('戳一戳没发出去（不影响这条消息）：', error?.message || error)
         }
@@ -720,11 +822,22 @@ export function createQqAdapter(options = {}) {
           const friends = await call('get_friend_list', {}, { timeoutMs: 15000 }).catch(() => [])
           return { groups: Array.isArray(groups) ? groups : [], friends: Array.isArray(friends) ? friends : [] }
         }
+        case 'contacts': {
+          const result = await call('get_friend_list', {}, { timeoutMs: 8000 })
+          const friends = Array.isArray(result) ? result : result?.friends
+          if (!Array.isArray(friends)) {
+            throw makeSendError('unknown', 'invalid-contacts-response', instance, 'QQ 网关返回了无法识别的好友列表')
+          }
+          return { friends }
+        }
         default:
           throw makeSendError('not-sent', 'bad-fetch-kind', instance, `认不出的 fetch 类型：${String(request.kind)}`)
       }
     } catch (error) {
       if (error?.certainty === 'not-sent' || error?.certainty === 'unknown') throw error
+      if (request.kind === 'contacts' && classifyProbeError(error) === 'unsupported') {
+        throw makeSendError('not-sent', 'contacts-unavailable', instance, '当前 QQ 网关不支持读取好友列表')
+      }
       throw toSendError(error, { instance, isDefiniteFailure })
     }
   }
@@ -841,6 +954,55 @@ export function createQqAdapter(options = {}) {
     },
   }
 
+  function disposeSidecar() {
+    const oldSidecar = sidecar
+    sidecar = null
+    try { oldSidecar?.dispose?.() } catch (error) { log().debug?.('停 SnowLuma 出错：', error?.message || error) }
+  }
+
+  function completeStop() {
+    stopPending = false
+    ctx?.state('stopped')
+  }
+
+  function confirmStopped() {
+    if (running || client?.confirmStopped?.() !== true) return false
+    if (stopPending) {
+      stopping = null
+      disposeSidecar()
+      completeStop()
+    }
+    return true
+  }
+
+  async function stopAndWait(options) {
+    if (stopping) return stopping
+    if (!running && !stopPending) return
+    running = false
+    connected = false
+    connectionGeneration++
+    migrationTransport = null
+    stopPending = true
+    if (typeof unbindClient === 'function') { try { unbindClient() } catch {} unbindClient = null }
+    const attempt = Promise.withResolvers()
+    stopping = attempt.promise
+    const stop = async () => {
+      try {
+        if (typeof client?.stopAndWait === 'function') await client.stopAndWait(options)
+        else await client?.stop?.()
+      } finally {
+        if (stopping === attempt.promise) disposeSidecar()
+      }
+      if (stopping === attempt.promise) completeStop()
+    }
+    stop().then(attempt.resolve, attempt.reject)
+    try {
+      await attempt.promise
+    } finally {
+      if (stopping === attempt.promise) stopping = null
+    }
+  }
+
   const adapter = {
     id,
     name: 'QQ',
@@ -858,15 +1020,22 @@ export function createQqAdapter(options = {}) {
       { key: 'wsUrl', label: 'WebSocket 地址', type: 'text', default: '', placeholder: 'ws://127.0.0.1:3001', description: 'OneBot v11 正向 WS（Universal 模式）。留空时若接了 SnowLuma 就自动从它的配置里读' },
       { key: 'httpUrl', label: 'HTTP 地址', type: 'text', default: '', placeholder: 'http://127.0.0.1:3000', description: '留着也能用：WS 没连上时走 HTTP 调动作' },
       { key: 'token', label: '访问令牌', type: 'password', default: '', description: '对方设了 access_token 就填，没设留空（WS 和 HTTP 共用）' },
+      { key: 'httpToken', label: 'HTTP 访问令牌', type: 'password', default: '', description: '仅当 HTTP 使用独立令牌时填写' },
+      { key: 'wsToken', label: 'WebSocket 访问令牌', type: 'password', default: '', description: '仅当 WebSocket 使用独立令牌时填写' },
       { key: 'snowlumaManaged', label: '由插件管理 SnowLuma', type: 'switch', default: false, description: '只在 Windows + backend=snowluma 时生效：替你启停本机的 SnowLuma，并只给机器人号注入' },
       { key: 'snowlumaDir', label: 'SnowLuma 目录', type: 'text', default: '', placeholder: 'C:\\Aurabot\\snowluma', description: '主人自己下载解压的那一份（插件不下载、不解压、不替你同意协议）' },
     ],
 
     async start(context) {
+      if (stopPending) await stopAndWait()
       if (running) return
+      const generation = ++startGeneration
       ctx = context
       instance = String(ctx.instance || id)
       running = true
+      migrationConnection = ctx.migrationHeld === true
+      migrationAccount = ''
+      migrationTransport = null
       ctx.state('connecting')
 
       const cfg = config()
@@ -888,6 +1057,7 @@ export function createQqAdapter(options = {}) {
             managerFactory: options.managerFactory,
           })
           const r = await sidecar.start()
+          if (!running || generation !== startGeneration) return
           if (r && r.ok === false) {
             // 启动不了不是致命错：用户可能已经把 SnowLuma 开着，照样去连它的端点
             log().warn?.('SnowLuma 没能替你启动：', r.message || '未知原因')
@@ -897,9 +1067,11 @@ export function createQqAdapter(options = {}) {
           }
           if (cfg.autoAttach !== false) {
             const a = await sidecar.attachBot()
+            if (!running || generation !== startGeneration) return
             if (a?.message) log().info?.(`SnowLuma 注入：${a.message}`)
           }
         } catch (error) {
+          if (!running || generation !== startGeneration) return
           log().warn?.('SnowLuma 子模块出错（继续按纯 OneBot 连接）：', error?.message || error)
           sidecar = null
         }
@@ -920,6 +1092,7 @@ export function createQqAdapter(options = {}) {
 
       // ② 连不上时不能假装连上：等一次连接结果（adapter-kit 要求 start 后状态到 connected）
       const ok = await waitConnected(client, Number(cfg.connectTimeoutMs) || 5000)
+      if (!running || generation !== startGeneration) return
       if (!ok) {
         // 没有地址 / 对面没起：按「未连接」报，不抛错（网关会记成断线，之后自动重连）
         ctx.state('unconfigured', endpoint().wsUrl || endpoint().httpUrl ? 'QQ 网关暂时连不上（会自动重连）' : '还没配置 OneBot 地址')
@@ -928,23 +1101,18 @@ export function createQqAdapter(options = {}) {
       // 连上后的状态由 onClientState 报（它会触发 afterConnect：whoami + 探测）
     },
 
-    async stop() {
-      if (!running) return
-      running = false
-      connected = false
-      if (typeof unbindClient === 'function') { try { unbindClient() } catch (error) {} unbindClient = null }
-      try { client?.stop?.() } catch (error) { log().debug?.('停 OneBot 客户端出错：', error?.message || error) }
-      if (sidecar) {
-        try { sidecar.dispose?.() } catch (error) { log().debug?.('停 SnowLuma 出错：', error?.message || error) }
-        sidecar = null
-      }
-      ctx?.state('stopped')
-      // 停了之后绝不能再 emit：onClientEvent 里有 running 守卫，这里再把 ctx 留着给状态用
-    },
+    stop: () => stopAndWait(),
+
+    stopAndWait,
+    confirmStopped,
 
     async whoami() {
       return loginInfo()
     },
+
+    verifyMigrationIdentity,
+
+    isMigrationIdentityCurrent,
 
     send,
 

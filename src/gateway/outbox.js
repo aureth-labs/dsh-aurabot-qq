@@ -1,7 +1,7 @@
 // Aurabot 多平台 · 网关补发队列（G1 产出）
 // 契约来源：src/gateway/contracts.d.ts（OutboundMessage / SendKind / SendError）；
 // 文字规则：docs/CONTRACTS.md §七.4/§七.5 —— 补发队列只收 'not-sent'，
-//   且只收不含媒体的消息；有效期按 SendKind：proactive 1 分钟 / diary 10 分钟 / 其余 5 分钟；
+//   只接收无媒体且未标记为敏感的消息。有效期按 SendKind：proactive 1 分钟 / diary 10 分钟 / 其余 5 分钟；
 //   实例重新连上时网关自动补发这个实例名下的；补发成功后经 onFlushed 回调通知中枢留痕（G3 接上）。
 // 逻辑源头：src/onebot/outbox.js（错误分类、大小上限、按种类有效期、原子落盘——照搬语义，
 //   队列项从「OneBot 动作 + 参数」改成 OutboundMessage）。
@@ -44,7 +44,9 @@ export function createOutbox({ file, log, now = Date.now, maxItems = DEFAULT_MAX
       if (!file || !existsSync(file)) return
       const parsed = JSON.parse(readFileSync(file, 'utf8'))
       // 只收形状完整的队列项：必须有 id / instance / message（OutboundMessage）
-      items = Array.isArray(parsed) ? parsed.filter((x) => x && x.id && x.instance && x.message && Array.isArray(x.message.parts)) : []
+      items = Array.isArray(parsed) ? parsed.filter((x) =>
+        x && x.id && x.instance && x.message && !x.message.sensitive && Array.isArray(x.message.parts)) : []
+      if (Array.isArray(parsed) && parsed.some(x => x?.message?.sensitive)) save()
     } catch (error) {
       log?.warn?.('补发队列读不出来，已忽略旧文件：', error?.message || error)
       items = []
@@ -78,11 +80,12 @@ export function createOutbox({ file, log, now = Date.now, maxItems = DEFAULT_MAX
 
   /**
    * 入队一条 OutboundMessage。只收 'not-sent' 的场合由网关判断后才调这里；
-   * 这里再兜两道底：含媒体的不入队、太大的不入队。
+   * 队列还会拒绝敏感消息、媒体消息和超出大小限制的消息。
    * @returns {{ ok: boolean, id?: string, expiresAt?: number, message?: string }}
    */
   function add(message = {}, { instance } = {}) {
     if (!instance) return { ok: false, message: '缺实例名' }
+    if (message.sensitive) return { ok: false, message: '敏感消息不放进补发队列' }
     if (hasMedia(message.parts)) return { ok: false, message: '媒体消息不放进补发队列' }
     const text = JSON.stringify(message || {})
     if (Buffer.byteLength(text, 'utf8') > maxBytes) return { ok: false, message: '消息太大，不放进补发队列' }
@@ -122,20 +125,21 @@ export function createOutbox({ file, log, now = Date.now, maxItems = DEFAULT_MAX
    *   'unknown' / 其他：可能已经发出去或没意义了，丢弃防重复。
    * @param {(item) => Promise<{ messageId: string }>} send
    * @param {string=} onlyInstance 只补发这个实例名下的（实例重连时用）
+   * @param {((item) => boolean)=} canFlush 暂停的实例跳过，不增加重试次数
    */
   // flush 串行化：自动补发（实例连上时）和手动 flush 可能同时进来，
   // 若并发跑，两边会各自读到同一条快照 → 同一条消息发两次。
   // 防重复发送是这个队列存在的根本目的，所以这里必须串行（排队执行，不并发）。
   let flushChain = Promise.resolve()
 
-  async function flush(send, onlyInstance) {
-    const run = flushChain.then(() => flushOnce(send, onlyInstance))
+  async function flush(send, onlyInstance, canFlush) {
+    const run = flushChain.then(() => flushOnce(send, onlyInstance, canFlush))
     // 无论成败都不让链条断掉，否则后续 flush 全部被拒
     flushChain = run.catch(() => {})
     return run
   }
 
-  async function flushOnce(send, onlyInstance) {
+  async function flushOnce(send, onlyInstance, canFlush) {
     load()
     let sent = 0
     let dropped = 0
@@ -146,6 +150,7 @@ export function createOutbox({ file, log, now = Date.now, maxItems = DEFAULT_MAX
       if (onlyInstance && item.instance !== onlyInstance) continue
       // 可能已被本轮前面的迭代删掉（极端情况下同一 id 重复）
       if (!items.some((x) => x.id === item.id)) continue
+      if (canFlush && !canFlush(item)) continue
       const at = now()
       if (item.expiresAt <= at) {
         remove(item.id)
@@ -180,9 +185,10 @@ export function createOutbox({ file, log, now = Date.now, maxItems = DEFAULT_MAX
     return { sent, dropped, left: list().length }
   }
 
-  function status() {
+  function status(instance) {
     prune()
-    return { count: items.length, oldestAt: items.length ? Math.min(...items.map((x) => x.createdAt)) : 0 }
+    const selected = instance === undefined ? items : items.filter((item) => item.instance === instance)
+    return { count: selected.length, oldestAt: selected.length ? Math.min(...selected.map((x) => x.createdAt)) : 0 }
   }
 
   /** 注册补发成功回调：onFlushed(message: OutboundMessage, result: SendResult)。G3 用它留痕。 */

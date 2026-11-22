@@ -32,6 +32,13 @@
 | `send(message)` | parts → 平台调用，返回 `{ messageId }`。失败抛 `SendError`（见下文「错误分类」） |
 | `fetch?` / `toParts?` / `native?` | 可选：拉媒体 / 展开合并转发 / 历史消息；把平台原生格式转成 parts；平台独有本事 |
 
+#### 参与网关迁移
+
+迁移的源和目标适配器都必须实现 `stopAndWait({ timeoutMs, signal })` 和 `confirmStopped()`。网关分配租约前会检查这两项，缺少任一项会返回 `MIGRATION_STOP_UNSUPPORTED`。
+
+- [ ] `stopAndWait` 在确认旧连接关闭后才返回成功。超时或收到中止信号时，结束本次等待并报告失败。
+- [ ] 即使原停止等待已超时，`confirmStopped()` 也能在旧连接确实关闭且无法重连后从 `false` 变为 `true`。验证迟到的停止回调无法影响接任连接。
+
 ### 3. 填 caps
 
 `caps()` 必须给全所有键（网关直接拿它做降级判断，缺键 = 撒谎）。规则（CONTRACTS 第八节）：

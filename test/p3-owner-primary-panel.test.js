@@ -37,7 +37,7 @@ beforeEach(() => {
   freshDataDir('aurabot-p3-case-')
 })
 
-async function startHost(t, { dataDir = process.env.AURABOT_DATA_DIR, seedConfig, seedOwnerAccounts = [] } = {}) {
+async function startHost(t, { dataDir = process.env.AURABOT_DATA_DIR, seedConfig, seedOwnerAccounts = [], configureDsh } = {}) {
   process.env.AURABOT_DATA_DIR = dataDir
   const seedId = createIdentity({ dataDir: join(dataDir, 'gateway'), log: { info() {}, warn() {}, debug() {} } })
   const ownerPerson = seedId.claimOwner('qq', '10001')
@@ -62,6 +62,7 @@ async function startHost(t, { dataDir = process.env.AURABOT_DATA_DIR, seedConfig
   writeFileSync(join(dataDir, 'config.json'), JSON.stringify(cfgObj), 'utf8')
 
   const fake = createFakeDsh({ brain: async () => '好的' })
+  configureDsh?.(fake.ctx)
   const applied = hostMod.apply(fake.ctx)
   t.after(async () => {
     try { await applied.gateway?.stopAll?.() } catch {}
@@ -90,6 +91,96 @@ async function startHost(t, { dataDir = process.env.AURABOT_DATA_DIR, seedConfig
 
   return { fake, applied, adapters, ownerPerson }
 }
+
+test('共享私聊接口拒绝以旧版直连 QQ 为主账号，已启用的旧配置仍可关闭', async (t) => {
+  const { fake, applied } = await startHost(t, {
+    seedConfig: {
+      ownerPrimary: { mode: 'fixed', platform: 'qq', instance: 'qq', account: '10001' },
+      platforms: { bridge: { enabled: true } },
+    },
+    configureDsh(ctx) {
+      ctx.services.sessionController.fork = async () => { throw new Error('测试只使用面板接口') }
+      ctx.services.sessionProjections = {}
+    },
+  })
+  const path = '/platforms/multi-private'
+  assert.ok(applied.gateway, '即使其他平台已接入网关也要拒绝旧版直连主账号')
+  const status = (await fake.call(path)).json()
+  assert.equal(status.available, false)
+  assert.equal(status.reason, 'gateway-required')
+  const refused = (await fake.call(path, { enabled: true })).json()
+  assert.equal(refused.ok, false)
+  assert.equal(refused.reason, 'gateway-required')
+  assert.match(refused.message, /旧版直连 QQ/)
+  assert.equal(applied.getConfig().multiPlatformPrivateSession, false)
+
+  applied.setConfig({ ...applied.getConfig(), multiPlatformPrivateSession: true })
+  const existing = (await fake.call(path)).json()
+  assert.equal(existing.enabled, true)
+  assert.equal(existing.available, false)
+  assert.equal((await fake.call(path, { enabled: false })).json().ok, true)
+  assert.equal(applied.getConfig().multiPlatformPrivateSession, false)
+
+  const config = applied.getConfig()
+  applied.setConfig({ ...config, platforms: { ...config.platforms, 'qq#2': { enabled: false } } })
+  const { instances } = (await fake.call('/platforms')).json()
+  assert.ok(instances.some(item => item.instance === 'qq' && item.legacy))
+  assert.ok(instances.some(item => item.instance === 'qq#2' && !item.legacy))
+})
+
+test('共享私聊接口确认旧历史后收起入口，授权轮换后拒绝继承', async (t) => {
+  const cwd = process.env.AURABOT_DATA_DIR
+  const sessionsFile = join(cwd, 'sessions.json')
+  const sessionId = 'bridge-old-owner-session'
+  const { fake, applied, ownerPerson } = await startHost(t, {
+    seedOwnerAccounts: [['bridge', 'b_owner']],
+    seedConfig: {
+      workspaceDir: cwd, ownerLevel: 'social', multiPlatformPrivateSession: true,
+      ownerPrimary: { mode: 'fixed', platform: 'bridge', instance: 'bridge', account: 'b_owner' },
+      platforms: { bridge: { enabled: true } },
+    },
+    configureDsh(ctx) {
+      ctx.services.sessionController.fork = async () => { throw new Error('测试只使用面板接口') }
+      ctx.services.sessionProjections = {}
+      ctx.services.sessionQuery = {
+        async observeSession(id) {
+          assert.equal(id, sessionId)
+          return {
+            header: { id, cwd },
+            events: [{ seq: 0, type: 'turn/end', data: { reason: { kind: 'completed' } } }],
+          }
+        },
+      }
+    },
+  })
+  writeFileSync(sessionsFile, JSON.stringify({
+    chats: { 'bridge:private:b_owner': { sessionId, level: 'social', preset: 'aurabot-social' } },
+  }))
+
+  const path = '/platforms/multi-private'
+  const status = async () => (await fake.call(path)).json()
+  assert.equal((await status()).legacyHistoryAvailable, true)
+  const prepared = (await fake.call(path + '/legacy/prepare', { mode: 'live' })).json()
+  assert.equal(prepared.ok, true, prepared.message)
+  const confirmed = (await fake.call(path + '/legacy/confirm', { mode: 'live', token: prepared.token, confirmed: true })).json()
+  assert.equal(confirmed.ok, true, confirmed.message)
+  assert.equal(confirmed.legacyHistoryAvailable, false)
+
+  const config = applied.getConfig()
+  const oldRevision = config.ownerAuthorization.revision
+  const changed = applied.setConfig({ ...config, ownerQQ: '' })
+  assert.equal(changed.ownerPersonId, ownerPerson)
+  assert.notEqual(changed.ownerAuthorization.revision, oldRevision)
+  const blocked = await status()
+  assert.equal(blocked.available, true)
+  assert.equal(blocked.sourceAuthorizationChanged, true)
+  assert.equal(blocked.legacyHistoryAvailable, false)
+  const beforeInherit = readFileSync(sessionsFile, 'utf8')
+  const inherit = (await fake.call(path + '/inherit', { mode: 'live' })).json()
+  assert.equal(inherit.ok, false)
+  assert.match(inherit.message, /主人授权已变化/)
+  assert.equal(readFileSync(sessionsFile, 'utf8'), beforeInherit)
+})
 
 test('P3-1: api.ownerRoute() 暴露结构化主账号路由，blocked/no-route 时绝不穿透 QQ', async (t) => {
   const dir = freshDataDir('aurabot-p3-mod-')
@@ -609,9 +700,16 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
     // 3) Platforms 人卡片：主人行不显示「固定平台」select，显示「当前主账号」与「设为主账号」按钮；非主人行保留「固定平台」select
     hook = 0
     state = [
-      { ok: true, owner: 'p-owner', instances: [], catalog: [], candidates: [], configs: {} }, // data
+      {
+        ok: true, owner: 'p-owner', instances: [], catalog: [], candidates: [], configs: {},
+        multiPrivate: {
+          enabled: true, available: true, state: 'active', mode: 'live', retiredCount: 0,
+          lastDeliveryFailure: { kind: 'failure-notice', platform: 'wechat-clawbot', at: 1767225600000, reason: 'offline' },
+        },
+      }, // data
       '', // busy
       '', // addPlatform
+      null, // legacyReview
       {
         ok: true,
         owner: 'p-owner',
@@ -647,6 +745,7 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
     const platText = textOf(platTree)
     assert.match(platText, /当前主人主账号：QQ · 10001/)
     assert.match(platText, /设为主人 bridge#2 主账号/)
+    assert.match(platText, /最近一次失败回执投递异常 · 微信 ClawBot · .* · 平台离线/)
 
     const unobsQuickBtn = collectNodes(platTree, (n) => n.type?.name === 'Btn' && textOf(n.children).includes('bridge 未观测'))[0]
     assert.ok(unobsQuickBtn)

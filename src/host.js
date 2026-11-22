@@ -10,12 +10,14 @@
 // ⚠ 安全默认：总开关关、试运行开。不手动打开，一句都不会真的发到 QQ。
 
 import { randomUUID } from 'node:crypto'
-import { readFileSync, readdirSync, existsSync, writeFileSync, unlinkSync, statSync, mkdirSync } from 'node:fs'
+import { readFileSync, readdirSync, existsSync, writeFileSync, unlinkSync, statSync, mkdirSync, rmSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawn } from 'node:child_process'
+import { setTimeout as delay } from 'node:timers/promises'
+import { isDeepStrictEqual } from 'node:util'
 import net from 'node:net'
-import { loadConfig, saveConfig, publicConfig, mergeFromPanel, authOwnerKey, ownerAuthorizationRevision, normalizeFallbackOrderList } from './core/config.js'
+import { loadConfig, saveConfig, normalize, publicConfig, mergeFromPanel, authOwnerKey, ownerAuthorizationRevision, normalizeFallbackOrderList, PLATFORM_SECRET_KEYS, readRawConfig, writeRawConfigAtomic, qqOwnershipConfigSnapshot } from './core/config.js'
 import { createLogger } from './core/logger.js'
 import { encodeResponse } from './core/http-compress.js'
 import { registerSecret, redact } from './core/redact.js'
@@ -45,7 +47,35 @@ import { createCommunity, REGISTRY_URL, GITEE_MIRROR } from './core/community.js
 import { createApprovalRelay } from './security/approval.js'
 import { createNoticeRelay, normalizeWorkspace } from './features/notice.js'
 import { captureSystemPrompt } from './security/leak-guard.js'
-import { applyPendingRestore, cancelRestore, createBackup, lastRestoreResult, listBackups, pendingModules, pendingRestore, setPendingModules, stageReceivedBackup, stageRestore } from './core/backup.js'
+import { applyPendingRestore, cancelRestore, createBackup, inspectBackupRestoreState, lastRestoreResult, listBackups, pendingModules, pendingRestore, quarantineCorruptBackupJournal, readBackupRestoreJournal, recoverBackupRestore, setPendingModules, stageReceivedBackup, stageRestore } from './core/backup.js'
+import {
+  applyRawQqSnapshot,
+  assertValidMigrationTxnId,
+  BACKUP_JOURNAL_FILE,
+  captureRawQqSnapshot,
+  checkMigrationPersistencePreflight,
+  cleanupMigrationTxn,
+  clearRecoveryGuard,
+  createHeldBufferStore,
+  createMigrationTxn,
+  dataEpochPath,
+  extractBufferPayloadText,
+  findActiveMigrationTxns,
+  isKnownGuardPhase,
+  isValidMigrationTxnId,
+  KNOWN_PAUSED_GUARD_PHASES,
+  listMigrationTxns,
+  MAX_HELD_BUFFER_BYTES,
+  MAX_HELD_BUFFER_ITEMS,
+  readDataEpoch,
+  readMigrationTxn,
+  readRecoveryGuard,
+  TERMINAL_TXN_PHASES,
+  updateMigrationTxn,
+  verifyRawQqSnapshot,
+  writeJsonAtomicFsync,
+  writeRecoveryGuard,
+} from './core/qq-gateway-migration.js'
 import { pushBackup, listWebdavBackups, downloadWebdavBackup } from './core/backup-push.js'
 import { cleanText } from './core/text.js'
 import { createBridge } from './core/bridge.js'
@@ -56,6 +86,7 @@ import { BUILTINS } from './modules/index.js'
 import { createOutboundPolicy } from './chat/outbound-policy.js'
 import { createPurposePolicy, createSpeakupPolicy, createSharedBudget } from './features/proactive-policy.js'
 import { parseChatId, normalizeChatId, formatChatId } from './gateway/address.js'
+import { fixedSharedPrimary } from './gateway/shared-private-route.js'
 import { createIdentity } from './gateway/identity.js'
 import { createGateway } from './gateway/index.js'
 import { createQqAdapter } from './adapters/qq/index.js'
@@ -156,15 +187,468 @@ export function isChatSession(hub, session) {
 export function apply(ctx, opts = {}) {
   const logger = createLogger({ dsh: ctx })
   const log = logger.child('core')
-  // 恢复备份必须在读配置之前：读完配置后内存里的旧状态会写回去
-  try {
-    const restored = applyPendingRestore()
-    if (restored) {
-      log.info(`已恢复备份：${restored} 个文件，原来的文件在 backups/ 里留了底`)
-      const report = lastRestoreResult()
-      if (report?.notice) log.warn(report.notice)
+  const dataRoot = dataDir()
+
+  const enterMinimalBackupMovingRecovery = (journal) => {
+    const epochNow = readDataEpoch(dataRoot).epoch
+    const guard = writeRecoveryGuard(dataRoot, {
+      phase: 'backup-moving',
+      txnId: journal?.txnId || '',
+      dataEpoch: epochNow,
+      reason: '备份恢复在文件搬移途中中断，需完成或回滚后才能恢复正常启动',
+    })
+    log.error('检测到备份恢复在搬移共享存储途中中断，进入最小恢复管理模式（共享存储与通讯平台均已暂停）')
+    const PREFIX_MIN = '/aurabot/api'
+    const minReply = (res, status, obj) => {
+      try {
+        res.statusCode = status
+        res.setHeader?.('content-type', 'application/json; charset=utf-8')
+        res.setHeader?.('cache-control', 'no-store')
+        res.end?.(JSON.stringify(obj))
+      } catch {}
     }
-  } catch (error) { log.error('恢复备份失败：', error.message) }
+    const minReadBody = async (req) => {
+      const chunks = []
+      for await (const c of req) chunks.push(c)
+      const text = Buffer.concat(chunks).toString('utf8').trim()
+      return text ? JSON.parse(text) : {}
+    }
+    const minRoute = (path, handler) => ctx.effect(() => ctx.webServer.register({
+      kind: 'exact',
+      path: PREFIX_MIN + path,
+      handler: async (req, res) => {
+        try {
+          const remote = String(req?.socket?.remoteAddress || '')
+          if (remote && !['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(remote)) {
+            return minReply(res, 403, { ok: false, message: '恢复管理接口只允许本机访问' })
+          }
+          const result = await handler(req, res)
+          if (result !== undefined) minReply(res, 200, result)
+        } catch (error) {
+          minReply(res, 500, { ok: false, message: error?.message || String(error) })
+        }
+      },
+    }), `aurabot: 最小恢复 ${path}`)
+    minRoute('/backup/state', async () => ({
+      ok: true,
+      recoveryMode: 'backup-moving',
+      guard: readRecoveryGuard(dataRoot),
+      backupState: inspectBackupRestoreState(dataRoot),
+      list: listBackups(),
+      pending: pendingRestore(),
+      modules: pendingModules(),
+      dir: dataDir('backups'),
+    }))
+    minRoute('/backup/recovery', async () => ({
+      ok: true,
+      recoveryMode: 'backup-moving',
+      guard: readRecoveryGuard(dataRoot),
+      backupState: inspectBackupRestoreState(dataRoot),
+    }))
+    minRoute('/backup/recovery/rollback', async (req) => {
+      if (req.method !== 'POST' || req.headers?.['x-aurabot-backup'] !== '1') {
+        return { ok: false, message: '请从恢复面板发起回滚操作' }
+      }
+      const res = recoverBackupRestore(dataRoot, { action: 'rollback' })
+      clearRecoveryGuard(dataRoot)
+      return { ...res, message: '备份已回滚到原数据，重启或重新加载插件即可恢复运行' }
+    })
+    minRoute('/backup/recovery/continue', async (req) => {
+      if (req.method !== 'POST' || req.headers?.['x-aurabot-backup'] !== '1') {
+        return { ok: false, message: '请从恢复面板发起继续提交操作' }
+      }
+      await minReadBody(req)
+      const res = recoverBackupRestore(dataRoot, { action: 'continue' })
+      clearRecoveryGuard(dataRoot)
+      return { ...res, message: '备份已继续提交，重启或重新加载插件即可恢复运行' }
+    })
+    return {
+      recoveryMode: 'backup-moving',
+      guard,
+      recovery: () => readRecoveryGuard(dataRoot),
+      backupState: () => inspectBackupRestoreState(dataRoot),
+      recoverBackup: (recOpts) => {
+        const res = recoverBackupRestore(dataRoot, recOpts)
+        clearRecoveryGuard(dataRoot)
+        return res
+      },
+      qqOwnership: {
+        status: () => ({ revision: 0, legacyQqEnabled: false, phase: 'backup-moving' }),
+        recovery: () => readRecoveryGuard(dataRoot),
+      },
+      gateway: null,
+      onebot: null,
+      hub: null,
+      ready: Promise.resolve(),
+    }
+  }
+
+  let unloaded = false
+  let qqStartupPaused = false
+  let qqOwnershipTransfer = null
+  let pendingCommittedRecovery = null
+  let lastPausePromise = Promise.resolve()
+  let qqPausePending = false
+  let qqPauseInFlight = null
+  let qqPauseRetryTimer = null
+  let qqPauseReason = ''
+  let qqPauseStartedAt = 0
+  let qqPauseAttempts = 0
+  let qqPauseHeld = false
+  let qqGatewayStopPending = false
+  let qqLegacyStopPending = false
+  let qqRecoveryActionInFlight = false
+  const qqPauseTimeoutMs = Math.max(1, Number(opts.migrationPauseTimeoutMs) || 6000)
+  const qqRecoveryWaitingForStop = () => Boolean(qqPauseInFlight || qqLegacyStopPending || qqGatewayStopPending)
+
+  function scheduleQqPauseRetry(reason) {
+    if (unloaded || !qqStartupPaused || !qqPausePending || qqRecoveryActionInFlight || qqPauseRetryTimer || qqPauseInFlight) return
+    qqPauseRetryTimer = setTimeout(() => {
+      qqPauseRetryTimer = null
+      if (unloaded || !qqStartupPaused || !qqPausePending || qqRecoveryActionInFlight) return
+      const guard = readRecoveryGuard(dataRoot)
+      const keepHeld = ['recovering', 'committed'].includes(guard.phase) && !isGuardInvalid(guard)
+      void queueQqPause(reason, { keepHeld })
+    }, 1000)
+    qqPauseRetryTimer.unref?.()
+  }
+
+  function queueQqPause(reason, { keepHeld = false } = {}) {
+    if (unloaded) return Promise.resolve(false)
+    const heldLease = qqOwnershipTransfer?.lease || null
+    const retainLease = Boolean(keepHeld && heldLease)
+    if (qqPauseInFlight) {
+      // 溢出或损坏可升级暂停要求。等当前尝试结束后再实际关闭原本仅挂起的连接。
+      return qqPauseInFlight.retainLease && !retainLease
+        ? lastPausePromise.then(() => qqStartupPaused && queueQqPause(reason))
+        : lastPausePromise
+    }
+    clearTimeout(qqPauseRetryTimer)
+    qqPauseRetryTimer = null
+    if (!qqPausePending && !qqPauseHeld) {
+      qqPauseStartedAt = Date.now()
+      qqPauseAttempts = 0
+    }
+    qqPauseAttempts++
+    qqPausePending = true
+    qqPauseHeld = false
+    qqPauseReason = '正在等待默认 QQ 连接停止'
+    let legacyStopped = false
+    const controller = new AbortController()
+    const { signal } = controller
+    qqPauseInFlight = { controller, retainLease }
+    const attempt = Promise.allSettled([
+      Promise.resolve().then(async () => {
+        await onebot?.stopAndWait?.({ signal })
+        legacyStopped = true
+      }),
+      Promise.resolve().then(() => retainLease || platformGateway?.pauseInstance?.(defaultPlatform, reason, { heldLease, signal })),
+    ])
+    const deadline = new Promise((resolve) => signal.addEventListener('abort', () => resolve(null), { once: true }))
+    const timeout = setTimeout(() => controller.abort(), qqPauseTimeoutMs)
+    timeout.unref?.()
+    lastPausePromise = Promise.race([attempt, deadline]).then((result) => {
+      clearTimeout(timeout)
+      if (qqPauseInFlight?.controller !== controller) return false
+      // 用同一个完成结果更新状态。成功结果之后的中止不能撤销停机确认。
+      const deadlineWon = result === null
+      const gateway = result?.[1]
+      const gatewayConfirmed = gateway?.status === 'fulfilled' && gateway.value !== false
+      const adapterStopPending = gateway?.status === 'rejected' && gateway.reason?.code === 'INSTANCE_STOP_PENDING'
+      const adapterStopUnsupported = gateway?.status === 'rejected' && gateway.reason?.code === 'MIGRATION_STOP_UNSUPPORTED'
+      qqLegacyStopPending = !legacyStopped
+      qqPausePending = qqLegacyStopPending || !gatewayConfirmed
+      qqPauseHeld = retainLease && !qqPausePending
+      qqGatewayStopPending = deadlineWon || adapterStopPending
+      qqPauseReason = deadlineWon ? '等待默认 QQ 停止超时，正在等待重试'
+        : qqLegacyStopPending ? '旧版 QQ 连接尚未停止，正在等待重试'
+          : adapterStopPending ? '网关适配器仍在执行原停止任务，正在等待确认'
+            : adapterStopUnsupported ? '当前网关适配器缺少迁移所需的停机确认能力'
+              : !gatewayConfirmed ? '网关 QQ 连接尚未确认停止，正在等待重试'
+                : qqPauseHeld ? '网关连接仍由迁移租约保留，等待重试迁移' : ''
+      qqPauseInFlight = null
+      scheduleQqPauseRetry(reason)
+      return !qqPausePending
+    })
+    return lastPausePromise
+  }
+
+  function clearQqRecoveryPause() {
+    qqStartupPaused = false
+    qqPauseInFlight?.controller.abort()
+    qqPauseInFlight = null
+    lastPausePromise = Promise.resolve(true)
+    clearTimeout(qqPauseRetryTimer)
+    qqPauseRetryTimer = null
+    qqPausePending = false
+    qqPauseHeld = false
+    qqGatewayStopPending = false
+    qqLegacyStopPending = false
+    qqPauseReason = ''
+    qqPauseStartedAt = 0
+    qqPauseAttempts = 0
+  }
+  const isGuardTxnIdInvalid = (guard = readRecoveryGuard(dataRoot)) => {
+    const rawId = String(guard?.txnId || '').trim()
+    return Boolean(rawId && !isValidMigrationTxnId(rawId))
+  }
+  const isGuardPhaseInvalid = (guard = readRecoveryGuard(dataRoot)) => {
+    return Boolean(guard?.corrupt || !isKnownGuardPhase(guard?.phase))
+  }
+  const isDataEpochCorrupt = () => Boolean(readDataEpoch(dataRoot).corrupt)
+  const isBackupJournalCorrupt = () => Boolean(readBackupRestoreJournal(dataRoot)?.corrupt)
+  const isGuardInvalid = (guard = readRecoveryGuard(dataRoot)) => {
+    return Boolean(isGuardTxnIdInvalid(guard) || isGuardPhaseInvalid(guard) || isDataEpochCorrupt() || isBackupJournalCorrupt())
+  }
+  const isQqRecoveryPaused = () => {
+    if (qqStartupPaused) return true
+    const guard = readRecoveryGuard(dataRoot)
+    if (isGuardInvalid(guard)) {
+      qqStartupPaused = true
+      hub?.setDefaultQqTransportPaused?.(true)
+      try { if (onebot?.state && onebot.state !== 'stopped') onebot.stop() } catch {}
+      void queueQqPause(`${qqRecoveryPausedMessage}（恢复门状态异常：phase=${guard?.phase || '?'}）`)
+      return true
+    }
+    return false
+  }
+  const backupState0 = inspectBackupRestoreState(dataRoot)
+  if (backupState0.state === 'backup-moving') {
+    return enterMinimalBackupMovingRecovery(backupState0.journal)
+  }
+
+  // 启动迁移 / 备份恢复仲裁（先看迁移事务与待恢复备份，绝不在未决时放行默认 QQ）：
+  const txns0 = listMigrationTxns(dataRoot)
+  for (const item of txns0) {
+    if (TERMINAL_TXN_PHASES.has(item.journal?.phase)) {
+      cleanupMigrationTxn(dataRoot, item.journal.txnId)
+    }
+  }
+  const activeTxns0 = findActiveMigrationTxns(dataRoot)
+  if (backupState0.state === 'backup-journal-corrupt') {
+    qqStartupPaused = true
+    writeRecoveryGuard(dataRoot, {
+      phase: 'migration-ambiguous',
+      txnId: activeTxns0[0]?.journal?.txnId || '',
+      dataEpoch: readDataEpoch(dataRoot).epoch,
+      reason: '备份恢复日志损坏（backup-journal-corrupt），已暂停默认 QQ 等待人工处理',
+    })
+    log.warn('检测到备份恢复日志 backup-restore-journal.json 已损坏，已暂停默认 QQ（其他平台与恢复面板照常可用）')
+  } else if (backupState0.state === 'backup-not-started' && activeTxns0.length > 0) {
+    qqStartupPaused = true
+    writeRecoveryGuard(dataRoot, {
+      phase: 'backup-not-started',
+      txnId: activeTxns0[0].journal?.txnId || '',
+      dataEpoch: readDataEpoch(dataRoot).epoch,
+      reason: '存在待恢复备份与未完成迁移事务冲突，等待人工确认',
+    })
+    log.warn('检测到待恢复备份与未完成默认 QQ 迁移事务冲突，已暂停默认 QQ（其他平台与恢复面板照常可用）')
+  } else {
+    // 恢复备份必须在读配置之前：读完配置后内存里的旧状态会写回去
+    try {
+      const restored = applyPendingRestore()
+      if (restored) {
+        log.info(`已恢复备份：${restored} 个文件，原来的文件在 backups/ 里留了底`)
+        const report = lastRestoreResult()
+        if (report?.notice) log.warn(report.notice)
+      }
+    } catch (error) {
+      if (error?.code === 'BACKUP_RESTORE_MOVING') {
+        return enterMinimalBackupMovingRecovery(error.journal)
+      }
+      if (error?.code === 'BACKUP_JOURNAL_CORRUPT') {
+        qqStartupPaused = true
+        writeRecoveryGuard(dataRoot, {
+          phase: 'migration-ambiguous',
+          txnId: activeTxns0[0]?.journal?.txnId || '',
+          dataEpoch: readDataEpoch(dataRoot).epoch,
+          reason: '备份恢复日志损坏（backup-journal-corrupt），已暂停默认 QQ 等待人工处理',
+        })
+      }
+      log.error('恢复备份失败：', error.message)
+    }
+  }
+
+  const PAUSED_GUARD_PHASES = new Set(['migration-ambiguous', 'buffer-overflow', 'aborted-uncertain'])
+
+  if (!qqStartupPaused) {
+    const epochState = readDataEpoch(dataRoot)
+    const postRestoreActive = findActiveMigrationTxns(dataRoot)
+    if (epochState.corrupt) {
+      qqStartupPaused = true
+      writeRecoveryGuard(dataRoot, {
+        phase: 'migration-ambiguous',
+        txnId: postRestoreActive[0]?.journal?.txnId || '',
+        dataEpoch: 0,
+        reason: '数据代次文件 qq-data-epoch.json 损坏，已暂停默认 QQ 等待人工确认',
+      })
+      log.warn('检测到数据代次文件 qq-data-epoch.json 已损坏，已暂停默认 QQ 等待确认')
+    } else {
+      const epochNow = epochState.epoch
+      for (const item of postRestoreActive) {
+        const j = item.journal
+        if (Number(j.dataEpoch || 0) < epochNow) {
+          try {
+            updateMigrationTxn(dataRoot, j.txnId, { phase: 'rolled-back', reason: 'stale-epoch-after-backup' })
+          } catch {}
+          cleanupMigrationTxn(dataRoot, j.txnId)
+          continue
+        }
+      if (j.phase === 'aborted-uncertain') {
+        const abBuf = createHeldBufferStore(dataRoot, j.txnId)
+        abBuf.markAllPendingUncertain('aborted-uncertain')
+        const phase = abBuf.isCorrupt() ? 'migration-ambiguous' : abBuf.isOverflowed() ? 'buffer-overflow' : 'aborted-uncertain'
+        qqStartupPaused = true
+        writeRecoveryGuard(dataRoot, {
+          phase,
+          txnId: j.txnId || '',
+          dataEpoch: epochNow,
+          reason: '上次中止回滚的迁移仍存在未决或溢出缓冲消息，等待确认后再恢复默认 QQ',
+        })
+        log.warn(`默认 QQ 迁移事务 ${j.txnId} 存在中止未决缓冲，已暂停默认 QQ 等待确认`)
+        break
+      }
+      if (j.phase === 'migration-ambiguous') {
+        qqStartupPaused = true
+        writeRecoveryGuard(dataRoot, {
+          phase: 'migration-ambiguous',
+          txnId: j.txnId || '',
+          dataEpoch: epochNow,
+          reason: j.error ? `默认 QQ 迁移事务处于不确定状态：${j.error}` : '默认 QQ 迁移事务处于不确定状态，已暂停默认 QQ 等待确认',
+        })
+        log.warn(`默认 QQ 迁移事务 ${j.txnId} 处于 migration-ambiguous，已暂停默认 QQ`)
+        break
+      }
+      if (postRestoreActive.length > 1 || j.corrupt || !verifyRawQqSnapshot(item.preSnapshot)) {
+        qqStartupPaused = true
+        writeRecoveryGuard(dataRoot, {
+          phase: 'migration-ambiguous',
+          txnId: j.txnId || '',
+          dataEpoch: epochNow,
+          reason: '默认 QQ 迁移事务或原配置快照校验失败，已暂停默认 QQ 等待确认',
+        })
+        log.warn(`默认 QQ 迁移事务 ${j.txnId} 校验失败，已暂停默认 QQ`)
+        break
+      }
+      if (j.committed !== true) {
+        if (j.phase === 'committing') {
+          const curRaw = readRawConfig()
+          const curSnap = captureRawQqSnapshot(curRaw)
+          const samePre = curSnap.hash === item.preSnapshot.hash
+          const matchesTarget = item.targetRecord && j.targetLegacyQqEnabled === (curRaw.legacyQqEnabled !== false)
+            && isDeepStrictEqual(curRaw.platforms?.qq || null, item.targetRecord.platform || null)
+          if (!samePre && matchesTarget) {
+            updateMigrationTxn(dataRoot, j.txnId, { phase: 'committed', committed: true })
+            const reconciled = createHeldBufferStore(dataRoot, j.txnId)
+            reconciled.reconcileAfterCrash()
+            if (reconciled.isCorrupt() || reconciled.isOverflowed()) {
+              const phase = reconciled.isCorrupt() ? 'migration-ambiguous' : 'buffer-overflow'
+              qqStartupPaused = true
+              writeRecoveryGuard(dataRoot, {
+                phase,
+                txnId: j.txnId,
+                dataEpoch: epochNow,
+                reason: reconciled.isCorrupt() ? '迁移缓冲存在损坏条目，需要人工处理' : '迁移缓冲已满，需要人工处理',
+              })
+              break
+            }
+            pendingCommittedRecovery = { ...item, journal: { ...j, phase: 'committed', committed: true } }
+            qqStartupPaused = true
+            writeRecoveryGuard(dataRoot, {
+              phase: 'recovering',
+              txnId: j.txnId,
+              dataEpoch: epochNow,
+              reason: '默认 QQ 迁移已提交，等待启动后以 held 状态重新验号交还',
+            })
+            break
+          }
+          if (!samePre) {
+            qqStartupPaused = true
+            writeRecoveryGuard(dataRoot, {
+              phase: 'migration-ambiguous',
+              txnId: j.txnId,
+              dataEpoch: epochNow,
+              reason: 'committing 阶段崩溃且当前配置与原快照不一致，等待恢复确认',
+            })
+            log.warn(`迁移事务 ${j.txnId} 在 committing 阶段中断且配置状态不明，已暂停默认 QQ`)
+            break
+          }
+        }
+        try {
+          const curRaw = readRawConfig()
+          const restoredRaw = applyRawQqSnapshot(curRaw, item.preSnapshot)
+          writeRawConfigAtomic(restoredRaw)
+          const preBuf = createHeldBufferStore(dataRoot, j.txnId)
+          const hasPreBuffer = preBuf.list().length > 0 || preBuf.isOverflowed() || preBuf.isCorrupt()
+          if (hasPreBuffer) {
+            preBuf.markAllPendingUncertain('aborted-uncertain')
+            const phase = preBuf.isCorrupt() ? 'migration-ambiguous' : preBuf.isOverflowed() ? 'buffer-overflow' : 'aborted-uncertain'
+            updateMigrationTxn(dataRoot, j.txnId, { phase, rolledBack: true })
+            qqStartupPaused = true
+            writeRecoveryGuard(dataRoot, {
+              phase,
+              txnId: j.txnId,
+              dataEpoch: epochNow,
+              reason: '未提交迁移事务崩溃回滚后仍留有 held 缓冲消息，已暂停默认 QQ 等待确认',
+            })
+            log.warn(`未提交迁移事务 ${j.txnId} 崩溃回滚时存在 held 缓冲消息，已标为 ${phase} 并暂停默认 QQ`)
+            break
+          }
+          updateMigrationTxn(dataRoot, j.txnId, { phase: 'rolled-back', reason: 'crash-before-commit' })
+          cleanupMigrationTxn(dataRoot, j.txnId)
+          clearRecoveryGuard(dataRoot)
+          log.info(`启动恢复：已回滚未提交的 QQ 迁移事务 ${j.txnId}`)
+        } catch (error) {
+          qqStartupPaused = true
+          writeRecoveryGuard(dataRoot, {
+            phase: 'migration-ambiguous',
+            txnId: j.txnId,
+            dataEpoch: epochNow,
+            reason: `回滚未提交迁移事务失败：${error?.message || error}`,
+          })
+          log.warn(`回滚未提交迁移事务 ${j.txnId} 失败，已暂停默认 QQ：`, error?.message || error)
+        }
+      } else {
+        const bufferStore = createHeldBufferStore(dataRoot, j.txnId)
+        if (bufferStore.isCorrupt() || bufferStore.isOverflowed()) {
+          const phase = bufferStore.isCorrupt() ? 'migration-ambiguous' : 'buffer-overflow'
+          qqStartupPaused = true
+          writeRecoveryGuard(dataRoot, {
+            phase,
+            txnId: j.txnId,
+            dataEpoch: epochNow,
+            reason: bufferStore.isCorrupt() ? '迁移缓冲存在损坏条目，需要人工处理' : '迁移缓冲已满，需要人工处理',
+          })
+          break
+        }
+        bufferStore.reconcileAfterCrash()
+        pendingCommittedRecovery = item
+        qqStartupPaused = true
+        writeRecoveryGuard(dataRoot, {
+          phase: 'recovering',
+          txnId: j.txnId,
+          dataEpoch: epochNow,
+          reason: '已提交的 QQ 迁移事务等待重启后验号与交还',
+        })
+      }
+    }
+    if (!qqStartupPaused) {
+      const guardPost = readRecoveryGuard(dataRoot)
+      const invalidGuard = isGuardInvalid(guardPost)
+      if (invalidGuard) {
+        qqStartupPaused = true
+        log.warn(`启动恢复门包含非法状态（phase=${guardPost.phase}, txnId=${guardPost.txnId}），已暂停默认 QQ 等待人工清理`)
+      } else if (KNOWN_PAUSED_GUARD_PHASES.has(guardPost.phase) && !(guardPost.phase === 'recovering' && pendingCommittedRecovery)) {
+        if (Number(guardPost.dataEpoch || 0) < epochNow) {
+          clearRecoveryGuard(dataRoot)
+        } else {
+          qqStartupPaused = true
+          log.warn(`启动恢复门（${guardPost.phase}）仍未解除，已暂停默认 QQ：${guardPost.reason || ''}`)
+        }
+      }
+    }
+    }
+  }
   let cfg = loadConfig(), startupNewClaimedQq = false
   // 启动迁移（I4/I3 就地升级点）：有旧记忆文件先成组备份并升级迁移身份表，再补认领旧配置 ownerQQ
   try {
@@ -310,6 +794,14 @@ export function apply(ctx, opts = {}) {
   // 已注册的策略源实例（name → policy），给 deliver 的 enginePolicy 解析用
   const enginePolicies = new Map()
   const getConfig = () => cfg
+  let qqOwnershipRevision = 0
+  const legacyQqOwnsConnection = () => cfg.legacyQqEnabled !== false
+  const legacyQqAvailable = () => legacyQqOwnsConnection() && !qqOwnershipTransfer && !isQqRecoveryPaused()
+  const legacyQqActive = () => cfg.enabled && legacyQqAvailable()
+  const gatewayQqMessage = '默认 QQ 由多平台网关托管，请在通讯平台页管理连接'
+  const qqTransferMessage = '默认 QQ 正在切换托管，请等待事务完成'
+  const qqRecoveryPausedMessage = '默认 QQ 等待恢复确认，已暂停启动'
+  const qqConfigFields = (c) => qqOwnershipConfigSnapshot(c)
   setSsrpMode(() => (getConfig().security && getConfig().security.ssrfMode === 'loose' ? 'loose' : 'strict'))
   const secrets = () => {
     for (const k of ['webuiPassword', 'httpToken', 'wsToken']) registerSecret(cfg.snowluma[k])
@@ -320,23 +812,26 @@ export function apply(ctx, opts = {}) {
     registerSecret(cfg.backup?.remote?.webdav?.password)
     for (const p of Object.values(cfg.platforms || {})) {
       if (!p || typeof p !== 'object') continue
-      for (const k of ['botToken', 'appSecret', 'clientSecret', 'encryptKey', 'verificationToken', 'botSecret', 'secret', 'token']) {
-        registerSecret(p[k])
-      }
+      for (const k of PLATFORM_SECRET_KEYS) registerSecret(p[k])
     }
   } // 含平台与云备份凭据，日志统一打码
-  const setConfig = (next) => {
+  const writeConfig = (next) => {
     const before = cfg
     cfg = saveConfig(next, before)
+    if (!isDeepStrictEqual(qqConfigFields(before), qqConfigFields(cfg))) qqOwnershipRevision++
+    return before
+  }
+  const publishConfig = (before) => {
     // 改机器人号后旧连接的核对结果立刻失效，必须重新核对才能处理消息或完成向导。
     if (before.botQQ !== cfg.botQQ) {
       wrongAccount = ''
-      if (onebotState === 'connected') onebot.restart()
+      if (legacyQqActive() && onebotState === 'connected') onebot.restart()
     }
     secrets()
     if (bridge && (before.bridge.dshTools !== cfg.bridge.dshTools || before.persona.current !== cfg.persona.current)) bridge.refresh()
     const platformsChanged = JSON.stringify(before.platforms) !== JSON.stringify(cfg.platforms)
-    if (platformsChanged) {
+    const ownershipChanged = before.legacyQqEnabled !== cfg.legacyQqEnabled
+    if (platformsChanged || ownershipChanged || (!legacyQqOwnsConnection() && before.enabled !== cfg.enabled)) {
       if (hasAnyPlatform() && !platformGateway) ensureGateway()
       else platformGateway?.sync?.().catch((error) => logger.child('gateway').warn('同步平台网关失败：', error?.message || error))
     }
@@ -345,10 +840,26 @@ export function apply(ctx, opts = {}) {
       blockedWarnAt.clear()
     }
     syncOwnerFixedCleanup(platformGateway, { allowMigrate: false })
-    if (mods && (platformsChanged || JSON.stringify(before.modules) !== JSON.stringify(cfg.modules) || before.safeMode !== cfg.safeMode)) mods.sync().catch(() => {})
+    hub?.refreshSharedConfig()
+    if (mods && (platformsChanged || ownershipChanged || JSON.stringify(before.modules) !== JSON.stringify(cfg.modules) || before.safeMode !== cfg.safeMode)) mods.sync().catch(() => {})
     mods?.emit('config', cfg, before)
     if (JSON.stringify(before.backup?.remote) !== JSON.stringify(cfg.backup?.remote)) scheduleRemoteBackup()
     return cfg
+  }
+  const setConfig = (next) => {
+    // 默认 QQ 托管权只由宿主内部的 QQ 切换事务提交。
+    const candidate = normalize({ ...next, legacyQqEnabled: cfg.legacyQqEnabled })
+    if (qqOwnershipTransfer && !isDeepStrictEqual(qqConfigFields(cfg), qqConfigFields(candidate))) {
+      throw Object.assign(new Error(qqTransferMessage), { code: 'QQ_OWNERSHIP_BUSY', status: 409 })
+    }
+    if (!legacyQqOwnsConnection()) {
+      const beforeSelf = cfg.platforms?.qq?.selfId
+      const nextSelf = candidate.platforms?.qq?.selfId
+      if (candidate.botQQ !== cfg.botQQ || (nextSelf !== beforeSelf && String(nextSelf || '') !== cfg.botQQ)) {
+        throw Object.assign(new Error('网关托管的默认 QQ 使用原机器人号，换号需要单独切换'), { code: 'QQ_ACCOUNT_CHANGE_REQUIRES_SWITCH', status: 409 })
+      }
+    }
+    return publishConfig(writeConfig(candidate))
   }
   const syncOwnerPersonId = () => {
     const ownerNow = identity.owner() || ''
@@ -469,12 +980,16 @@ export function apply(ctx, opts = {}) {
   // 核对期间收到的事件先攒着：核对通过就补处理，核对失败就丢掉。
   // 直接丢弃的话，刚连上那几百毫秒里主人发的消息就没了（登录核对要等一次 get_login_info 往返）。
   let verifying = false
+  let loginGeneration = 0
   let pendingEvents = []
   let hub = null
   let dangerGuard = null // 危险命令确认（security.dangerConfirm 开着才生效）
   let approvalRelay = null // DSH 要授权时在 QQ 私聊问主人（approvalViaQQ 开着才生效）
   let noticeRelay = null // DSH 要授权 / 要选选项时通知到主人私聊（config.notice，按工作区开关）
   async function checkLogin() {
+    if (!legacyQqActive()) return
+    const generation = loginGeneration
+    const current = () => generation === loginGeneration && legacyQqActive() && onebotState === 'connected'
     verifying = true
     pendingEvents = []
     try {
@@ -485,13 +1000,15 @@ export function apply(ctx, opts = {}) {
       } catch (error) {
         logger.child('onebot').warn('核对登录的 QQ 号失败：', error.message)
       }
-      if (onebotState !== 'connected') return
+      if (!current()) return
       if (!uin) {
         // 核对不了就别用，断开后由看门狗重试
         onebot.stop()
         return
       }
-      if (await snowluma.confirmLogin(uin)) {
+      const confirmed = await snowluma.confirmLogin(uin)
+      if (!current()) return
+      if (confirmed) {
         loginOk = true
         wrongAccount = ''
         // 把核对期间攒下的补上（按到达顺序）
@@ -504,12 +1021,12 @@ export function apply(ctx, opts = {}) {
         onebot.stop()
       }
     } finally {
-      verifying = false
+      if (generation === loginGeneration) verifying = false
     }
   }
   /** 核对通过后的事件都在这里处理（onEvent 直接调，核对期间攒下的也会补到这里）。 */
   function handleEvent(ev) {
-    if (!hub) return
+    if (!hub || !legacyQqActive()) return
     // 模块能看到所有原始事件（加群、撤回、好友申请……），只看不拦
     mods?.emit('onebot', ev)
     if (ev.post_type === 'message' || ev.post_type === 'message_sent') {
@@ -548,10 +1065,16 @@ export function apply(ctx, opts = {}) {
   const platformCandidates = new Map() // 私聊里最近发话的人：首次向导用它认主
   const defaultPlatform = parseChatId('private:0')?.platform || ''
   const platformLabel = (platform) => ({ qq: 'QQ', feishu: '飞书', qqbot: 'QQ 官方机器人', 'wechat-clawbot': '微信 ClawBot', bridge: '通用桥' })[platform] || platform
-  const legacyQqActive = () => Boolean(getConfig()?.enabled)
-  const hasAnyPlatform = () => Object.entries((getConfig()?.platforms) || {}).some(
-    ([k, p]) => p && p.enabled !== false && !(k === defaultPlatform && legacyQqActive()),
+  const gatewayPlatforms = () => {
+    const platforms = cfg.platforms || {}
+    const qq = platforms[defaultPlatform]
+    if (cfg.enabled || legacyQqOwnsConnection() || !qq) return platforms
+    return { ...platforms, [defaultPlatform]: { ...qq, enabled: false } }
+  }
+  const hasAnyPlatform = () => Object.entries(gatewayPlatforms()).some(
+    ([k, p]) => p && p.enabled !== false && !(k === defaultPlatform && legacyQqOwnsConnection()),
   )
+  const gatewayQqStatus = () => platformGateway?.instances().find((status) => status.instance === defaultPlatform)
   let lastBlockedRoute = null // { at, reason, target, purpose }
   const blockedWarnAt = new Map()
   const BLOCKED_WARN_THROTTLE_MS = 5 * 60_000
@@ -588,10 +1111,10 @@ export function apply(ctx, opts = {}) {
     if (!hasConfiguredPrimary) {
       if (!allowMigrate) return
       try {
-        cfg = saveConfig({
+        writeConfig({
           ...cfg,
           ownerPrimary: { ...(cfg.ownerPrimary || {}), mode: 'fixed', platform: legacyFixed },
-        }, cfg)
+        })
       } catch (error) {
         logger.child('gateway').warn('迁移旧固定平台到 ownerPrimary 失败：', error?.message || error)
         return
@@ -1005,9 +1528,10 @@ export function apply(ctx, opts = {}) {
     try {
       // I1 的 dataDir 要**目录字符串**（它自己拼 identity.sqlite），G1 的 dataDir 是函数，别混用；宿主直连 QQ 时不抢接 defaultPlatform 实例
       platformGateway = createGateway({
-        config: { get platforms() { return getConfig()?.platforms || {} } },
+        config: { get platforms() { return gatewayPlatforms() } },
         dataDir: (...p) => dataDir('gateway', ...p),
-        isExternalInstance: (inst) => inst === defaultPlatform && legacyQqActive(),
+        isExternalInstance: (inst) => inst === defaultPlatform && !isQqRecoveryPaused() && legacyQqOwnsConnection(),
+        isPausedInstance: (inst) => inst === defaultPlatform && isQqRecoveryPaused(),
         http: { route: (path, handler) => {
           // 平台回调必须挂在 /platform/<实例>/callback，不能套 /aurabot/api 前缀，
           // 也不能走面板的 Host/CSRF 鉴权；平台端自己用签名验来源。
@@ -1083,8 +1607,7 @@ export function apply(ctx, opts = {}) {
       // 接线要等 hub 建好；这里只登记，由下面的 effect 在 hub 就绪后订阅
       gatewayReady?.(platformGateway)
     } catch (error) {
-      // 网关建不起来不能拖垮整个插件：QQ 直连路径照旧跑
-      logger.child('gateway').warn('多平台网关初始化失败（已退回仅 QQ 直连）：', error?.message || error)
+      logger.child('gateway').warn('多平台网关初始化失败：', error?.message || error)
       platformGateway = null
     }
     return platformGateway
@@ -1102,11 +1625,12 @@ export function apply(ctx, opts = {}) {
     endpoint,
     log: logger.child('onebot'),
     onState: (s, d) => {
+      loginGeneration++
       onebotState = s
       if (s === 'connected' || s === 'stopped' || s === 'unconfigured') { gatewayWarmSince = 0; warmupPhase = { phase: '', label: '' } }
-      else if (!gatewayWarmSince && cfg.enabled) gatewayWarmSince = Date.now()
-      if (s !== 'connected') { loginOk = false; pendingEvents = [] }
-      else checkLogin().then(() => { if (loginOk) flushOutbox() }).catch((error) => log.warn('核对登录号出错：', error.message))
+      else if (!gatewayWarmSince && legacyQqActive()) gatewayWarmSince = Date.now()
+      if (s !== 'connected') { loginOk = false; verifying = false; pendingEvents = [] }
+      else if (legacyQqActive()) checkLogin().then(() => { if (loginOk) flushOutbox() }).catch((error) => log.warn('核对登录号出错：', error.message))
       // 预热阶段 connecting/disconnected 会每 3 秒来回刷：首次和每 20 秒记一条 info，其余进 debug
       const line = `QQ 网关：${s}${d ? '（' + d + '）' : ''}`
       const now = Date.now()
@@ -1116,9 +1640,10 @@ export function apply(ctx, opts = {}) {
       } else {
         logger.child('onebot').debug(line)
       }
-      mods?.emit('onebot/state', s)
+      if (legacyQqOwnsConnection()) mods?.emit('onebot/state', s)
     },
     onEvent: (ev) => {
+      if (!legacyQqActive()) return
       // 还没核对是机器人号：核对期间先攒着，核对通过后补处理
       if (!loginOk) {
         if (verifying) {
@@ -1130,8 +1655,950 @@ export function apply(ctx, opts = {}) {
       handleEvent(ev)
     },
   })
+  const legacyOnebot = () => legacyQqAvailable() ? onebot : null
+  const rebindLegacyQq = () => {
+    const client = legacyOnebot()
+    hub.setLegacyQqTransport({ onebot: client, outbox: client ? outbox : null })
+  }
+
+  const dispatchGatewayEvent = (ev) => {
+    if (!ev) return
+    if (ev.type === 'recall' && ev.messageId) {
+      hub?.onGatewayRecall?.(ev.chatId || '', ev.messageId)
+    } else if (ev.type === 'native' && ev.name === 'im.message.recalled_v1') {
+      const mid = ev.raw?.event?.message_id
+      if (mid) hub?.onGatewayRecall?.('', mid)
+    }
+  }
+
+  function pauseForRecovery(phase, txnId, reason, extra = {}) {
+    qqStartupPaused = true
+    hub?.setDefaultQqTransportPaused?.(true)
+    rebindLegacyQq()
+    try { if (onebot?.state && onebot.state !== 'stopped') onebot.stop() } catch {}
+    const pauseMsg = `${qqRecoveryPausedMessage}${reason ? `（${reason}）` : ''}`
+    const pause = queueQqPause(pauseMsg, { keepHeld: phase === 'recovering' || phase === 'committed' })
+    writeRecoveryGuard(dataRoot, {
+      phase,
+      txnId: String(txnId || ''),
+      dataEpoch: readDataEpoch(dataRoot).epoch,
+      reason: String(reason || ''),
+      ...extra,
+    })
+    return pause
+  }
+
+  function makeMigrationBufferStore(txnId, onOverflowExtra, subDir = 'buffer') {
+    return createHeldBufferStore(dataRoot, txnId, {
+      maxItems: Math.max(1, Number(opts?.migrationBufferMaxItems) || MAX_HELD_BUFFER_ITEMS),
+      maxBytes: Math.max(128, Number(opts?.migrationBufferMaxBytes) || MAX_HELD_BUFFER_BYTES),
+      subDir,
+      onOverflow(overflowInfo) {
+        try { updateMigrationTxn(dataRoot, txnId, { bufferOverflow: overflowInfo }) } catch {}
+        void pauseForRecovery('buffer-overflow', txnId, '迁移缓冲已满，需要人工处理')
+        try { onOverflowExtra?.(overflowInfo) } catch {}
+      },
+    })
+  }
+
+  function assertBufferClean(txnId, bufferStore) {
+    if (bufferStore?.isCorrupt?.()) {
+      pauseForRecovery('migration-ambiguous', txnId, '迁移缓冲存在损坏条目，需要人工处理')
+      throw Object.assign(new Error('迁移缓冲存在损坏条目，需要人工处理'), { code: 'MIGRATION_BUFFER_CORRUPT' })
+    }
+    if (bufferStore?.isOverflowed?.()) {
+      pauseForRecovery('buffer-overflow', txnId, '迁移缓冲已满，需要人工处理')
+      throw Object.assign(new Error('迁移缓冲已满，需要人工处理'), { code: 'MIGRATION_BUFFER_OVERFLOW' })
+    }
+  }
+
+  /**
+   * 迁移放行前按序闭合排空 held 期间的持久化缓冲：
+   * - 循环扫描直到本轮及 lease.release() 边界均无 pending（防止排空途中新到消息丢失）；
+   * - 缓冲满/持续新消息超轮次或超时时保持 held 并进入明确恢复门，绝不静默丢消息；
+   * - 超时或 bufferStore.close() 后的迟到回执只记日志，绝不再写入/重建已清理事务目录。
+   */
+  async function drainHeldBuffer(txnId, lease, bufferStore, { targetLegacyQqEnabled = false, timeoutMs = 10_000 } = {}) {
+    if (targetLegacyQqEnabled || !lease || !bufferStore) return { drained: 0 }
+    const maxRounds = Math.max(1, Number(opts?.migrationMaxDrainRounds) || 20)
+    const entryTimeoutMs = Math.max(50, Number(opts?.migrationDrainEntryTimeoutMs) || timeoutMs)
+    const maxDurationMs = Math.max(500, Number(opts?.migrationMaxDrainDurationMs) || Math.max(entryTimeoutMs * 5, 15_000))
+    const startedAt = Date.now()
+    let drained = 0
+
+    for (let round = 1; ; round++) {
+      if (unloaded) throw new Error('插件已卸载，终止缓冲排空')
+      assertBufferClean(txnId, bufferStore)
+      const entries = bufferStore.list().filter((e) => e.status === 'pending')
+      if (!entries.length) break
+      if (round > maxRounds || Date.now() - startedAt > maxDurationMs) {
+        await pauseForRecovery('recovering', txnId, '迁移缓冲持续有新消息进入，已暂停放行等待确认')
+        throw Object.assign(new Error('迁移缓冲持续有新消息进入，已暂停放行等待确认'), { code: 'MIGRATION_DRAIN_BOUND_EXCEEDED' })
+      }
+
+      for (const entry of entries) {
+        if (unloaded) throw new Error('插件已卸载，终止缓冲排空')
+        assertBufferClean(txnId, bufferStore)
+        if (entry.kind === 'event') {
+          const wrapped = lease.materializeEvent(entry.payload)
+          if (!wrapped) {
+            bufferStore.markStatus(entry.seq, 'filtered', { reason: 'event-invalid' })
+            continue
+          }
+          bufferStore.markStatus(entry.seq, 'dispatching', {})
+          try {
+            dispatchGatewayEvent(wrapped)
+            bufferStore.markStatus(entry.seq, 'accepted', {})
+            drained++
+          } catch (error) {
+            bufferStore.markStatus(entry.seq, 'uncertain', { reason: error?.message || 'event-dispatch-failed' })
+          }
+          continue
+        }
+        const inbound = lease.materializeInbound(entry.payload)
+        if (!inbound) {
+          bufferStore.markStatus(entry.seq, 'filtered', { reason: 'deduped-or-invalid' })
+          continue
+        }
+        if (inbound.kind === 'private' && inbound.sender?.account) {
+          if (dangerGuard?.handleReply(inbound.chatId, inbound.sender.account, inbound.text)
+            || approvalRelay?.handleReply(inbound.chatId, inbound.sender.account, inbound.text)) {
+            bufferStore.markStatus(entry.seq, 'filtered', { reason: 'relay-reply' })
+            continue
+          }
+        }
+        let resolveSettled
+        const settled = new Promise((resolve) => { resolveSettled = resolve })
+        let finished = false
+        let timedOut = false
+        const receipt = {
+          onBeforeDispatch({ sessionId, messageId, baselineSeq }) {
+            if (timedOut || bufferStore.isClosed?.()) return
+            bufferStore.markStatus(entry.seq, 'dispatching', { sessionId, messageId, baselineSeq })
+          },
+          onVerified({ status, sessionId, messageId, baselineSeq, reason }) {
+            if (timedOut || bufferStore.isClosed?.()) {
+              log.warn(`迁移缓冲条目 #${entry.seq} 收到迟到回执（status=${status}），已跳过写盘`)
+              return
+            }
+            bufferStore.markStatus(entry.seq, status, {
+              ...(sessionId ? { sessionId } : {}),
+              ...(messageId ? { messageId } : {}),
+              ...(baselineSeq !== undefined ? { baselineSeq } : {}),
+              reason: reason || '',
+            })
+            if (!finished) {
+              finished = true
+              resolveSettled(status)
+            }
+          },
+        }
+        let timer = null
+        try {
+          const delivery = Promise.resolve()
+            .then(() => hub.deliverMigrationInbound(inbound, receipt))
+            .catch((error) => {
+              if (!timedOut && !bufferStore.isClosed?.() && !finished) {
+                finished = true
+                bufferStore.markStatus(entry.seq, 'uncertain', { reason: error?.message || 'drain-error' })
+                resolveSettled('uncertain')
+              } else {
+                log.warn(`迁移缓冲条目 #${entry.seq} 迟到投递错误已忽略：`, error?.message || error)
+              }
+            })
+          await Promise.race([
+            settled,
+            delivery.then(() => settled),
+            new Promise((resolve) => {
+              timer = setTimeout(() => {
+                if (!finished) {
+                  timedOut = true
+                  finished = true
+                  if (!bufferStore.isClosed?.()) {
+                    bufferStore.markStatus(entry.seq, 'uncertain', { reason: 'drain-timeout' })
+                  }
+                  resolve('uncertain')
+                }
+              }, entryTimeoutMs)
+            }),
+          ])
+          drained++
+        } catch (error) {
+          if (!timedOut && !bufferStore.isClosed?.() && !finished) {
+            finished = true
+            bufferStore.markStatus(entry.seq, 'uncertain', { reason: error?.message || 'drain-error' })
+          }
+        } finally {
+          if (timer) clearTimeout(timer)
+        }
+      }
+    }
+    assertBufferClean(txnId, bufferStore)
+    return { drained }
+  }
+
+  /** 闭合排空并在网关锁内校验最后边界无新消息，再交还正式通道。 */
+  async function drainAndReleaseLease(txnId, lease, bufferStore, { targetLegacyQqEnabled = false, timeoutMs = 10_000 } = {}) {
+    if (targetLegacyQqEnabled) {
+      bufferStore?.close?.()
+      await lease?.release?.()
+      return { drained: 0 }
+    }
+    const maxRounds = Math.max(1, Number(opts?.migrationMaxDrainRounds) || 20)
+    let totalDrained = 0
+    for (let attempt = 1; attempt <= maxRounds + 1; attempt++) {
+      const { drained } = await drainHeldBuffer(txnId, lease, bufferStore, { targetLegacyQqEnabled: false, timeoutMs })
+      totalDrained += drained
+      try {
+        await lease.release()
+        return { drained: totalDrained }
+      } catch (error) {
+        if (error?.code === 'MIGRATION_BUFFER_CORRUPT' || error?.code === 'MIGRATION_BUFFER_OVERFLOW') {
+          assertBufferClean(txnId, bufferStore)
+          throw error
+        }
+        if (error?.code === 'MIGRATION_BUFFER_NOT_DRAINED' && attempt <= maxRounds) {
+          continue
+        }
+        if (error?.code === 'MIGRATION_BUFFER_NOT_DRAINED') {
+          await pauseForRecovery('recovering', txnId, '迁移缓冲持续有新消息进入，已暂停放行等待确认')
+          throw Object.assign(new Error('迁移缓冲持续有新消息进入，已暂停放行等待确认'), { code: 'MIGRATION_DRAIN_BOUND_EXCEEDED' })
+        }
+        throw error
+      }
+    }
+  }
+
+  const normalizeGatewayEndpoint = (value) => String(value || '').trim().replace(/\/+$/, '')
+  const sameGatewayEndpoint = (left, right) => {
+    const a = normalizeGatewayEndpoint(left)
+    const b = normalizeGatewayEndpoint(right)
+    return Boolean(a && b && a === b)
+  }
+
+  /** 目标地址是否仍指向旧版直连正在使用的 OneBot 端点。 */
+  function targetMatchesLegacyEndpoint(target = {}) {
+    const legacy = endpoint()
+    const ws = normalizeGatewayEndpoint(target.wsUrl)
+    const http = normalizeGatewayEndpoint(target.httpUrl)
+    const legacyWs = normalizeGatewayEndpoint(legacy.wsUrl)
+    const legacyHttp = normalizeGatewayEndpoint(legacy.httpUrl)
+    if (!legacyWs && !legacyHttp) return false
+    if (legacyWs && !sameGatewayEndpoint(ws, legacyWs)) return false
+    if (legacyHttp && !sameGatewayEndpoint(http, legacyHttp)) return false
+    return true
+  }
+
+  function resolveTargetGatewayPlatform(inputPlat = {}, extra = {}) {
+    const curPlat = cfg.platforms?.[defaultPlatform] && typeof cfg.platforms[defaultPlatform] === 'object' && !Array.isArray(cfg.platforms[defaultPlatform])
+      ? cfg.platforms[defaultPlatform]
+      : {}
+    const legacy = endpoint()
+    const src = { ...(inputPlat && typeof inputPlat === 'object' && !Array.isArray(inputPlat) ? inputPlat : {}) }
+    if (src.wsUrl === undefined && (extra.targetWsUrl !== undefined || extra.wsUrl !== undefined)) {
+      src.wsUrl = extra.targetWsUrl ?? extra.wsUrl
+    }
+    if (src.httpUrl === undefined && (extra.targetHttpUrl !== undefined || extra.httpUrl !== undefined)) {
+      src.httpUrl = extra.targetHttpUrl ?? extra.httpUrl
+    }
+    if (src.backend === undefined && extra.backend !== undefined) src.backend = extra.backend
+    if (src.wsToken === undefined && extra.wsToken !== undefined) src.wsToken = extra.wsToken
+    if (src.httpToken === undefined && extra.httpToken !== undefined) src.httpToken = extra.httpToken
+    if (src.token === undefined && extra.token !== undefined) src.token = extra.token
+
+    const backend = String(src.backend || curPlat.backend || (cfg.gateway === 'onebot' ? 'onebot' : 'snowluma')).trim() || 'onebot'
+    // 地址优先级：显式表单 > 已保存的 platforms.qq > 旧版直连 endpoint。
+    const wsUrl = src.wsUrl !== undefined
+      ? String(src.wsUrl || '').trim()
+      : String(curPlat.wsUrl || legacy.wsUrl || '').trim()
+    const httpUrl = src.httpUrl !== undefined
+      ? String(src.httpUrl || '').trim()
+      : String(curPlat.httpUrl || legacy.httpUrl || '').trim()
+    const selfId = String(src.selfId || curPlat.selfId || cfg.botQQ || '').trim()
+
+    const merged = { ...curPlat, ...src, enabled: true, backend, selfId, wsUrl, httpUrl }
+    const inheritLegacyCredentials = extra.inheritLegacyCredentials !== false
+      && targetMatchesLegacyEndpoint({ wsUrl, httpUrl })
+    const hasSecret = (value) => value !== null && value !== undefined && String(value).trim() !== ''
+    for (const k of PLATFORM_SECRET_KEYS) {
+      if (Object.hasOwn(src, k)) {
+        // 缺省或空白沿用旧值，null 清除该字段的覆盖。端点仍可继承统一令牌。
+        const v = typeof src[k] === 'string' ? src[k].trim() : src[k]
+        if (v === null) merged[k] = ''
+        else if (v === undefined || v === '') {
+          if (Object.hasOwn(curPlat, k) && hasSecret(curPlat[k])) merged[k] = curPlat[k]
+          else if (inheritLegacyCredentials && legacy[k]) merged[k] = legacy[k]
+          else if (Object.hasOwn(curPlat, k)) merged[k] = curPlat[k]
+          else delete merged[k]
+        } else merged[k] = String(v).trim()
+      } else if (Object.hasOwn(curPlat, k) && hasSecret(curPlat[k])) {
+        merged[k] = curPlat[k]
+      } else if (inheritLegacyCredentials && legacy[k]) {
+        merged[k] = legacy[k]
+      } else if (Object.hasOwn(curPlat, k)) {
+        // 归一化后的空字段不能挡住旧版直连 token 的自动继承。
+        merged[k] = curPlat[k]
+      }
+      delete merged[`${k}Set`]
+    }
+    const explicitUnified = (typeof src.token === 'string' && src.token.trim()) || (typeof src.accessToken === 'string' && src.accessToken.trim())
+    if (explicitUnified) {
+      if (!(typeof src.httpToken === 'string' && src.httpToken.trim()) && src.httpToken !== null) delete merged.httpToken
+      if (!(typeof src.wsToken === 'string' && src.wsToken.trim()) && src.wsToken !== null) delete merged.wsToken
+    }
+    return merged
+  }
+
+  async function stopAndReleaseLease(lease, bufferStore) {
+    if (lease) {
+      try { await lease.stop() } catch {}
+      bufferStore?.close?.()
+      try { await lease.release() } catch {}
+    } else {
+      bufferStore?.close?.()
+    }
+  }
+
+  async function stopGatewayForRecovery(reason, waitForStopRetry) {
+    const stopPending = (cause) => Object.assign(new Error('目标网关 QQ 旧连接尚未完全停止，请稍后重试', { cause }), {
+      code: 'INSTANCE_STOP_PENDING', retryable: true,
+    })
+    const stop = async () => {
+      try { return await platformGateway?.pauseInstance(defaultPlatform, reason, { forceReleaseLease: true }) }
+      catch (error) {
+        if (error?.code === 'MIGRATION_STOP_UNSUPPORTED') throw error
+        if (error?.code === 'INSTANCE_STOP_PENDING' || error?.code === 'ONEBOT_CLOSE_TIMEOUT' || error?.name === 'TimeoutError') return false
+        throw stopPending(error)
+      }
+    }
+    let stopped = await stop()
+    if (stopped === false && waitForStopRetry && await waitForStopRetry()) stopped = await stop()
+    if (stopped === false) throw stopPending()
+    qqOwnershipTransfer?.bufferStore?.close()
+    qqOwnershipTransfer = null
+  }
+
+  const qqOwnership = {
+    status: () => ({
+      revision: qqOwnershipRevision,
+      legacyQqEnabled: legacyQqOwnsConnection(),
+      phase: qqOwnershipTransfer?.phase || 'idle',
+      paused: isQqRecoveryPaused(),
+      guard: readRecoveryGuard(dataRoot),
+      bufferOverflow: qqOwnershipTransfer?.bufferStore?.overflowState?.() || null,
+    }),
+    recovery: () => readRecoveryGuard(dataRoot),
+    bufferStatus(targetTxnId = '') {
+      if (targetTxnId !== undefined && targetTxnId !== null && String(targetTxnId).trim() !== '') {
+        assertValidMigrationTxnId(String(targetTxnId))
+      }
+      const rawId = String(targetTxnId || qqOwnershipTransfer?.txnId || readRecoveryGuard(dataRoot)?.txnId || '').trim()
+      const id = rawId && isValidMigrationTxnId(rawId) ? rawId : ''
+      if (!id) return { txnId: '', overflow: null, corrupt: false, corruptFiles: [], entries: [] }
+      const store = qqOwnershipTransfer?.txnId === id ? qqOwnershipTransfer.bufferStore : createHeldBufferStore(dataRoot, id)
+      return {
+        txnId: id,
+        overflow: store.overflowState(),
+        corrupt: store.isCorrupt(),
+        corruptFiles: store.corruptFiles(),
+        entries: store.list(),
+      }
+    },
+    async resolveRecovery({ txnId: targetTxnId = '', action = 'acknowledge', operator = 'panel-admin', reason: customReason = '', retryStopPending = false } = {}) {
+      if (targetTxnId !== undefined && targetTxnId !== null && targetTxnId !== '') {
+        assertValidMigrationTxnId(String(targetTxnId))
+      }
+      if (!['retry', 'rollback', 'acknowledge', 'discard-uncertain'].includes(action)) {
+        throw new Error(`未知恢复确认动作：${action}`)
+      }
+      if (unloaded || qqOwnershipTransfer?.inFlight || qqRecoveryActionInFlight) {
+        throw new Error('当前迁移事务仍在执行中，无法解除恢复暂停')
+      }
+      await lastPausePromise.catch(() => {})
+      const readRecoveryPrerequisites = () => {
+        const bkJournal = readBackupRestoreJournal(dataRoot)
+        if (bkJournal?.corrupt) {
+          throw Object.assign(new Error('备份恢复日志损坏，请先保留并隔离损坏日志'), { code: 'BACKUP_JOURNAL_CORRUPT' })
+        }
+        if (pendingRestore() || bkJournal) {
+          throw Object.assign(new Error('存在待恢复或恢复中的备份，请先完成或取消备份恢复后再执行 QQ 迁移恢复'), { code: 'BACKUP_RESTORE_PENDING' })
+        }
+        const guard = readRecoveryGuard(dataRoot)
+        if (action !== 'rollback') {
+          if (isDataEpochCorrupt()) {
+            throw Object.assign(new Error('数据代际记录损坏，只能回滚恢复'), { code: 'DATA_EPOCH_CORRUPT' })
+          }
+          if (isGuardTxnIdInvalid(guard) || isGuardPhaseInvalid(guard)) {
+            throw Object.assign(new Error('QQ 恢复门状态损坏或未知，只能回滚恢复'), { code: 'RECOVERY_GUARD_INVALID' })
+          }
+        }
+        return guard
+      }
+      const guard = readRecoveryPrerequisites()
+      let stopRetryAvailable = retryStopPending === true && (action === 'retry' || action === 'rollback')
+      const retryScope = stopRetryAvailable ? {
+        revision: qqOwnershipRevision,
+        transfer: qqOwnershipTransfer,
+        phase: qqOwnershipTransfer?.phase,
+        epoch: readDataEpoch(dataRoot),
+        txns: findActiveMigrationTxns(dataRoot),
+      } : null
+      const waitForStopRetry = async () => {
+        if (!stopRetryAvailable) return false
+        stopRetryAvailable = false
+        await delay(2000)
+        const stateChanged = (cause) => Object.assign(new Error('QQ 恢复状态已变化，请重新核对后再操作', { cause }), { code: 'RECOVERY_STATE_CHANGED' })
+        if (unloaded || retryScope.revision !== qqOwnershipRevision || retryScope.transfer !== qqOwnershipTransfer || retryScope.phase !== qqOwnershipTransfer?.phase
+          || !isDeepStrictEqual(guard, readRecoveryGuard(dataRoot)) || !isDeepStrictEqual(retryScope.epoch, readDataEpoch(dataRoot))
+          || !isDeepStrictEqual(retryScope.txns, findActiveMigrationTxns(dataRoot))) {
+          throw stateChanged()
+        }
+        try { readRecoveryPrerequisites() } catch (error) { throw stateChanged(error) }
+        return true
+      }
+      if (qqRecoveryWaitingForStop() && stopRetryAvailable) await waitForStopRetry()
+      if (qqRecoveryWaitingForStop()) {
+        throw Object.assign(new Error('默认 QQ 旧连接尚未完全停止，请稍后重试'), { code: 'INSTANCE_STOP_PENDING', retryable: true })
+      }
+      if (unloaded || qqOwnershipTransfer?.inFlight || qqRecoveryActionInFlight) {
+        throw new Error('当前迁移事务仍在执行中，无法解除恢复暂停')
+      }
+      const list = retryScope?.txns ?? findActiveMigrationTxns(dataRoot)
+      const activeTxnId = qqOwnershipTransfer?.txnId || ''
+      if (qqOwnershipTransfer && targetTxnId && activeTxnId !== targetTxnId) {
+        throw new Error('指定的迁移事务与当前活跃事务不匹配')
+      }
+      const validGuardId = guard?.txnId && isValidMigrationTxnId(String(guard.txnId).trim()) ? String(guard.txnId).trim() : ''
+      const id = String(targetTxnId || activeTxnId || validGuardId || list[0]?.journal?.txnId || '').trim()
+      if (id) assertValidMigrationTxnId(id)
+
+      const verificationAudit = (buffer) => {
+        const entries = buffer?.list() || []
+        const verifyAccepted = entries.filter((entry) => entry.status === 'accepted').length
+        const verifyFiltered = entries.filter((entry) => entry.status === 'filtered').length
+        return { verifyAccepted, verifyFiltered, verifyDiscarded: entries.length - verifyAccepted - verifyFiltered }
+      }
+      let verifyAudit = verificationAudit()
+      const recordDiscardAudit = (targetId, act) => {
+        const bufSnap = targetId && isValidMigrationTxnId(targetId)
+          ? qqOwnership.bufferStatus(targetId)
+          : { entries: [], overflow: null, corruptFiles: [] }
+        const entries = Array.isArray(bufSnap.entries) ? bufSnap.entries : []
+        const pendingCount = entries.filter((e) => e.status === 'pending' || e.status === 'dispatching').length
+        const uncertainCount = entries.filter((e) => e.status === 'uncertain').length
+        const overflowDroppedCount = Number(bufSnap.overflow?.count) || 0
+        const corruptFiles = Array.isArray(bufSnap.corruptFiles) ? bufSnap.corruptFiles : []
+        const discardedMain = pendingCount + uncertainCount
+        const defaultReason = act === 'rollback'
+          ? '用户确认回滚并丢弃迁移缓冲'
+          : '用户确认丢弃未决/溢出迁移缓冲'
+        const audit = {
+          txnId: targetId || '',
+          action: act,
+          operator: String(operator || 'panel-admin'),
+          reason: String(customReason || defaultReason),
+          discardedCount: discardedMain + verifyAudit.verifyDiscarded,
+          discardedMain,
+          discardedVerify: verifyAudit.verifyDiscarded,
+          ...verifyAudit,
+          pendingCount,
+          uncertainCount,
+          overflowDroppedCount,
+          corruptFiles,
+          at: Date.now(),
+        }
+        writeRecoveryGuard(dataRoot, { lastResolution: audit })
+        log.warn(`默认 QQ 迁移恢复审计（${act}）：txn=${audit.txnId || '(无)'} operator=${audit.operator} discarded=${audit.discardedCount} (main=${audit.discardedMain}, verify=${audit.verifyDiscarded}) verifyAccepted=${audit.verifyAccepted} verifyFiltered=${audit.verifyFiltered} uncertain=${audit.uncertainCount} overflow=${audit.overflowDroppedCount} reason=${audit.reason}`)
+        return audit
+      }
+
+      let enteredMutatingRecovery = false
+      qqRecoveryActionInFlight = true
+      try {
+        if (action === 'retry') {
+          if (qqOwnershipTransfer) {
+            if (qqOwnershipTransfer.phase === 'committed' && qqOwnershipTransfer.tx) {
+              enteredMutatingRecovery = true
+              await qqOwnershipTransfer.tx.finish({ timeoutMs: Math.max(500, Number(opts?.migrationTimeoutMs) || 6000) })
+              return { ok: !isQqRecoveryPaused(), status: qqOwnership.status() }
+            }
+            throw new Error('当前迁移事务尚未提交，请使用 rollback 回滚后再重新迁移')
+          }
+          const item = (pendingCommittedRecovery && (!targetTxnId || pendingCommittedRecovery.journal?.txnId === targetTxnId)
+            ? pendingCommittedRecovery
+            : null) || list.find((x) => x.journal?.committed === true && (!targetTxnId || x.journal.txnId === targetTxnId))
+          if (!item) throw new Error('没有可重试的已提交迁移事务')
+          enteredMutatingRecovery = true
+          await resumeCommittedRecovery(item)
+          return { ok: !isQqRecoveryPaused(), status: qqOwnership.status() }
+        }
+        if (action === 'rollback') {
+          enteredMutatingRecovery = true
+          const item = (id ? readMigrationTxn(dataRoot, id) : null) || list[0] || null
+          if (item?.preSnapshot && !verifyRawQqSnapshot(item.preSnapshot)) {
+            throw new Error('原配置快照校验失败，无法自动回滚到迁移前配置')
+          }
+          await stopGatewayForRecovery('准备回滚到旧版直连 QQ', waitForStopRetry)
+          if (item?.preSnapshot) {
+            const restoredRaw = applyRawQqSnapshot(readRawConfig(), item.preSnapshot)
+            cfg = writeRawConfigAtomic(restoredRaw)
+            qqOwnershipRevision++
+            secrets()
+            hub?.refreshSharedConfig?.()
+          } else if (!legacyQqOwnsConnection()) {
+            const target = { ...(cfg.platforms?.[defaultPlatform] || {}), enabled: false }
+            const before = writeConfig({
+              ...cfg,
+              legacyQqEnabled: true,
+              platforms: { ...cfg.platforms, [defaultPlatform]: target },
+            })
+            publishConfig(before)
+          }
+          const audit = recordDiscardAudit(id, 'rollback')
+          if (id) cleanupMigrationTxn(dataRoot, id)
+          if (readDataEpoch(dataRoot).corrupt) {
+            writeJsonAtomicFsync(dataEpochPath(dataRoot), {
+              version: 1,
+              epoch: 0,
+              lastTxnId: '',
+              updatedAt: Date.now(),
+            })
+          }
+          clearRecoveryGuard(dataRoot, audit)
+          pendingCommittedRecovery = null
+          clearQqRecoveryPause()
+          wrongAccount = ''
+          rebindLegacyQq()
+          hub.setDefaultQqTransportPaused(false)
+          if (platformGateway) await platformGateway.sync()
+          if (legacyQqActive()) await watchdog()
+          return { ok: !isQqRecoveryPaused(), status: qqOwnership.status() }
+        }
+
+        const item = (id ? readMigrationTxn(dataRoot, id) : null) || list[0] || null
+        if (!legacyQqOwnsConnection()) {
+          if (action === 'acknowledge') {
+            throw Object.assign(new Error('网关托管目标不允许直接 acknowledge 跳过验号，请使用 discard-uncertain、retry 或 rollback'), {
+              code: 'ACKNOWLEDGE_REQUIRES_LEGACY',
+            })
+          }
+          enteredMutatingRecovery = true
+          await stopGatewayForRecovery('准备执行网关托管恢复验号')
+          const gw = ensureGateway()
+          if (!gw) throw new Error('恢复网关托管 QQ 失败：多平台网关未就绪')
+          const targetCfg = cfg.platforms?.[defaultPlatform]
+          if (!targetCfg || targetCfg.enabled !== true || String(targetCfg.selfId || '') !== String(cfg.botQQ || '')) {
+            throw new Error('恢复网关托管 QQ 失败：目标网关配置缺失或与机器人 QQ 不一致')
+          }
+          const timeoutMs = Math.max(500, Number(opts?.migrationTimeoutMs) || 6000)
+          const verifyBuffer = id ? makeMigrationBufferStore(id, null, 'buffer-verify') : null
+          let lease = null
+          let audit = null
+          try {
+            lease = await gw.acquireLease(defaultPlatform, {
+              config: { ...targetCfg, enabled: true },
+              buffer: verifyBuffer,
+            })
+            await lease.startHeld()
+            await lease.whenReady({ timeoutMs })
+            await drainAndReleaseLease(id || 'discard-verify', lease, verifyBuffer, { targetLegacyQqEnabled: false, timeoutMs })
+            verifyAudit = verificationAudit(verifyBuffer)
+            audit = recordDiscardAudit(id, action)
+            if (id) {
+              createHeldBufferStore(dataRoot, id).discardAll()
+            }
+          } catch (error) {
+            await stopAndReleaseLease(lease, verifyBuffer)
+            verifyAudit = verificationAudit(verifyBuffer)
+            verifyBuffer?.discardAll?.()
+            throw error
+          }
+          verifyBuffer?.close?.()
+          if (id) {
+            try { updateMigrationTxn(dataRoot, id, { phase: 'active' }) } catch {}
+            cleanupMigrationTxn(dataRoot, id)
+          }
+          clearRecoveryGuard(dataRoot, audit)
+          pendingCommittedRecovery = null
+          clearQqRecoveryPause()
+          wrongAccount = ''
+          rebindLegacyQq()
+          hub.setDefaultQqTransportPaused(false)
+          if (platformGateway) await platformGateway.sync()
+          return { ok: !isQqRecoveryPaused(), status: qqOwnership.status() }
+        }
+
+        enteredMutatingRecovery = true
+        if (qqOwnershipTransfer) {
+          await stopGatewayForRecovery('结束当前迁移并恢复旧版直连 QQ')
+          if (item?.preSnapshot && verifyRawQqSnapshot(item.preSnapshot)) {
+            const restoredRaw = applyRawQqSnapshot(readRawConfig(), item.preSnapshot)
+            cfg = writeRawConfigAtomic(restoredRaw)
+            qqOwnershipRevision++
+            secrets()
+            hub?.refreshSharedConfig?.()
+          }
+        }
+        const audit = recordDiscardAudit(id, action)
+        if (id) cleanupMigrationTxn(dataRoot, id)
+        clearRecoveryGuard(dataRoot, audit)
+        pendingCommittedRecovery = null
+        clearQqRecoveryPause()
+        wrongAccount = ''
+        rebindLegacyQq()
+        hub.setDefaultQqTransportPaused(false)
+        if (platformGateway) await platformGateway.sync()
+        if (legacyQqActive()) await watchdog()
+        return { ok: !isQqRecoveryPaused(), status: qqOwnership.status() }
+      } catch (error) {
+        if (enteredMutatingRecovery && error?.code !== 'RECOVERY_STATE_CHANGED') {
+          const failedResolution = {
+            txnId: id || '',
+            action,
+            operator: String(operator || 'panel-admin'),
+            reason: String(customReason || ''),
+            ...verifyAudit,
+            discardedVerify: verifyAudit.verifyDiscarded,
+            discardedCount: verifyAudit.verifyDiscarded,
+            error: error?.message || String(error),
+            ok: false,
+            at: Date.now(),
+          }
+          const curGuardPhase = readRecoveryGuard(dataRoot)?.phase
+          const keepSpecificRetryGuard = action === 'retry' && qqStartupPaused && ['buffer-overflow', 'migration-ambiguous', 'aborted-uncertain', 'recovering'].includes(curGuardPhase)
+          if (keepSpecificRetryGuard) {
+            writeRecoveryGuard(dataRoot, { lastFailedResolution: failedResolution })
+          } else {
+            if (id && isValidMigrationTxnId(id)) {
+              try {
+                updateMigrationTxn(dataRoot, id, {
+                  phase: 'migration-ambiguous',
+                  error: error?.message || String(error),
+                })
+              } catch {}
+            }
+            await pauseForRecovery('migration-ambiguous', id, `执行恢复动作（${action}）失败：${error?.message || error}`, {
+              lastFailedResolution: failedResolution,
+            })
+          }
+        }
+        throw error
+      } finally {
+        qqRecoveryActionInFlight = false
+        scheduleQqPauseRetry(qqRecoveryPausedMessage)
+      }
+    },
+    view: () => qqMigrationView(),
+    async preflight({ sessionId, platform, targetLegacyQqEnabled, targetWsUrl, targetHttpUrl, wsUrl, httpUrl, backend } = {}) {
+      if (unloaded) return { ok: false, reason: 'unloaded' }
+      if (isQqRecoveryPaused()) return { ok: false, reason: 'recovery-paused' }
+      if (qqOwnershipTransfer) return { ok: false, reason: 'migration-busy' }
+      if (pendingRestore() || readBackupRestoreJournal(dataRoot)) {
+        return { ok: false, reason: 'backup-restore-pending' }
+      }
+      if (!cfg.enabled || !cfg.botQQ || cfg.multiPlatformPrivateSession) {
+        return { ok: false, reason: 'preconditions-not-met' }
+      }
+      const toLegacy = targetLegacyQqEnabled !== undefined ? Boolean(targetLegacyQqEnabled) : !legacyQqOwnsConnection()
+      if (!toLegacy) {
+        const targetPlat = resolveTargetGatewayPlatform(platform, { targetWsUrl, targetHttpUrl, wsUrl, httpUrl, backend })
+        const hasWs = Boolean(String(targetPlat.wsUrl || '').trim())
+        const hasHttp = Boolean(String(targetPlat.httpUrl || '').trim())
+        if (!hasWs && !hasHttp) {
+          return { ok: false, reason: 'missing-target-endpoint' }
+        }
+        if (!hasWs) {
+          return { ok: false, reason: 'missing-target-ws-url' }
+        }
+      }
+      if (!hub?.isDefaultQqTransportIdle?.() || outbox.status().count) {
+        return { ok: false, reason: 'default-qq-not-idle' }
+      }
+      return await checkMigrationPersistencePreflight(ctx, { sessionId })
+    },
+    // 此接口只供宿主迁移流程使用。面板和模块没有这条配置写入路径。
+    begin({ txnId, expectedRevision, legacyQqEnabled, platform } = {}) {
+      assertValidMigrationTxnId(txnId)
+      if (qqOwnershipTransfer) {
+        throw Object.assign(new Error('QQ 托管迁移事务正在进行中'), { code: 'MIGRATION_BUSY' })
+      }
+      if (unloaded || isQqRecoveryPaused() || expectedRevision !== qqOwnershipRevision) {
+        throw Object.assign(new Error('QQ 托管事务或配置 revision 已失效'), { code: 'REVISION_MISMATCH' })
+      }
+      if (pendingRestore() || readBackupRestoreJournal(dataRoot)) {
+        throw Object.assign(new Error('存在待恢复或恢复中的备份，暂不允许启动 QQ 托管迁移'), { code: 'BACKUP_RESTORE_PENDING' })
+      }
+      if (!cfg.enabled || !cfg.botQQ || cfg.multiPlatformPrivateSession) {
+        throw new Error('请启用 Aurabot、核对机器人 QQ 并关闭共享私聊后再切换托管')
+      }
+      if (typeof legacyQqEnabled !== 'boolean' || legacyQqEnabled === legacyQqOwnsConnection()) {
+        throw Object.assign(new Error('QQ 托管切换需要不同的目标托管方'), { code: 'ALREADY_IN_TARGET_MODE' })
+      }
+      if (legacyQqOwnsConnection() && (!loginOk || onebotState !== 'connected')) {
+        throw new Error('旧版 QQ 直连尚未通过登录核对')
+      }
+      if (!legacyQqEnabled && (!platform || platform.enabled !== true || String(platform.selfId || '') !== cfg.botQQ)) {
+        throw new Error('目标 QQ 必须启用并使用原机器人号')
+      }
+      if (!legacyQqEnabled && !String(platform?.wsUrl || '').trim()) {
+        const hasHttp = Boolean(String(platform?.httpUrl || '').trim())
+        throw Object.assign(
+          new Error(hasHttp ? '目标 QQ 迁移必须配置 OneBot WS URL（仅配置 HTTP URL 无法完成事件连接与双端点验号）' : '目标 QQ 缺少 OneBot WS URL'),
+          { code: hasHttp ? 'MISSING_TARGET_WS_URL' : 'MISSING_TARGET_ENDPOINT' },
+        )
+      }
+      if (!hub.isDefaultQqTransportIdle() || outbox.status().count) {
+        throw new Error('请等默认 QQ 的回合和旧补发队列清空后再切换')
+      }
+      const gw = ensureGateway()
+      if (!gw) throw new Error('多平台网关初始化失败')
+      if (expectedRevision !== qqOwnershipRevision) throw Object.assign(new Error('QQ 配置 revision 已失效，请重新检查'), { code: 'REVISION_MISMATCH' })
+      if (gw.outbox.status(defaultPlatform).count) throw new Error('请等默认 QQ 的网关补发队列清空后再切换')
+
+      const target = structuredClone(legacyQqEnabled ? { ...cfg.platforms.qq, enabled: false } : platform)
+      for (const k of PLATFORM_SECRET_KEYS) registerSecret(target[k])
+      const rawPreConfig = readRawConfig()
+      const { snapshot } = createMigrationTxn(dataRoot, {
+        txnId,
+        expectedRevision,
+        fromLegacyQqEnabled: legacyQqOwnsConnection(),
+        targetLegacyQqEnabled: legacyQqEnabled,
+        targetPlatform: target,
+        rawPreConfig,
+        targetConfig: {
+          ...cfg,
+          legacyQqEnabled,
+          platforms: { ...cfg.platforms, [defaultPlatform]: target },
+        },
+      })
+      let transfer = null
+      const bufferStore = makeMigrationBufferStore(txnId, () => {
+        if (transfer) transfer.overflowed = true
+      })
+      writeRecoveryGuard(dataRoot, {
+        phase: 'recovering',
+        txnId,
+        dataEpoch: readDataEpoch(dataRoot).epoch,
+        reason: '默认 QQ 托管权切换事务进行中',
+      })
+
+      transfer = { txnId, revision: expectedRevision, phase: 'locked', inFlight: false, lease: null, bufferStore, snapshot, overflowed: false, tx: null }
+      qqOwnershipTransfer = transfer
+      hub.setDefaultQqTransportPaused(true)
+      rebindLegacyQq()
+
+      const requirePhase = (...phases) => {
+        if (unloaded || qqOwnershipTransfer !== transfer || transfer.revision !== qqOwnershipRevision || !phases.includes(transfer.phase)) {
+          throw new Error('QQ 托管事务状态已失效')
+        }
+      }
+      const resume = async () => {
+        qqOwnershipTransfer = null
+        rebindLegacyQq()
+        hub.setDefaultQqTransportPaused(false)
+        await gw.sync()
+        if (legacyQqActive()) await watchdog()
+      }
+      const txObj = Object.freeze({
+        async prepare({ timeoutMs } = {}) {
+          requirePhase('locked')
+          transfer.inFlight = true
+          transfer.phase = 'preparing'
+          updateMigrationTxn(dataRoot, txnId, { phase: 'preparing' })
+          try {
+            transfer.lease = await gw.acquireLease(defaultPlatform, {
+              config: { ...target, enabled: true },
+              buffer: !legacyQqEnabled ? bufferStore : null,
+            })
+            requirePhase('preparing')
+            if (gw.outbox.status(defaultPlatform).count) throw new Error('默认 QQ 的网关补发队列尚未清空')
+            if (legacyQqEnabled) {
+              await transfer.lease.stop()
+            } else {
+              await onebot.stopAndWait()
+              await transfer.lease.startHeld()
+              await transfer.lease.whenReady({ timeoutMs })
+            }
+            requirePhase('preparing')
+            transfer.phase = 'prepared'
+            updateMigrationTxn(dataRoot, txnId, { phase: 'prepared' })
+          } catch (error) {
+            transfer.phase = 'prepare-failed'
+            try { updateMigrationTxn(dataRoot, txnId, { phase: 'prepare-failed', error: error?.message || String(error) }) } catch {}
+            throw error
+          } finally {
+            transfer.inFlight = false
+          }
+        },
+        commit({ txnId: id, expectedRevision: revision } = {}) {
+          requirePhase('prepared')
+          transfer.inFlight = true
+          try {
+            if (id !== transfer.txnId || revision !== transfer.revision) throw new Error('QQ 托管事务或配置 revision 已失效')
+            assertBufferClean(txnId, bufferStore)
+            if (!legacyQqEnabled && !transfer.lease.isReady()) {
+              const err = new Error('目标 QQ 的登录核对已失效')
+              pauseForRecovery('recovering', txnId, err.message)
+              throw err
+            }
+            updateMigrationTxn(dataRoot, txnId, { phase: 'committing' })
+            // 同一次配置替换写入托管方和默认 QQ 实例，失败时内存仍保留旧配置。
+            try {
+              const before = writeConfig({
+                ...cfg, legacyQqEnabled,
+                platforms: { ...cfg.platforms, [defaultPlatform]: target },
+              })
+              transfer.revision = qqOwnershipRevision
+              transfer.phase = 'committed'
+              updateMigrationTxn(dataRoot, txnId, {
+                phase: 'committed',
+                committed: true,
+                committedRevision: transfer.revision,
+              })
+              publishConfig(before)
+            } catch (error) {
+              if (!qqStartupPaused) pauseForRecovery('recovering', txnId, `迁移配置提交失败：${error?.message || error}`)
+              throw error
+            }
+          } finally {
+            transfer.inFlight = false
+          }
+        },
+        async finish({ timeoutMs } = {}) {
+          requirePhase('committed')
+          transfer.inFlight = true
+          try {
+            assertBufferClean(txnId, bufferStore)
+            transfer.phase = 'finishing'
+            updateMigrationTxn(dataRoot, txnId, { phase: 'finishing' })
+            try {
+              if (!legacyQqEnabled && !transfer.lease.isReady()) await transfer.lease.whenReady({ timeoutMs })
+              requirePhase('finishing')
+              await drainAndReleaseLease(txnId, transfer.lease, bufferStore, { targetLegacyQqEnabled: legacyQqEnabled, timeoutMs })
+              requirePhase('finishing')
+            } catch (error) {
+              transfer.phase = 'committed'
+              try { updateMigrationTxn(dataRoot, txnId, { phase: 'committed', error: error?.message || String(error) }) } catch {}
+              if (bufferStore.isCorrupt()) {
+                await pauseForRecovery('migration-ambiguous', txnId, '迁移缓冲存在损坏条目，需要人工处理')
+              } else if (bufferStore.isOverflowed()) {
+                await pauseForRecovery('buffer-overflow', txnId, '迁移缓冲已满，需要人工处理')
+              } else if (!qqStartupPaused) {
+                await pauseForRecovery('recovering', txnId, error?.message || '迁移排空或交还失败，等待重试')
+              }
+              throw error
+            }
+            bufferStore.close()
+            wrongAccount = ''
+            clearQqRecoveryPause()
+            try {
+              await resume()
+            } catch (error) {
+              try {
+                updateMigrationTxn(dataRoot, txnId, {
+                  phase: 'migration-ambiguous',
+                  error: error?.message || String(error),
+                })
+              } catch {}
+              await pauseForRecovery('migration-ambiguous', txnId, `迁移放行后运行态同步失败：${error?.message || error}`)
+              throw error
+            }
+            // 先持久化终态 active 并完成 resume，再清配置快照、缓冲与恢复门（v7/v8 顺序要求）。
+            updateMigrationTxn(dataRoot, txnId, { phase: 'active' })
+            cleanupMigrationTxn(dataRoot, txnId)
+            clearRecoveryGuard(dataRoot)
+          } finally {
+            transfer.inFlight = false
+          }
+        },
+        async abort() {
+          requirePhase('locked', 'prepare-failed', 'prepared')
+          transfer.inFlight = true
+          transfer.phase = 'aborting'
+          updateMigrationTxn(dataRoot, txnId, { phase: 'aborting' })
+          try {
+            try {
+              if (transfer.lease) {
+                await transfer.lease.stop()
+                bufferStore.markAllPendingUncertain('aborted-uncertain')
+                await transfer.lease.release()
+              } else {
+                bufferStore.markAllPendingUncertain('aborted-uncertain')
+                bufferStore.close()
+              }
+            } catch (error) {
+              transfer.phase = 'prepare-failed'
+              try { updateMigrationTxn(dataRoot, txnId, { phase: 'prepare-failed', error: error?.message || String(error) }) } catch {}
+              throw error
+            }
+            bufferStore.close()
+            try {
+              const curRaw = readRawConfig()
+              const restoredRaw = applyRawQqSnapshot(curRaw, snapshot)
+              cfg = writeRawConfigAtomic(restoredRaw)
+              qqOwnershipRevision++
+            } catch (error) {
+              qqOwnershipTransfer = null
+              try {
+                updateMigrationTxn(dataRoot, txnId, {
+                  phase: 'migration-ambiguous',
+                  error: error?.message || String(error),
+                })
+              } catch {}
+              await pauseForRecovery('migration-ambiguous', txnId, `中止迁移回滚配置失败：${error?.message || error}`)
+              throw error
+            }
+            const entriesAfterAbort = bufferStore.list()
+            const hasOverflow = bufferStore.isOverflowed()
+            const hasCorrupt = bufferStore.isCorrupt()
+            if (entriesAfterAbort.length > 0 || hasOverflow || hasCorrupt) {
+              const guardPhase = hasCorrupt ? 'migration-ambiguous' : hasOverflow ? 'buffer-overflow' : 'aborted-uncertain'
+              const reason = hasCorrupt
+                ? '迁移已中止回滚，但缓冲存在损坏条目，需人工确认后再恢复默认 QQ'
+                : hasOverflow
+                  ? '迁移已中止回滚，但缓冲曾发生溢出，需人工确认未决消息后再恢复默认 QQ'
+                  : '迁移已中止回滚，缓冲中存在未决消息（aborted-uncertain），需人工确认后再恢复默认 QQ'
+              qqOwnershipTransfer = null
+              try {
+                updateMigrationTxn(dataRoot, txnId, {
+                  phase: guardPhase,
+                  rolledBack: true,
+                  uncertainCount: entriesAfterAbort.length,
+                  ...(bufferStore.overflowState() ? { bufferOverflow: bufferStore.overflowState() } : {}),
+                })
+              } catch {}
+              await pauseForRecovery(guardPhase, txnId, reason)
+              return
+            }
+            try {
+              clearQqRecoveryPause()
+              await resume()
+            } catch (error) {
+              qqOwnershipTransfer = null
+              try {
+                updateMigrationTxn(dataRoot, txnId, {
+                  phase: 'migration-ambiguous',
+                  rolledBack: true,
+                  error: error?.message || String(error),
+                })
+              } catch {}
+              await pauseForRecovery('migration-ambiguous', txnId, `中止迁移后恢复运行态失败：${error?.message || error}`)
+              throw error
+            }
+            updateMigrationTxn(dataRoot, txnId, { phase: 'rolled-back' })
+            cleanupMigrationTxn(dataRoot, txnId)
+            clearRecoveryGuard(dataRoot)
+          } finally {
+            transfer.inFlight = false
+          }
+        },
+      })
+      transfer.tx = txObj
+      return txObj
+    },
+  }
   async function flushOutbox () {
-    if (onebotState !== 'connected' || !loginOk) return
+    if (!legacyQqActive() || onebotState !== 'connected' || !loginOk) return
     try {
       const r = await outbox.flush((action, params, opts) => onebot.call(action, params, { ...opts, retries: 0 }))
       if (r.sent || r.dropped || r.left) log.info(`补发队列：成功 ${r.sent}，丢弃 ${r.dropped}，剩余 ${r.left}`)
@@ -1231,12 +2698,17 @@ export function apply(ctx, opts = {}) {
     dsh: ctx,
     getConfig,
     log: logger.child('chat'),
-    onebot,
-    outbox,
+    onebot: legacyOnebot(),
+    outbox: legacyQqAvailable() ? outbox : null,
     // ── G3：把网关交给中枢。出站改走 gateway.send；中枢原有直连路径在 gateway 为空时保留。
     // 惰性：只有配置里真开了平台才把它给 hub（见 ensureGateway），QQ 单平台时行为与改动前完全一致。
     gateway: platformGateway,
     identity,
+    isDefaultQqTransportPaused: () => Boolean(qqOwnershipTransfer || isQqRecoveryPaused()),
+    resolveSharedPrimary: () => fixedSharedPrimary({
+      cfg: getConfig(), identity, instances: knownPlatformInstances(),
+      instancesForAccount: (platform, account) => platformGateway?.routing?.instancesForAccount?.(platform, account),
+    }),
     handover: createHandover({ dsh: ctx, getConfig, identity, log: logger.child('handover') }),
     platformLabel,
     resolveOwnerRoute,
@@ -1324,6 +2796,7 @@ export function apply(ctx, opts = {}) {
       journal: (row) => mods?.emit('chat/log', row),
     },
   })
+  if (isQqRecoveryPaused()) hub.setDefaultQqTransportPaused(true)
 
   // 启动时修正旧版本留下的重复平台前缀（QQ · QQ · …），失败不影响主流程。
   Promise.resolve().then(() => hub.migrateLegacyTitles()).catch((error) => logger.child('chat').debug?.('迁移会话标题失败：', error?.message || error))
@@ -1332,6 +2805,7 @@ export function apply(ctx, opts = {}) {
   gatewayReady = (gw) => {
     hub?.setGateway?.(gw)
     const offMsg = gw.onMessage((m) => {
+      if (qqOwnershipTransfer && m?.instance === defaultPlatform) return
       if (m && m.kind === 'private' && m.sender?.account) {
         const key = `${m.platform}:${m.sender.account}`
         platformCandidates.set(key, { instance: m.instance || m.platform, platform: m.platform, account: m.sender.account, name: m.sender.name || '', at: Number(m.at) || Date.now() })
@@ -1346,6 +2820,7 @@ export function apply(ctx, opts = {}) {
     })
     const offEvent = gw.onEvent?.((ev) => {
       if (!ev) return
+      if (qqOwnershipTransfer && ev.instance === defaultPlatform) return
       if (ev.type === 'recall' && ev.messageId) {
         hub?.onGatewayRecall?.(ev.chatId || '', ev.messageId)
       } else if (ev.type === 'native' && ev.name === 'im.message.recalled_v1') {
@@ -1648,7 +3123,18 @@ export function apply(ctx, opts = {}) {
 
   // ---------- 模块 ----------
   const core = {
-    hub, onebot, snowluma, local, groupRoles, mutes, logger, bridge: null, identity, resolveOwnerRoute, routeOwner,
+    hub, snowluma, local, groupRoles, mutes, logger, bridge: null, identity, resolveOwnerRoute, routeOwner,
+    get onebot() { return legacyOnebot() },
+    get legacyQqEnabled() {
+      if (!legacyQqOwnsConnection()) return false
+      // platforms.qq.enabled 可能是回滚时写回的 false；只要有实际旧版端点/连接，
+      // 或用户明确启用了 qq 平台，模块仍应把 QQ 视为已启用。
+      const ep = endpoint()
+      return cfg.platforms?.[defaultPlatform]?.enabled === true
+        || Boolean(ep.wsUrl || ep.httpUrl)
+        || onebotState === 'connected'
+    },
+    get defaultQqTransportPaused() { return Boolean(qqOwnershipTransfer || isQqRecoveryPaused()) },
     proactHealth: () => lastBlockedRoute,
     get gateway() { return platformGateway },
     stickerSync: (() => {
@@ -1872,9 +3358,63 @@ export function apply(ctx, opts = {}) {
   }
   mods.listen('module/start', (id) => { if (id === 'pet') injectPetPort() })
 
-  let unloaded = false
+  async function resumeCommittedRecovery(item) {
+    const j = item.journal
+    const txnId = j.txnId
+    const targetLegacy = Boolean(j.targetLegacyQqEnabled)
+    const timeoutMs = Math.max(500, Number(opts?.migrationTimeoutMs) || 6000)
+    const bufferStore = makeMigrationBufferStore(txnId)
+    let lease = null
+    try {
+      assertBufferClean(txnId, bufferStore)
+      const gw = ensureGateway()
+      if (!targetLegacy) {
+        if (!gw) throw new Error('恢复已提交迁移失败：多平台网关未就绪')
+        const targetCfg = cfg.platforms?.[defaultPlatform]
+        if (!targetCfg || targetCfg.enabled !== true) {
+          throw new Error('恢复已提交迁移失败：目标网关 QQ 配置缺失或未启用')
+        }
+        lease = await gw.acquireLease(defaultPlatform, {
+          config: { ...targetCfg, enabled: true },
+          buffer: bufferStore,
+        })
+        await lease.startHeld()
+        await lease.whenReady({ timeoutMs })
+        await drainAndReleaseLease(txnId, lease, bufferStore, { targetLegacyQqEnabled: false, timeoutMs })
+        clearQqRecoveryPause()
+      } else {
+        clearQqRecoveryPause()
+        if (gw) await gw.sync()
+      }
+      bufferStore.close()
+      wrongAccount = ''
+      rebindLegacyQq()
+      hub.setDefaultQqTransportPaused(false)
+      if (gw) await gw.sync()
+      if (legacyQqActive()) await watchdog()
+      updateMigrationTxn(dataRoot, txnId, { phase: 'active' })
+      cleanupMigrationTxn(dataRoot, txnId)
+      clearRecoveryGuard(dataRoot)
+      pendingCommittedRecovery = null
+      log.info(`启动恢复：已完成已提交迁移事务 ${txnId} 的验号与交还`)
+    } catch (error) {
+      await stopAndReleaseLease(lease, bufferStore)
+      const guardPhase = !bufferStore.isCorrupt() && bufferStore.isOverflowed() ? 'buffer-overflow' : 'migration-ambiguous'
+      const reason = guardPhase === 'buffer-overflow'
+        ? '迁移缓冲已满，需要人工处理'
+        : `已提交迁移事务重启恢复失败：${error?.message || error}`
+      await pauseForRecovery(guardPhase, txnId, reason)
+      log.warn(`已提交迁移事务 ${txnId} 重启恢复失败，已保持默认 QQ 暂停：`, error?.message || error)
+    }
+  }
+
   const community = createCommunity({ mods, getConfig, setConfig, log, version: VERSION, alive: () => !unloaded })
   const booted = mods.boot()
+  const ready = booted.then(async () => {
+    if (!unloaded && pendingCommittedRecovery) {
+      await resumeCommittedRecovery(pendingCommittedRecovery)
+    }
+  })
   booted.then(() => injectPetPort()).catch(() => {})
   booted.then(() => { if (getConfig().debug) hub.ensureDebugSession().catch((error) => log.warn('建调试会话失败：', error.message)) }).catch(() => {})
   // 模块起来之后再把策略源接上（此时 use('speakup') / use('purpose') 才拿得到实例）
@@ -2043,22 +3583,33 @@ export function apply(ctx, opts = {}) {
 
   // ---------- 启动 / 看门狗 ----------
   async function watchdog() {
+    if (unloaded) return
+    if (isQqRecoveryPaused()) {
+      scheduleQqPauseRetry(qqRecoveryPausedMessage)
+      return
+    }
+    if (qqOwnershipTransfer) return
     if (!cfg.enabled) {
       if (onebot.state !== 'stopped') onebot.stop()
       return
     }
-    const own = cfg.gateway === 'snowluma' // 接别人的 OneBot 时不启动、不注入 SnowLuma
+    const qq = cfg.platforms?.[defaultPlatform]
+    const own = cfg.gateway === 'snowluma' && (legacyQqOwnsConnection()
+      || (qq?.enabled && qq.backend === 'snowluma' && qq.snowlumaManaged !== true))
     const inst = snowluma.detect()
-    if (own && inst.installed && cfg.snowluma.autoStart && !(await snowluma.running())) {
+    if (own && inst.installed && cfg.snowluma.autoStart && !(await snowluma.running()) && !unloaded && !qqOwnershipTransfer && cfg.enabled) {
       const r = await snowluma.start()
       log.info('SnowLuma：', r.message)
     }
-    // 上次连上的不是机器人号：等主人手动点「接入机器人号」或改设置再连
-    if (wrongAccount) return
-    if (onebot.state === 'stopped') onebot.start()
-    if (own && cfg.snowluma.autoAttach && cfg.snowluma.webuiPassword && onebotState !== 'connected' && (await snowluma.running())) {
+    if (legacyQqActive()) {
+      // 上次连上的不是机器人号：等主人手动点「接入机器人号」或改设置再连。
+      if (wrongAccount) return
+      if (onebot.state === 'stopped') onebot.start()
+    }
+    const qqConnected = legacyQqOwnsConnection() ? onebotState === 'connected' : gatewayQqStatus()?.state === 'connected'
+    if (!unloaded && !qqOwnershipTransfer && cfg.enabled && own && cfg.snowluma.autoAttach && cfg.snowluma.webuiPassword && !qqConnected && (await snowluma.running())) {
       const last = snowluma.lastAttach
-      if (Date.now() - last.at > 60_000) {
+      if (!unloaded && !qqOwnershipTransfer && cfg.enabled && Date.now() - last.at > 60_000) {
         const r = await snowluma.attachBot()
         log.info('接入机器人号：', r.message)
       }
@@ -2071,6 +3622,8 @@ export function apply(ctx, opts = {}) {
   ctx.effect(() => () => {
     unloaded = true
     clearTimeout(firstWatch)
+    clearTimeout(qqPauseRetryTimer)
+    qqPauseInFlight?.controller.abort()
     if (pushTimer) { clearTimeout(pushTimer); pushTimer = null } // 云备份的每日定时也要收尾，别留悬空回调
     dangerGuard?.dispose()
     approvalRelay?.dispose()
@@ -2092,22 +3645,263 @@ export function apply(ctx, opts = {}) {
     return value
   }
 
+  const formatBufferEntryForView = (entry) => {
+    const p = entry?.payload || {}
+    const chatKind = String(p?.chat?.kind || '')
+    const chatId = String(p?.chat?.id || '')
+    const senderAccount = String(p?.sender?.account || '')
+    const source = entry?.kind === 'event'
+      ? `事件 ${String(entry?.instance || defaultPlatform)}`
+      : chatKind === 'group'
+        ? `群 ${chatId || '?'}`
+        : `私聊 ${senderAccount || chatId || '?'}`
+    return {
+      seq: Number(entry?.seq) || 0,
+      kind: entry?.kind === 'event' ? 'event' : 'inbound',
+      status: String(entry?.status || 'pending'),
+      reason: String(entry?.reason || ''),
+      messageId: String(entry?.messageId || p?.messageId || ''),
+      sessionId: String(entry?.sessionId || ''),
+      senderAccount,
+      senderName: String(p?.sender?.name || ''),
+      chatKind,
+      chatId,
+      source,
+      text: extractBufferPayloadText(p),
+      at: Number(entry?.at) || 0,
+    }
+  }
+
+  function formatMigrationPhaseLabel(phase, { invalid = false, corrupt = false } = {}) {
+    const key = String(phase || '').trim()
+    if (key === 'corrupt-guard' || corrupt || invalid) {
+      return key && key !== 'corrupt-guard' && !isKnownGuardPhase(key)
+        ? `恢复门状态损坏（未知阶段：${key}，请执行回滚或查看日志）`
+        : '恢复门状态损坏（请执行回滚或查看日志）'
+    }
+    const labels = {
+      idle: '空闲（idle）',
+      preparing: '预检与旧端排空中（preparing）',
+      prepared: '旧端已排空待提交（prepared）',
+      committed: '配置已提交待切换完成（committed）',
+      finishing: '目标端缓冲回放与切换收尾中（finishing）',
+      recovering: '迁移恢复中（recovering）',
+      'migration-ambiguous': '恢复状态待人工确认（migration-ambiguous）',
+      'buffer-overflow': '迁移缓冲已满（buffer-overflow）',
+      'aborted-uncertain': '迁移已中止·存在未决消息（aborted-uncertain）',
+      'backup-not-started': '待恢复备份与迁移事务冲突（backup-not-started）',
+      'backup-moving': '备份恢复搬移中断（backup-moving）',
+    }
+    return labels[key] || `恢复门状态损坏（未知阶段：${key || '?'}，请执行回滚或查看日志）`
+  }
+
+  function qqMigrationView() {
+    const guard = readRecoveryGuard(dataRoot)
+    const rawGuardTxnId = String(guard?.txnId || '').trim()
+    const txnIdInvalid = Boolean(rawGuardTxnId && !isValidMigrationTxnId(rawGuardTxnId))
+    const phaseInvalid = isGuardPhaseInvalid(guard)
+    const epochCorrupt = isDataEpochCorrupt()
+    const backupJournalObj = readBackupRestoreJournal(dataRoot)
+    const backupJournalCorrupt = Boolean(backupJournalObj?.corrupt)
+    const guardInvalid = Boolean(txnIdInvalid || phaseInvalid || epochCorrupt || backupJournalCorrupt)
+    const safeGuardTxnId = (!txnIdInvalid && rawGuardTxnId) ? rawGuardTxnId : ''
+    const activeTxns = findActiveMigrationTxns(dataRoot)
+    const activeTxn = qqOwnershipTransfer
+      ? readMigrationTxn(dataRoot, qqOwnershipTransfer.txnId)
+      : (activeTxns[0] || null)
+    const candidateTxnId = qqOwnershipTransfer?.txnId || activeTxn?.journal?.txnId || safeGuardTxnId || ''
+    const txnId = candidateTxnId && isValidMigrationTxnId(candidateTxnId) ? candidateTxnId : ''
+    const rawBuf = txnId
+      ? qqOwnership.bufferStatus(txnId)
+      : { txnId: '', overflow: null, corrupt: false, corruptFiles: [], entries: [] }
+    const buf = guardInvalid
+      ? {
+          ...rawBuf,
+          corrupt: true,
+          corruptFiles: [...new Set([
+            ...(rawBuf.corruptFiles || []),
+            ...(txnIdInvalid ? ['guard-invalid'] : []),
+            ...(phaseInvalid ? ['guard-phase-invalid'] : []),
+            ...(epochCorrupt ? ['data-epoch-corrupt'] : []),
+            ...(backupJournalCorrupt ? ['backup-journal-corrupt'] : []),
+          ])],
+        }
+      : rawBuf
+    const rawEntries = Array.isArray(buf.entries) ? buf.entries : []
+    const entries = rawEntries.map(formatBufferEntryForView)
+    let pendingCount = 0
+    let dispatchingCount = 0
+    let acceptedCount = 0
+    let filteredCount = 0
+    let uncertainCount = 0
+    for (const e of entries) {
+      if (e.status === 'pending') pendingCount++
+      else if (e.status === 'dispatching') dispatchingCount++
+      else if (e.status === 'accepted') acceptedCount++
+      else if (e.status === 'filtered') filteredCount++
+      else if (e.status === 'uncertain') uncertainCount++
+    }
+    const overflowCount = Number(buf.overflow?.count) || 0
+    const corruptCount = Array.isArray(buf.corruptFiles) ? buf.corruptFiles.length : 0
+    const pausedNow = isQqRecoveryPaused()
+    const rawPhase = qqOwnershipTransfer
+      ? qqOwnershipTransfer.phase
+      : pausedNow
+        ? ((guard.phase && guard.phase !== 'idle') ? guard.phase : (activeTxn?.journal?.phase || 'recovering'))
+        : (activeTxn?.journal?.phase && !TERMINAL_TXN_PHASES.has(activeTxn.journal.phase))
+          ? activeTxn.journal.phase
+          : 'idle'
+    const phase = guardInvalid && (rawPhase === 'idle' || rawPhase === 'recovering') ? 'migration-ambiguous' : rawPhase
+    const phaseLabel = formatMigrationPhaseLabel(phase, {
+      invalid: guardInvalid,
+      corrupt: Boolean(guard?.corrupt || epochCorrupt || backupJournalCorrupt),
+    })
+    const guardPhaseLabel = formatMigrationPhaseLabel(guard?.phase, {
+      invalid: guardInvalid,
+      corrupt: Boolean(guard?.corrupt || epochCorrupt || backupJournalCorrupt),
+    })
+    const hasRecoveryAttention = Boolean(
+      pausedNow
+      || (qqOwnershipTransfer && !qqOwnershipTransfer.inFlight)
+      || (guard.phase && guard.phase !== 'idle')
+      || entries.length > 0
+      || buf.corrupt
+      || buf.overflow?.overflowed,
+    )
+    const canRollbackToSnapshot = Boolean(activeTxn?.preSnapshot && verifyRawQqSnapshot(activeTxn.preSnapshot))
+    const hasPendingBackup = Boolean(pendingRestore() || (backupJournalObj && !backupJournalObj.corrupt))
+    const curTargetPlat = cfg.platforms?.[defaultPlatform] && typeof cfg.platforms[defaultPlatform] === 'object' && !Array.isArray(cfg.platforms[defaultPlatform])
+      ? cfg.platforms[defaultPlatform]
+      : {}
+    const legacyTarget = endpoint()
+    const legacyTargetEndpoint = Boolean(legacyTarget.wsUrl || legacyTarget.httpUrl)
+    const suggestedWsUrl = String(curTargetPlat.wsUrl || legacyTarget.wsUrl || '')
+    const suggestedHttpUrl = String(curTargetPlat.httpUrl || legacyTarget.httpUrl || '')
+    // normalizePlatforms 会把旧 snowluma 字段换算成一份 platforms.qq。
+    // 当前仍是旧版托管、且换算后的目标地址与原直连端点一致时，按“旧版直连带入”展示。
+    const legacyDerivedTarget = Boolean(
+      cfg.legacyQqEnabled
+      && legacyTargetEndpoint
+      && targetMatchesLegacyEndpoint({ wsUrl: suggestedWsUrl, httpUrl: suggestedHttpUrl }),
+    )
+    const inheritedLegacyCredentials = legacyTargetEndpoint
+      && (legacyDerivedTarget || !curTargetPlat.wsUrl && !curTargetPlat.httpUrl)
+      && targetMatchesLegacyEndpoint({ wsUrl: suggestedWsUrl, httpUrl: suggestedHttpUrl })
+    const targetPlatform = {
+      backend: String(curTargetPlat.backend || (cfg.gateway === 'onebot' ? 'onebot' : 'snowluma')),
+      wsUrl: suggestedWsUrl,
+      httpUrl: suggestedHttpUrl,
+      source: legacyDerivedTarget ? 'legacy-direct' : (curTargetPlat.wsUrl || curTargetPlat.httpUrl) ? 'platforms.qq' : 'manual',
+      wsTokenSet: Boolean(curTargetPlat.wsToken || curTargetPlat.token || (inheritedLegacyCredentials && legacyTarget.wsToken)),
+      httpTokenSet: Boolean(curTargetPlat.httpToken || curTargetPlat.token || (inheritedLegacyCredentials && legacyTarget.httpToken)),
+      legacyCredentialsAvailable: Boolean(legacyTarget.wsToken || legacyTarget.httpToken || legacyTarget.token),
+      inheritLegacyCredentials: Boolean(inheritedLegacyCredentials && (legacyTarget.wsToken || legacyTarget.httpToken || legacyTarget.token)),
+    }
+    const busy = Boolean(qqOwnershipTransfer?.inFlight || qqRecoveryActionInFlight)
+    const recommendedActions = []
+    if (!busy && !hasPendingBackup && !backupJournalCorrupt) {
+      if (guardInvalid) {
+        recommendedActions.push('rollback')
+      } else if (hasRecoveryAttention) {
+        if ((activeTxn?.journal?.committed === true || qqOwnershipTransfer?.phase === 'committed') && !buf.corrupt && !buf.overflow?.overflowed) {
+          recommendedActions.push('retry')
+        }
+        if (legacyQqOwnsConnection() || activeTxn?.journal?.committed === true || qqOwnershipTransfer?.phase === 'committed') {
+          recommendedActions.push('discard-uncertain')
+        }
+        if (!legacyQqOwnsConnection() || canRollbackToSnapshot || Boolean(qqOwnershipTransfer)) {
+          recommendedActions.push('rollback')
+        }
+      } else {
+        recommendedActions.push(legacyQqOwnsConnection() ? 'start' : 'rollback')
+      }
+    }
+    return {
+      ok: true,
+      revision: qqOwnershipRevision,
+      legacyQqEnabled: legacyQqOwnsConnection(),
+      ownerMode: legacyQqOwnsConnection() ? 'legacy' : 'gateway',
+      txnId,
+      phase,
+      phaseLabel,
+      paused: pausedNow,
+      pausePending: pausedNow && qqPausePending,
+      pauseHeld: pausedNow && qqPauseHeld,
+      recoveryWaitingForStop: pausedNow && qqRecoveryWaitingForStop(),
+      stopAttemptSince: pausedNow ? platformGateway?.stopAttemptSince?.(defaultPlatform) ?? null : null,
+      pauseReason: pausedNow ? qqPauseReason : '',
+      pauseStartedAt: pausedNow ? qqPauseStartedAt : 0,
+      pauseAttempts: pausedNow ? qqPauseAttempts : 0,
+      busy,
+      guard,
+      guardPhaseLabel,
+      guardInvalid,
+      backupJournalCorrupt,
+      backupRecovery: backupJournalCorrupt ? {
+        journalPath: join(dataRoot, BACKUP_JOURNAL_FILE),
+        canQuarantine: Boolean(inspectBackupRestoreState(dataRoot).canQuarantine),
+      } : null,
+      lastResolution: guard.lastResolution || null,
+      lastFailedResolution: guard.lastFailedResolution || null,
+      targetPlatform,
+      canRollbackToSnapshot,
+      recommendedActions,
+      buffer: {
+        totalCount: entries.length,
+        pendingCount,
+        dispatchingCount,
+        acceptedCount,
+        filteredCount,
+        uncertainCount,
+        overflowCount,
+        overflowed: Boolean(buf.overflow?.overflowed),
+        corruptCount,
+        corrupt: Boolean(buf.corrupt),
+        corruptFiles: buf.corruptFiles || [],
+        overflow: buf.overflow || null,
+        entries,
+      },
+    }
+  }
+
+  const qqMigrationSummary = (mig = qqMigrationView()) => ({
+    txnId: mig.txnId,
+    phase: mig.phase,
+    paused: mig.paused,
+    pausePending: mig.pausePending,
+    pauseHeld: mig.pauseHeld,
+    ownerMode: mig.ownerMode,
+    bufferTotal: mig.buffer.totalCount,
+    uncertainCount: mig.buffer.uncertainCount,
+    overflowCount: mig.buffer.overflowCount,
+    corruptCount: mig.buffer.corruptCount,
+    recommendedActions: mig.recommendedActions,
+  })
+
+  const legacyQqInstance = (mig = qqMigrationView()) => ({
+    instance: defaultPlatform || 'qq',
+    platform: defaultPlatform || 'qq',
+    name: defaultPlatform || 'qq',
+    enabled: legacyQqActive(),
+    legacy: true,
+    state: legacyQqActive() ? onebotState : 'stopped',
+    detail: isQqRecoveryPaused()
+      ? `${qqRecoveryPausedMessage}${mig.guard?.reason ? `（${mig.guard.reason}）` : ''}`
+      : qqOwnershipTransfer
+        ? qqTransferMessage
+        : !cfg.enabled ? '总开关关闭' : '旧版直连 QQ（由连接页管理）',
+    self: cfg.botQQ ? { account: String(cfg.botQQ), name: '' } : null,
+    caps: null,
+    settings: [],
+    migration: qqMigrationSummary(mig),
+  })
   const platformInstancesSummary = () => {
     if (platformGateway) return knownPlatformInstances()
     const list = []
-    if (legacyQqActive()) {
-      list.push({
-        instance: defaultPlatform || 'qq',
-        platform: defaultPlatform || 'qq',
-        name: defaultPlatform || 'qq',
-        enabled: true,
-        legacy: true,
-        state: onebotState,
-      })
-    }
-    for (const [instance, p] of Object.entries(cfg.platforms || {})) {
+    if (legacyQqOwnsConnection()) list.push(legacyQqInstance())
+    for (const [instance, p] of Object.entries(gatewayPlatforms())) {
       if (!p || typeof p !== 'object') continue
-      if (instance === defaultPlatform && legacyQqActive()) continue
+      if (instance === defaultPlatform && legacyQqOwnsConnection()) continue
       list.push({
         instance,
         platform: String(p.platform || instance).split('#')[0] || instance,
@@ -2124,7 +3918,7 @@ export function apply(ctx, opts = {}) {
     const inst = snowluma.detect()
     const running = inst.installed ? await snowluma.running() : false
     let login = null
-    if (onebotState === 'connected') {
+    if (legacyQqActive() && onebotState === 'connected') {
       try {
         const info = await onebot.call('get_login_info', {}, { timeoutMs: 5000 })
         login = { uin: String(info?.user_id ?? ''), nickname: info?.nickname || '' }
@@ -2251,7 +4045,7 @@ export function apply(ctx, opts = {}) {
     const changedModel = before.model.provider !== cfg.model.provider || before.model.model !== cfg.model.model
     if (changedModel) { clearReasoningCache(); clearVisionCache() }
     if (changedConn || before.botQQ !== cfg.botQQ) wrongAccount = ''
-    if (changedConn && onebot.state !== 'stopped') onebot.restart()
+    if (changedConn && legacyQqActive() && onebot.state !== 'stopped') onebot.restart()
     if (!before.enabled && cfg.enabled) setTimeout(safe(watchdog, '看门狗'), 100)
     if (before.enabled && !cfg.enabled) onebot.stop()
     log.info(`设置已保存｜总开关 ${cfg.enabled ? '开' : '关'}｜试运行 ${cfg.dryRun && !cfg.debug ? '开' : '关'}｜调试 ${cfg.debug ? '开' : '关'}`)
@@ -2848,14 +4642,17 @@ export function apply(ctx, opts = {}) {
   })
 
   // SnowLuma
-  route('/snowluma/start', async () => snowluma.start())
-  route('/snowluma/stop', async () => snowluma.stop())
+  route('/snowluma/start', async () => qqOwnershipTransfer ? { ok: false, message: qqTransferMessage } : isQqRecoveryPaused() ? { ok: false, message: qqRecoveryPausedMessage } : snowluma.start())
+  route('/snowluma/stop', async () => qqOwnershipTransfer ? { ok: false, message: qqTransferMessage } : isQqRecoveryPaused() ? { ok: false, message: qqRecoveryPausedMessage } : snowluma.stop())
   route('/snowluma/attach', async () => {
+    if (qqOwnershipTransfer) return { ok: false, message: qqTransferMessage }
+    if (isQqRecoveryPaused()) return { ok: false, message: qqRecoveryPausedMessage }
+    if (!legacyQqOwnsConnection()) return { ok: false, message: gatewayQqMessage }
     wrongAccount = ''
     snowluma.clearRejected()
     const r = await snowluma.attachBot()
     // 刚注入完 OneBot 会话可能还没起：立刻再试一次 WS，比等 3 秒轮询更快
-    if (cfg.enabled && r.ok && onebotState !== 'connected') {
+    if (legacyQqActive() && r.ok && onebotState !== 'connected') {
       if (onebot.state === 'stopped') onebot.start()
       else onebot.restart()
     }
@@ -2885,12 +4682,20 @@ export function apply(ctx, opts = {}) {
     }
   })
   route('/permissions/friends', async () => {
+    if (qqOwnershipTransfer) return { ok: false, message: qqTransferMessage }
     try {
-      const result = await onebot.call('get_friend_list', {}, { timeoutMs: 8000 })
+      if (!legacyQqOwnsConnection() && !platformGateway) return { ok: false, message: '默认 QQ 网关未就绪' }
+      const result = legacyQqOwnsConnection()
+        ? await onebot.call('get_friend_list', {}, { timeoutMs: 8000 })
+        : await platformGateway.fetch(defaultPlatform, { kind: 'contacts' })
       const friends = Array.isArray(result) ? result : (result?.friends || [])
       return { ok: true, friends: friends.map((friend) => ({ id: String(friend.user_id || ''), name: String(friend.remark || friend.nickname || '') })).filter(({ id }) => /^\d{5,12}$/.test(id)) }
     } catch (error) {
-      return { ok: false, message: `读取 QQ 好友失败：${error.message || String(error)}` }
+      return {
+        ok: false,
+        ...(error?.code === 'contacts-unavailable' ? { code: 'FEATURE_UNAVAILABLE' } : {}),
+        message: `读取 QQ 好友失败：${error.message || String(error)}`,
+      }
     }
   })
   // 更新：检查 GitHub 上有没有新版本；这次更新了什么
@@ -3034,7 +4839,10 @@ export function apply(ctx, opts = {}) {
   })
   /** 连不上 QQ 网关时，按顺序找卡在哪一步，给一句人话。 */
   async function connectionProblem() {
+    if (isQqRecoveryPaused()) return qqRecoveryPausedMessage
+    if (qqOwnershipTransfer) return qqTransferMessage
     if (!cfg.enabled) return '总开关关着（右上角），打开后才会连'
+    if (!legacyQqOwnsConnection()) return gatewayQqMessage
     if (!cfg.botQQ) return '还没填机器人 QQ 号'
     if (cfg.gateway === 'onebot') {
       const ep = endpoint()
@@ -3063,19 +4871,16 @@ export function apply(ctx, opts = {}) {
     return `连 ${ep.wsUrl || ep.httpUrl} 没连上：确认机器人号的 QQ 开着、已经登录，并且 SnowLuma 控制台里这个号显示已接入`
   }
   route('/onebot/reconnect', async () => {
-    if (!cfg.enabled) return { ok: false, message: await connectionProblem() }
+    if (!legacyQqActive()) return { ok: false, message: await connectionProblem() }
     wrongAccount = ''
-    if (onebot.state !== 'stopped') {
-      onebot.stop()
-      await new Promise((r) => setTimeout(r, 60))
-    }
+    if (onebot.state !== 'stopped') await onebot.stopAndWait()
+    if (!legacyQqActive()) return { ok: false, message: await connectionProblem() }
     onebot.start()
     // 等几秒看结果，别只回一句「正在重连」
-    for (let i = 0; i < 20 && !(onebotState === 'connected' && loginOk); i++) {
+    for (let i = 0; i < 20 && legacyQqActive() && !(onebotState === 'connected' && loginOk); i++) {
       if (i > 0 && onebotState === 'disconnected' && !wrongAccount) {
-        onebot.stop()
-        await new Promise((r) => setTimeout(r, 60))
-        onebot.start()
+        await onebot.stopAndWait()
+        if (legacyQqActive()) onebot.start()
       }
       await new Promise((r) => setTimeout(r, 500))
     }
@@ -3083,6 +4888,14 @@ export function apply(ctx, opts = {}) {
     return { ok: false, message: '没连上：' + (await connectionProblem()) }
   })
   route('/onebot/test', async () => {
+    if (qqOwnershipTransfer) return { ok: false, message: qqTransferMessage }
+    if (!legacyQqOwnsConnection()) {
+      const status = gatewayQqStatus()
+      const account = status?.self?.account
+      if (status?.state !== 'connected' || !account) return { ok: false, message: status?.detail || '默认 QQ 网关未就绪' }
+      const ok = account === cfg.botQQ
+      return { ok, message: ok ? `连上了：${status.self.name || account}（${account}）` : `网关登录的账号与配置的机器人号不一致（${account}）` }
+    }
     try {
       const info = await onebot.call('get_login_info', {}, { timeoutMs: 8000 })
       const uin = String(info?.user_id ?? '')
@@ -3197,7 +5010,36 @@ export function apply(ctx, opts = {}) {
     if (req.method !== 'POST' || req.headers?.['x-aurabot-backup'] !== '1') return { ok: false, message: '请从面板发起操作' }
     return run(req)
   }
-  route('/backup/state', async () => ({ ok: true, job: backupJob, list: listBackups(), pending: pendingRestore(), modules: pendingModules(), dir: dataDir('backups') }))
+  route('/backup/state', async () => ({
+    ok: true,
+    job: backupJob,
+    list: listBackups(),
+    pending: pendingRestore(),
+    modules: pendingModules(),
+    dir: dataDir('backups'),
+    guard: readRecoveryGuard(dataRoot),
+    backupState: inspectBackupRestoreState(dataRoot),
+  }))
+  route('/backup/recovery', async (req) => {
+    if (req.method !== 'GET') return { ok: false, code: 'METHOD_NOT_ALLOWED', message: '只支持 GET' }
+    const { state, corrupt, canQuarantine } = inspectBackupRestoreState(dataRoot)
+    return { ok: true, backupState: { state, corrupt: Boolean(corrupt), canQuarantine: Boolean(canQuarantine) } }
+  })
+  route('/backup/recovery/open', backupAction(async () => {
+    if (!isBackupJournalCorrupt()) return { ok: false, message: '当前没有损坏的备份恢复日志' }
+    return openFolder(dataRoot)
+  }))
+  route('/backup/recovery/quarantine', backupAction(async (req) => {
+    const body = await readBody(req)
+    if (body?.confirmed !== true) return { ok: false, code: 'CONFIRMATION_REQUIRED', message: '请确认保留并隔离损坏的备份恢复日志' }
+    if (qqOwnershipTransfer?.inFlight || qqRecoveryActionInFlight) return { ok: false, code: 'MIGRATION_BUSY', message: '默认 QQ 正在切换，请等待事务完成' }
+    try {
+      const savedName = quarantineCorruptBackupJournal(dataRoot)
+      return { ok: true, savedName, message: '损坏日志已保留到备份文件夹。可以回滚恢复默认 QQ。' }
+    } catch (error) {
+      return { ok: false, code: error?.code || 'BACKUP_JOURNAL_QUARANTINE_FAILED', message: error?.message || String(error) }
+    }
+  }))
   route('/backup/create', backupAction(async () => {
     if (backupJob?.running) return { ok: false, message: '上一个备份还在打包' }
     backupJob = { running: true, done: 0, total: 0 }
@@ -3401,31 +5243,34 @@ export function apply(ctx, opts = {}) {
     }
   })
   // U1：平台页。instances() 已包含平台端声明的 settings，前端按模块表单的写法渲染。
-  const knownPlatformInstances = () => {
+  function knownPlatformInstances(mig = qqMigrationView()) {
     if (!platformGateway) ensureGateway()
+    const migMeta = qqMigrationSummary(mig)
     // 旧版直连 QQ 的实例由宿主管理，网关里即使有同名 idle 记录也不显示，
     // 下面单独合成一张 legacy 卡片，避免出现「已停用 / 未连接」的假状态。
-    let list = (platformGateway?.instances?.() || []).filter((x) => !(x.platform === defaultPlatform && legacyQqActive()))
+    const list = (platformGateway?.instances?.() || [])
+      .filter((x) => !(x.instance === defaultPlatform && legacyQqOwnsConnection()))
+      .map((x) => {
+        if (x.instance !== defaultPlatform) return x
+        if (isQqRecoveryPaused()) {
+          return {
+            ...x,
+            enabled: false,
+            state: 'stopped',
+            detail: `${qqRecoveryPausedMessage}${mig.guard?.reason ? `（${mig.guard.reason}）` : ''}`,
+            migration: migMeta,
+          }
+        }
+        return { ...x, migration: migMeta }
+      })
     // 旧版直连 QQ 没有网关实例，但面板仍要能看到这张卡；它由「QQ 网关」页管理，
     // 这里只读展示，不能通过平台页开关（否则会以为关了，实际直连还在跑）。
-    if (legacyQqActive()) {
-      list = [{
-        instance: defaultPlatform || 'qq',
-        platform: defaultPlatform || 'qq',
-        name: defaultPlatform || 'qq',
-        enabled: true,
-        legacy: true,
-        state: onebotState,
-        detail: onebotState === 'connected' ? '旧版直连 QQ（由连接页管理）' : (onebot.problem || '旧版直连 QQ'),
-        self: (onebot.login?.uin || cfg.botQQ) ? { account: String(onebot.login?.uin || cfg.botQQ), name: onebot.login?.nickname || '' } : null,
-        caps: null,
-        settings: [],
-      }, ...list]
-    }
+    if (legacyQqOwnsConnection()) list.unshift(legacyQqInstance(mig))
     return list
   }
   const platformView = () => {
-    const list = knownPlatformInstances()
+    const mig = qqMigrationView()
+    const list = knownPlatformInstances(mig)
     const pubPlats = publicConfig(getConfig()).platforms || {}
     return {
       ok: true,
@@ -3434,9 +5279,343 @@ export function apply(ctx, opts = {}) {
       catalog: platformGateway?.catalog?.() || [],
       candidates: [...platformCandidates.values()].sort((a, b) => b.at - a.at).slice(0, 10),
       configs: Object.fromEntries(list.map((x) => [x.instance, pubPlats[x.instance] || {}])),
+      multiPrivate: hub?.sharedStatus(),
+      qqMigration: mig,
     }
   }
-  route('/platforms', async () => platformView())
+  route('/platforms', async () => {
+    if (!qqOwnershipTransfer && isQqRecoveryPaused()) await lastPausePromise
+    return platformView()
+  })
+
+  async function executeQqMigrationSwitch(body = {}) {
+    const targetLegacy = body.targetLegacyQqEnabled === true
+    const hasCustomTxnId = body.txnId !== undefined && body.txnId !== null && body.txnId !== ''
+    const txnId = hasCustomTxnId ? String(body.txnId) : `qq-mig-${randomUUID().slice(0, 8)}`
+    if (!isValidMigrationTxnId(txnId)) {
+      return {
+        ok: false,
+        code: 'INVALID_TXN_ID',
+        message: `非法迁移事务 ID：${txnId}`,
+        view: qqMigrationView(),
+        platforms: platformView(),
+      }
+    }
+    const targetPlat = targetLegacy ? undefined : resolveTargetGatewayPlatform(body.platform, body)
+    const pre = await qqOwnership.preflight({
+      sessionId: String(body.sessionId || ''),
+      targetLegacyQqEnabled: targetLegacy,
+      platform: targetPlat,
+    })
+    if (!pre.ok) {
+      return {
+        ok: false,
+        reason: pre.reason,
+        message: `迁移前置检查未通过：${pre.reason}`,
+        view: qqMigrationView(),
+        platforms: platformView(),
+      }
+    }
+    const expectedRevision = body.expectedRevision !== undefined ? Number(body.expectedRevision) : qqOwnership.status().revision
+    const timeoutMs = Math.max(500, Number(body.timeoutMs) || Number(opts?.migrationTimeoutMs) || 6000)
+
+    let tx
+    try {
+      tx = qqOwnership.begin({ txnId, expectedRevision, legacyQqEnabled: targetLegacy, platform: targetPlat })
+    } catch (error) {
+      return {
+        ok: false,
+        code: error?.code || 'BEGIN_FAILED',
+        message: error?.message || String(error),
+        view: qqMigrationView(),
+        platforms: platformView(),
+      }
+    }
+    try {
+      await tx.prepare({ timeoutMs })
+    } catch (error) {
+      await tx.abort().catch(() => {})
+      await lastPausePromise.catch(() => {})
+      return {
+        ok: false,
+        code: error?.code || 'PREPARE_FAILED',
+        message: error?.message || String(error),
+        view: qqMigrationView(),
+        platforms: platformView(),
+      }
+    }
+    try {
+      tx.commit({ txnId, expectedRevision })
+    } catch (error) {
+      await lastPausePromise.catch(() => {})
+      return {
+        ok: false,
+        code: error?.code || 'COMMIT_FAILED',
+        message: error?.message || String(error),
+        view: qqMigrationView(),
+        platforms: platformView(),
+      }
+    }
+    try {
+      await tx.finish({ timeoutMs })
+    } catch (error) {
+      await lastPausePromise.catch(() => {})
+      return {
+        ok: false,
+        code: error?.code || 'FINISH_FAILED',
+        message: error?.message || String(error),
+        view: qqMigrationView(),
+        platforms: platformView(),
+      }
+    }
+    return {
+      ok: true,
+      txnId,
+      message: targetLegacy ? '已切回旧版直连 QQ' : '默认 QQ 已切换到多平台网关托管',
+      view: qqMigrationView(),
+      platforms: platformView(),
+    }
+  }
+
+  const requirePost = (req) => String(req?.method || 'GET').toUpperCase() === 'POST'
+  const rejectInvalidRouteTxnId = (body) => {
+    const raw = body?.txnId
+    if (raw === undefined || raw === null || raw === '') return null
+    const id = String(raw)
+    if (isValidMigrationTxnId(id)) return null
+    return {
+      ok: false,
+      code: 'INVALID_TXN_ID',
+      message: `非法迁移事务 ID：${id}`,
+      view: qqMigrationView(),
+      platforms: platformView(),
+    }
+  }
+
+  route('/platforms/qq-migration', async (req) => {
+    if (String(req?.method || 'GET').toUpperCase() !== 'GET') {
+      return { ok: false, code: 'METHOD_NOT_ALLOWED', message: '只支持 GET', view: qqMigrationView() }
+    }
+    return {
+      ...qqMigrationView(),
+      platforms: platformView(),
+    }
+  })
+  route('/platforms/qq-migration/preflight', async (req) => {
+    const method = String(req?.method || 'GET').toUpperCase()
+    if (method !== 'GET' && method !== 'POST') {
+      return { ok: false, code: 'METHOD_NOT_ALLOWED', message: '只支持 GET 或 POST', view: qqMigrationView() }
+    }
+    const q = query(req)
+    const b = method === 'POST' ? await readBody(req) : {}
+    const sessionId = String(b.sessionId || q.sessionId || '')
+    const res = await qqOwnership.preflight({
+      sessionId,
+      platform: b.platform,
+      targetLegacyQqEnabled: b.targetLegacyQqEnabled,
+      targetWsUrl: b.targetWsUrl ?? q.targetWsUrl,
+      targetHttpUrl: b.targetHttpUrl ?? q.targetHttpUrl,
+      wsUrl: b.wsUrl ?? q.wsUrl,
+      httpUrl: b.httpUrl ?? q.httpUrl,
+      backend: b.backend ?? q.backend,
+    })
+    return {
+      ...res,
+      message: res.ok
+        ? '迁移前置检查通过'
+        : res.reason === 'missing-target-ws-url'
+          ? '前置检查未通过：目标网关 QQ 必须填写 OneBot WS URL（仅填 HTTP URL 无法完成连接与迁移验号）'
+          : `前置检查未通过：${res.reason}`,
+      view: qqMigrationView(),
+    }
+  })
+  route('/platforms/qq-migration/start', async (req) => {
+    if (!requirePost(req)) {
+      return { ok: false, code: 'METHOD_NOT_ALLOWED', message: '只支持 POST', view: qqMigrationView() }
+    }
+    const b = await readBody(req)
+    return executeQqMigrationSwitch(b)
+  })
+  route('/platforms/qq-migration/retry', async (req) => {
+    if (!requirePost(req)) {
+      return { ok: false, code: 'METHOD_NOT_ALLOWED', message: '只支持 POST', view: qqMigrationView() }
+    }
+    const b = await readBody(req)
+    try {
+      const res = await qqOwnership.resolveRecovery({ txnId: String(b.txnId || ''), action: 'retry', retryStopPending: b.retryStopPending === true })
+      return {
+        ...res,
+        message: res.ok ? '已重试并完成默认 QQ 迁移恢复' : '重试恢复尚未完成，默认 QQ 仍保持暂停保护',
+        view: qqMigrationView(),
+        platforms: platformView(),
+      }
+    } catch (error) {
+      return {
+        ok: false,
+        ...(error?.code ? { code: error.code } : {}),
+        message: error?.message || String(error),
+        view: qqMigrationView(),
+        platforms: platformView(),
+      }
+    }
+  })
+  route('/platforms/qq-migration/discard-uncertain', async (req) => {
+    if (!requirePost(req)) {
+      return { ok: false, code: 'METHOD_NOT_ALLOWED', message: '只支持 POST', view: qqMigrationView() }
+    }
+    const b = await readBody(req)
+    try {
+      const res = await qqOwnership.resolveRecovery({
+        txnId: String(b.txnId || ''),
+        action: 'discard-uncertain',
+        operator: String(b.operator || 'panel-admin'),
+        reason: String(b.reason || ''),
+      })
+      return {
+        ...res,
+        message: res.ok ? '已确认并清理未决/溢出缓冲，恢复默认 QQ 运行' : '默认 QQ 仍保持暂停保护',
+        view: qqMigrationView(),
+        platforms: platformView(),
+      }
+    } catch (error) {
+      return {
+        ok: false,
+        ...(error?.code ? { code: error.code } : {}),
+        message: error?.message || String(error),
+        view: qqMigrationView(),
+        platforms: platformView(),
+      }
+    }
+  })
+  route('/platforms/qq-migration/rollback', async (req) => {
+    if (!requirePost(req)) {
+      return { ok: false, code: 'METHOD_NOT_ALLOWED', message: '只支持 POST', view: qqMigrationView() }
+    }
+    const b = await readBody(req)
+    const badTxn = rejectInvalidRouteTxnId(b)
+    if (badTxn) return badTxn
+    const viewNow = qqMigrationView()
+    const hasPendingRecovery = Boolean(
+      isQqRecoveryPaused()
+      || viewNow.guardInvalid
+      || (qqOwnershipTransfer && !qqOwnershipTransfer.inFlight)
+      || (viewNow.guard?.phase && viewNow.guard.phase !== 'idle')
+      || findActiveMigrationTxns(dataRoot).length > 0,
+    )
+    if (hasPendingRecovery) {
+      try {
+        const res = await qqOwnership.resolveRecovery({
+          txnId: String(b.txnId || ''),
+          action: 'rollback',
+          retryStopPending: b.retryStopPending === true,
+          operator: String(b.operator || 'panel-admin'),
+          reason: String(b.reason || ''),
+        })
+        return {
+          ...res,
+          message: res.ok ? '已回滚并清理恢复状态，默认 QQ 已恢复运行' : '回滚后默认 QQ 仍保持暂停保护',
+          view: qqMigrationView(),
+          platforms: platformView(),
+        }
+      } catch (error) {
+        return {
+          ok: false,
+          ...(error?.code ? { code: error.code } : {}),
+          message: error?.message || String(error),
+          view: qqMigrationView(),
+          platforms: platformView(),
+        }
+      }
+    }
+    if (!legacyQqOwnsConnection()) {
+      return executeQqMigrationSwitch({ ...b, targetLegacyQqEnabled: true })
+    }
+    return {
+      ok: false,
+      message: '当前已在旧版直连 QQ 模式，且没有待回滚的迁移事务',
+      view: viewNow,
+      platforms: platformView(),
+    }
+  })
+  route('/platforms/qq-migration/buffer/action', async (req) => {
+    if (!requirePost(req)) {
+      return { ok: false, code: 'METHOD_NOT_ALLOWED', message: '只支持 POST', view: qqMigrationView() }
+    }
+    const b = await readBody(req)
+    const badTxn = rejectInvalidRouteTxnId(b)
+    if (badTxn) return badTxn
+    const action = String(b.action || '').trim()
+    if (!['retry', 'discard-uncertain', 'acknowledge', 'rollback'].includes(action)) {
+      return { ok: false, message: `未知缓冲恢复动作：${action || '(空)'}`, view: qqMigrationView() }
+    }
+    try {
+      const res = await qqOwnership.resolveRecovery({
+        txnId: String(b.txnId || ''),
+        action,
+        operator: String(b.operator || 'panel-admin'),
+        reason: String(b.reason || ''),
+      })
+      return {
+        ...res,
+        message: res.ok ? `已执行恢复动作（${action}）` : '恢复动作尚未解除暂停',
+        view: qqMigrationView(),
+        platforms: platformView(),
+      }
+    } catch (error) {
+      return {
+        ok: false,
+        ...(error?.code ? { code: error.code } : {}),
+        message: error?.message || String(error),
+        view: qqMigrationView(),
+        platforms: platformView(),
+      }
+    }
+  })
+  route('/platforms/multi-private', async req => {
+    if (req.method === 'GET') return { ok: true, ...hub.sharedStatus() }
+    if (req.method !== 'POST') return { ok: false, message: '仅支持 GET 或 POST' }
+    const body = await readBody(req)
+    if (typeof body.enabled !== 'boolean') return { ok: false, message: 'enabled 必须是布尔值' }
+    const state = hub.sharedStatus()
+    if (body.enabled && !state.available) {
+      const message = state.reason === 'gateway-required'
+        ? '共享私聊需要经多平台网关接入的主账号。旧版直连 QQ 使用普通会话。'
+        : '请先确认 DSH 宿主支持，并绑定唯一的主人主账号'
+      return { ok: false, ...state, message }
+    }
+    setConfig({ ...getConfig(), multiPlatformPrivateSession: body.enabled })
+    return { ok: true, ...hub.sharedStatus(), message: body.enabled ? '已开启多平台私聊' : '已切回普通会话' }
+  })
+  for (const action of ['prepare', 'confirm']) {
+    route('/platforms/multi-private/legacy/' + action, async req => {
+      if (req.method !== 'POST') return { ok: false, message: '仅支持 POST' }
+      const { mode, token, confirmed } = await readBody(req)
+      if (mode !== 'live' && mode !== 'debug') return { ok: false, message: '请选择正式或调试会话' }
+      try {
+        if (action === 'prepare') return await hub.prepareLegacyHistory(mode)
+        if (confirmed !== true || typeof token !== 'string') return { ok: false, message: '请先核对旧会话并确认归属' }
+        const result = await hub.confirmLegacyHistory(mode, token)
+        return { ...hub.sharedStatus(), ...result }
+      } catch (error) {
+        logger.child('chat').debug('旧共享历史核对失败：', error.message)
+        return { ok: false, message: '暂时无法核对旧会话，请检查 DSH 中的原会话后重试' }
+      }
+    })
+  }
+  for (const [action, policy] of [['reset', 'empty'], ['inherit', 'inherit']]) {
+    route('/platforms/multi-private/' + action, async req => {
+      if (req.method !== 'POST') return { ok: false, message: '仅支持 POST' }
+      const { mode } = await readBody(req)
+      if (mode !== 'live' && mode !== 'debug') return { ok: false, message: '请选择正式或调试会话' }
+      if (policy === 'inherit') {
+        const status = hub.sharedStatus(mode)
+        if (!status.available) return { ok: false, message: '当前主账号或宿主不可用' }
+        if (status.sourceAuthorizationChanged) return { ok: false, message: '原会话的主人授权已变化，请从空会话开始' }
+      }
+      hub.resetShared([mode], policy)
+      return { ok: true, ...hub.sharedStatus(), message: policy === 'empty' ? '下一轮将使用空会话' : '下一轮将重新继承主账号历史' }
+    })
+  }
   const toolsView = async () => ({ ...(await listTools(getConfig)), jobs: toolJobs(), tunnel: tunnelState() })
   // 外置工具页：检测、手动路径；FFmpeg/Python/uv 支持后台安装/修复。
   route('/tools', async () => toolsView())
@@ -3892,6 +6071,7 @@ export function apply(ctx, opts = {}) {
       const prevOwner = identity.owner() || ''
       const prevAccounts = prevOwner ? (identity.accountsOf(prevOwner) || []) : []
       identity.unlink(platform, account)
+      hub?.invalidateSharedSource(platform, account)
       syncOwnerPersonId()
       syncOwnerFallbackOnAccountChange({ prevOwner, prevAccounts, allowAutoAppend: false })
       return { ...(await platformView()), ok: true, message: '已解绑这个账号' }
@@ -4158,7 +6338,7 @@ export function apply(ctx, opts = {}) {
     // 先用内置整表（329 条）打底：网关取不到目录时，面板也不会只剩 65 个常用表情
     let byId = new Map(FACE_TABLE.map((f) => [String(f.id), f.name]))
     try {
-      const r = await onebot.call('fetch_sys_faces', {}, { timeoutMs: 8000 })
+      const r = await legacyOnebot()?.call('fetch_sys_faces', {}, { timeoutMs: 8000 })
       const built = buildFaceIndex(r?.packs ? r : r?.data)
       if (built.byId.size) byId = new Map([...byId, ...built.byId])
     } catch (error) {
@@ -4236,9 +6416,11 @@ export function apply(ctx, opts = {}) {
     return { ok: true, message: '恢复成默认头像了', avatar: avatarInfo() }
   })
   route('/avatar/sync-qq', async () => {
+    const client = legacyOnebot()
+    if (!client) return { ok: false, message: qqOwnershipTransfer ? qqTransferMessage : '当前 QQ 网关不支持通过连接页同步头像' }
     const buf = existsSync(AVATAR()) ? readFileSync(AVATAR()) : readFileSync(join(ROOT, 'assets', 'dafeiyu.jpg'))
     try {
-      await onebot.call('set_qq_avatar', { file: 'base64://' + buf.toString('base64') })
+      await client.call('set_qq_avatar', { file: 'base64://' + buf.toString('base64') })
       return { ok: true, message: '已经设成机器人号的 QQ 头像' }
     } catch (error) {
       return { ok: false, message: 'QQ 头像没换成：' + error.message }
@@ -4249,7 +6431,8 @@ export function apply(ctx, opts = {}) {
   log.info(`Aurabot v${VERSION} 已加载｜总开关 ${cfg.enabled ? '开' : '关'}｜试运行 ${cfg.dryRun ? '开' : '关'}｜工作区 ${workspaceDirOf(cfg)}`)
 
   return {
-    hub, onebot, snowluma, getConfig, setConfig, logger, modules: mods, bridge, resolveOwnerRoute, routeOwner, proactHealth: () => lastBlockedRoute, ready: booted,
+    hub, qqOwnership, snowluma, getConfig, setConfig, logger, modules: mods, bridge, resolveOwnerRoute, routeOwner, proactHealth: () => lastBlockedRoute, ready,
+    get onebot() { return legacyOnebot() },
     get gateway() { return platformGateway },
     get stickers() { return use('stickers') },
     get qzone() { return use('diary') },

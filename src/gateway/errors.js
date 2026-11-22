@@ -25,6 +25,13 @@ export function isNotSent(error) {
   return Boolean(error) && typeof error === 'object' && error.certainty === 'not-sent'
 }
 
+/** Call before a dispatch that may have been preceded by async preparation. */
+export function assertReplyCurrent(replyGuard, instance, partiallySent = false) {
+  if (replyGuard && !replyGuard()) {
+    throw makeSendError(partiallySent ? 'unknown' : 'not-sent', 'reply-revoked', instance, '该轮回复已撤销')
+  }
+}
+
 /**
  * 平台端抛的任何非 SendError（普通 Error、字符串、undefined……）一律包成 'unknown'。
  * 平台端按契约必须抛 SendError；包一层是网关对违约平台端的兜底（CONTRACTS §七.3）。

@@ -360,6 +360,27 @@ test('出站：私聊/群聊分别调 send_private_msg / send_group_msg', async 
   await adapter.stop()
 })
 
+test('QQ 共享回复在 OneBot 文件发送后撤销时停止余下文本', async (t) => {
+  const client = makeFakeClient()
+  const adapter = createQqAdapter({ client, fs: fakeFs() })
+  t.after(() => adapter.stop())
+  await adapter.start(makeCtx(adapter))
+  let current = true
+  const call = client.call
+  client.call = async (action, params, opts) => {
+    const response = await call(action, params, opts)
+    if (action === 'upload_private_file') current = false
+    return response
+  }
+  await assert.rejects(adapter.send({
+    chat: { kind: 'private', id: '10001' },
+    inResponseTo: 'original',
+    parts: [{ type: 'file', media: { path: 'unused.txt', name: 'test.txt' } }, { type: 'text', text: '后续文本' }],
+  }, { replyGuard: () => current }), { code: 'reply-revoked', certainty: 'unknown' })
+  assert.equal(client.calls.filter(item => item.action === 'upload_private_file').length, 1)
+  assert.equal(client.calls.some(item => item.action === 'send_private_msg'), false)
+})
+
 test('whoami：返回登录账号，与配置的机器人号不符时报错/断开由网关处理', async () => {
   const h = makeHarness()
   const adapter = h.makeAdapter()
@@ -369,6 +390,82 @@ test('whoami：返回登录账号，与配置的机器人号不符时报错/断�
   assert.equal(me.account, '10000')
   assert.equal(me.name, '假机器人')
   await adapter.stop()
+})
+
+test('挂起 QQ 的严格验号要求 WS 和已配置的 HTTP 都匹配，失效前仅使用核对过的连接', async (t) => {
+  const client = makeFakeClient()
+  const checked = []
+  let current = true
+  let httpAccount = 20000
+  client.captureTransport = () => ({
+    hasHttp: true,
+    isCurrent: () => current,
+    async call(action, params, opts) {
+      if (action !== 'get_login_info') return client.call(action, params, opts)
+      checked.push({ transport: opts.transport, retries: opts.retries })
+      return { user_id: opts.transport === 'http' ? httpAccount : 10000, nickname: '假机器人' }
+    },
+  })
+  let restarts = 0
+  client.restart = () => { restarts++ }
+  const adapter = createQqAdapter({ client, fs: fakeFs(), probeTable: [] })
+  await adapter.start({ ...makeCtx(adapter), migrationHeld: true })
+  t.after(() => adapter.stop())
+  const send = () => adapter.send({ chat: { kind: 'private', id: '10001' }, parts: [{ type: 'text', text: '消息' }] })
+
+  assert.equal(client.calls.length, 0)
+  await assert.rejects(send, { code: 'migration-identity-unverified' })
+  await assert.rejects(adapter.verifyMigrationIdentity('10000'), { code: 'migration-identity-mismatch' })
+  assert.equal(adapter.isMigrationIdentityCurrent(), false)
+  assert.deepEqual(checked, [{ transport: 'ws', retries: 0 }, { transport: 'http', retries: 0 }])
+  assert.equal(client.calls.some(({ action }) => action === 'send_private_msg'), false)
+
+  httpAccount = 10000
+  assert.deepEqual(await adapter.verifyMigrationIdentity('10000'), { account: '10000', name: '假机器人' })
+  assert.equal(adapter.isMigrationIdentityCurrent(), true)
+  assert.ok((await send()).messageId)
+  current = false
+  assert.equal(adapter.isMigrationIdentityCurrent(), false)
+  await assert.rejects(send, { code: 'migration-identity-unverified' })
+  assert.equal(restarts, 1)
+  assert.equal(client.calls.filter(({ action }) => action === 'send_private_msg').length, 1)
+})
+
+test('已核对的 QQ 迁移连接重连后须重新验号，期间阻止业务', async (t) => {
+  const client = makeFakeClient()
+  let generation = 0
+  let acceptReconnect
+  const reconnectIdentity = new Promise(resolve => { acceptReconnect = resolve })
+  client.captureTransport = () => {
+    const captured = generation
+    return {
+      hasHttp: false,
+      isCurrent: () => captured === generation,
+      async call(action, params, opts) {
+        if (action !== 'get_login_info') return client.call(action, params, opts)
+        assert.equal(opts.transport, 'ws')
+        return captured === 0 ? { user_id: 10000 } : reconnectIdentity
+      },
+    }
+  }
+  const adapter = createQqAdapter({ client, fs: fakeFs(), probeTable: [] })
+  const ctx = { ...makeCtx(adapter), migrationHeld: true }
+  await adapter.start(ctx)
+  t.after(() => adapter.stop())
+  await adapter.verifyMigrationIdentity('10000')
+
+  client.stop()
+  generation++
+  client.start()
+  await Promise.resolve()
+  assert.equal(adapter.isMigrationIdentityCurrent(), false)
+  assert.equal(ctx.states.filter(([state]) => state === 'connected').length, 1)
+  await assert.rejects(adapter.fetch({ kind: 'contacts' }), { code: 'migration-identity-unverified' })
+
+  acceptReconnect({ user_id: 10000 })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(adapter.isMigrationIdentityCurrent(), true)
+  assert.equal(ctx.states.filter(([state]) => state === 'connected').length, 2)
 })
 
 test('native：转发到 OneBot 扩展动作（空间/收藏表情等）', async () => {
@@ -381,6 +478,85 @@ test('native：转发到 OneBot 扩展动作（空间/收藏表情等）', async
     const r = await adapter.native('get_group_list', {})
     assert.ok(r !== undefined, 'native 应把动作转发给 OneBot client')
   }
+  await adapter.stop()
+})
+
+test('QQ 好友查询保留空列表和查询错误的区别', async (t) => {
+  const client = makeFakeClient()
+  const originalCall = client.call
+  const friend = { user_id: 10001, nickname: '张三', remark: '备注' }
+  let response = { friends: [friend] }
+  client.call = async (...args) => {
+    const result = await originalCall(...args)
+    return args[0] === 'get_friend_list' ? { ...result, data: response } : result
+  }
+  const adapter = createQqAdapter({ client, fs: fakeFs(), probeTable: [] })
+  await adapter.start(makeCtx(adapter))
+  t.after(() => adapter.stop())
+
+  const request = { kind: 'contacts' }
+  assert.deepEqual(await adapter.fetch(request), { friends: [friend] })
+  response = []
+  assert.deepEqual(await adapter.fetch(request), { friends: [] })
+  assert.equal(client.calls.some(({ action }) => action === 'get_group_list'), false)
+
+  response = {}
+  await assert.rejects(() => adapter.fetch(request), { code: 'invalid-contacts-response' })
+  client.failOnce('get_friend_list', Object.assign(new Error('不支持的 API'), { data: { retcode: 1404 } }))
+  await assert.rejects(() => adapter.fetch(request), { code: 'contacts-unavailable', certainty: 'not-sent' })
+  client.failOnce('get_friend_list', Object.assign(new Error('没有权限'), { data: { retcode: 1403 } }))
+  await assert.rejects(() => adapter.fetch(request), { code: '1403' })
+})
+
+test('QQ 适配器仅在确认 OneBot 连接退出后报告 stopped，超时后可重试', async () => {
+  const client = makeFakeClient()
+  const stopOptions = []
+  let finishClose
+  const closing = new Promise((resolve) => { finishClose = resolve })
+  client.stopAndWait = async (options) => {
+    stopOptions.push(options)
+    if (stopOptions.length === 1) throw Object.assign(new Error('关闭超时'), { code: 'ONEBOT_CLOSE_TIMEOUT' })
+    await closing
+    client.stop()
+  }
+  const adapter = createQqAdapter({ client, fs: fakeFs(), probeTable: [] })
+  const ctx = makeCtx(adapter)
+  await adapter.start(ctx)
+
+  await assert.rejects(() => adapter.stopAndWait({ timeoutMs: 1 }), { code: 'ONEBOT_CLOSE_TIMEOUT' })
+  assert.equal(ctx.states.some(([state]) => state === 'stopped'), false)
+  const first = adapter.stopAndWait({ timeoutMs: 100 })
+  const second = adapter.stop()
+  assert.deepEqual(stopOptions, [{ timeoutMs: 1 }, { timeoutMs: 100 }])
+  assert.equal(ctx.states.some(([state]) => state === 'stopped'), false)
+  finishClose()
+  await Promise.all([first, second])
+  assert.equal(ctx.states.filter(([state]) => state === 'stopped').length, 1)
+})
+
+test('QQ 适配器独立确认旧连接退出后，迟到的停止回调不会改写新状态', async () => {
+  const client = makeFakeClient()
+  const oldWaiter = Promise.withResolvers()
+  client.stopAndWait = () => oldWaiter.promise
+  client.confirmStopped = () => !client.started()
+  const adapter = createQqAdapter({ client, fs: fakeFs(), probeTable: [] })
+  const firstCtx = makeCtx(adapter)
+  await adapter.start(firstCtx)
+
+  const pending = adapter.stopAndWait()
+  assert.equal(adapter.confirmStopped(), false)
+  client.stop()
+  assert.equal(adapter.confirmStopped(), true)
+  assert.equal(firstCtx.states.filter(([state]) => state === 'stopped').length, 1)
+
+  const secondCtx = makeCtx(adapter)
+  await adapter.start(secondCtx)
+  oldWaiter.resolve()
+  await pending
+  assert.equal(adapter.confirmStopped(), false)
+  assert.equal(secondCtx.states.some(([state]) => state === 'stopped'), false)
+  assert.equal(client.started(), true)
+  delete client.stopAndWait
   await adapter.stop()
 })
 

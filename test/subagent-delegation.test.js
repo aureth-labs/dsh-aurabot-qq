@@ -3,7 +3,8 @@
 // 调用方传的 moduleId / source 一律不认。
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync } from 'node:fs'
+import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createFakeDsh } from './helpers/fake-dsh.js'
@@ -43,12 +44,16 @@ function setup(t, { subagents, capabilities, config } = {}) {
       },
     }
   }
-  t.after(() => {
-    hub.dispose()
-    fake.dispose()
-    if (oldDir === undefined) delete process.env.AURABOT_DATA_DIR
-    else process.env.AURABOT_DATA_DIR = oldDir
-    rmSync(root, { recursive: true, force: true })
+  t.after(async () => {
+    try {
+      hub.dispose()
+      fake.dispose()
+      // The Windows workspace grant may still be releasing the directory.
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
+    } finally {
+      if (oldDir === undefined) delete process.env.AURABOT_DATA_DIR
+      else process.env.AURABOT_DATA_DIR = oldDir
+    }
   })
   // 模块拿到的唯一入口：subagentFor(真实 id)；调用方不能自报 moduleId/source
   const run = (prompt = '任务书', opts = {}) => hub.subagentFor('phone')('手机逛逛', '手机逛逛', prompt, opts)
@@ -88,6 +93,10 @@ test('委派契约：spawn + delivery:"caller" + 显式 agentPreset，父级常�
 })
 
 test('结果形状兜底：字符串 / 消息块数组 / 包着 output 的对象，都取最后一段有效文本', async (t) => {
+  let response
+  const s = setup(t, { subagents: { async startActivation() {
+    return { result: Promise.resolve(response), dispose: async () => {} }
+  } } })
   const shapes = [
     ['纯字符串', '直接给的答案', '直接给的答案'],
     ['消息块数组', [{ type: 'text', text: '先想了下' }, { type: 'text', text: '最终答案' }], '最终答案'],
@@ -95,8 +104,7 @@ test('结果形状兜底：字符串 / 消息块数组 / 包着 output 的对象
     ['对象 text', { text: 'text 字段的答案' }, 'text 字段的答案'],
   ]
   for (const [name, result, want] of shapes) {
-    const s = setup(t)
-    s.fake.ctx.subagents = { async startActivation() { return { result: Promise.resolve(result), dispose: async () => {} } } }
+    response = result
     assert.equal(await s.run(), want, name)
   }
 })
