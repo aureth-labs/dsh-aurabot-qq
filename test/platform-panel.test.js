@@ -23,10 +23,22 @@ test('连接页改成临时 QQ详细设置，只从 QQ 卡片进入，外置工�
   assert.equal((client.match(/go\('connect'\)/g) || []).length, 1, '详细设置页只能从 QQ 卡片进入')
   assert.ok(client.includes("cur.id === 'connect' || last[curGroup.id]"), '导航分组不应记住临时详细设置页')
   assert.ok(client.includes("t.id !== 'connect'"), '重新点系统分组不应自动打开详细设置页')
+  assert.ok(client.includes("if (t.id === 'connect') return 0.5"), '详细设置页应排在通讯平台后面')
   const systemTabs = "tabs: ['platforms', 'model', 'access', 'browser', 'tools', 'security'"
   assert.ok(client.includes(systemTabs), '系统页签顺序不是 tools 在 security 前')
   assert.ok(client.includes("right: openWizard ? h(Btn, { small: true, kind: 'ghost', onClick: openWizard }, '重新走一遍设置向导')"), '向导按钮未挂到通讯平台')
   assert.ok(!client.includes("right: openWizard ? h(Btn, { small: true, kind: 'ghost', onClick: openWizard }, '重新走一遍设置向导') : null }, h(GatewayChoice"), '连接页仍挂着向导按钮')
+})
+
+test('平台卡片可折叠，状态写入配置且不触发平台重配', () => {
+  assert.ok(client.includes("post('/platforms/collapsed'"), '面板没有折叠保存接口')
+  assert.ok(client.includes('const collapsedOf'), '缺少平台折叠状态读取')
+  assert.ok(client.includes('collapsible: true'), '平台卡片不是可折叠卡片')
+  assert.ok(client.includes('open: !collapsedOf(inst)'), '平台卡片折叠未受控')
+  assert.ok(host.includes("route('/platforms/collapsed'"), '宿主没有折叠状态路由')
+  assert.ok(host.includes("ui: { platformsCollapsed: getConfig().ui?.platformsCollapsed || {} }"), '平台视图没有返回折叠状态')
+  assert.ok(client.includes("stopped: '未连接'"), '未连接状态仍带总开关说明')
+  assert.ok(host.includes("默认 QQ 已由多平台网关托管"), '网关托管提示未改成已托管')
 })
 
 test('顶部状态按主平台判断，SnowLuma/OneBot 标签只在 QQ 直连时显示', () => {

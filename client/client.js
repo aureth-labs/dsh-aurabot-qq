@@ -693,10 +693,16 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     function Row({ label, hint, children }) {
       return h('div', { className: 'ab-row' }, h('div', { className: 'ab-label' }, h('b', null, label), hint ? h('small', null, hint) : null), h('div', { className: 'ab-ctl' }, children))
     }
-    function Card({ title, desc, icon, right, children, className, collapsible, defaultOpen = true }) {
-      const [open, setOpen] = useState(!collapsible || defaultOpen)
+    function Card({ title, desc, icon, right, children, className, collapsible, defaultOpen = true, open: controlledOpen, onToggle }) {
+      const [openState, setOpenState] = useState(!collapsible || defaultOpen)
+      const open = controlledOpen === undefined ? openState : Boolean(controlledOpen)
+      const toggle = () => {
+        if (!collapsible) return
+        if (onToggle) onToggle()
+        else setOpenState((v) => !v)
+      }
       const head = title ? h('div', { className: 'ab-flex', style: { marginBottom: (desc && open) ? 0 : 10 } },
-        h('h3', { onClick: collapsible ? () => setOpen((v) => !v) : undefined, style: collapsible ? { cursor: 'pointer', userSelect: 'none' } : undefined },
+        h('h3', { onClick: collapsible ? toggle : undefined, style: collapsible ? { cursor: 'pointer', userSelect: 'none' } : undefined },
           icon || null, title,
           collapsible ? h('span', { className: 'ab-muted', style: { marginLeft: 6, fontSize: 11 } }, open ? '▾ 收起' : '▸ 展开') : null),
         h('div', { className: 'ab-spacer' }), right || null) : null
@@ -935,7 +941,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     const navGroupById = (id) => NAV_GROUPS.find((group) => group.id === id)
     const navGroupOf = (t) => NAV_GROUPS.find((g) => g.tabs.includes(t.id)) || navGroupById(t.navGroup) ||
       (t.ext && PLATFORM_EXT.test(t.label) ? NAV_GROUPS[3] : NAV_GROUPS[4])
-    const navOrder = (g, t) => { if (t.id === 'connect') return 1.5; const i = g.tabs.indexOf(t.id); return i >= 0 ? i : g.tabs.length - (g.tabs.includes('logs') ? 1.5 : 0) }
+    const navOrder = (g, t) => { if (t.id === 'connect') return 0.5; const i = g.tabs.indexOf(t.id); return i >= 0 ? i : g.tabs.length - (g.tabs.includes('logs') ? 1.5 : 0) }
     const NAV_ALIAS = {
       overview: '首页 状态', tools: '外置工具 ffmpeg python uv git edge-tts', connect: 'qq 网关 snowluma onebot 登录 工作区', character: '人设 性格 设定 头像', persona: '人物 画像 小档案 群印象 梗概 时间轴 相处经验 说话方式', access: '主人 白名单 权限 群管 改资料',
       group: '群聊 插话 合并', model: 'ai 大模型 视觉 思考强度', voice: '语音 tts 说话 音色 edge', asr: '语音识别 听语音 转文字 asr 语音转文本', stickers: '表情 小黄脸 gif 商城表情',
@@ -1791,6 +1797,28 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const list = (data && data.instances) || []
       const owner = data && data.owner
       const multiPrivate = data?.multiPrivate
+      const collapsedOf = (inst) => Boolean(data?.ui?.platformsCollapsed?.[inst.instance])
+      const setCollapsedLocal = (instance, collapsed) => setData((cur) => cur ? {
+        ...cur,
+        ui: {
+          ...(cur.ui || {}),
+          platformsCollapsed: { ...(cur.ui?.platformsCollapsed || {}), [instance]: collapsed },
+        },
+      } : cur)
+      const toggleCollapse = async (inst) => {
+        const next = !collapsedOf(inst)
+        setCollapsedLocal(inst.instance, next)
+        try {
+          const r = await post('/platforms/collapsed', { instance: inst.instance, collapsed: next })
+          if (r.ok === false) {
+            setCollapsedLocal(inst.instance, !next)
+            toast(r.message || '折叠状态没保存', 'err')
+          } else if (r.ui) setData((cur) => cur ? { ...cur, ui: r.ui } : cur)
+        } catch (error) {
+          setCollapsedLocal(inst.instance, !next)
+          toast(error.message || '折叠状态没保存', 'err')
+        }
+      }
       const changeShared = async (body, action = '') => {
         setLegacyReview(null)
         setBusy('multi-private')
@@ -2275,6 +2303,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         list.length ? list.map((inst) => h(Card, {
           key: inst.instance,
           title: platformLabel(inst.platform) + (inst.name && inst.name !== inst.platform ? ' · ' + inst.name : ''),
+          collapsible: true,
+          open: !collapsedOf(inst),
+          onToggle: () => toggleCollapse(inst),
           right: h('span', { className: 'ab-flex' },
             h('i', { className: cx('ab-dot', inst.state === 'connected' ? 'ok' : inst.state === 'connecting' ? 'warn' : inst.enabled ? 'err' : '') }),
             h('span', { className: 'ab-small ab-muted' }, inst.migration?.pausePending ? '等待停止确认'
@@ -2484,7 +2515,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
               } }, '搬过去')))),
         h(Card, { title: '连接状态' },
           h('div', { className: 'ab-kv' },
-            h('span', null, 'QQ 网关'), h('span', null, h('span', { className: 'ab-flex' }, h('i', { className: cx('ab-dot', conn ? 'ok' : st.onebot.state === 'connecting' ? 'warn' : 'err') }), { connected: '已连上', connecting: '连接中', disconnected: '断开了，正在重连', stopped: '没启动（总开关关着）', unconfigured: '还没配置' }[st.onebot.state] || st.onebot.state)),
+            h('span', null, 'QQ 网关'), h('span', null, h('span', { className: 'ab-flex' }, h('i', { className: cx('ab-dot', conn ? 'ok' : st.onebot.state === 'connecting' ? 'warn' : 'err') }), { connected: '已连上', connecting: '连接中', disconnected: '断开了，正在重连', stopped: '未连接', unconfigured: '还没配置' }[st.onebot.state] || st.onebot.state)),
             h('span', null, '登录的号'), h('span', null, login ? login.nickname + '（' + login.uin + '）' + (login.uin !== draft.botQQ ? ' ⚠ 不是机器人号！' : '') : '—'),
             h('span', null, 'HTTP'), h('span', null, st.onebot.endpoint.httpUrl || '—'),
             h('span', null, 'WebSocket'), h('span', null, st.onebot.endpoint.wsUrl || '—'),

@@ -798,7 +798,7 @@ export function apply(ctx, opts = {}) {
   const legacyQqOwnsConnection = () => cfg.legacyQqEnabled !== false
   const legacyQqAvailable = () => legacyQqOwnsConnection() && !qqOwnershipTransfer && !isQqRecoveryPaused()
   const legacyQqActive = () => cfg.enabled && legacyQqAvailable()
-  const gatewayQqMessage = '默认 QQ 由多平台网关托管，请在通讯平台页管理连接'
+  const gatewayQqMessage = '默认 QQ 已由多平台网关托管，请在通讯平台页管理连接'
   const qqTransferMessage = '默认 QQ 正在切换托管，请等待事务完成'
   const qqRecoveryPausedMessage = '默认 QQ 等待恢复确认，已暂停启动'
   const qqConfigFields = (c) => qqOwnershipConfigSnapshot(c)
@@ -1945,6 +1945,14 @@ export function apply(ctx, opts = {}) {
     if (explicitUnified) {
       if (!(typeof src.httpToken === 'string' && src.httpToken.trim()) && src.httpToken !== null) delete merged.httpToken
       if (!(typeof src.wsToken === 'string' && src.wsToken.trim()) && src.wsToken !== null) delete merged.wsToken
+    }
+    // 旧版直连原本由插件管理 SnowLuma 时，迁到网关 qq 也应继续由插件管理；
+    // 否则目标适配器只会连端点，不会在 DSH 重启后把 SnowLuma 拉起来。
+    if (!Object.hasOwn(src, 'snowlumaManaged')
+      && legacyQqOwnsConnection()
+      && cfg.gateway === 'snowluma'
+      && backend === 'snowluma') {
+      merged.snowlumaManaged = true
     }
     return merged
   }
@@ -5279,6 +5287,7 @@ export function apply(ctx, opts = {}) {
       catalog: platformGateway?.catalog?.() || [],
       candidates: [...platformCandidates.values()].sort((a, b) => b.at - a.at).slice(0, 10),
       configs: Object.fromEntries(list.map((x) => [x.instance, pubPlats[x.instance] || {}])),
+      ui: { platformsCollapsed: getConfig().ui?.platformsCollapsed || {} },
       multiPrivate: hub?.sharedStatus(),
       qqMigration: mig,
     }
@@ -5731,6 +5740,19 @@ export function apply(ctx, opts = {}) {
     setConfig(next)
     try { await platformGateway?.sync?.() } catch (error) { log.warn('移除平台后同步失败：', error.message) }
     return { ...(await platformView()), ok: true, message: '平台已移除' }
+  })
+  // 平台卡片折叠是纯面板 UI 状态：写顶层 ui，不碰 platforms，避免触发网关重启。
+  route('/platforms/collapsed', async (req) => {
+    const b = await readBody(req)
+    const instance = String(b.instance || '').trim()
+    const current = getConfig()
+    if (!instance || (!current.platforms?.[instance] && !(instance === defaultPlatform && legacyQqOwnsConnection()))) {
+      return { ok: false, message: '没有这个平台实例' }
+    }
+    const collapsed = b.collapsed === true
+    const next = { ...(current.ui?.platformsCollapsed || {}), [instance]: collapsed }
+    setConfig(mergeFromPanel(current, { ui: { platformsCollapsed: next } }))
+    return { ok: true, ui: { platformsCollapsed: getConfig().ui?.platformsCollapsed || {} } }
   })
   route('/platforms/settings', async (req) => {
     const b = await readBody(req)

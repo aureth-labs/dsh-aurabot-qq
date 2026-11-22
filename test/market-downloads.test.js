@@ -188,5 +188,5 @@ test('市场面板：地址设置默认折叠、放在市场上方', () => {
   const registry = src.indexOf("title: '模块市场地址'")
   assert.ok(registry >= 0 && market > registry, '地址卡要在市场卡的上方')
   assert.match(src, /collapsible: true, defaultOpen: false/, '地址卡要默认折叠')
-  assert.match(src, /function Card\(\{ title, desc, icon, right, children, className, collapsible, defaultOpen = true \}\)/, 'Card 要支持折叠')
+  assert.match(src, /function Card\(\{ title, desc, icon, right, children, className, collapsible, defaultOpen = true/, 'Card 要支持折叠')
 })

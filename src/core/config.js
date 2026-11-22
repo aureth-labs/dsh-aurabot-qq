@@ -54,6 +54,8 @@ export const DEFAULTS = {
   // 现在还没有网关消费它——旧字段 gateway + snowluma.* 照常可读、行为不变；
   // normalize 时会把旧字段换算成 platforms.qq 一份（见下方 normalizePlatforms），G1 接手后以新字段为准。
   platforms: {},
+  // 面板 UI 状态（不进平台适配器配置，避免折叠卡片触发网关重配）
+  ui: { platformsCollapsed: {} },
   workspaceDir: '', // QQ 会话放在哪个文件夹（DSH 里的「Aurabot · QQ」工作区）；留空 = 默认（用户目录下 Aurabot\\qq-chats）
   // 发文件（#52）：默认开但限制很多——她只能把 QQ 工作区（workspaceDir）和 dirs 里列的目录中的文件当文件发出去；
   // 单个文件有大小上限；主人私聊里能触发，群里只在主人开口那一轮能触发（可以发给白名单里的人和群）。日志里会记下发了什么。
@@ -614,6 +616,11 @@ export function normalize(raw) {  const c = deepMerge(DEFAULTS, raw)
   c.qqApi.enabled = bool(c.qqApi.enabled, true)
   c.gateway = c.gateway === 'onebot' ? 'onebot' : 'snowluma'
   c.platforms = normalizePlatforms(raw, c.gateway)
+  // 面板折叠只是 UI 状态：只保留 true 的实例，默认展开；不参与平台/网关比较。
+  if (!isObj(c.ui)) c.ui = {}
+  if (!isObj(c.ui.platformsCollapsed)) c.ui.platformsCollapsed = {}
+  c.ui.platformsCollapsed = Object.fromEntries(Object.entries(c.ui.platformsCollapsed)
+    .filter(([k, v]) => typeof k === 'string' && k.length <= 80 && v === true))
   // 只认绝对路径（Windows 的 D:\\… 或 Linux 的 /…），别的当没填
   c.workspaceDir = String(c.workspaceDir || '').trim()
   if (c.workspaceDir && !/^([a-zA-Z]:[\\/]|\/)/.test(c.workspaceDir)) c.workspaceDir = ''
