@@ -3,7 +3,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { setTimeout as delay } from 'node:timers/promises'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { runAdapterContract, makeCtx } from '../contract/adapter-kit.js'
@@ -425,6 +425,45 @@ test('协议版本：入站/回执里带了 protocol≠1 一律 400 且不 emit'
 })
 
 // ───────────────────────── 重启后队列不丢 ─────────────────────────
+
+test('Bridge 共享回复只在内存等待，外部取走之前撤销时丢弃', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bridge-guard-'))
+  const adapter = createBridgeAdapter({ token: TOKEN, timeoutMs: 3000, dataDir: () => dir })
+  const ctx = makeCtx(adapter)
+  try {
+    await adapter.start(ctx)
+    await call(ctx, '/hello', { protocol: 1, caps: { proactive: 'free' } })
+    const msg = { chat: { kind: 'private', id: 'u-1' }, parts: [{ type: 'text', text: '本地测试' }] }
+    let current = true
+    const shared = adapter.send({ ...msg, inResponseTo: 'original' }, { replyGuard: () => current })
+    const rejected = assert.rejects(shared, { code: 'reply-revoked', certainty: 'not-sent' })
+    const ordinary = adapter.send(msg)
+    assert.equal(adapter.__bridge.queueLength(), 2)
+    const stored = JSON.parse(readFileSync(adapter.__bridge.pendingFile(), 'utf8'))
+    assert.equal(stored.items.length, 1)
+    assert.equal(stored.items[0].inResponseTo, undefined)
+    current = false
+    const res = await call(ctx, '/outbound', {})
+    await rejected
+    assert.equal(res.statusCode, 200)
+    assert.equal(res.payload.message.inResponseTo, undefined)
+    await call(ctx, '/ack', { id: res.payload.message.id, ok: true, messageId: 'ordinary-done' })
+    assert.deepEqual(await ordinary, { messageId: 'ordinary-done' })
+
+    current = true
+    const waiting = callGet(ctx, '/outbound', { wait: 'true', timeoutMs: '3000' })
+    const selected = adapter.send({ ...msg, inResponseTo: 'original' }, { replyGuard: () => current })
+    const cancelled = assert.rejects(selected, { code: 'reply-revoked', certainty: 'not-sent' })
+    assert.equal(adapter.__bridge.inflightCount(), 1)
+    current = false
+    assert.equal((await waiting).statusCode, 204)
+    await cancelled
+    assert.equal(adapter.__bridge.inflightCount(), 0)
+  } finally {
+    await adapter.stop()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
 
 test('重启后队列不丢：进程重启前没被取走的消息，重启后外部程序还能取到', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'bridge-queue-'))

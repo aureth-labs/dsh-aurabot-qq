@@ -358,6 +358,45 @@ test('入站消息解析：文本、引用 ref_msg、图片/语音/文件/视频
   await adapter.stop()
 })
 
+test('共享回复要求原消息的微信凭据，上传期间撤销后不再提交消息', async (t) => {
+  let authorized = true
+  const client = makeMockIlinkClient(({ url }) => {
+    if (url.includes('/upload?')) authorized = false
+  })
+  const adapter = createWechatClawbotAdapter({ client })
+  t.after(() => adapter.stop())
+  await adapter.start(makeCtx(adapter, { botToken: 'tok_shared', botId: 'bot@im.bot' }))
+
+  for (const [messageId, account, token] of [
+    ['original', 'wxu_alice', 'ctx_original'],
+    ['newer', 'wxu_alice', 'ctx_newer'],
+    ['other', 'wxu_bob', 'ctx_other'],
+  ]) {
+    adapter.platform.deliver({
+      message_id: messageId, from_user_id: account, context_token: token,
+      message_type: MESSAGE_TYPE.USER,
+      item_list: [{ type: ITEM_TYPE.TEXT, text_item: { text: '本地测试' } }],
+    })
+  }
+  const text = {
+    chat: { kind: 'private', id: 'wxu_alice' },
+    inResponseTo: 'original',
+    parts: [{ type: 'text', text: '原轮次的回复' }],
+  }
+  const options = { replyGuard: () => authorized }
+  const sent = () => client.calls.filter(call => call.url.includes('/ilink/bot/sendmessage'))
+  await adapter.send(text, options)
+  assert.equal(sent()[0].body.msg.context_token, 'ctx_original')
+  for (const inResponseTo of ['missing', 'other']) {
+    await assert.rejects(adapter.send({ ...text, inResponseTo }, options), { code: 'no-context-token' })
+  }
+  await assert.rejects(adapter.send({
+    ...text,
+    parts: [{ type: 'sticker', media: { bytes: Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), mime: 'image/png' } }],
+  }, options), { certainty: 'not-sent', code: 'reply-revoked' })
+  assert.equal(sent().length, 1)
+})
+
 test('出站 send：长文本分段、图片/视频/文件/语音降级加密上传、proactive limited 限流与错因分类', async () => {
   let now = 500_000
   const client = makeMockIlinkClient()

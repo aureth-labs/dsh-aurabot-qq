@@ -28,6 +28,7 @@
 
 import { createPrivateKey, createPublicKey, sign as ed25519Sign, verify as ed25519Verify } from 'node:crypto'
 import { readFileSync } from 'node:fs'
+import { assertReplyCurrent } from '../../gateway/errors.js'
 
 // ───────────────────────── 平台常量（均来自官方文档，见 ADAPTER-QQBOT.md） ─────────────────────────
 
@@ -415,8 +416,9 @@ export function createQqbotAdapter(options = {}) {
   }
 
   /** 带 token 调接口；401（或允许时 403）强制换一次 token 再试 */
-  async function authedRequest({ path, method = 'POST', body, query, timeoutMs, retryOn403 = true, retried = false }) {
+  async function authedRequest({ path, method = 'POST', body, query, timeoutMs, retryOn403 = true, retried = false, beforeDispatch }) {
     const accessToken = await ensureToken({ force: retried })
+    beforeDispatch?.()
     const res = await client.request({
       path, method, body, query,
       headers: { Authorization: `QQBot ${accessToken}` },
@@ -424,7 +426,7 @@ export function createQqbotAdapter(options = {}) {
     })
     if ((res?.status === 401 || (retryOn403 && res?.status === 403)) && !retried) {
       token = { value: '', expiresAt: 0 }
-      return authedRequest({ path, method, body, query, timeoutMs, retryOn403, retried: true })
+      return authedRequest({ path, method, body, query, timeoutMs, retryOn403, retried: true, beforeDispatch })
     }
     return res
   }
@@ -785,7 +787,7 @@ export function createQqbotAdapter(options = {}) {
   }
 
   /** 媒体先上传拿 file_info（单聊/群聊上传接口不互通，必须按场景选） */
-  async function uploadMedia(kind, chatId, item, timeoutMs) {
+  async function uploadMedia(kind, chatId, item, timeoutMs, beforeDispatch) {
     const media = item.media || {}
     if (Number(media.size) > MAX_FILE_BYTES) {
       throw sendError('not-sent', 'too-large', instance, `文件超过 ${MAX_FILE_BYTES} 字节`)
@@ -819,7 +821,7 @@ export function createQqbotAdapter(options = {}) {
     }
     // 群聊上传接口的 body 字段官方写作 file_type + url/file_data（与单聊一致）；srv_send_msg 关掉，
     // 否则会「上传即发送」并额外吃掉一次主动消息额度。
-    const res = await authedRequest({ path, body, timeoutMs })
+    const res = await authedRequest({ path, body, timeoutMs, beforeDispatch })
     const data = res?.data || {}
     // 上传响应字段官方文档示例未给全，这里宽容取（见 ADAPTER-QQBOT.md「未确认点」）
     const fileInfo = data.file_info || data.fileInfo || data.file_uuid || (data.data && (data.data.file_info || data.data.file_uuid))
@@ -844,7 +846,7 @@ export function createQqbotAdapter(options = {}) {
     return sendError('unknown', code || fallbackCode || `http-${res?.status ?? 'unreadable'}`, instance, `响应不明：${data.message || res?.status || '读不懂'}`)
   }
 
-  async function callSend(kind, chatId, payload, { timeoutMs, inResponseTo, replyAs } = {}) {
+  async function callSend(kind, chatId, payload, { timeoutMs, inResponseTo, replyAs, beforeDispatch } = {}) {
     const path = kind === 'group'
       ? `/v2/groups/${encodeURIComponent(chatId)}/messages`
       : `/v2/users/${encodeURIComponent(chatId)}/messages`
@@ -864,7 +866,7 @@ export function createQqbotAdapter(options = {}) {
 
     let res
     try {
-      res = await authedRequest({ path, method: 'POST', body, timeoutMs })
+      res = await authedRequest({ path, method: 'POST', body, timeoutMs, beforeDispatch })
     } catch (error) {
       if (error?.certainty) throw error
       if (isTimeoutError(error)) throw sendError('unknown', 'timeout', instance, `平台 ${timeoutMs || DEFAULT_TIMEOUT_MS}ms 内没有响应`)
@@ -1194,7 +1196,7 @@ export function createQqbotAdapter(options = {}) {
      * 出站：parts → /v2/users|groups/{openid}/messages。
      * inResponseTo 就是 msg_id（或 event_id）——本平台的被动回复凭证。
      */
-    async send(message) {
+    async send(message, { replyGuard } = {}) {
       const currentCaps = caps()
       const kind = message?.chat?.kind === 'group' ? 'group' : 'private'
       const chatId = String(message?.chat?.id ?? '')
@@ -1206,6 +1208,7 @@ export function createQqbotAdapter(options = {}) {
       if (!chatId) throw sendError('not-sent', 'no-chat', instance, '缺少会话编号')
 
       const inResponseTo = message?.inResponseTo ? String(message.inResponseTo) : ''
+      if (replyGuard && !inResponseTo) throw sendError('not-sent', 'missing-reply-id', instance, '缺少原入站消息编号')
       const proactiveMode = currentCaps.proactive
 
       // ① 没有 inResponseTo = 主动消息
@@ -1260,24 +1263,31 @@ export function createQqbotAdapter(options = {}) {
       }
 
       let lastId = ''
+      const beforeDispatch = replyGuard && (() => assertReplyCurrent(replyGuard, instance, Boolean(lastId)))
       const replyAs = cfg.replyAs === 'event_id' ? 'event_id' : 'msg_id'
-      for (const item of messages) {
-        let payload
-        if (item.media) {
-          const fileInfo = await uploadMedia(kind, chatId, item, timeoutMs)
-          payload = { msg_type: 7, media: { file_info: fileInfo } }
-        } else {
-          payload = { msg_type: 0, content: item.content }
+      try {
+        for (const item of messages) {
+          beforeDispatch?.()
+          let payload
+          if (item.media) {
+            const fileInfo = await uploadMedia(kind, chatId, item, timeoutMs, beforeDispatch)
+            payload = { msg_type: 7, media: { file_info: fileInfo } }
+          } else {
+            payload = { msg_type: 0, content: item.content }
+          }
+          const result = await callSend(kind, chatId, payload, { timeoutMs, inResponseTo: inResponseTo || undefined, replyAs, beforeDispatch })
+          lastId = result.messageId
         }
-        const result = await callSend(kind, chatId, payload, { timeoutMs, inResponseTo: inResponseTo || undefined, replyAs })
-        lastId = result.messageId
-      }
-      // 记账：一次 send 记一次「回复」/ 一次主动消息（与平台「每消息最多回复 N 次」同一口径）
-      if (inResponseTo) replyCount.set(replyKey, (replyCount.get(replyKey) || 0) + 1)
-      else {
-        const day = new Date(now()).toISOString().slice(0, 10)
-        const key = `${day}\u0000${kind}\u0000${chatId}`
-        proactiveCount.set(key, (proactiveCount.get(key) || 0) + 1)
+      } finally {
+        if (lastId) {
+          // 一次 send 记一次，部分已发也消耗额度。
+          if (inResponseTo) replyCount.set(replyKey, (replyCount.get(replyKey) || 0) + 1)
+          else {
+            const day = new Date(now()).toISOString().slice(0, 10)
+            const key = `${day}\u0000${kind}\u0000${chatId}`
+            proactiveCount.set(key, (proactiveCount.get(key) || 0) + 1)
+          }
+        }
       }
       return { messageId: lastId }
     },

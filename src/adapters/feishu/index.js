@@ -53,6 +53,7 @@
 //      机器人不在群里 → 230002。这些都按 not-sent 分类，绝不谎报成功。
 
 import { createDecipheriv, createHash, timingSafeEqual } from 'node:crypto'
+import { assertReplyCurrent } from '../../gateway/errors.js'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute } from 'node:path'
 
@@ -940,8 +941,9 @@ export function createFeishuAdapter(options = {}) {
   }
 
   /** 带 token 的 API 调用（401 / token 失效码换一次 token 再试） */
-  async function api(method, path, payload, { retried = false, timeoutMs } = {}) {
+  async function api(method, path, payload, { retried = false, timeoutMs, beforeDispatch } = {}) {
     const token = await tenantToken({ force: retried })
+    beforeDispatch?.()
     const r = await httpClient.request({
       method,
       url: `${baseUrl()}${path}`,
@@ -952,7 +954,7 @@ export function createFeishuAdapter(options = {}) {
     const code = Number(r.json?.code ?? 0)
     if ((r.status === 401 || TOKEN_INVALID_CODES.has(String(code))) && !retried) {
       tokenCache = { token: '', expiresAt: 0 }
-      return api(method, path, payload, { retried: true, timeoutMs })
+      return api(method, path, payload, { retried: true, timeoutMs, beforeDispatch })
     }
     return { status: r.status, code, json: r.json }
   }
@@ -1341,7 +1343,7 @@ export function createFeishuAdapter(options = {}) {
   // ───────────────────────── 媒体上传 ─────────────────────────
 
   /** 上传图片换 image_key（image_type=message） */
-  async function uploadImage(media) {
+  async function uploadImage(media, beforeDispatch) {
     const bytes = await loadMediaBytes(media)
     if (!bytes.length) throw sendError('not-sent', 'empty-media', instance, '图片是空文件')
     if (bytes.length > MAX_IMAGE_BYTES) {
@@ -1354,6 +1356,7 @@ export function createFeishuAdapter(options = {}) {
     form.set('image', new Blob([bytes], { type: media?.mime || IMAGE_MIME[ext] || 'application/octet-stream' }), filename)
 
     const token = await tenantToken()
+    beforeDispatch?.()
     const r = await httpClient.request({
       method: 'POST',
       url: `${baseUrl()}${PATH_UPLOAD_IMAGE}`,
@@ -1368,7 +1371,7 @@ export function createFeishuAdapter(options = {}) {
   }
 
   /** 上传文件换 file_key（语音要 file_type=opus） */
-  async function uploadFile(media, { fileType = 'stream', durationMs } = {}) {
+  async function uploadFile(media, { fileType = 'stream', durationMs, beforeDispatch } = {}) {
     const bytes = await loadMediaBytes(media)
     if (!bytes.length) throw sendError('not-sent', 'empty-media', instance, '文件是空文件')
     if (bytes.length > MAX_FILE_BYTES) {
@@ -1382,6 +1385,7 @@ export function createFeishuAdapter(options = {}) {
     form.set('file', new Blob([bytes], { type: media?.mime || 'application/octet-stream' }), filename)
 
     const token = await tenantToken()
+    beforeDispatch?.()
     const r = await httpClient.request({
       method: 'POST',
       url: `${baseUrl()}${PATH_UPLOAD_FILE}`,
@@ -1627,7 +1631,7 @@ export function createFeishuAdapter(options = {}) {
      * 出站。一条飞书消息只能带一种 msg_type，多段拆成多次调用；
      * 超长文本按 maxTextChars 分条；媒体先上传换 key；语音只有 opus 才发成语音条。
      */
-    async send(message = {}) {
+    async send(message = {}, { replyGuard } = {}) {
       if (!running || !connected) throw sendError('not-sent', 'offline', instance, '飞书平台端未连接')
       const cfg = config()
       const chat = message.chat || {}
@@ -1669,12 +1673,16 @@ export function createFeishuAdapter(options = {}) {
       })
 
       const isGroup = chat.kind === 'group'
-      // 引用回复：replyTo 优先（显式引用哪条），其次 inResponseTo（被动回复凭证）
-      const replyTo = message.replyTo ? String(message.replyTo) : (message.inResponseTo ? String(message.inResponseTo) : '')
+      // 飞书用 URL 定位被回复的消息。共享回复必须回到原入站消息。
+      const replyTo = String((replyGuard ? message.inResponseTo : message.replyTo || message.inResponseTo) || '')
+      if (replyGuard && !replyTo) throw sendError('not-sent', 'missing-reply-id', instance, '缺少原入站消息编号')
       const timeoutMs = Math.max(1, Number(message.timeoutMs) || timeoutMsOf())
 
       let lastMessageId = ''
+      let dispatched = false
+      const beforeDispatch = replyGuard && (() => assertReplyCurrent(replyGuard, instance, dispatched))
       for (const item of sends) {
+        beforeDispatch?.()
         // 需要先上传的媒体：网关只给 parts，不带 key
         if (item.needsUpload) {
           const media = item.needsUpload.media || {}
@@ -1685,8 +1693,8 @@ export function createFeishuAdapter(options = {}) {
           }
           if (!contentObj[keyField] && (media.url || media.path || media.bytes)) {
             const key = item.needsUpload.kind === 'image'
-              ? await uploadImage(media)
-              : await uploadFile(media, { fileType: item.needsUpload.fileType, durationMs: item.needsUpload.durationMs })
+              ? await uploadImage(media, beforeDispatch)
+              : await uploadFile(media, { fileType: item.needsUpload.fileType, durationMs: item.needsUpload.durationMs, beforeDispatch })
             contentObj[keyField] = key
           }
           if (!contentObj[keyField]) {
@@ -1700,7 +1708,7 @@ export function createFeishuAdapter(options = {}) {
         let r
         try {
           if (replyTo) {
-            r = await api('POST', `/open-apis/im/v1/messages/${encodeURIComponent(replyTo)}/reply`, payload, { timeoutMs })
+            r = await api('POST', `/open-apis/im/v1/messages/${encodeURIComponent(replyTo)}/reply`, payload, { timeoutMs, beforeDispatch })
           } else {
             // receive_id_type 按 ID 前缀判定（ou_/on_/oc_），认不出才退回 kind
             const idType = receiveIdTypeOf(chat.id, isGroup ? 'chat_id' : 'open_id')
@@ -1710,6 +1718,7 @@ export function createFeishuAdapter(options = {}) {
           throw classifyThrown(error)
         }
         if (r.code !== 0) throw classifyResponse(r)
+        dispatched = true
         lastMessageId = String(r.json?.data?.message_id || '')
         if (!isGroup && chat?.id && r.json?.data?.chat_id) {
           rememberP2pChat(String(chat.id), String(r.json.data.chat_id))

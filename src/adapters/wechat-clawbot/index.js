@@ -15,6 +15,7 @@ import { readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 
 import { assertPublicUrl } from '../../core/net.js'
 import { ensureDir } from '../../core/store.js'
 import { sanitizeFeaturesInput } from '../../gateway/features.js'
+import { assertReplyCurrent } from '../../gateway/errors.js'
 import {
   checkMediaConstraints,
   classifyTransportError,
@@ -709,14 +710,18 @@ export function createWechatClawbotAdapter(options = {}) {
     persistContextTokens()
   }
 
-  function resolveContextToken(chatId, inResponseTo) {
+  function resolveContextToken(chatId, inResponseTo, exact = false) {
     const ttl = Math.max(60_000, Number(cfgOf().contextTokenTtlMs) || DEFAULT_CONTEXT_TOKEN_TTL_MS)
     const now = clock()
     if (inResponseTo) {
       const m = msgContextTokens.get(String(inResponseTo))
-      if (m && now - m.at <= ttl) return m.token
-      if (m) msgContextTokens.delete(String(inResponseTo))
+      if (m && now - m.at <= ttl) {
+        if (!exact || m.chatId === chatId) return m.token
+      } else if (m) {
+        msgContextTokens.delete(String(inResponseTo))
+      }
     }
+    if (exact) return ''
     if (chatId) {
       const c = chatContextTokens.get(String(chatId))
       if (c && now - c.at <= ttl) return c.token
@@ -1320,7 +1325,7 @@ export function createWechatClawbotAdapter(options = {}) {
 
     whoami: async () => ({ account: self.account, name: self.name }),
 
-    async send(message) {
+    async send(message, { replyGuard } = {}) {
       if (!running || !connected || stopped || sessionExpired) {
         throw createSendError('not-sent', sessionExpired ? 'session-expired' : 'not-connected', instance,
           sessionExpired ? '微信 ClawBot 会话已过期（-14），请重新扫码登录' : 'wechat-clawbot 尚未连接')
@@ -1353,8 +1358,8 @@ export function createWechatClawbotAdapter(options = {}) {
         }
       }
 
-      const contextToken = resolveContextToken(toUserId, message?.inResponseTo)
-      if (!contextToken && current.proactive !== 'free') {
+      const contextToken = resolveContextToken(toUserId, message?.inResponseTo, Boolean(replyGuard))
+      if (!contextToken && (replyGuard || current.proactive !== 'free')) {
         throw createSendError('not-sent', 'no-context-token', instance, '还没有收到对方消息或会话 context_token 已过期，请等对方先发消息后再回复')
       }
 
@@ -1430,6 +1435,7 @@ export function createWechatClawbotAdapter(options = {}) {
 
       let lastMessageId = ''
       for (const entry of itemsToSend) {
+        assertReplyCurrent(replyGuard, instance, Boolean(lastMessageId))
         let item = entry.item
         if (!item && entry.kind === 'image') {
           const uploaded = await prepareOutboundMedia(entry.media, UPLOAD_MEDIA_TYPE.IMAGE, toUserId, timeoutMs, '图片')
@@ -1450,6 +1456,7 @@ export function createWechatClawbotAdapter(options = {}) {
           item = buildFileItem(uploaded, entry.media)
         }
 
+        assertReplyCurrent(replyGuard, instance, Boolean(lastMessageId))
         const clientId = `wx-${randomUUID().replace(/-/g, '').slice(0, 16)}`
         let r
         try {

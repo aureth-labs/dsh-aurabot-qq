@@ -753,6 +753,27 @@ test('出站：带 inResponseTo / replyTo 时走 /messages/:id/reply（引用回
   await adapter.stop()
 })
 
+test('飞书共享回复使用原消息，首段后撤销时停止余下分段', async (t) => {
+  const client = makeFakeClient()
+  const adapter = createFeishuAdapter({ client })
+  t.after(() => adapter.stop())
+  await adapter.start(makeCtx(adapter, { ...CFG, maxTextChars: 50 }))
+  let current = true
+  const request = client.request
+  client.request = async (req) => {
+    const response = await request(req)
+    if (req.url.endsWith('/reply')) current = false
+    return response
+  }
+  await assert.rejects(adapter.send({
+    chat: { kind: 'private', id: 'ou_alice' }, inResponseTo: 'om_original', replyTo: 'om_other',
+    parts: [{ type: 'text', text: '第一段内容'.repeat(25) }],
+  }, { replyGuard: () => current }), { code: 'reply-revoked', certainty: 'unknown' })
+  const dispatched = client.calls.filter(item => item.url.endsWith('/reply'))
+  assert.equal(dispatched.length, 1)
+  assert.match(dispatched[0].url, /\/om_original\/reply$/)
+})
+
 test('长文本分条：超过 maxTextChars 拆成多条发出，内容不丢', async () => {
   const client = makeFakeClient()
   const adapter = createFeishuAdapter({ client })

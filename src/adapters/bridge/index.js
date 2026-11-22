@@ -32,13 +32,14 @@
 // 进程重启（面板重载、宿主重启）会丢掉队列，而那时调用 send 的网关侧 promise 也一起没了
 // ——没有任何一层记得这条消息，等于静默丢消息。所以**未取走**的队列项落盘（pending.json），
 // 重启后原样装回，外部程序连上即可继续取。
-// 只落盘「还没被取走」的：已被取走的已经是 unknown（可能已发出），落盘会让重启后重发一遍。
+// 待取的普通消息可以落盘。共享回复依赖当前轮次授权，只在内存中等待。
 // 优雅 stop() 时队列项以 not-sent 还给网关（网关补发队列接手）并清空落盘，
 // 避免「网关补发一次 + 重启后队列再交一次」变成两条。
 
 import { readFileSync, writeFileSync, renameSync } from 'node:fs'
 import { dirname, isAbsolute, join } from 'node:path'
 import { ensureDir } from '../../core/store.js'
+import { assertReplyCurrent } from '../../gateway/errors.js'
 import { sanitizeFeaturesInput } from '../../gateway/features.js'
 
 /** 协议版本。不一致一律拒绝（宁可连不上，也不猜字段含义）。 */
@@ -268,7 +269,8 @@ export function createBridgeAdapter(options = {}) {
     try {
       ensureDir(dirname(file))
       const tmp = `${file}.tmp-${process.pid}`
-      writeFileSync(tmp, JSON.stringify({ protocol: PROTOCOL, items: queue.map(serialize) }, null, 2), { encoding: 'utf8', mode: 0o600 })
+      const items = queue.filter(item => !item.replyGuard).map(serialize)
+      writeFileSync(tmp, JSON.stringify({ protocol: PROTOCOL, items }, null, 2), { encoding: 'utf8', mode: 0o600 })
       renameSync(tmp, file)
     } catch (error) {
       ctx?.log?.warn?.('bridge 待发队列落盘失败（不影响本次运行）：', error?.message || error)
@@ -307,9 +309,23 @@ export function createBridgeAdapter(options = {}) {
     return restored
   }
 
+  /** 丢弃尚未交付给外部程序的失效回复，并结算原 send。 */
+  function dropRevoked(item) {
+    try {
+      assertReplyCurrent(item.replyGuard, instance)
+      return false
+    } catch (error) {
+      clearTimeout(item.timer)
+      inflight.delete(item.id)
+      item.reject?.(error)
+      return true
+    }
+  }
+
   /** 外部程序取走一条 → 移进 inflight 等回执；这一步之后超时就是 unknown。 */
   function takeOne() {
-    const item = queue.shift()
+    let item = queue.shift()
+    while (item && dropRevoked(item)) item = queue.shift()
     if (!item) return null
     item.takenAt = clock()
     inflight.set(item.id, item)
@@ -417,7 +433,7 @@ export function createBridgeAdapter(options = {}) {
     const waitMs = Math.min(Math.max(Number(source.timeoutMs) || 0, 0), MAX_WAIT_MS)
     let item = takeOne()
     if (!item && wait && waitMs > 0) item = await waitForItem(waitMs)
-    if (!item) return json(res, 204, { ok: true, message: null })
+    if (!item || dropRevoked(item)) return json(res, 204, { ok: true, message: null })
     return json(res, 200, {
       ok: true,
       message: {
@@ -541,11 +557,13 @@ export function createBridgeAdapter(options = {}) {
      *  4) 已被取走但没回执 → unknown 'no-ack'（拿不准，绝不重发）
      * 另外：外部程序回 ack ok:false → not-sent（用它报的 code）。
      */
-    async send(message = {}) {
+    async send(message = {}, { replyGuard } = {}) {
       if (!running || !connected) throw sendError('not-sent', 'offline', instance, 'bridge 平台端未连接')
       if (!message.inResponseTo && caps.proactive === 'none') {
         throw sendError('not-sent', 'proactive-not-allowed', instance, '这个接入端只允许被动回复（proactive=none）')
       }
+      if (replyGuard && !message.inResponseTo) throw sendError('not-sent', 'missing-reply-id', instance, '缺少原入站消息编号')
+      assertReplyCurrent(replyGuard, instance)
       const parts = message.parts || []
       if (!parts.length) throw sendError('not-sent', 'nothing-to-send', instance, '没有可发送的内容')
       if (!message.chat || (message.chat.kind !== 'private' && message.chat.kind !== 'group')) {
@@ -569,6 +587,7 @@ export function createBridgeAdapter(options = {}) {
         parts,
         replyTo: message.replyTo,
         inResponseTo: message.inResponseTo,
+        replyGuard,
         enqueuedAt: clock(),
         takenAt: null,
         timer: null,
@@ -621,7 +640,7 @@ export function createBridgeAdapter(options = {}) {
         }
 
         queue.push(item)
-        savePending()
+        if (!replyGuard) savePending()
         notifyWaiters()
       })
     },

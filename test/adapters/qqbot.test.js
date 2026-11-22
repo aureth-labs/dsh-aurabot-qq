@@ -408,6 +408,27 @@ test('passive: 一次回复里含多个媒体时，按「回复一次」计数�
   assert.equal(adapter.platform.replyCountOf('private', 'USER-OPENID-A1', C2C_EVENT.id), 1, '按回复次数计 1 次')
 })
 
+test('QQBot 共享回复在取回新令牌后复核授权，不重送已撤销的回复', async (t) => {
+  const { adapter, client } = await boot()
+  t.after(() => adapter.stop())
+  const message = { chat: { kind: 'private', id: 'OPEN-U' }, parts: [{ type: 'text', text: '收到' }] }
+  await adapter.send({ ...message, inResponseTo: 'm-warmup' })
+  let current = true
+  const request = client.request
+  client.faults.push({ status: 401, data: {} })
+  client.request = async (req) => {
+    const response = await request(req)
+    if (req.path === '/app/getAppAccessToken') current = false
+    return response
+  }
+  await assert.rejects(adapter.send({
+    ...message, inResponseTo: 'm-original',
+  }, { replyGuard: () => current }), { code: 'reply-revoked', certainty: 'not-sent' })
+  const dispatched = client.calls.filter(item => item.path === '/v2/users/OPEN-U/messages' && item.body?.msg_id === 'm-original')
+  assert.equal(dispatched.length, 1)
+  assert.equal(dispatched[0].body.msg_id, 'm-original')
+})
+
 test('passive: proactive=limited 时主动消息按每日额度记账，超了抛 proactive-limit', async () => {
   const { adapter, client } = await boot({ config: { proactivePerDay: 2 } })
   const chat = { kind: 'group', id: 'G9' }
