@@ -1,9 +1,12 @@
 import { randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
 import { isSharedHostContext } from './shared-turn-guard.js'
-import { sameChat } from '../gateway/address.js'
+import { parseChatId, sameChat } from '../gateway/address.js'
 
 export const SHARED_MODES = Object.freeze(['live', 'debug'])
+
+// 默认平台名从地址层取，避免在 chat 层硬编码平台名。
+const DEFAULT_PLATFORM = parseChatId('private:0')?.platform || ''
 
 const newMode = (historyPolicy = 'inherit', generation = 1) => ({
   generation, historyPolicy, state: 'uninitialized',
@@ -36,9 +39,18 @@ function retireMode(shared, mode, historyPolicy) {
   shared.sessions[mode] = newMode(historyPolicy, branch.generation + 1)
 }
 
+function sourceChatId(chats, bindingChatId) {
+  const addr = parseChatId(bindingChatId)
+  // 迁移后的默认 QQ 会同时有旧裸键 private:<号> 和网关键 qq:private:<号>；
+  // 旧裸键才是迁移前复用下来的原会话，优先它，别从后建的空会话分叉。
+  const alias = addr?.platform === DEFAULT_PLATFORM && addr.instance === DEFAULT_PLATFORM ? `${addr.kind}:${addr.id}` : ''
+  if (alias && Object.hasOwn(chats, alias)) return alias
+  if (Object.hasOwn(chats, bindingChatId)) return bindingChatId
+  return Object.keys(chats).find(key => sameChat(key, bindingChatId))
+}
+
 export function selectSharedBase(chats, scope) {
-  const chatId = Object.hasOwn(chats, scope.binding.chatId) ? scope.binding.chatId
-    : Object.keys(chats).find(key => sameChat(key, scope.binding.chatId))
+  const chatId = sourceChatId(chats, scope.binding.chatId)
   const entry = chatId && chats[chatId]
   if (!entry) return { reason: 'source-missing' }
   const sessionId = entry.sessions?.[scope.mode] ?? ((entry.mode || 'live') === scope.mode ? entry.sessionId : '')
@@ -131,7 +143,19 @@ export function createSharedPrivateSessions({ read, write, fork, create, restore
         || shared.ownerAuthorizationRevision !== ownerAuthorizationRevision
         || !isDeepStrictEqual(shared.primaryBinding, binding)
       const changedPolicy = shared.level !== level || shared.preset !== preset
-      if (!changedOwner && !changedPolicy && shared.enabled === enabled && shared.mode === mode) return false
+      // 迁移后可能出现「旧裸键 private:<号> + 网关键 qq:private:<号>」两份映射。
+      // 如果当前分支是从后建的空会话分叉的，切回旧裸键并重新分叉，别把错的历史继续带下去。
+      let rebased = false
+      if (!changedOwner && !changedPolicy && enabled && binding && shared.sessions[mode]?.state === 'active') {
+        const active = shared.sessions[mode]
+        const preferred = active.baseSessionId ? selectSharedBase(read().chats, scope) : null
+        if (preferred?.sessionId && preferred.sessionId !== active.baseSessionId) {
+          retireMode(shared, mode, active.historyPolicy)
+          retireIdlePending(shared, mode)
+          rebased = true
+        }
+      }
+      if (!changedOwner && !changedPolicy && !rebased && shared.enabled === enabled && shared.mode === mode) return false
       if (changedOwner || changedPolicy) {
         for (const key of SHARED_MODES) {
           retireMode(shared, key, shared.sessions[key].historyPolicy)

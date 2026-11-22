@@ -1463,7 +1463,45 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     } catch { return false }
   }
 
+  /**
+   * 迁移前默认 QQ 用的是裸键 private:<号>；迁移后网关会另建 qq:private:<号>。
+   * 共享会话必须优先用旧裸键里的原会话，但旧条目没有 sessionOwners 证明，先在这里补上。
+   * 只处理主人私聊，且只在共享模式开启/已有共享状态时做。
+   */
+  function reconcileLegacyPrivateOwnershipProof() {
+    const cfg = getConfig()
+    if (cfg.multiPlatformPrivateSession !== true && !map().multiPrivate) return
+    const owner = ownerId()
+    const revision = ownerAuthorizationRevision(cfg)
+    if (!owner || !revision) return
+    const data = map()
+    let changed = false
+    for (const [chatId, entry] of Object.entries(data.chats || {})) {
+      if (!entry || typeof entry !== 'object') continue
+      if (chatId === normalizeChatId(chatId)) continue
+      const addr = parseChatId(chatId)
+      if (!addr || addr.platform !== defaultPlatform() || addr.instance !== defaultPlatform() || addr.kind !== 'private') continue
+      if (!isOwnerPrivateChat(ownerRef(), chatId)) continue
+      for (const mode of SHARED_MODES) {
+        // 只给显式 sessions 映射过的旧会话补证明；只有 sessionId 的旧记录
+        // 仍走「旧历史核验」，避免把未核验的旧历史直接当已继承。
+        const sessionId = entry.sessions?.[mode]
+        if (!sessionId) continue
+        const proof = entry.sessionOwners?.[mode]
+        if (proof?.sessionId === sessionId && !proof.unverified
+          && proof.ownerPersonId === owner && proof.ownerAuthorizationRevision === revision) continue
+        entry.sessionOwners = {
+          ...entry.sessionOwners,
+          [mode]: { sessionId, ownerPersonId: owner, ownerAuthorizationRevision: revision },
+        }
+        changed = true
+      }
+    }
+    if (changed) saveMap(data)
+  }
+
   function sharedScope(primary = resolveSharedPrimary?.()) {
+    reconcileLegacyPrivateOwnershipProof()
     const cfg = getConfig()
     const binding = primary?.ok ? primary.binding : null
     const chat = binding ? chatFromId(binding.chatId) : null
@@ -1639,8 +1677,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const reason = !gateway || primary?.reason === 'gateway-required' ? 'gateway-required'
       : sharedSupported() ? primary?.reason : 'host-unavailable'
     const available = !reason && primary?.ok && Boolean(ownerAuthorizationRevision(getConfig()))
-    const data = sharedSessions.read()
     const scope = { ...sharedScope(primary), mode }
+    if (available) sharedSessions.sync(scope)
+    const data = sharedSessions.read()
     const snapshot = available ? map() : null
     const review = snapshot && legacyHistorySource(mode, scope, snapshot)
     const branch = data.sessions[mode]

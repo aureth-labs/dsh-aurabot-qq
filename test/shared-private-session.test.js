@@ -25,8 +25,8 @@ const identity = {
   lookup: (platform, account) => ({ qq: '12345', feishu: 'ou_owner' })[platform] === account ? owner : null,
 }
 
-function fixture(overrides = {}) {
-  let data = { chats: ordinary }
+function fixture({ chats = ordinary, ...overrides } = {}) {
+  let data = { chats }
   const calls = []
   const service = createSharedPrivateSessions({
     read: () => structuredClone(data),
@@ -46,6 +46,15 @@ test('shared mode must be a boolean and is not writable via generic panel settin
   assert.equal(normalize({ multiPlatformPrivateSession: 'true' }).multiPlatformPrivateSession, false)
   const cfg = normalize({ multiPlatformPrivateSession: true })
   assert.equal(mergeFromPanel(cfg, { multiPlatformPrivateSession: false }).multiPlatformPrivateSession, true)
+})
+
+test('default QQ legacy bare chat is preferred over a later canonical duplicate', () => {
+  const canonical = {
+    ...scope, sessionId: 'newer-live', sessions: { live: 'newer-live' },
+    sessionOwners: { live: { ...scope, sessionId: 'newer-live' } },
+  }
+  const chats = { ...ordinary, 'qq:private:12345': canonical }
+  assert.equal(selectSharedBase(chats, scope).sessionId, 'base-live')
 })
 
 test('primary binding uses the fixed instance and account even when disconnected', () => {
@@ -132,6 +141,23 @@ test('first messages share a fork and close/reopen reuses its mapping', async ()
   service.sync({ ...scope, enabled: false })
   assert.equal((await service.ensure(scope)).branch.sessionId, first.branch.sessionId)
   assert.deepEqual(data().chats, ordinary)
+})
+
+test('an active branch from the canonical duplicate is rebased to the legacy bare chat', async () => {
+  const canonical = {
+    ...scope, sessionId: 'canonical-live', sessions: { live: 'canonical-live' },
+    sessionOwners: { live: { ...scope, sessionId: 'canonical-live' } },
+  }
+  const { service, calls, data } = fixture({ chats: { 'qq:private:12345': canonical } })
+  const first = await service.ensure(scope)
+  assert.equal(first.branch.baseSessionId, 'canonical-live')
+  data().chats['private:12345'] = ordinary['private:12345']
+  service.sync(scope)
+  assert.equal(service.read().sessions.live.state, 'uninitialized')
+  assert.equal(service.owns(first.branch.sessionId), true)
+  const second = await service.ensure(scope)
+  assert.equal(second.branch.baseSessionId, 'base-live')
+  assert.deepEqual(calls, [['fork', 'canonical-live'], ['fork', 'base-live']])
 })
 
 test('reset persists empty-history policy and ownership of the retired branch', async () => {
