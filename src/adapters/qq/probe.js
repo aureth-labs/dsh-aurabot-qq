@@ -346,11 +346,15 @@ export function supportedActions(probe) {
     set.add('modify_custom_face')
     set.add('delete_custom_face')
   }
-  // 空间读列表存在时，雪/网关通常同时提供动态、详情与互动动作。
-  // 写动作不做启动期探测（会真的评论/点赞），运行期由 native() 的
+  // 空间读列表存在时，雪/网关通常同时提供动态、详情、发布与互动动作。
+  // 写动作不做启动期探测（会真的发说说/评论/点赞），运行期由 native() 的
   // unsupported-action 懒降级兜底。
   if (set.has('get_qzone_msg_list')) {
-    for (const a of ['get_qzone_feeds', 'get_qzone_msg_detail', 'like_qzone', 'comment_qzone']) set.add(a)
+    for (const a of [
+      'get_qzone_feeds', 'get_qzone_msg_detail',
+      'send_qzone_msg', 'delete_qzone_msg', 'set_qzone_msg_right',
+      'like_qzone', 'comment_qzone',
+    ]) set.add(a)
   }
   for (const a of ['send_private_msg', 'send_group_msg', 'send_msg', 'get_login_info', 'get_version_info', 'get_status', 'get_friend_list', 'get_group_list', 'get_group_info', 'get_group_member_info', 'get_group_member_list', 'get_stranger_info', 'can_send_image', 'can_send_record', 'set_group_ban', 'set_group_whole_ban', 'set_group_kick', 'set_group_special_title', '_send_group_notice', 'set_qq_profile', 'set_self_longnick', 'set_qq_avatar']) set.add(a)
   return set

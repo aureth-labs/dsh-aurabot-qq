@@ -756,10 +756,15 @@ test('supportedActions 永远含标准动作，且改资料写动作不依赖危
   for (const a of ['set_qq_profile', 'set_self_longnick', 'set_qq_avatar']) assert.ok(set.has(a))
 
   const qzone = supportedActions({ supported: ['get_qzone_msg_list'] })
-  for (const a of ['get_qzone_feeds', 'get_qzone_msg_detail', 'like_qzone', 'comment_qzone']) {
+  for (const a of [
+    'get_qzone_feeds', 'get_qzone_msg_detail',
+    'send_qzone_msg', 'delete_qzone_msg', 'set_qzone_msg_right',
+    'like_qzone', 'comment_qzone',
+  ]) {
     assert.ok(qzone.has(a), `空间列表可用时必须放行 ${a}`)
   }
   assert.equal(supportedActions({ supported: [] }).has('get_qzone_feeds'), false)
+  assert.equal(supportedActions({ supported: [] }).has('send_qzone_msg'), false)
 })
 
 // ═════════════════════════ 9. SnowLuma 子模块 ═════════════════════════
