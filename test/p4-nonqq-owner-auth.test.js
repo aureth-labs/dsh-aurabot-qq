@@ -773,5 +773,5 @@ test('P4-4: 前端 client.js 对纯非 QQ 主人的 GlobalAccess 展示、向导
   const wizQqOkLine = source.split(/\r?\n/).find((l) => l.includes('const qqOk ='))
   const wizCanNextLine = source.split(/\r?\n/).find((l) => l.includes('const canNext ='))
   assert.ok(wizQqOkLine && wizCanNextLine)
-  assert.match(wizCanNextLine, /mode === 'qq' \? qqCanNext\[step\] : externalCanNext\[step\]/)
+  assert.match(wizCanNextLine, /(?:isQqMode|mode === 'qq') \? qqCanNext\[step\] : externalCanNext\[step\]/)
 })

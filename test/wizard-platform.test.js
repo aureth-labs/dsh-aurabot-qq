@@ -6,6 +6,15 @@ import { readFileSync } from 'node:fs'
 const client = readFileSync(new URL('../client/client.js', import.meta.url), 'utf8')
 const host = readFileSync(new URL('../src/host.js', import.meta.url), 'utf8')
 
+test('设置向导：QQ 旧版直连和网关托管分开，网关模式走迁移事务', () => {
+  assert.ok(client.includes("id: 'qq-gateway'"), '缺少 QQ 网关托管选项')
+  assert.ok(client.includes("label: 'QQ（旧）'"), '旧版直连没有标注（旧）')
+  assert.ok(client.includes('finishGatewayQq'), '缺少网关托管完成流程')
+  assert.ok(client.includes("post('/platforms/qq-migration/preflight'"), '缺少迁移预检')
+  assert.ok(client.includes("post('/platforms/qq-migration/start'"), '缺少迁移启动')
+  assert.ok(client.includes('完成并切换到网关托管'), '缺少网关托管完成按钮')
+})
+
 test('多平台向导：第 1 步可以选择 QQ / 飞书 / QQ 官方机器人 / 通用桥', () => {
   assert.ok(client.includes("id: 'qq'") && client.includes("id: 'feishu'"), '缺 QQ/飞书选项')
   assert.ok(client.includes("id: 'qqbot'") && client.includes("id: 'bridge'"), '缺 QQ 官方/通用桥选项')

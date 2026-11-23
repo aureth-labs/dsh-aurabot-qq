@@ -10231,7 +10231,8 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     const WIZ_QQ_STEPS = ['选择接入方式', '你们的 QQ 号', '接 QQ 网关', '启动并同意协议', '连上机器人号', '完成']
     const WIZ_PLATFORM_STEPS = ['选择接入方式', '填写平台配置', '连接确认', '认主并完成']
     const WIZ_PLATFORM_MODES = [
-      { id: 'qq', label: 'QQ', desc: 'SnowLuma 或已有 OneBot，适合已经有机器人 QQ 号' },
+      { id: 'qq', label: 'QQ（旧）', desc: '旧版直连：SnowLuma 或已有 OneBot；兼容旧配置，后续可手动迁移' },
+      { id: 'qq-gateway', label: 'QQ（网关托管）', desc: '先完成一次旧版验号，再自动切换到多平台网关；推荐新装使用' },
       { id: 'feishu', label: '飞书', desc: '企业自建应用，默认 WebSocket，不需要公网回调' },
       { id: 'qqbot', label: 'QQ 官方机器人', desc: 'AppID + AppSecret，默认 WebSocket' },
       { id: 'wechat-clawbot', label: '微信 ClawBot', desc: '腾讯官方 iLink 长轮询，面板微信扫码即用（1:1 为主，不做群管）' },
@@ -10252,7 +10253,11 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           return Math.max(0, Number(localStorage.getItem('aurabot.wiz') || 0))
         } catch (e) { return 0 }
       })
-      const steps = mode === 'qq' ? WIZ_QQ_STEPS : WIZ_PLATFORM_STEPS
+      const isQqMode = mode === 'qq' || mode === 'qq-gateway'
+      const gatewayQq = mode === 'qq-gateway'
+      const steps = isQqMode
+        ? (gatewayQq ? [...WIZ_QQ_STEPS.slice(0, -1), '切换并完成'] : WIZ_QQ_STEPS)
+        : WIZ_PLATFORM_STEPS
       const go = (i) => { setStep(i); try { localStorage.setItem('aurabot.wiz', String(i)) } catch (e) {} }
       const f = useField(draft, setDraft)
       const sl = st.snowluma
@@ -10271,6 +10276,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [platformValues, setPlatformValues] = useState({})
       const [platformBusy, setPlatformBusy] = useState(false)
       const [platformError, setPlatformError] = useState('')
+      const [gatewayQqBusy, setGatewayQqBusy] = useState(false)
       const seededMode = useRef('')
       const refreshPlatforms = () => get('/platforms').then(setPdata).catch(() => {})
       const refreshPeople = () => get('/platforms/people').then(setPeopleData).catch(() => {})
@@ -10327,7 +10333,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       // 非 QQ 模式：第一次拿到平台配置时，把已保存的值灌进表单；
       // 后续轮询 pdata 不覆盖用户正在输入的内容。
       useEffect(() => {
-        if (mode === 'qq' || !pdata) return
+        if (isQqMode || !pdata) return
         const key = mode + ':' + (platformInst?.instance || '')
         if (seededMode.current === key) return
         seededMode.current = key
@@ -10343,7 +10349,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
 
       // 连接/认主阶段轮询；只在非 QQ 模式启动。
       useEffect(() => {
-        if (mode === 'qq') return undefined
+        if (isQqMode) return undefined
         const timer = setInterval(() => {
           refreshPlatforms()
           if (step >= 2) refreshPeople()
@@ -10418,9 +10424,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const candidateBound = Boolean(selectedCandidate && ownerAccounts.some((a) => a.platform === selectedCandidate.platform && a.account === selectedCandidate.account))
       const canFinishExternal = Boolean(pdata?.owner && (ownerAccountOnMode || candidateBound))
       const externalCanNext = [platformReady, platformReady, platformInst?.state === 'connected', canFinishExternal]
-      const canNext = mode === 'qq' ? qqCanNext[step] : externalCanNext[step]
+      const canNext = isQqMode ? qqCanNext[step] : externalCanNext[step]
       const next = async () => {
-        if (mode === 'qq') {
+        if (isQqMode) {
           if ((step === 1 || step === 2) && !(await save({ ...draft, enabled: true }))) return
           go(Math.min(step + 1, steps.length - 1))
           reload()
@@ -10450,6 +10456,52 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             localStorage.removeItem('aurabot.wiz.v2')
           } catch (e) {}
           reload(); onClose && onClose()
+        }
+      }
+      const finishGatewayQq = async () => {
+        if (gatewayQqBusy) return
+        setGatewayQqBusy(true)
+        try {
+          if (!(await save({ ...draft, enabled: true, dryRun: live === 'dry' }))) return
+          const wsUrl = String(draft.snowluma?.wsUrl || st.config?.snowluma?.wsUrl || '').trim()
+          const httpUrl = String(draft.snowluma?.httpUrl || st.config?.snowluma?.httpUrl || '').trim()
+          if (!wsUrl) {
+            toast('网关托管 QQ 需要 OneBot WebSocket 地址，请先在上一页填写并连接', 'err')
+            return
+          }
+          const target = {
+            enabled: true,
+            selfId: String(draft.botQQ || '').trim(),
+            backend: draft.gateway === 'onebot' ? 'onebot' : 'snowluma',
+            wsUrl,
+            ...(httpUrl ? { httpUrl } : {}),
+            ...(draft.snowluma?.wsToken ? { wsToken: String(draft.snowluma.wsToken).trim() } : {}),
+            ...(draft.snowluma?.httpToken ? { httpToken: String(draft.snowluma.httpToken).trim() } : {}),
+          }
+          const pre = await post('/platforms/qq-migration/preflight', { platform: target })
+          if (!pre.ok) {
+            toast(pre.message || '迁移前置检查未通过', 'err')
+            return
+          }
+          const switched = await post('/platforms/qq-migration/start', { targetLegacyQqEnabled: false, platform: target })
+          if (switched.platforms) setPdata(switched.platforms)
+          if (!switched.ok) {
+            toast(switched.message || '切换到网关托管 QQ 失败', 'err')
+            return
+          }
+          const done = await post('/setup/done', { platformOnly: true })
+          toast(done.message || switched.message, done.ok ? 'ok' : 'err')
+          if (!done.ok) return
+          try {
+            localStorage.removeItem('aurabot.wiz')
+            localStorage.removeItem('aurabot.wiz.mode')
+            localStorage.removeItem('aurabot.wiz.v2')
+          } catch (e) {}
+          reload(); onClose && onClose()
+        } catch (error) {
+          toast(error?.message || '切换到网关托管 QQ 失败', 'err')
+        } finally {
+          setGatewayQqBusy(false)
         }
       }
       // 点了接入之后每 2 秒刷新一次状态；45 秒还没好就提示去看诊断
@@ -10541,6 +10593,8 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         // 4. 完成
         h('div', null,
           h('p', { className: 'ab-desc' }, '都准备好了！最后选一下ta怎么上线：'),
+          gatewayQq ? h('div', { className: 'ab-note', style: { marginBottom: 10 } },
+            '完成后会把默认 QQ 从旧版直连切换到多平台网关；迁移失败会保留旧版连接，不会丢消息。') : null,
           h(Choices, { value: live, onChange: setLive, options: [
             { value: 'dry', label: '先试运行', desc: 'ta会照常思考，但只写进日志、不真的发出去。看几条没问题再在右上角关掉试运行' },
             { value: 'live', label: '直接上线', desc: '马上开始真的回 QQ 消息' },
@@ -10592,7 +10646,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       }
 
       const selectionStep = h('div', null,
-        h('p', { className: 'ab-desc' }, '先选一种接入方式。选 QQ 会继续走 SnowLuma / OneBot；选其他平台可以在这里直接填凭证并连接。'),
+        h('p', { className: 'ab-desc' }, '先选一种接入方式。QQ（旧）继续走旧版直连 SnowLuma / OneBot；QQ（网关托管）在完成一次验号后自动切换到多平台网关；其他平台在这里直接填凭证并连接。'),
         h(Choices, {
           value: mode,
           onChange: chooseMode,
@@ -10681,7 +10735,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       )
 
       const externalSteps = [selectionStep, configStep, connectStep, bindStep]
-      const body = mode === 'qq' ? [selectionStep, ...qqBody][step] : externalSteps[step]
+      const body = isQqMode ? [selectionStep, ...qqBody][step] : externalSteps[step]
       return h('div', { className: 'ab-card', style: { padding: '20px 22px' } },
         h('div', { className: 'ab-flex', style: { marginBottom: 6 } }, h('h3', { style: { margin: 0, fontSize: 16 } }, '设置向导'), h('span', { className: 'ab-muted ab-small' }, '第 ' + (step + 1) + ' / ' + steps.length + ' 步 · ' + steps[step]), h('div', { className: 'ab-spacer' }),
           st.config.setupDone && onClose ? h(Btn, { small: true, kind: 'ghost', onClick: onClose }, '关闭向导') : null),
@@ -10693,20 +10747,22 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           step > 0 ? h(Btn, { kind: 'ghost', onClick: () => go(step - 1) }, '上一步') : null,
           h('div', { className: 'ab-spacer' }),
           step < steps.length - 1
-            ? h(Btn, { kind: 'primary', disabled: !canNext, onClick: next }, mode !== 'qq' && step === 1 ? '保存并连接' : '下一步')
-            : mode === 'qq'
-              ? h(Btn, { kind: 'primary', onClick: async () => {
-                if (!(await save({ ...draft, enabled: true, dryRun: live === 'dry' }))) return
-                const r = await post('/setup/done'); toast(r.message, r.ok ? 'ok' : 'err')
-                if (r.ok) {
-                  try {
-                    localStorage.removeItem('aurabot.wiz')
-                    localStorage.removeItem('aurabot.wiz.mode')
-                    localStorage.removeItem('aurabot.wiz.v2')
-                  } catch (e) {}
-                  reload(); onClose && onClose()
-                }
-              } }, '完成，让大肥鱼上线')
+            ? h(Btn, { kind: 'primary', disabled: !canNext, onClick: next }, !isQqMode && step === 1 ? '保存并连接' : '下一步')
+            : isQqMode
+              ? gatewayQq
+                ? h(Btn, { kind: 'primary', disabled: !canNext || gatewayQqBusy, onClick: finishGatewayQq }, gatewayQqBusy ? '正在切换…' : '完成并切换到网关托管')
+                : h(Btn, { kind: 'primary', onClick: async () => {
+                  if (!(await save({ ...draft, enabled: true, dryRun: live === 'dry' }))) return
+                  const r = await post('/setup/done'); toast(r.message, r.ok ? 'ok' : 'err')
+                  if (r.ok) {
+                    try {
+                      localStorage.removeItem('aurabot.wiz')
+                      localStorage.removeItem('aurabot.wiz.mode')
+                      localStorage.removeItem('aurabot.wiz.v2')
+                    } catch (e) {}
+                    reload(); onClose && onClose()
+                  }
+                } }, '完成，让大肥鱼上线')
               : h(Btn, { kind: 'primary', disabled: !canNext, onClick: finishPlatform }, '完成并进入面板')))
     }
 
