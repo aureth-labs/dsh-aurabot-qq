@@ -63,6 +63,26 @@ test('平台页状态每 5 秒自动刷新，旧版能力提示明确', () => {
   assert.ok(client.includes('旧版直连（由 QQ 网关页管理）'), '旧版直连能力提示缺失')
 })
 
+test('共享私聊在当前暂停分支通过预检后可确认恢复', () => {
+  const button = client.match(/sharedState === 'paused' && checkedRecovery\?\.recoverable === true \? h\(Btn, \{[\s\S]*?\}, '从最近核验点恢复'\) : null/)?.[0]
+  assert.ok(button, '恢复按钮应仅对预检通过的暂停分支显示')
+  assert.ok(button.includes('disabled: changingShared'))
+  assert.match(button, /if \(window\.confirm\([^]*?multiPrivate\.recoverCheckpoint[^]*?changeShared\(\{ mode: multiPrivate\.mode, recoverKey \}, '\/recover'\)/)
+  assert.ok(client.includes("await post('/platforms/multi-private' + action, body)"))
+  assert.ok(client.includes("recovering: '正在从核验点恢复…'"))
+  assert.match(client, /sharedState === 'paused' && !checkingRecovery[^]*?'no-checkpoint':[^]*?\[recoverReason\]/)
+  assert.ok(client.includes("role: 'status' }, '正在核对恢复点…'"))
+})
+
+test('共享私聊仅对当前恢复目标发起预检并忽略已失效的响应', () => {
+  assert.match(client, /const recoverKey = multiPrivate\?\.enabled && sharedState === 'paused' && multiPrivate\.recoverable\s+\? multiPrivate\.recoverKey : ''/)
+  assert.match(client, /const checkedRecovery = recoverKey && recoveryCheck\?\.key === recoverKey \? recoveryCheck : null/)
+  assert.match(client, /if \(!recoverKey \|\| changingShared\)[^]*?get\('\/platforms\/multi-private'\)\.then\(\(status\) => \{\s*if \(!alive\) return/)
+  assert.match(client, /status\.ok === true && status\.recoverKey === recoverKey[^]*?recoverable: matched && status\.recoverable === true/)
+  assert.match(client, /return \(\) => \{ alive = false \}\s*\}, \[recoverKey, recoveryRetry, changingShared\]\)/)
+  assert.ok(client.includes("onClick: retryRecoveryCheck }, '重新核对'"), '临时失败后应允许重新核对')
+})
+
 test('平台页可以添加尚未配置的平台', () => {
   assert.ok(client.includes("post('/platforms/add'"), '面板缺添加平台请求')
   assert.ok(client.includes("{ title: '添加平台'"), '面板缺添加平台卡片')

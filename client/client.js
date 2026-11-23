@@ -1787,6 +1787,8 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [busy, setBusy] = useState('')
       const [addPlatform, setAddPlatform] = useState('')
       const [legacyReview, setLegacyReview] = useState(null)
+      const [recoveryCheck, setRecoveryCheck] = useState(null)
+      const [recoveryRetry, setRecoveryRetry] = useState(0)
       useEffect(() => {
         let alive = true
         const tick = () => get('/platforms').then((r) => { if (alive) setData(r) }).catch(() => {})
@@ -1797,6 +1799,34 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const list = (data && data.instances) || []
       const owner = data && data.owner
       const multiPrivate = data?.multiPrivate
+      const changingShared = busy === 'multi-private' || busy === 'multi-private-recover'
+      const sharedState = busy === 'multi-private-recover' ? 'recovering' : multiPrivate?.state
+      const recoverKey = multiPrivate?.enabled && sharedState === 'paused' && multiPrivate.recoverable
+        ? multiPrivate.recoverKey : ''
+      const checkedRecovery = recoverKey && recoveryCheck?.key === recoverKey ? recoveryCheck : null
+      const recoverReason = checkedRecovery?.reason || multiPrivate?.recoverReason
+      const checkingRecovery = recoverKey && !checkedRecovery
+      useEffect(() => {
+        if (!recoverKey || changingShared) {
+          setRecoveryCheck(null)
+          return
+        }
+        let alive = true
+        get('/platforms/multi-private').then((status) => {
+          if (!alive) return
+          const matched = status.ok === true && status.recoverKey === recoverKey
+          setRecoveryCheck({
+            key: recoverKey,
+            recoverable: matched && status.recoverable === true,
+            reason: matched ? status.recoverReason : 'session-unavailable',
+          })
+        })
+        return () => { alive = false }
+      }, [recoverKey, recoveryRetry, changingShared])
+      const retryRecoveryCheck = () => {
+        setRecoveryCheck(null)
+        setRecoveryRetry((attempt) => attempt + 1)
+      }
       const collapsedOf = (inst) => Boolean(data?.ui?.platformsCollapsed?.[inst.instance])
       const setCollapsedLocal = (instance, collapsed) => setData((cur) => cur ? {
         ...cur,
@@ -1821,14 +1851,15 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       }
       const changeShared = async (body, action = '') => {
         setLegacyReview(null)
-        setBusy('multi-private')
+        setRecoveryCheck(null)
+        setBusy(action === '/recover' ? 'multi-private-recover' : 'multi-private')
         try {
           const result = await post('/platforms/multi-private' + action, body)
           toast(result.message || (result.ok ? '已更新' : '未能更新'), result.ok ? 'ok' : 'err')
-          if (result.ok) {
+          if (result.ok || (action === '/recover' && result.mode === body.mode && result.state)) {
             setData(current => current && { ...current, multiPrivate: result })
-            reload()
           }
+          if (result.ok) reload()
         } finally { setBusy('') }
       }
       const reviewSharedHistory = async () => {
@@ -2224,7 +2255,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         },
           h(Row, { label: '共用私聊会话' }, h(Switch, {
             on: multiPrivate.enabled,
-            disabled: busy === 'multi-private' || (!multiPrivate.enabled && !multiPrivate.available),
+            disabled: changingShared || (!multiPrivate.enabled && !multiPrivate.available),
             onChange: () => changeShared({ enabled: !multiPrivate.enabled }),
           })),
           h('div', { className: 'ab-small ab-muted' }, multiPrivate.available && multiPrivate.binding
@@ -2238,7 +2269,8 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             (multiPrivate.mode === 'debug' ? '调试' : '正式') + ' · ' + (multiPrivate.reason === 'gateway-required' ? '当前使用普通会话' : ({
               uninitialized: '等待第一条主人私聊', active: '分支已建立', deleted: '会话已删除', paused: '会话待人工核验',
               'pending-operation': '等待核对创建结果', 'restore-unavailable': '会话暂时无法恢复',
-            }[multiPrivate.state] || '未建立')) + (({
+              recovering: '正在从核验点恢复…',
+            }[sharedState] || '未建立')) + (({
               'source-missing': '（没有可继承的原会话）', 'source-unverified': '（原会话归属未核验）',
               'source-authorization-changed': '（原会话的主人授权已变化）',
               'source-no-completed-turn': '（原会话没有完整轮次）',
@@ -2248,8 +2280,24 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
               + (multiPrivate.retiredArchivePending ? ' · 待归档 ' + multiPrivate.retiredArchivePending : '')),
           multiPrivate.pauseReason ? h('div', { className: 'ab-note warn' }, ({
             'candidate-history-unverified': '候选有未核验活动，已退役。请重新开始共享会话。',
-            'restored-history-unverified': '恢复时发现核验点之后有未核验记录。崩溃前已完成的轮次也可能在此范围。请在 DSH 查看原历史，并重新开始共享会话。',
+            'restored-history-unverified': '重启时发现核验点之后有未核验记录，可能包含意外退出前已完成的轮次。原历史可在 DSH 查看。',
           })[multiPrivate.pauseReason]) : null,
+          checkingRecovery ? h('div', { className: 'ab-small ab-muted', role: 'status' }, '正在核对恢复点…') : null,
+          multiPrivate.enabled && sharedState === 'paused' && !checkingRecovery && checkedRecovery?.recoverable !== true
+            ? h('div', { className: 'ab-note warn' }, ({
+              'no-checkpoint': '该共享分支还没有可用的核验点。可重新开始或重新继承主账号历史。',
+              'checkpoint-invalid': '该共享分支的核验点无效。可重新开始或重新继承主账号历史。',
+              'session-deleted': '原共享会话已删除，无法从核验点恢复。',
+              'session-unavailable': '原共享会话暂不可用，无法从核验点恢复。',
+              'workspace-unavailable': '原共享会话的工作区暂不可用，无法从核验点恢复。',
+              'authorization-changed': '主人授权已变更，无法从该核验点恢复。',
+              obsolete: '共享分支已变化，请重新核对。',
+              busy: '共享会话正在处理其他操作，请稍后再试。',
+            }[recoverReason] || '当前共享分支无法从核验点恢复。'),
+              recoverKey && ['busy', 'obsolete', 'session-unavailable', 'workspace-unavailable'].includes(recoverReason)
+                ? h(Btn, { small: true, kind: 'ghost', disabled: changingShared, onClick: retryRecoveryCheck }, '重新核对')
+                : null)
+            : null,
           multiPrivate.lastDeliveryFailure ? h('div', { className: 'ab-note warn' },
             '最近一次' + (multiPrivate.lastDeliveryFailure.kind === 'failure-notice' ? '失败回执' : '共享回复') + '投递异常'
             + ' · ' + platformLabel(multiPrivate.lastDeliveryFailure.platform)
@@ -2263,15 +2311,24 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             ? h('div', { className: 'ab-note warn' }, '旧历史的主人授权已失效。当前授权下可从空会话开始，原历史可在 DSH 查看。')
             : null,
           multiPrivate.enabled ? h('div', { className: 'ab-flex', style: { marginTop: 8, flexWrap: 'wrap', gap: 8 } },
-            h(Btn, { small: true, disabled: busy === 'multi-private', onClick: () => changeShared({ enabled: false }) }, '切回普通会话'),
-            h(Btn, { small: true, disabled: busy === 'multi-private', onClick: () => {
+            h(Btn, { small: true, disabled: changingShared, onClick: () => changeShared({ enabled: false }) }, '切回普通会话'),
+            sharedState === 'paused' && checkedRecovery?.recoverable === true ? h(Btn, {
+              small: true, kind: 'primary', disabled: changingShared,
+              onClick: () => {
+                if (window.confirm('确定从最近核验点 #' + multiPrivate.recoverCheckpoint + ' 恢复共享会话吗？'
+                  + '\n新分支会保留截至该核验点的历史。核验点之后的记录留在旧会话中，旧会话归档后仍可在 DSH 查看。')) {
+                  changeShared({ mode: multiPrivate.mode, recoverKey }, '/recover')
+                }
+              },
+            }, '从最近核验点恢复') : null,
+            h(Btn, { small: true, disabled: changingShared, onClick: () => {
               if (window.confirm('确定让下一条共享私聊从空会话开始？')) changeShared({ mode: multiPrivate.mode }, '/reset')
             } }, '共享会话重新开始'),
-            h(Btn, { small: true, disabled: busy === 'multi-private' || !multiPrivate.available || multiPrivate.sourceAuthorizationChanged, onClick: () => {
+            h(Btn, { small: true, disabled: changingShared || !multiPrivate.available || multiPrivate.sourceAuthorizationChanged, onClick: () => {
               if (window.confirm('确定用主账号历史重新建立共享会话？')) changeShared({ mode: multiPrivate.mode }, '/inherit')
             } }, '重新继承主账号历史'),
             multiPrivate.legacyHistoryAvailable ? h(Btn, {
-              small: true, disabled: busy === 'multi-private',
+              small: true, disabled: changingShared,
               onClick: reviewSharedHistory,
             }, multiPrivate.legacyHistoryChanged ? '重新核对已变化的旧历史' : '核对并继承旧历史') : null,
           ) : null,
@@ -2281,7 +2338,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             h('div', null, '请在 DSH 核对「' + (legacyReview.title || '旧主账号会话') + '」（会话 ID '
               + legacyReview.sessionId + '）。确认后将重建当前共享分支，并将截至事件序号 ' + legacyReview.atSeq + ' 的历史共享给已绑定平台。'),
             h('div', { className: 'ab-flex', style: { marginTop: 8, gap: 8 } },
-              h(Btn, { small: true, kind: 'primary', disabled: busy === 'multi-private', onClick: () =>
+              h(Btn, { small: true, kind: 'primary', disabled: changingShared, onClick: () =>
                 changeShared({ mode: legacyReview.mode, token: legacyReview.token, confirmed: true }, '/legacy/confirm'),
               }, '确认归属并继承'),
               h(Btn, { small: true, onClick: () => setLegacyReview(null) }, '取消')),

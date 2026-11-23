@@ -60,6 +60,62 @@ beforeEach(() => {
   freshDataDir('aurabot-p4-case-')
 })
 
+test('共享核验点状态先预检，恢复校验模式和当前候选', async (t) => {
+  const fake = fakeDshMod.createFakeDsh({ brain: async () => '' })
+  const { hub } = hostMod.apply(fake.ctx)
+  t.after(() => fake.dispose())
+  const statusPath = '/platforms/multi-private'
+  const path = statusPath + '/recover'
+  const modes = []
+  let recoverable = false
+  let state = 'paused'
+  hub.sharedStatus = (mode = 'debug') => ({
+    mode, state, recoverable,
+    recoverReason: recoverable ? '' : 'no-checkpoint',
+    recoverKey: recoverable ? 'current-candidate' : '',
+  })
+  let preflightCalls = 0
+  hub.preflightSharedRecovery = async () => {
+    preflightCalls++
+    return { ...hub.sharedStatus(), recoverable: false, recoverReason: 'checkpoint-invalid' }
+  }
+  hub.recoverSharedFromCheckpoint = async (mode) => {
+    modes.push(mode)
+    state = 'active'
+    recoverable = false
+    return { ok: true, sessionId: 'recovered-session', checkpoint: 12 }
+  }
+
+  assert.equal((await fake.call(path)).json().ok, false)
+  assert.equal((await fake.call(path, { mode: 'invalid' })).json().ok, false)
+  const unavailable = (await fake.call(path, { mode: 'debug' })).json()
+  assert.equal(unavailable.ok, false)
+  assert.equal(unavailable.recoverReason, 'no-checkpoint')
+  assert.deepEqual(modes, [])
+
+  recoverable = true
+  const platforms = (await fake.call('/platforms')).json()
+  assert.equal(platforms.multiPrivate.recoverKey, 'current-candidate')
+  assert.equal(preflightCalls, 0)
+  const preflight = (await fake.call(statusPath)).json()
+  assert.equal(preflight.recoverKey, 'current-candidate')
+  assert.equal(preflight.recoverable, false)
+  assert.equal(preflight.recoverReason, 'checkpoint-invalid')
+  assert.equal(preflightCalls, 1)
+  const stale = (await fake.call(path, { mode: 'debug', recoverKey: 'old-candidate' })).json()
+  assert.equal(stale.ok, false)
+  assert.equal(stale.recoverReason, 'obsolete')
+  assert.deepEqual(modes, [])
+
+  const result = (await fake.call(path, { mode: 'debug', recoverKey: 'current-candidate' })).json()
+  assert.deepEqual(modes, ['debug'])
+  assert.equal(result.ok, true)
+  assert.equal(result.mode, 'debug')
+  assert.equal(result.state, 'active')
+  assert.equal(result.sessionId, 'recovered-session')
+  assert.equal(result.checkpoint, 12)
+})
+
 test('P4-1: config.js 三分支 ownerAuthorization 规则与 mergeFromPanel 防篡改', () => {
   const {
     DEFAULTS,

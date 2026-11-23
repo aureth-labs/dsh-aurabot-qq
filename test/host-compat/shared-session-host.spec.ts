@@ -54,6 +54,11 @@ async function mountAgentRuntime(ctx: Context, responses: ConstructorParameters<
   await ctx.plugin(SessionProjectionRegistry)
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
+  // Hosts with scoped executor selection load native dispatch as a separate plugin.
+  if (typeof ctx.tools.setExecutor === 'function') {
+    const nativeExecutor = '@deepseek-ai/dsh-tool-executor-native'
+    await ctx.plugin(await import(nativeExecutor))
+  }
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(AgentLoop, { agents: [] })
   const adapter = new MockAdapter(responses)
@@ -688,7 +693,7 @@ it('routes owner speakup through ordinary, fallback, live shared and normalized 
   }
 }, 30_000)
 
-it('forks only the confirmed legacy prefix with the real DSH controller and restores the same child from disk', async () => {
+it('recovers the verified shared prefix with the real DSH controller and reopens the recovered branch from disk', async () => {
   const root = await mkdtemp(join(tmpdir(), 'aurabot-dsh-fork-'))
   vi.stubEnv('AURABOT_DATA_DIR', root)
   vi.stubEnv('DSH_HOME', root)
@@ -718,7 +723,7 @@ it('forks only the confirmed legacy prefix with the real DSH controller and rest
     await ctx.plugin(WorkspaceRegistry)
     await ctx.plugin(ArchivedSessionGate)
     await ctx.plugin(SessionTitleService, { fallbackMaxWords: 5, fallbackMaxBytes: 80, maxTitleBytes: 100 })
-    createSessionTestController(ctx, { defaultModelSelection: () => model, cwd: root })
+    const controller = await createSessionTestController(ctx, { defaultModelSelection: () => model, cwd: root })
     const gateway = createGateway({ config: cfg, dataDir: (...path) => join(root, ...path), identity, log })
     const qq = makeFakeAdapter({ id: 'qq', self: { account: '20001' } })
     const wx = makeFakeAdapter({ id: 'wechat-clawbot', caps: { proactive: 'none' } })
@@ -733,7 +738,7 @@ it('forks only the confirmed legacy prefix with the real DSH controller and rest
     const submitted: Promise<unknown>[] = []
     const stop = gateway.onMessage(message => { submitted.push(hub.onGatewayMessage(message)) })
     return {
-      adapter, hub, qq, wx,
+      adapter, controller, hub, qq, wx,
       trackOutput() {
         off = ctx.on('session/event', hub.onSessionEvent)
       },
@@ -770,11 +775,12 @@ it('forks only the confirmed legacy prefix with the real DSH controller and rest
     await ctx.workspaceRegistry.get(workspace.id)!.attachSession(sourceId)
     ordinary.followup(prompt('已核对的旧 QQ 历史'))
     await ordinary.whenIdle()
+    expect(lastOutcome(ordinary), JSON.stringify(ordinary.session.snapshotEvents().at(-1))).toBe('completed')
     expect(await ctx.sessions.flush(ordinary.session)).toBe(true)
 
     expect(host.hub.sharedStatus()).toMatchObject({ legacyHistoryAvailable: true, legacyHistoryChanged: false })
     const review = await host.hub.prepareLegacyHistory('live')
-    expect(review).toMatchObject({ ok: true, sessionId: sourceId, title: '旧主账号私聊' })
+    expect(review, JSON.stringify(review)).toMatchObject({ ok: true, sessionId: sourceId, title: '旧主账号私聊' })
     expect(await host.hub.confirmLegacyHistory('live', 'wrong-token')).toMatchObject({ ok: false })
     ordinary.followup(prompt('核对后追加的普通私聊'))
     await ordinary.whenIdle()
@@ -793,6 +799,8 @@ it('forks only the confirmed legacy prefix with the real DSH controller and rest
     host.trackOutput()
     await host.send('qq', 'fork-qq', '共享中的 QQ 消息')
     await host.send('wx', 'fork-wx', '共享中的微信消息')
+    const sharedStartup = host.hub.sharedStatus()
+    expect(sharedStartup, JSON.stringify({ state: sharedStartup, warnings: log.warn.mock.calls })).toMatchObject({ state: 'active' })
     const delivered = vi.fn()
     const ended = vi.fn()
     const primaryChat = { chatId: 'private:10001', kind: 'private', userId: '10001' }
@@ -858,7 +866,9 @@ it('forks only the confirmed legacy prefix with the real DSH controller and rest
     host.trackOutput()
     const retryText = '重启后尝试继续共享会话'
     await host.send('wx', 'unverified-recovery', retryText)
-    expect(host.hub.sharedStatus()).toMatchObject({ state: 'paused', pauseReason: 'restored-history-unverified' })
+    expect(host.hub.sharedStatus()).toMatchObject({
+      state: 'paused', pauseReason: 'restored-history-unverified', recoverable: true, recoverCheckpoint: recoveredCheckpoint,
+    })
     const pausedChild = ctx.sessions.get(childId)!
     expect(pausedChild.eventAt(proactiveCheckpoint)).toMatchObject({
       type: 'turn/end', data: { reason: { kind: 'completed' } },
@@ -878,11 +888,154 @@ it('forks only the confirmed legacy prefix with the real DSH controller and rest
     expect((await readMap()).multiPrivate.sessions.live).toMatchObject({
       sessionId: childId, verifiedThroughSeq: recoveredCheckpoint,
     })
-    host.hub.resetShared(['live'], 'empty')
-    await vi.waitFor(async () => {
-      expect((await readMap()).multiPrivate.retiredSessions[childId].archiveState).toBe('archived')
+    await vi.waitFor(() => expect(host?.wx.sent.map(record => record.payload.inResponseTo)).toEqual(['unverified-recovery']), { timeout: 5000 })
+    const pausedMap = await readMap()
+    const pausedBranch = pausedMap.multiPrivate.sessions.live
+    const fork = vi.spyOn(host.controller, 'fork')
+    const pausedStatus = host.hub.sharedStatus()
+    const preflight = await host.hub.preflightSharedRecovery('live')
+    expect(pausedStatus.recoverKey).toEqual(expect.any(String))
+    expect(preflight).toMatchObject({
+      state: 'paused', recoverable: true, recoverCheckpoint: recoveredCheckpoint, recoverKey: pausedStatus.recoverKey,
     })
+    expect(await readMap()).toEqual(pausedMap)
+
+    const workspaces = vi.spyOn(ctx.workspaceRegistry, 'list').mockReturnValue([])
+    try {
+      expect(await host.hub.preflightSharedRecovery('live')).toMatchObject({
+        state: 'paused', recoverable: false, recoverReason: 'workspace-unavailable', recoverKey: pausedStatus.recoverKey,
+      })
+    } finally { workspaces.mockRestore() }
+    const sessionQuery = ctx.get('sessionQuery')!
+    const observeSession = sessionQuery.observeSession.bind(sessionQuery)
+    const observed = vi.spyOn(sessionQuery, 'observeSession')
+    observed.mockRejectedValueOnce(new Error('暂时无法读取 DSH 会话'))
+    expect(await host.hub.preflightSharedRecovery('live')).toMatchObject({
+      state: 'paused', recoverable: false, recoverReason: 'session-unavailable', recoverKey: pausedStatus.recoverKey,
+    })
+    expect(await readMap()).toEqual(pausedMap)
+
+    const invalidMap = structuredClone(pausedMap)
+    const invalidBranch = invalidMap.multiPrivate.sessions.live
+    const readStarted = Promise.withResolvers<void>()
+    const resumeRead = Promise.withResolvers<void>()
+    observed.mockImplementationOnce(async (...args) => {
+      readStarted.resolve()
+      await resumeRead.promise
+      return observeSession(...args)
+    })
+    const stalePreflight = host.hub.preflightSharedRecovery('live')
+    delete invalidBranch.verifiedThroughSeq
+    try {
+      await readStarted.promise
+      await writeFile(sessionsPath, JSON.stringify(invalidMap))
+    } finally { resumeRead.resolve() }
+    expect(await stalePreflight).toMatchObject({
+      recoverable: false, recoverReason: 'obsolete', recoverKey: pausedStatus.recoverKey,
+    })
+    observed.mockRestore()
+    expect(host.hub.sharedStatus()).toMatchObject({ recoverable: false, recoverReason: 'no-checkpoint' })
+    expect(await host.hub.preflightSharedRecovery('live')).toMatchObject({ recoverable: false, recoverReason: 'no-checkpoint' })
+    expect(await host.hub.recoverSharedFromCheckpoint('live')).toMatchObject({ ok: false, reason: 'no-checkpoint' })
+
+    const nonBoundary = recoveredCheckpoint - 1
+    expect(pausedChild.eventAt(nonBoundary)?.type).not.toBe('turn/end')
+    invalidBranch.verifiedThroughSeq = nonBoundary
+    await writeFile(sessionsPath, JSON.stringify(invalidMap))
+    const invalidStatus = host.hub.sharedStatus()
+    expect(invalidStatus.recoverKey).not.toBe(pausedStatus.recoverKey)
+    expect(await host.hub.preflightSharedRecovery('live')).toMatchObject({
+      state: 'paused', recoverable: false, recoverReason: 'checkpoint-invalid', recoverKey: invalidStatus.recoverKey,
+    })
+    expect(await readMap()).toEqual(invalidMap)
+    expect(fork).not.toHaveBeenCalled()
+    expect(await host.hub.recoverSharedFromCheckpoint('live')).toMatchObject({ ok: false, reason: 'checkpoint-invalid' })
+    expect(fork).not.toHaveBeenCalled()
+    expect(ctx.workspaceRegistry.archivedSessionIds).not.toContain(childId)
+    await writeFile(sessionsPath, JSON.stringify(pausedMap))
+
+    fork.mockRejectedValueOnce(new Error('测试：核验点分叉失败'))
+    expect(await host.hub.recoverSharedFromCheckpoint('live')).toMatchObject({ ok: false })
+    expect(fork).toHaveBeenCalledWith({ sessionId: childId, atSeq: recoveredCheckpoint })
+    const afterFailure = (await readMap()).multiPrivate
+    expect(afterFailure.sessions.live).toEqual(pausedBranch)
+    expect(afterFailure.retiredSessions[childId]).toBeUndefined()
+    expect(ctx.workspaceRegistry.archivedSessionIds).not.toContain(childId)
+    expect(host.hub.sharedStatus()).toMatchObject({ state: 'paused', recoverable: true })
+
+    const fallbackText = '分叉失败后仍走普通会话'
+    await host.send('wx', 'checkpoint-fork-failed', fallbackText)
+    await vi.waitFor(() => expect(host?.wx.sent.map(record => record.payload.inResponseTo))
+      .toEqual(['unverified-recovery', 'checkpoint-fork-failed']), { timeout: 5000 })
+    const fallbackMessages = JSON.stringify(host.adapter.requests.at(-1)?.messages)
+    expect(fallbackMessages).toContain(fallbackText)
+    expect(fallbackMessages).not.toContain(unverifiedText)
+    expect(JSON.stringify(pausedChild.deriveMessages())).not.toContain(fallbackText)
+
+    const requestsBeforeRecovery = host.adapter.requests.length
+    const result = await host.hub.recoverSharedFromCheckpoint('live')
+    expect(result).toMatchObject({ ok: true, checkpoint: recoveredCheckpoint, sessionId: expect.any(String) })
+    expect(fork).toHaveBeenCalledTimes(2)
+    const recoveredId = SessionId(result.sessionId)
+    expect(recoveredId).not.toBe(childId)
+    const recovered = ctx.sessions.get(recoveredId)!
+    expect(recovered.header.parentSession).toBe(childId)
+    expect(recovered.inheritedEventCount).toBe(recoveredCheckpoint + 1)
+    expect(recovered.snapshotEvents().slice(0, recoveredCheckpoint + 1))
+      .toEqual(pausedChild.snapshotEvents().slice(0, recoveredCheckpoint + 1))
+    expect(recovered.snapshotEvents().findLast(event => event.type === 'session/title')?.data.title).toBe('多平台 · 主人私聊')
+    expect(ctx.workspaceRegistry.get(workspace.id)?.sessionIds).toContain(recoveredId)
+    expect(host.hub.sharedStatus()).toMatchObject({ state: 'active', recoverable: false })
+    expect((await readMap()).multiPrivate.sessions.live).toMatchObject({
+      sessionId: recoveredId, state: 'active', baseSessionId: childId, recoveredFrom: childId,
+      generation: pausedBranch.generation + 1, verifiedThroughSeq: recoveredCheckpoint, checkpointRecovery: true,
+    })
+    const recoveredHistory = JSON.stringify(recovered.deriveMessages())
+    expect(recoveredHistory).toContain('共享中的 QQ 消息')
+    expect(recoveredHistory).toContain('共享中的微信消息')
+    expect(recoveredHistory).toContain('冷恢复后的微信消息')
+    expect(recoveredHistory).toContain('主动搭话专用提示')
+    expect(recoveredHistory).not.toContain(unverifiedText)
+    expect(recoveredHistory).not.toContain(retryText)
+    expect(recoveredHistory).not.toContain(fallbackText)
+    expect(host.adapter.requests).toHaveLength(requestsBeforeRecovery)
+    expect(host.qq.sent).toEqual([])
+    expect(host.wx.sent.map(record => record.payload.inResponseTo)).toEqual(['unverified-recovery', 'checkpoint-fork-failed'])
+    expect(delivered).toHaveBeenCalledTimes(1)
+
+    await vi.waitFor(async () => {
+      expect((await readMap()).multiPrivate.retiredSessions[childId]).toMatchObject({
+        mode: 'live', generation: pausedBranch.generation, archiveState: 'archived',
+      })
+    }, { timeout: 5000 })
     expect(ctx.workspaceRegistry.archivedSessionIds).toContain(childId)
+    const inboundAfterRecovery = '核验点恢复后的 QQ 消息'
+    await host.send('qq', 'after-checkpoint-recovery', inboundAfterRecovery)
+    expect(host.qq.sent.map(record => record.payload.inResponseTo)).toEqual(['after-checkpoint-recovery'])
+    expect(host.hub.sharedStatus().state).toBe('active')
+    const afterInbound = (await readMap()).multiPrivate.sessions.live
+    expect(afterInbound.sessionId).toBe(recoveredId)
+    expect(afterInbound.verifiedThroughSeq).toBeGreaterThan(recoveredCheckpoint)
+    expect(JSON.stringify(recovered.deriveMessages())).toContain(inboundAfterRecovery)
+
+    await host.close()
+    await ctx.fiber.dispose()
+    host = undefined
+    ctx = new Context()
+    host = await start(ctx)
+    host.trackOutput()
+    expect(ctx.sessions.get(recoveredId)).toBeUndefined()
+    expect(ctx.workspaceRegistry.archivedSessionIds).toContain(childId)
+    await host.send('wx', 'after-recovered-restart', '恢复分支再次启动后的微信消息')
+    expect(host.hub.sharedStatus().state).toBe('active')
+    expect((await readMap()).multiPrivate.sessions.live.sessionId).toBe(recoveredId)
+    expect(ctx.sessions.get(recoveredId)?.header.parentSession).toBe(childId)
+    const reopenedMessages = JSON.stringify(host.adapter.requests.at(-1)?.messages)
+    expect(reopenedMessages).toContain(inboundAfterRecovery)
+    expect(reopenedMessages).not.toContain(unverifiedText)
+    expect(host.qq.sent).toEqual([])
+    expect(host.wx.sent.map(record => record.payload.inResponseTo)).toEqual(['after-recovered-restart'])
+    expect(delivered).toHaveBeenCalledTimes(1)
 
     // A saved fingerprint for a changed prefix requires an explicit new review.
     const stale = await readMap()
@@ -911,7 +1064,7 @@ it('forks only the confirmed legacy prefix with the real DSH controller and rest
       await rm(root, { recursive: true, force: true })
     }
   }
-}, 30_000)
+}, 60_000)
 
 it('verifies persisted agent/inbox/spliced events through real DSH JsonlSessionPersistence before model step finishes', async () => {
   const cwd = await mkdtemp(join(tmpdir(), 'aurabot-dsh-inbox-proof-'))

@@ -710,6 +710,8 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
       '', // busy
       '', // addPlatform
       null, // legacyReview
+      null, // recoveryCheck
+      0, // recoveryRetry
       {
         ok: true,
         owner: 'p-owner',

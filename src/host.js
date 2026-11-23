@@ -5622,7 +5622,7 @@ export function apply(ctx, opts = {}) {
     }
   })
   route('/platforms/multi-private', async req => {
-    if (req.method === 'GET') return { ok: true, ...hub.sharedStatus() }
+    if (req.method === 'GET') return { ok: true, ...await hub.preflightSharedRecovery() }
     if (req.method !== 'POST') return { ok: false, message: '仅支持 GET 或 POST' }
     const body = await readBody(req)
     if (typeof body.enabled !== 'boolean') return { ok: false, message: 'enabled 必须是布尔值' }
@@ -5652,6 +5652,33 @@ export function apply(ctx, opts = {}) {
       }
     })
   }
+  route('/platforms/multi-private/recover', async req => {
+    if (req.method !== 'POST') return { ok: false, message: '仅支持 POST' }
+    const { mode, recoverKey } = await readBody(req)
+    if (mode !== 'live' && mode !== 'debug') return { ok: false, message: '请选择正式或调试会话' }
+    const status = hub.sharedStatus(mode)
+    let result
+    if (!status.recoverable) result = { ok: false, reason: status.recoverReason }
+    else if (recoverKey !== undefined && recoverKey !== status.recoverKey) result = { ok: false, reason: 'obsolete' }
+    else result = await hub.recoverSharedFromCheckpoint(mode)
+    const messages = {
+      busy: '共享会话正在处理，请稍后重试',
+      'session-deleted': '原共享会话已删除',
+      'session-unavailable': '暂时无法读取或保存共享会话',
+      'workspace-unavailable': '原共享工作区不可用',
+      'authorization-changed': '主人绑定或授权已变化',
+      'checkpoint-invalid': '当前核验点未指向已保存的轮次',
+      'recover-fork-unavailable': '当前 DSH 无法从该核验点分叉',
+      obsolete: '恢复期间共享会话设置已变化',
+    }
+    return {
+      ...hub.sharedStatus(mode),
+      ok: result.ok,
+      ...(result.ok ? { sessionId: result.sessionId, checkpoint: result.checkpoint } : { recoverReason: result.reason }),
+      message: result.ok ? '已从最近核验点恢复共享会话'
+        : messages[result.reason] || '未能从当前核验点恢复共享会话',
+    }
+  })
   for (const [action, policy] of [['reset', 'empty'], ['inherit', 'inherit']]) {
     route('/platforms/multi-private/' + action, async req => {
       if (req.method !== 'POST') return { ok: false, message: '仅支持 POST' }

@@ -25,8 +25,8 @@ const identity = {
   lookup: (platform, account) => ({ qq: '12345', feishu: 'ou_owner' })[platform] === account ? owner : null,
 }
 
-function fixture({ chats = ordinary, ...overrides } = {}) {
-  let data = { chats }
+function fixture({ chats = ordinary, initialData = { chats }, ...overrides } = {}) {
+  let data = structuredClone(initialData)
   const calls = []
   const service = createSharedPrivateSessions({
     read: () => structuredClone(data),
@@ -39,6 +39,21 @@ function fixture({ chats = ordinary, ...overrides } = {}) {
     ...overrides,
   })
   return { service, calls, data: () => data }
+}
+
+async function pausedFixture(overrides) {
+  const f = fixture({
+    restore: async branch => {
+      if (branch.sessionId === 'child-base-live') {
+        throw Object.assign(new Error('history beyond checkpoint'), { code: 'shared/history-unverified' })
+      }
+      return { id: branch.sessionId }
+    },
+    ...overrides,
+  })
+  const parent = (await f.service.ensure(scope)).branch
+  assert.equal((await f.service.ensure(scope)).reason, 'candidate-unavailable')
+  return { ...f, parent }
 }
 
 test('shared mode must be a boolean and is not writable via generic panel settings', () => {
@@ -218,6 +233,183 @@ test('a restored branch with history past the verified checkpoint remains paused
   assert.equal(restores, 1)
   assert.equal(service.read().sessions.live.sessionId, active.branch.sessionId)
   assert.equal(service.read().sessions.live.pauseReason, 'restored-history-unverified')
+})
+
+test('checkpoint recovery publishes one verified child and prevents ordinary alias rebase', async () => {
+  const retired = []
+  const { service, parent } = await pausedFixture({ onRetired: id => retired.push(id) })
+  const before = service.read()
+  const checkpoint = parent.verifiedThroughSeq
+  assert.deepEqual(service.recoveryStatus(scope), { recoverable: true, recoverCheckpoint: checkpoint, recoverReason: '' })
+  const result = await service.recoverFromCheckpoint(scope, {
+    async forkAtCheckpoint(branch, atSeq) {
+      assert.equal(branch.sessionId, parent.sessionId)
+      assert.equal(atSeq, checkpoint)
+      assert.equal(service.read().sessions.live.state, 'recovering')
+      assert.equal((await service.ensure(scope)).reason, 'candidate-unavailable')
+      return { sessionId: 'recovered-child' }
+    },
+    async verifyRecovered(child, branch, atSeq) {
+      assert.equal(branch.sessionId, parent.sessionId)
+      assert.equal(atSeq, checkpoint)
+      assert.equal(service.owns(child.sessionId), true)
+      assert.deepEqual(retired, [])
+      return true
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.sessionId, 'recovered-child')
+  assert.equal(result.checkpoint, checkpoint)
+  assert.equal(result.branch.level, scope.level)
+  assert.equal(result.branch.preset, scope.preset)
+  assert.equal(result.branch.verifiedThroughSeq, checkpoint)
+  assert.equal(result.branch.generation, parent.generation + 1)
+  assert.equal(result.branch.baseSessionId, parent.sessionId)
+  assert.equal(result.branch.recoveredFrom, parent.sessionId)
+  assert.equal(result.branch.checkpointRecovery, true)
+  assert.equal(result.branch.pauseReason, undefined)
+  assert.deepEqual(retired, [parent.sessionId])
+  assert.equal(service.read().routingRevision, before.routingRevision + 1)
+  assert.deepEqual(service.read().pendingOperations, {})
+  assert.equal(service.sync(scope).sessions.live.sessionId, result.sessionId)
+  assert.equal((await service.ensure(scope)).branch.sessionId, result.sessionId)
+})
+
+test('failed checkpoint recovery leaves the original paused, retires only a known failed child, and retries', async () => {
+  const retired = []
+  const { service, parent } = await pausedFixture({ onRetired: id => retired.push(id) })
+  const retry = {
+    forkAtCheckpoint: async () => ({ sessionId: 'eventual-child' }),
+    verifyRecovered: async () => true,
+  }
+  const original = service.read().sessions.live
+  assert.equal((await service.recoverFromCheckpoint(scope, {
+    ...retry, forkAtCheckpoint: async () => { throw new Error('fork failed') },
+  })).reason, 'recover-fork-unavailable')
+  assert.deepEqual(service.read().sessions.live, original)
+  assert.deepEqual(retired, [])
+  assert.equal((await service.recoverFromCheckpoint(scope, {
+    forkAtCheckpoint: async () => ({ sessionId: 'invalid-prefix' }),
+    verifyRecovered: async () => false,
+  })).reason, 'candidate-unavailable')
+  assert.equal((await service.recoverFromCheckpoint(scope, {
+    ...retry,
+    forkAtCheckpoint: async () => {
+      throw Object.assign(new Error('cannot attach'), {
+        code: 'session/workspace-attach-failed', details: { sessionId: 'unattached-recovery-child' },
+      })
+    },
+  })).reason, 'workspace-unavailable')
+  for (const sessionId of [parent.sessionId, ordinary['private:12345'].sessionId]) {
+    assert.equal((await service.recoverFromCheckpoint(scope, {
+      ...retry, forkAtCheckpoint: async () => ({ sessionId }),
+    })).reason, 'candidate-unavailable')
+  }
+  assert.deepEqual(service.read().sessions.live, original)
+  assert.deepEqual(service.read().pendingOperations, {})
+  assert.deepEqual(retired, ['invalid-prefix', 'unattached-recovery-child'])
+  assert.equal((await service.recoverFromCheckpoint(scope, retry)).sessionId, 'eventual-child')
+  assert.deepEqual(retired, ['invalid-prefix', 'unattached-recovery-child', parent.sessionId])
+})
+
+test('checkpoint recovery rejects missing checkpoints, changed authorization and deleted parents', async () => {
+  const { service, data } = await pausedFixture()
+  const callbacks = {
+    forkAtCheckpoint: async () => {
+      throw Object.assign(new Error('deleted'), { code: 'shared/session-deleted' })
+    },
+    verifyRecovered: async () => { throw new Error('fork should have failed') },
+  }
+  const branch = data().multiPrivate.sessions.live
+  const checkpoint = branch.verifiedThroughSeq
+  delete branch.verifiedThroughSeq
+  assert.deepEqual(service.recoveryStatus(scope), { recoverable: false, recoverCheckpoint: null, recoverReason: 'no-checkpoint' })
+  assert.equal((await service.recoverFromCheckpoint(scope, callbacks)).reason, 'no-checkpoint')
+  branch.verifiedThroughSeq = checkpoint
+  const revoked = { ...scope, ownerAuthorizationRevision: 'new-authorization' }
+  assert.equal((await service.recoverFromCheckpoint(revoked, callbacks)).reason, 'authorization-changed')
+  assert.equal((await service.recoverFromCheckpoint(scope, callbacks)).reason, 'session-deleted')
+  assert.equal(service.read().sessions.live.state, 'paused')
+  assert.equal(service.recoveryStatus(scope).recoverReason, 'session-deleted')
+  assert.deepEqual(service.read().retiredSessions, {})
+})
+
+test('switch, reset or authorization changes invalidate a pending checkpoint fork', async () => {
+  const changes = [
+    { change: service => { service.sync({ ...scope, enabled: false }); service.sync(scope) }, state: 'paused' },
+    { change: service => service.sync({ ...scope, mode: 'debug' }), state: 'paused' },
+    { change: service => service.reset(['live']), state: 'uninitialized' },
+    { change: service => service.sync({ ...scope, ownerAuthorizationRevision: 'new-authorization' }), state: 'uninitialized' },
+  ]
+  for (const { change, state } of changes) {
+    const { service, parent } = await pausedFixture()
+    const deferred = Promise.withResolvers()
+    let verifications = 0
+    const callbacks = {
+      forkAtCheckpoint: () => deferred.promise,
+      verifyRecovered: async () => { verifications++; return true },
+    }
+    const pending = service.recoverFromCheckpoint(scope, callbacks)
+    assert.equal(service.recoveryStatus(scope).recoverReason, 'busy')
+    assert.equal((await service.recoverFromCheckpoint(scope, callbacks)).reason, 'busy')
+    change(service)
+    deferred.resolve({ sessionId: 'obsolete-recovery-child' })
+    assert.deepEqual(await pending, { ok: false, reason: 'obsolete' })
+    assert.equal(verifications, 0)
+    assert.equal(service.read().sessions.live.state, state)
+    assert.deepEqual(service.read().pendingOperations, {})
+    assert.equal(service.read().retiredSessions['obsolete-recovery-child'].archiveState, 'pending')
+    assert.equal(Boolean(service.read().retiredSessions[parent.sessionId]), state === 'uninitialized')
+  }
+})
+
+test('recovery may target an inactive mode and rolls back if the host revokes it during verification', async () => {
+  const { service, parent } = await pausedFixture()
+  service.sync({ ...scope, mode: 'debug' })
+  const verifying = Promise.withResolvers()
+  const deferred = Promise.withResolvers()
+  let current = true
+  assert.equal(service.recoveryStatus(scope).recoverable, true)
+  const pending = service.recoverFromCheckpoint(scope, {
+    isCurrent: () => current,
+    forkAtCheckpoint: async () => ({ sessionId: 'inactive-mode-child' }),
+    verifyRecovered: () => { verifying.resolve(); return deferred.promise },
+  })
+  await verifying.promise
+  assert.equal(service.isRecovering('live'), true)
+  assert.equal(service.read().mode, 'debug')
+  assert.equal(service.owns('inactive-mode-child'), true)
+  current = false
+  deferred.resolve(true)
+  assert.deepEqual(await pending, { ok: false, reason: 'obsolete' })
+  assert.equal(service.isRecovering('live'), false)
+  assert.equal(service.read().sessions.live.sessionId, parent.sessionId)
+  assert.equal(service.read().sessions.live.state, 'paused')
+  assert.equal(service.read().retiredSessions[parent.sessionId], undefined)
+  assert.equal(service.read().retiredSessions['inactive-mode-child'].archiveState, 'pending')
+})
+
+test('a restart interrupts a pending checkpoint recovery and retires only the recorded child', async () => {
+  const { service, data, parent } = await pausedFixture()
+  const verifying = Promise.withResolvers()
+  const deferred = Promise.withResolvers()
+  const pending = service.recoverFromCheckpoint(scope, {
+    forkAtCheckpoint: async () => ({ sessionId: 'interrupted-recovery-child' }),
+    verifyRecovered: () => { verifying.resolve(); return deferred.promise },
+  })
+  await verifying.promise
+  const restarted = fixture({ initialData: data() }).service
+  assert.equal(restarted.read().sessions.live.state, 'recovering')
+  restarted.sync(scope)
+  assert.equal(restarted.read().sessions.live.state, 'paused')
+  assert.equal(restarted.read().sessions.live.sessionId, parent.sessionId)
+  assert.equal(restarted.read().sessions.live.pauseReason, 'restored-history-unverified')
+  assert.equal(restarted.recoveryStatus(scope).recoverable, true)
+  assert.equal(restarted.read().retiredSessions[parent.sessionId], undefined)
+  assert.equal(restarted.read().retiredSessions['interrupted-recovery-child'].archiveState, 'pending')
+  assert.deepEqual(restarted.read().pendingOperations, {})
+  deferred.resolve(false)
+  await pending
 })
 
 test('missing source creates empty, transient restore keeps the branch, and attachment failure is remembered', async () => {

@@ -117,6 +117,7 @@ export function sharedQuietHistory(session, afterSeq = null) {
 // read and write must use the same synchronous persistence as the ordinary session map.
 export function createSharedPrivateSessions({ read, write, fork, create, restore, recover, verifyCandidate, rename, onRetired, log }) {
   const creating = new Map()
+  const checkpointRecoveries = new Set()
   const failing = reason => ({ ok: false, reason })
   const readShared = () => read().multiPrivate || initialShared()
   const update = change => {
@@ -138,6 +139,20 @@ export function createSharedPrivateSessions({ read, write, fork, create, restore
 
   function sync(scope) {
     return update(shared => {
+      let interrupted = false
+      for (const key of SHARED_MODES) {
+        if (checkpointRecoveries.has(key)) continue
+        const branch = shared.sessions[key]
+        const pending = shared.pendingOperations[key]
+        if (branch.state === 'recovering') {
+          branch.state = 'paused'
+          interrupted = true
+        }
+        if (pending?.kind === 'checkpoint-recovery') {
+          retireIdlePending(shared, key)
+          interrupted = true
+        }
+      }
       const { ownerPersonId, ownerAuthorizationRevision, binding, enabled, mode, level, preset } = scope
       const changedOwner = shared.ownerPersonId !== ownerPersonId
         || shared.ownerAuthorizationRevision !== ownerAuthorizationRevision
@@ -148,14 +163,16 @@ export function createSharedPrivateSessions({ read, write, fork, create, restore
       let rebased = false
       if (!changedOwner && !changedPolicy && enabled && binding && shared.sessions[mode]?.state === 'active') {
         const active = shared.sessions[mode]
-        const preferred = active.baseSessionId ? selectSharedBase(read().chats, scope) : null
+        const preferred = active.baseSessionId && !active.checkpointRecovery ? selectSharedBase(read().chats, scope) : null
         if (preferred?.sessionId && preferred.sessionId !== active.baseSessionId) {
           retireMode(shared, mode, active.historyPolicy)
           retireIdlePending(shared, mode)
           rebased = true
         }
       }
-      if (!changedOwner && !changedPolicy && !rebased && shared.enabled === enabled && shared.mode === mode) return false
+      if (!changedOwner && !changedPolicy && !rebased && shared.enabled === enabled && shared.mode === mode) {
+        return interrupted ? undefined : false
+      }
       if (changedOwner || changedPolicy) {
         for (const key of SHARED_MODES) {
           retireMode(shared, key, shared.sessions[key].historyPolicy)
@@ -169,11 +186,23 @@ export function createSharedPrivateSessions({ read, write, fork, create, restore
 
   function retireIdlePending(shared, mode) {
     const pending = shared.pendingOperations[mode]
-    if (!pending?.sessionId || creating.has(mode)) return
+    if (!pending || creating.has(mode) || checkpointRecoveries.has(mode)) return
+    if (!pending.sessionId && pending.kind !== 'checkpoint-recovery') return
+    if (pending.sessionId && (pending.kind !== 'checkpoint-recovery' || !sharedSessionExists(shared, pending.sessionId))) {
+      retirePendingSession(shared, mode, pending)
+    }
+    delete shared.pendingOperations[mode]
+  }
+
+  function retirePendingSession(shared, mode, pending) {
     shared.retiredSessions[pending.sessionId] ??= {
       ownerPersonId: pending.ownerPersonId, mode, generation: pending.generation, archiveState: 'pending',
     }
-    delete shared.pendingOperations[mode]
+  }
+
+  function sharedSessionExists(shared, sessionId) {
+    return Object.hasOwn(shared.retiredSessions, sessionId)
+      || SHARED_MODES.some(mode => shared.sessions[mode].sessionId === sessionId)
   }
 
   function reset(modes, policy = 'empty') {
@@ -189,14 +218,14 @@ export function createSharedPrivateSessions({ read, write, fork, create, restore
   function owns(sessionId) {
     if (!sessionId) return false
     const data = readShared()
-    return Object.hasOwn(data.retiredSessions, sessionId)
-      || SHARED_MODES.some(mode => data.sessions[mode].sessionId === sessionId
-        || data.pendingOperations[mode]?.sessionId === sessionId)
+    return sharedSessionExists(data, sessionId)
+      || SHARED_MODES.some(mode => data.pendingOperations[mode]?.sessionId === sessionId)
   }
 
   async function ensureMode(scope, snapshot) {
     const { mode } = scope
     const branch = snapshot.sessions[mode]
+    if (branch.state === 'recovering') return failing('candidate-unavailable')
     const current = data => data.enabled && data.mode === mode && data.routingRevision === snapshot.routingRevision
       && data.sessions[mode].generation === branch.generation
     const pending = snapshot.pendingOperations[mode]
@@ -309,9 +338,7 @@ export function createSharedPrivateSessions({ read, write, fork, create, restore
   function retireCandidate(mode, operation, pause = false) {
     update(data => {
       if (pause) Object.assign(data.sessions[mode], { state: 'paused', pauseReason: 'candidate-history-unverified' })
-      data.retiredSessions[operation.sessionId] ??= {
-        ownerPersonId: operation.ownerPersonId, mode, generation: operation.generation, archiveState: 'pending',
-      }
+      retirePendingSession(data, mode, operation)
       if (data.pendingOperations[mode]?.token === operation.token) delete data.pendingOperations[mode]
     })
   }
@@ -360,6 +387,7 @@ export function createSharedPrivateSessions({ read, write, fork, create, restore
     if (!scope.enabled || !scope.binding || !scope.ownerPersonId || !scope.ownerAuthorizationRevision) {
       return Promise.resolve(failing('unavailable'))
     }
+    if (checkpointRecoveries.has(scope.mode)) return Promise.resolve(failing('candidate-unavailable'))
     const previous = creating.get(scope.mode)
     if (previous) return previous
     const promise = ensureMode(scope, snapshot).finally(() => {
@@ -367,6 +395,134 @@ export function createSharedPrivateSessions({ read, write, fork, create, restore
     })
     creating.set(scope.mode, promise)
     return promise
+  }
+
+  function recoveryScopeMatches(data, scope) {
+    return data.ownerPersonId === scope.ownerPersonId
+      && data.ownerAuthorizationRevision === scope.ownerAuthorizationRevision
+      && isDeepStrictEqual(data.primaryBinding, scope.binding)
+      && data.level === scope.level && data.preset === scope.preset
+  }
+
+  function recoveryStatus(scope, data = readShared()) {
+    const { mode } = scope
+    const branch = data.sessions[mode]
+    const unavailable = reason => ({ recoverable: false, recoverCheckpoint: null, recoverReason: reason })
+    if (!SHARED_MODES.includes(mode) || !branch || !data.enabled || !scope.enabled || !scope.binding || !scope.ownerPersonId
+      || !scope.ownerAuthorizationRevision) return unavailable('unavailable')
+    if (!recoveryScopeMatches(data, scope)) return unavailable('authorization-changed')
+    if (branch.state === 'recovering' || creating.has(mode) || checkpointRecoveries.has(mode)
+      || data.pendingOperations[mode]) return unavailable('busy')
+    if (branch.state === 'deleted') return unavailable('session-deleted')
+    if (branch.state !== 'paused') return unavailable('not-paused')
+    if (branch.recoverReason) return unavailable(branch.recoverReason)
+    if (typeof branch.sessionId !== 'string' || !branch.sessionId) return unavailable('session-unavailable')
+    const checkpoint = branch.verifiedThroughSeq
+    if (!Number.isSafeInteger(checkpoint) || checkpoint < 0) return unavailable('no-checkpoint')
+    return { recoverable: true, recoverCheckpoint: checkpoint, recoverReason: '' }
+  }
+
+  async function recoverFromCheckpoint(scope, { forkAtCheckpoint, verifyRecovered, isCurrent = () => true }) {
+    const snapshot = readShared()
+    const status = recoveryStatus(scope, snapshot)
+    if (!status.recoverable) return failing(status.recoverReason)
+    if (!isCurrent()) return failing('obsolete')
+    const { mode, ownerPersonId } = scope
+    const branch = snapshot.sessions[mode]
+    const checkpoint = status.recoverCheckpoint
+    const operation = {
+      kind: 'checkpoint-recovery', token: randomUUID(),
+      generation: branch.generation + 1, ownerPersonId, baseSessionId: branch.sessionId,
+    }
+    const parentPending = data => {
+      const currentBranch = data.sessions[mode]
+      return currentBranch.state === 'recovering' && currentBranch.generation === branch.generation
+        && currentBranch.sessionId === branch.sessionId && currentBranch.verifiedThroughSeq === checkpoint
+    }
+    const sameOperation = data => data.pendingOperations[mode]?.token === operation.token
+    const current = data => isCurrent() && data.enabled && data.mode === snapshot.mode
+      && data.routingRevision === snapshot.routingRevision && recoveryScopeMatches(data, scope)
+      && parentPending(data) && sameOperation(data)
+    const freshSessionId = sessionId => {
+      if (typeof sessionId !== 'string' || !sessionId || owns(sessionId)) return ''
+      // A controller must return a fresh child, never one of our ordinary sessions.
+      return Object.values(read().chats || {}).some(entry => entry?.sessionId === sessionId
+        || Object.values(entry?.sessions || {}).includes(sessionId)) ? '' : sessionId
+    }
+
+    let failureReason = 'recover-fork-unavailable'
+    checkpointRecoveries.add(mode)
+    try {
+      update(data => {
+        data.sessions[mode].state = 'recovering'
+        data.pendingOperations[mode] = operation
+      })
+
+      const child = await forkAtCheckpoint(branch, checkpoint)
+      const sessionId = freshSessionId(child?.sessionId)
+      if (!sessionId) return failing(current(readShared()) ? 'candidate-unavailable' : 'obsolete')
+      operation.sessionId = sessionId
+      if (!current(readShared())) return failing('obsolete')
+      // Persist ownership before inspecting the child so it cannot run unguarded during verification.
+      update(data => { data.pendingOperations[mode] = operation })
+      failureReason = 'candidate-unavailable'
+      const verified = await verifyRecovered(child, branch, checkpoint)
+      if (!current(readShared())) return failing('obsolete')
+      if (!verified) return failing(failureReason)
+      try {
+        await rename(sessionId, mode)
+      } catch (error) {
+        log?.warn?.('核验点恢复分支改名失败', error?.message)
+      }
+
+      if (!current(readShared())) return failing('obsolete')
+      const record = {
+        ...branch, state: 'active', generation: operation.generation, sessionId, verifiedThroughSeq: checkpoint,
+        baseSessionId: branch.sessionId, recoveredFrom: branch.sessionId, checkpointRecovery: true, forkedAt: Date.now(),
+      }
+      delete record.pauseReason
+      delete record.emptyReason
+      update(data => {
+        retire(data, mode, branch.sessionId, branch.generation)
+        data.sessions[mode] = record
+        delete data.pendingOperations[mode]
+        data.routingRevision++
+      })
+      return { ok: true, branch: record, sessionId, checkpoint }
+    } catch (error) {
+      if (error?.code === 'session/workspace-attach-failed') {
+        operation.sessionId ||= freshSessionId((error.data || error.details)?.sessionId)
+        failureReason = 'workspace-unavailable'
+      } else if (error?.code === 'session/not-found') {
+        failureReason = 'session-deleted'
+      } else {
+        const reason = error?.code?.startsWith?.('shared/') ? error.code.slice(7) : ''
+        if (['checkpoint-invalid', 'session-unavailable', 'session-deleted', 'workspace-unavailable',
+          'recover-fork-unavailable', 'candidate-unavailable'].includes(reason)) failureReason = reason
+      }
+      log?.warn?.('从共享会话核验点恢复失败', error?.message)
+      return failing(current(readShared()) ? failureReason : 'obsolete')
+    } finally {
+      try {
+        update(data => {
+          const ownOperation = sameOperation(data)
+          const retireChild = operation.sessionId && !sharedSessionExists(data, operation.sessionId)
+          if (!ownOperation && !retireChild) return false
+          if (retireChild) retirePendingSession(data, mode, operation)
+          if (ownOperation) {
+            if (parentPending(data)) {
+              if (['session-deleted', 'checkpoint-invalid'].includes(failureReason) && current(data)) {
+                data.sessions[mode].recoverReason = failureReason
+              }
+              data.sessions[mode].state = 'paused'
+            }
+            delete data.pendingOperations[mode]
+          }
+        })
+      } finally {
+        checkpointRecoveries.delete(mode)
+      }
+    }
   }
 
   function checkpoint(mode, sessionId, generation, seq) {
@@ -393,5 +549,9 @@ export function createSharedPrivateSessions({ read, write, fork, create, restore
     })
   }
 
-  return { sync, ensure, reset, owns, checkpoint, removeRetired, markRetiredArchive, read: readShared }
+  return {
+    sync, ensure, reset, owns, checkpoint, recoveryStatus, recoverFromCheckpoint,
+    isRecovering: mode => checkpointRecoveries.has(mode),
+    removeRetired, markRetiredArchive, read: readShared,
+  }
 }

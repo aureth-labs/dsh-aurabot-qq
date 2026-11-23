@@ -10,6 +10,7 @@ import { basename, isAbsolute, join, relative, resolve } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import { spawn } from 'node:child_process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { isDeepStrictEqual } from 'node:util'
 import { ownerAuthorizationRevision } from '../core/config.js'
 import { dataDir, readJson, writeJson } from '../core/store.js'
 import { isDefiniteFailure } from '../onebot/client.js'
@@ -1509,8 +1510,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (changed) saveMap(data)
   }
 
-  function sharedScope(primary = resolveSharedPrimary?.()) {
-    reconcileLegacyPrivateOwnershipProof()
+  function sharedScope(primary = resolveSharedPrimary?.(), { reconcile = true } = {}) {
+    if (reconcile) reconcileLegacyPrivateOwnershipProof()
     const cfg = getConfig()
     const binding = primary?.ok ? primary.binding : null
     const chat = binding ? chatFromId(binding.chatId) : null
@@ -1529,7 +1530,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const route = sessionRouteFor(chat, { cfg: getConfig(), identity, primary, ingress })
     if (route.kind !== 'multi-private') return null
     const scope = sharedScope(primary)
-    return scope.ownerAuthorizationRevision ? scope : null
+    return scope.ownerAuthorizationRevision && !sharedSessions.isRecovering(scope.mode) ? scope : null
   }
 
   function sharedAuthorized(turn) {
@@ -1689,24 +1690,121 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     return { ok: true, message: '已登记核对结果，下一轮将继承这段旧历史' }
   }
 
+  function checkpointError(reason, message, cause) {
+    return Object.assign(new Error(message, { cause }), { code: 'shared/' + reason })
+  }
+
+  function checkpointWorkspace(sessionId) {
+    try {
+      const registry = dsh.workspaceRegistry || dsh.get('workspaceRegistry')
+      const workspace = registry?.list?.().find(ws => ws.sessionIds?.includes(sessionId))
+      if (workspace?.path && statSync(workspace.path, { throwIfNoEntry: false })?.isDirectory()) return workspace
+    } catch (error) {
+      throw checkpointError('workspace-unavailable', '原共享工作区不可用', error)
+    }
+    throw checkpointError('workspace-unavailable', '原共享工作区不可用')
+  }
+
+  async function observeCheckpointPrefix(sessionId, checkpoint, scope, { includeFingerprint = true } = {}) {
+    let observation
+    try {
+      observation = await dsh.get('sessionQuery').observeSession(sessionId)
+    } catch (error) {
+      const reason = error?.code === 'SESSION_QUERY_SESSION_NOT_FOUND' ? 'session-deleted' : 'session-unavailable'
+      throw checkpointError(reason, '无法读取原共享会话', error)
+    }
+    try {
+      const { header, events, persistedEventCount } = observation
+      const boundary = events[checkpoint]
+      if (header.id !== sessionId || boundary?.seq !== checkpoint || boundary.type !== 'turn/end'
+        || (persistedEventCount !== undefined && persistedEventCount <= checkpoint)) {
+        throw checkpointError('checkpoint-invalid', '核验点没有指向已保存的轮次结束事件')
+      }
+      if (header.agentPreset && header.agentPreset !== scope.preset) {
+        throw checkpointError('session-unavailable', '原共享会话的预设与当前权限不一致')
+      }
+      const workspace = checkpointWorkspace(sessionId)
+      if (!includeFingerprint) return
+      return { header, workspaceId: workspace.id, fingerprint: historyFingerprint(events.slice(0, checkpoint + 1)) }
+    } finally { observation[Symbol.dispose]?.() }
+  }
+
+  function sharedRecoveryStatus(scope, data) {
+    const status = sharedSessions.recoveryStatus(scope, data)
+    if (!status.recoverable) return status
+    const busy = [...sharedTurns.values()].some(turn => turn.scope.mode === scope.mode)
+    const supported = dsh.get('sessionQuery')?.observeSession && dsh.sessions?.flush
+    if (busy || !supported) {
+      return { ...status, recoverable: false, recoverReason: busy ? 'busy' : 'session-unavailable' }
+    }
+    return status
+  }
+
+  async function recoverSharedFromCheckpoint(mode) {
+    assertActive()
+    if (!SHARED_MODES.includes(mode)) return { ok: false, reason: 'unavailable' }
+    const initialScope = sharedScope()
+    sharedSessions.sync(initialScope)
+    const scope = { ...initialScope, mode }
+    const status = sharedRecoveryStatus(scope)
+    if (!status.recoverable) return { ok: false, reason: status.recoverReason }
+    const cwd = workspaceDirOf(getConfig())
+    const persona = getConfig().persona?.current
+    const isCurrent = () => !disposed && isDeepStrictEqual(sharedScope(undefined, { reconcile: false }), initialScope)
+      && workspaceDirOf(getConfig()) === cwd && getConfig().persona?.current === persona
+    let source
+    return sharedSessions.recoverFromCheckpoint(scope, {
+      isCurrent,
+      forkAtCheckpoint: async (oldBranch, checkpoint) => {
+        source = await observeCheckpointPrefix(oldBranch.sessionId, checkpoint, scope)
+        if (!isCurrent()) throw checkpointError('obsolete', '恢复时共享配置已变化')
+        return controller().fork({ sessionId: oldBranch.sessionId, atSeq: checkpoint })
+      },
+      verifyRecovered: async ({ sessionId }, oldBranch, checkpoint) => {
+        const agent = await resolveAgent(sessionId)
+        await agent.whenIdle()
+        const parent = await observeCheckpointPrefix(oldBranch.sessionId, checkpoint, scope)
+        const { session, inbox } = agent
+        const count = checkpoint + 1
+        const verified = () => session.header.id === sessionId && session.header.parentSession === oldBranch.sessionId
+          && session.inheritedEventCount === count && session.header.cwd === source.header.cwd
+          && session.header.agentPreset === source.header.agentPreset
+          && historyFingerprint(session.snapshotEvents().slice(0, count)) === source.fingerprint
+          && sharedQuietHistory(session) && !inbox.nextTurn.length && inbox.nextStep.every(isSharedHostContext)
+        if (parent.fingerprint !== source.fingerprint || parent.workspaceId !== source.workspaceId
+          || !verified() || checkpointWorkspace(sessionId).id !== source.workspaceId) return false
+        if (!await dsh.sessions.flush(session)) {
+          throw checkpointError('session-unavailable', '恢复出的共享会话尚未保存')
+        }
+        return Boolean(verified()) && checkpointWorkspace(sessionId).id === source.workspaceId
+      },
+    })
+  }
+
   function sharedStatus(mode = getConfig().debug ? 'debug' : 'live') {
     const primary = resolveSharedPrimary?.()
     const reason = !gateway || primary?.reason === 'gateway-required' ? 'gateway-required'
       : sharedSupported() ? primary?.reason : 'host-unavailable'
     const available = !reason && primary?.ok && Boolean(ownerAuthorizationRevision(getConfig()))
-    const scope = { ...sharedScope(primary), mode }
-    if (available) sharedSessions.sync(scope)
+    const currentScope = sharedScope(primary)
+    const scope = { ...currentScope, mode }
+    if (available) sharedSessions.sync(currentScope)
     const data = sharedSessions.read()
     const snapshot = available ? map() : null
     const review = snapshot && legacyHistorySource(mode, scope, snapshot)
     const branch = data.sessions[mode]
+    const recovery = sharedRecoveryStatus(scope, data)
     const delivery = data.ownerAuthorizationRevision === scope.ownerAuthorizationRevision
       ? sharedDeliveryFailures.get(branch.sessionId)?.status : undefined
     return {
       enabled: getConfig().multiPlatformPrivateSession === true, available: Boolean(available), mode,
       binding: primary?.binding, reason,
-      state: data.pendingOperations[mode] ? 'pending-operation' : branch.state,
+      state: branch.state !== 'recovering' && data.pendingOperations[mode] ? 'pending-operation' : branch.state,
       emptyReason: branch.emptyReason, pauseReason: branch.pauseReason,
+      ...recovery,
+      recoverKey: recovery.recoverable
+        ? historyFingerprint([mode, data.routingRevision, branch.generation, branch.sessionId, recovery.recoverCheckpoint])
+        : '',
       lastDeliveryFailure: delivery,
       legacyHistoryAvailable: Boolean(review),
       legacyHistoryChanged: Boolean(review?.legacyPrefix),
@@ -1716,6 +1814,25 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       retiredArchivePending: Object.values(data.retiredSessions).filter(record => record.archiveState !== 'archived').length,
       retiredAudit: sharedAudit,
     }
+  }
+
+  async function preflightSharedRecovery(mode) {
+    const status = sharedStatus(mode)
+    if (!status.recoverable) return status
+    const scope = sharedScope(undefined, { reconcile: false })
+    const { sessionId } = sharedSessions.read().sessions[status.mode]
+    let reason = ''
+    try {
+      await observeCheckpointPrefix(sessionId, status.recoverCheckpoint, scope, { includeFingerprint: false })
+    } catch (error) {
+      reason = error?.code?.startsWith?.('shared/') ? error.code.slice(7) : 'session-unavailable'
+    }
+    const current = sharedStatus(status.mode)
+    if (disposed || current.recoverKey !== status.recoverKey
+      || !isDeepStrictEqual(sharedScope(undefined, { reconcile: false }), scope)) {
+      return { ...status, recoverable: false, recoverReason: 'obsolete' }
+    }
+    return { ...current, recoverable: !reason, recoverReason: reason }
   }
 
   function queueShared(task) {
@@ -1751,7 +1868,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (!primary?.ok || !sameChat(primary.binding.chatId, route.chatId)) return null
     if (!primaryCanSpeak(primary.binding)) return null
     const scope = sharedScope(primary)
-    return scope.ownerAuthorizationRevision ? scope : null
+    return scope.ownerAuthorizationRevision && !sharedSessions.isRecovering(scope.mode) ? scope : null
   }
 
   async function pushProactiveToSession(chat, content, senderId = '', opts = {}) {
@@ -6452,6 +6569,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     invalidateSharedSource,
     resetShared,
     sharedStatus,
+    preflightSharedRecovery,
+    recoverSharedFromCheckpoint,
     prepareLegacyHistory,
     confirmLegacyHistory,
     // 给模块用的出站清洗（和 QQ 投递同一套：工具标记 + 提示词复读 + 格式变体）。
