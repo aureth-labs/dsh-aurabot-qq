@@ -774,6 +774,35 @@ test('飞书共享回复使用原消息，首段后撤销时停止余下分段',
   assert.match(dispatched[0].url, /\/om_original\/reply$/)
 })
 
+test('飞书主动发送刷新令牌期间授权撤销时不重试发消息', async (t) => {
+  const client = makeFakeClient()
+  const adapter = createFeishuAdapter({ client })
+  t.after(() => adapter.stop())
+  await adapter.start(makeCtx(adapter, CFG))
+
+  let current = true
+  let sendAttempts = 0
+  let refreshes = 0
+  const request = client.request
+  client.request = async (req) => {
+    const response = await request(req)
+    if (req.url.includes('/tenant_access_token/')) {
+      refreshes++
+      current = false
+    }
+    if (req.url.includes('/im/v1/messages?') && ++sendAttempts === 1) {
+      return { status: 401, json: { code: 99991663 } }
+    }
+    return response
+  }
+
+  await assert.rejects(adapter.send({
+    chat: { kind: 'private', id: 'ou_alice' }, parts: [{ type: 'text', text: '这条不应在撤销后重试' }],
+  }, { proactiveGuard: () => current }), { code: 'reply-revoked', certainty: 'not-sent' })
+  assert.equal(refreshes, 1)
+  assert.equal(sendAttempts, 1)
+})
+
 test('长文本分条：超过 maxTextChars 拆成多条发出，内容不丢', async () => {
   const client = makeFakeClient()
   const adapter = createFeishuAdapter({ client })

@@ -33,6 +33,7 @@ import { createGateway } from '../../src/gateway/index.js'
 import { createIdentity } from '../../src/gateway/identity.js'
 import { fixedSharedPrimary } from '../../src/gateway/shared-private-route.js'
 import { checkMigrationPersistencePreflight, verifyPersistedInboxMessage } from '../../src/core/qq-gateway-migration.js'
+import chatTools from '../../src/modules/chat-tools/index.js'
 import { currentPromptSources } from '../../src/security/leak-guard.js'
 import { makeFakeAdapter } from '../helpers/fake-adapter.js'
 import { fakeFactory } from '../gateway/helpers.js'
@@ -677,6 +678,146 @@ it('queues two platforms on one DSH session and preserves reply credentials for 
     identity.close?.()
   }
 }, 15_000)
+
+it('sends to the owner on another platform without changing the shared reply or checkpoint path', async () => {
+  const plainText = '晚点再聊 ||| 仍是同一条文字'
+  const h = await harness({ responses: [
+    toolCallResponse('platform-send', 'send_to_platform', { platform: '飞书', text: plainText, rich: false }), textResponse('已经发给你了'),
+    toolCallResponse('platform-offline', 'send_to_platform', { platform: 'feishu', text: '飞书离线测试' }), textResponse('飞书暂时离线'),
+    toolCallResponse('platform-rejected', 'send_to_platform', { platform: 'feishu', text: '飞书拒绝测试' }), textResponse('飞书发送失败'),
+    toolCallResponse('platform-policy', 'send_to_platform', { platform: 'feishu', text: '出站限制测试' }), textResponse('出站策略拦下了飞书消息'),
+    toolCallResponse('platform-rich', 'send_to_platform', { platform: '飞书', text: '第一段<poke><reply:99> ||| 第二段' }), textResponse('分段也发出去了'),
+  ] })
+  vi.stubEnv('AURABOT_DATA_DIR', h.cwd)
+  const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() }
+  const identity = createIdentity({ dataDir: join(h.cwd, 'identity'), log })
+  const owner = identity.claimOwner('qq', '10001')
+  identity.link('feishu', 'ou_owner', owner, 'owner')
+  const cfg = normalize({
+    enabled: true, dryRun: false, ownerLevel: 'social', ownerPersonId: owner, ownerQQ: '10001',
+    ownerAuthorization: { owner, revision: '11111111-2222-4333-8444-555555555555' }, multiPlatformPrivateSession: true,
+    ownerPrimary: { platform: 'qq', instance: 'qq', account: '10001' },
+    platforms: { qq: { enabled: true }, feishu: { enabled: true } },
+    workspaceDir: h.cwd, merge: { enabled: false }, voice: { enabled: false }, stickers: { enabled: false },
+    chat: { thinkingGuard: { enabled: false } },
+  })
+  const gateway = createGateway({ config: cfg, dataDir: (...path) => join(h.cwd, ...path), identity, log })
+  const qq = makeFakeAdapter({ id: 'qq', self: { account: '20001' } })
+  const feishu = makeFakeAdapter({ id: 'feishu' })
+  gateway.register(() => qq)
+  gateway.register(() => feishu)
+  await gateway.sync()
+
+  const sessionId = SessionId('session-shared-explicit-platform')
+  const create = vi.fn(async () => {
+    await h.ctx.agentLoop.create(sessionId, { provider: 'mock', model: 'mock' }, { cwd: h.cwd })
+    return { sessionId }
+  })
+  h.ctx.provide('sessionController', { create, fork: vi.fn(), rename: vi.fn(),
+    resolveAgent: async id => ({ agent: h.ctx.agents.get(id) }),
+  } as never)
+  h.ctx.workspaceRegistry.list = () => [{ id: 'workspace', path: h.cwd }]
+  const flush = vi.spyOn(h.ctx.sessions, 'flush').mockResolvedValue(true)
+  const readBranch = async () => JSON.parse(await readFile(join(h.cwd, 'sessions.json'), 'utf8')).multiPrivate.sessions.live
+  const feishuSend = feishu.send.bind(feishu)
+  const sendCheckpoints: unknown[] = []
+  vi.spyOn(feishu, 'send').mockImplementation(async message => {
+    sendCheckpoints.push((await readBranch()).verifiedThroughSeq ?? null)
+    return feishuSend(message)
+  })
+  let buildChatTools: ((where) => any[]) | undefined
+  let executeSendToPlatform: ((args: { platform: string; text: string }) => Promise<unknown>) | undefined
+  const toolResults: unknown[] = []
+  const hub = createHub({
+    dsh: h.ctx, getConfig: () => cfg, log, gateway, identity,
+    resolveSharedPrimary: () => fixedSharedPrimary({ cfg, identity, instances: gateway.instances() }),
+    buildTools: where => (buildChatTools?.(where) || []).map(tool => {
+      if (tool.name !== 'send_to_platform') return tool
+      executeSendToPlatform = args => tool.execute(args)
+      return {
+        ...tool,
+        async execute(args, exec) {
+          const result = await tool.execute(args, exec)
+          toolResults.push(result)
+          return result
+        },
+      }
+    }),
+  })
+  chatTools.setup({ core: { hub, gateway, identity }, config: () => cfg, tool: builder => { buildChatTools = builder } })
+  const off = h.ctx.on('session/event', hub.onSessionEvent)
+  const submitted: Promise<unknown>[] = []
+  const stop = gateway.onMessage(message => { submitted.push(hub.onGatewayMessage(message)) })
+  async function submit(messageId: string, text: string) {
+    const index = submitted.length
+    qq.pushInbound({ messageId, chat: { kind: 'private', id: '10001' },
+      sender: { account: '10001', name: '主人' }, parts: [{ type: 'text', text }],
+    })
+    await vi.waitFor(() => expect(submitted).toHaveLength(index + 1))
+    await submitted[index]
+  }
+  try {
+    await submit('qq-send', '把“晚点再聊”发到飞书')
+    expect(toolResults).toMatchObject([{ ok: true, platform: 'feishu', instance: 'feishu', account: 'ou_owner', chatId: 'feishu:private:ou_owner' }])
+    expect(feishu.sent.map(record => record.payload)).toEqual([
+      { chat: { kind: 'private', id: 'ou_owner' }, parts: [{ type: 'text', text: plainText }], replyTo: undefined, inResponseTo: undefined },
+    ])
+    const firstBranch = await readBranch()
+    const agent = h.ctx.agents.get(sessionId)!
+    const turnEnds = () => agent.session.snapshotEvents().filter(event => event.type === 'turn/end')
+    expect(turnEnds()).toHaveLength(1)
+    expect(firstBranch.verifiedThroughSeq).toBe(turnEnds()[0].seq)
+    expect(sendCheckpoints).toEqual([null])
+
+    feishu.disconnect()
+    await submit('qq-offline', '再发一次给飞书')
+    expect(toolResults[1]).toMatchObject({ ok: false, message: expect.any(String) })
+    expect(sendCheckpoints).toHaveLength(1)
+    const offlineBranch = await readBranch()
+    expect(offlineBranch.verifiedThroughSeq).toBe(turnEnds()[1].seq)
+
+    feishu.reconnect()
+    feishu.failNext('not-sent', 'rejected')
+    await submit('qq-rejected', '再试一次飞书消息')
+    expect(toolResults[2]).toMatchObject({ ok: false, message: expect.any(String) })
+    const settle = vi.fn()
+    const outboundGuard = vi.fn(() => ({ action: 'allow', tier: 'broker', settle }))
+    hub.setOutboundGuard(outboundGuard)
+    await submit('qq-policy', '再发给飞书一次')
+    expect(outboundGuard).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ chatId: 'feishu:private:ou_owner', sourceModule: 'chat-tools' }))
+    expect(settle).toHaveBeenCalledExactlyOnceWith('failed')
+    expect(toolResults[3]).toMatchObject({ ok: false, message: expect.any(String) })
+    expect(sendCheckpoints).toEqual([null, offlineBranch.verifiedThroughSeq])
+    expect(qq.sent.map(({ payload }) => [payload.inResponseTo, payload.parts[0].text])).toEqual([
+      ['qq-send', '已经发给你了'], ['qq-offline', '飞书暂时离线'], ['qq-rejected', '飞书发送失败'], ['qq-policy', '出站策略拦下了飞书消息'],
+    ])
+    const lastBranch = await readBranch()
+    expect(lastBranch).toMatchObject({ sessionId: firstBranch.sessionId, generation: firstBranch.generation })
+    expect(turnEnds()).toHaveLength(4)
+    expect(lastBranch.verifiedThroughSeq).toBe(turnEnds()[3].seq)
+    expect(agent.session.deriveMessages().filter(message => message.role === 'user')).toHaveLength(4)
+    expect(h.adapter.requests).toHaveLength(8)
+    expect(flush).toHaveBeenCalledTimes(4)
+    expect(create).toHaveBeenCalledTimes(1)
+
+    hub.setOutboundGuard(null)
+    await submit('qq-rich', '把两句话发到飞书')
+    expect(toolResults[4]).toMatchObject({ ok: true, platform: 'feishu', sentCount: 2 })
+    expect(feishu.sent.slice(1).map(record => record.payload)).toEqual([
+      { chat: { kind: 'private', id: 'ou_owner' }, parts: [{ type: 'text', text: '第一段' }], replyTo: undefined, inResponseTo: undefined },
+      { chat: { kind: 'private', id: 'ou_owner' }, parts: [{ type: 'text', text: '第二段' }], replyTo: undefined, inResponseTo: undefined },
+    ])
+    expect(await executeSendToPlatform?.({ platform: 'feishu', text: '轮次结束后重放' })).toMatchObject({ ok: false })
+    expect(feishu.sent).toHaveLength(3)
+    expect(gateway.outbox.status().count).toBe(0)
+  } finally {
+    stop()
+    off()
+    hub.dispose()
+    await gateway.stopAll()
+    identity.close?.()
+  }
+}, 20_000)
 
 it('routes owner speakup through ordinary, fallback, live shared and normalized debug sessions', async () => {
   const h = await harness({ responses: [

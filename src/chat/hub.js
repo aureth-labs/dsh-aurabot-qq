@@ -49,6 +49,8 @@ import { SESSION_BACKOFF, isSessionBackoff } from './session-backoff.js'
 import { recordUsage, moduleLabel, moduleOfTool } from '../core/usage.js'
 import { normalizeChatId, parseChatId, sameChat, formatChatId } from '../gateway/address.js'
 import { sessionRouteFor } from '../gateway/shared-private-route.js'
+import { resolveSharedPlatformTarget } from '../gateway/shared-platform-target.js'
+import { makeSendError } from '../gateway/errors.js'
 import { createDedupe } from '../gateway/dedupe.js'
 import { createSharedPrivateSessions, selectSharedBase, sharedQuietHistory, sharedRetiredAuditPage, SHARED_MODES } from './shared-private-sessions.js'
 import { isSharedHostContext, registerSharedTurnGuard } from './shared-turn-guard.js'
@@ -1540,6 +1542,95 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     return sharedSessions.read().sessions[turn.scope.mode].generation === turn.branch.generation
   }
 
+  function canSendToSharedPlatform(sessionId, sourceChatId) {
+    const turn = sharedTurns.get(sessionKey(sessionId))
+    const cfg = getConfig()
+    return Boolean(gateway && cfg.enabled && cfg.multiPlatformPrivateSession === true && !cfg.dryRun && !cfg.debug
+      && turn?.scope.mode === 'live' && !turn.task.proactive && !turn.blocked && !turn.finished
+      && sameChat(turn.task.chat.chatId, sourceChatId) && sharedAuthorized(turn)
+      && turn.task.routingRevision === sharedSessions.read().routingRevision)
+  }
+
+  async function sendToSharedPlatform(sessionId, sourceChatId, args, exec) {
+    const key = sessionKey(sessionId)
+    const turn = sharedTurns.get(key)
+    const currentGateway = gateway
+    const callId = exec?.rootCallId || exec?.callId
+    const turnCurrent = () => gateway === currentGateway && sharedTurns.get(key) === turn && turn?.admitted
+      && exec?.agent === turn.agent && exec.name === 'send_to_platform' && !exec.signal?.aborted
+      && turn.calls.has(callId) && turnSendersAllOwner(sessionId) && canSendToSharedPlatform(sessionId, sourceChatId)
+    const denied = { ok: false, message: '此工具仅用于当前已经核验的主人共享私聊轮次。' }
+    if (!turnCurrent()) return denied
+
+    const text = typeof args.text === 'string' ? args.text.trim() : ''
+    if (!text) return { ok: false, message: '要发送的文字不能为空。' }
+    const rich = args?.rich !== false
+    const ownerPersonId = turn.scope.ownerPersonId
+    const resolveTarget = () => resolveSharedPlatformTarget({
+      platform: args.platform, instance: args.instance, account: args.account,
+      ownerPersonId, identity, gateway: currentGateway, ownerPrimary: turn.scope.binding, sourceChatId,
+    })
+    const target = resolveTarget()
+    if (!target.ok) return { ok: false, message: target.error }
+    const targetKey = JSON.stringify([target.platform, target.account])
+    const targetRevision = sharedSourceRevisions.get(targetKey) || 0
+    const isCurrent = () => turnCurrent() && identity.lookup(target.platform, target.account) === ownerPersonId
+      && (sharedSourceRevisions.get(targetKey) || 0) === targetRevision && resolveTarget().chatId === target.chatId
+    const sendOnce = () => withDefaultQqWork(target.chatId, () => withPromptCapture(turn.sources, () => deliver(target.chatId, text, {
+      ...(rich ? { rich: true } : { textOnly: true }),
+      proactive: true, isCurrent, sourceModule: 'chat-tools', proactiveCause: 'send_to_platform',
+      userText: turn.sources.userText,
+    })))
+    try {
+      let result = await sendOnce()
+      // 微信 ClawBot 的主动发送有 3 秒最小间隔；单条也没发出去时，等一个窗口后重试一次。
+      // 只有 sentCount===0 才重试，已有消息发出时绝不重放。
+      if (rich && target.platform === 'wechat-clawbot'
+        && Number(result?.sentCount) === 0 && Number(result?.failed) > 0 && isCurrent()) {
+        await new Promise(resolve => setTimeout(resolve, 3200))
+        if (!isCurrent()) return { ok: false, message: '发送前授权或目的地状态已变化，请重新发起请求。' }
+        result = await sendOnce()
+      }
+      if (!rich) {
+        if (reallySent(result)) return target
+        if (!isCurrent()) return { ok: false, message: '发送前授权或目的地状态已变化，请重新发起请求。' }
+        return { ok: false, message: '没有发送回执。内容可能为空、被拦截或目标暂不可用。' }
+      }
+      const sentCount = Number(result?.sentCount) || 0
+      const failedCount = Number(result?.failed) || 0
+      if (sentCount > 0 && failedCount === 0) {
+        return { ...target, sentCount, ...(result?.degraded ? { degraded: result.degraded } : {}) }
+      }
+      if (sentCount > 0 && failedCount > 0) {
+        const detail = !isCurrent()
+          ? `只发出了 ${sentCount} 条，剩余 ${failedCount} 条因授权或状态变化已停止。`
+          : `只发出了 ${sentCount} 条，有 ${failedCount} 条发送失败${result?.errors?.[0] ? `：${result.errors[0]}` : '。'}`
+        return {
+          ok: false,
+          partial: true,
+          platform: target.platform,
+          instance: target.instance,
+          account: target.account,
+          chatId: target.chatId,
+          sentCount,
+          failedCount,
+          ...(result?.degraded ? { degraded: result.degraded } : {}),
+          message: detail,
+        }
+      }
+      if (!isCurrent()) return { ok: false, message: '发送前授权或目的地状态已变化，请重新发起请求。' }
+      if (result?.emptyRich) return { ok: false, message: '没有可发送的文字、语音、表情或图片内容。' }
+      return { ok: false, message: result?.errors?.[0] || '没有发送回执。内容可能为空、被拦截或目标暂不可用。' }
+    } catch (error) {
+      const reason = sharedDeliveryFailureReason(error)
+      if (reason === 'uncertain') return { ok: false, message: '平台未确认是否送达，请先核对目标平台的消息。' }
+      if (reason === 'offline') return { ok: false, message: '目标平台实例未连接。' }
+      if (error?.code === 'broker-review-required') return { ok: false, message: '出站策略要求由引擎代发，当前工具无法直接发送。' }
+      if (!isCurrent()) return { ok: false, message: '发送前授权或目的地状态已变化，请重新发起请求。' }
+      return { ok: false, message: '目标平台发送失败。' }
+    }
+  }
+
   function sharedSenderCurrent(task) {
     if (task.proactive) {
       const cfg = getConfig()
@@ -2656,6 +2747,11 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         log.info(`出站被策略拦下（${verdict.reason || 'deny'}）→ ${chatId}：${opts.sourceModule || opts.enginePolicy || ''} [${note || ''}]`)
         return null
       }
+      if (opts.textOnly && verdict.tier === 'broker') {
+        // 代发可能排队或开启另一轮处理，此处只接受实时投递。
+        settleOutbound(verdict, 'failed')
+        throw makeSendError('not-sent', 'broker-review-required', undefined, '出站策略要求代发')
+      }
       // 往下走的是真实出口：成功后结算成 sent（失败/异常分支各自结算成 failed）
       opts = { ...opts, sourceModule: undefined, enginePolicy: undefined, cause: undefined, itemId: undefined }
     }
@@ -2682,6 +2778,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     }
     // 钩子可能重新写入工具标记；最终网关出口仍使用同一份清洗。
     message = cleanOutboundSegments(message, cleaning)
+    if (opts.textOnly && message.some(segment => segment.type !== 'text')) return settleOutboundFailed(verdict)
     if (!message.length || disposed || isDefaultQqPaused(chatId) || (isCurrent && !isCurrent())) return settleOutboundFailed(verdict)
     const cap = captureStore.getStore()
     if (cap) {
@@ -2725,6 +2822,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         if (caps?.voice === 'native' && addrSeg?.platform !== defaultPlatform()) {
           parts = await nativeVoiceParts(parts)
         }
+        if (opts.textOnly && (replyTo || parts.some(part => part.type !== 'text'))) return settleOutboundFailed(verdict)
         if (caps?.proactive === 'none' && !responseTo && !force) {
           const list = passivePending.get(chatId) || []
           list.push({ chatId: normSegId, parts, replyTo, note, timeoutMs })
@@ -2743,6 +2841,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
           inResponseTo: responseTo,
           timeoutMs,
         }, gatewaySendGuard(opts))
+        if (opts.textOnly && !reallySent(sent)) {
+          throw makeSendError('unknown', 'missing-send-receipt', addrSeg?.instance, '平台未确认发送结果')
+        }
         if (opts.proactiveGuard && (!sent?.messageId || sent.queued)) throw new Error('主动搭话未获得发送回执')
         if (sent?.messageId && !sent?.queued) {
           addSentId(normSegId, sent.messageId)
@@ -2760,7 +2861,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         bump('errors')
         const detail = (sharedReply && opts.onSharedDeliveryError?.(error)) || (sensitive ? '敏感命令回执发送失败' : error.message)
         log.warn(`发到 ${chatId} 失败（网关）：`, detail)
-        settleOutbound(verdict, 'failed')
+        settleOutbound(verdict, opts.textOnly && error?.certainty === 'unknown' ? 'uncertain' : 'failed')
         if (throwOnError || !quiet) throw error
         return null
       }
@@ -2813,7 +2914,10 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (d.url) media.url = String(d.url)
     else if (/^https?:\/\//i.test(file)) media.url = file
     else if (file.startsWith('base64://')) media.bytes = Buffer.from(file.slice(9), 'base64')
-    else if (file.startsWith('file://')) media.path = file.replace(/^file:\/+(?=[A-Za-z]:)/, '').replace(/^file:\/\//, '')
+    else if (file.startsWith('file://')) {
+      const raw = file.replace(/^file:\/+(?=[A-Za-z]:)/, '').replace(/^file:\/\//, '')
+      try { media.path = decodeURIComponent(raw) } catch { media.path = raw }
+    }
     else if (file) media.id = file
     if (d.name) media.name = String(d.name)
     if (d.mime || defaultMime) media.mime = String(d.mime || defaultMime)
@@ -3300,6 +3404,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       ...(userId ? [{ type: 'mention', account: String(userId) }] : []),
       part,
     ]
+    const sentBefore = outputScope.getStore()?.sent || 0
     try {
       const r = await sendParts(chatId, parts, {
         replyTo: replyId,
@@ -3312,11 +3417,20 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         sensitive: opts.sensitive,
         sharedReply: opts.sharedReply,
       })
-      if (!r || (Array.isArray(r.degraded) && r.degraded.includes('sticker dropped'))) return false
+      if (!r || (Array.isArray(r.degraded) && r.degraded.includes('sticker dropped'))) {
+        const store = outputScope.getStore()
+        if (store && store.sent > sentBefore) store.sent = sentBefore
+        return false
+      }
+      if (Array.isArray(r.degraded) && r.degraded.includes('sticker→image')) {
+        opts.onDegraded?.('sticker-image')
+      }
       stickers.markUsed?.(item.md5)
       bump('stickers')
       return true
     } catch (error) {
+      const store = outputScope.getStore()
+      if (store && store.sent > sentBefore) store.sent = sentBefore
       if (opts.throwOnError) throw error
       if (!opts.quiet) failStore.getStore()?.push(error?.message || String(error))
       return false
@@ -3383,7 +3497,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       groupEngagedRun.delete(gid)
       groupInterjects.set(gid, [...(groupInterjects.get(gid) || []), Date.now()].slice(-60))
     }
-    return { silent: true }
+    return { silent: true, sentCount: 0, failed: 0, errors: [], sent: '', missedAt: [] }
   }
 
   /**
@@ -3492,21 +3606,36 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       }
       text = guarded.text
     }
+    if (opts.textOnly) {
+      // 保留出站策略与清洗，整条内容作为文本交给平台，不解析消息、媒体或引用指令。
+      const receipt = await sendSegments(chatId, [{ type: 'text', data: { text } }], '指定平台发送', {
+        textOnly: true, sourceModule: opts.sourceModule, cause: opts.proactiveCause,
+      })
+      if (reallySent(receipt)) logChat(chatId, 'bot', text, '', { proactive: opts.proactiveCause })
+      return receipt
+    }
+    const rich = Boolean(opts.rich)
+    const allowedRichKinds = new Set(['text', 'voice', 'sticker', 'image'])
+    const filterRichItems = (list) => list
+      .filter((item) => item && allowedRichKinds.has(item.kind))
+      .map((item) => (item.replyTo ? (({ replyTo: _drop, ...rest }) => rest)(item) : item))
+
     const r = parseReply(text, cleaningFor(chatId))
     if (r.silent) return silenceTurn(chatId)
-    let items = r.items
+    let items = rich ? filterRichItems(r.items) : r.items
+    if (rich && !items.length) return { ...silenceTurn(chatId), emptyRich: true }
     // 分条发出的中间段（chat.everyStep）：只发她当时说的原话，不做语音转换、不补表情、不按概率改形态，
     // 免得一段闲聊被拆成语音条和表情乱入。标签、markdown 图片照旧解析。
     const interim = Boolean(opts.interim)
     const voiceAllowed = !platformVoiceDisabled(chatId)
     // 对方明确要语音、她却只打了字：整段改成语音发（模型偶尔会忘，这里兜底）
-    if (!interim && voiceAllowed && opts.wantVoice && cfg.voice.enabled && !items.some((i) => i.kind === 'voice')) {
+    if (!rich && !interim && voiceAllowed && opts.wantVoice && cfg.voice.enabled && !items.some((i) => i.kind === 'voice')) {
       const spoken = items.filter((i) => i.kind === 'text').map((i) => i.value).join('，')
       if (spoken && spoken.length <= 300) items = [{ kind: 'voice', value: spoken }, ...items.filter((i) => i.kind !== 'text')]
     }
     // 短回复按概率整条变语音
     const texts = items.filter((i) => i.kind === 'text')
-    if (!interim && voiceAllowed && cfg.voice.enabled && items.length === texts.length && texts.length > 0) {
+    if (!rich && !interim && voiceAllowed && cfg.voice.enabled && items.length === texts.length && texts.length > 0) {
       const all = texts.map((t) => t.value).join('，')
       if (all.length <= cfg.voice.autoMaxChars && Math.random() < cfg.voice.autoChance * mood().voice) items = [{ kind: 'voice', value: all }]
     }
@@ -3516,7 +3645,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     // 群里别刷屏：一段最多 3 条
     if (inGroup && items.length > 3) items = items.slice(0, 3)
     // 按概率补一张表情（群里已经有两条以上就不补了）
-    if (!interim && cfg.stickers.enabled && !items.some((i) => i.kind === 'sticker') && !(inGroup && items.length >= 2) && Math.random() < cfg.stickers.autoChance * mood().sticker) {
+    if (!rich && !interim && cfg.stickers.enabled && !items.some((i) => i.kind === 'sticker') && !(inGroup && items.length >= 2) && Math.random() < cfg.stickers.autoChance * mood().sticker) {
       const pick = stickers.pickForReply(texts.map((t) => t.value).join(' '))
       if (pick) items.push({ kind: 'sticker', value: pick })
     }
@@ -3524,7 +3653,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       try {
         const next = await hooks.items(items, { chatId, text, userText: opts.userText || '' })
         if (next === null) return log.info(`${chatId}：扩展模块拦下了这次回复`)
-        if (Array.isArray(next)) items = next
+        if (Array.isArray(next)) items = rich ? filterRichItems(next) : next
       } catch (error) {
         log.warn('扩展模块改写回复出错：', error.message)
       }
@@ -3535,7 +3664,30 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       data: { text: item.value }, item,
     })), { ...cleaningFor(chatId), allowPromptEcho: false, onPromptDecision: (allow) => { outputScope.getStore().allowPromptEcho = allow } })
       .map((seg) => seg.type === 'text' ? { ...seg.item, value: seg.data.text } : seg.item)
-    if (!items.length) return silenceTurn(chatId)
+    if (rich) items = filterRichItems(items)
+    if (!items.length) return rich ? { ...silenceTurn(chatId), emptyRich: true } : silenceTurn(chatId)
+
+    let richVerdict = null
+    if (rich && wantsOutbound(opts)) {
+      richVerdict = passOutbound({
+        chatId,
+        text,
+        sourceModule: opts.sourceModule,
+        enginePolicy: opts.enginePolicy,
+        cause: opts.proactiveCause || opts.cause,
+        itemId: opts.itemId,
+        kind: 'segments',
+      })
+      if (richVerdict.action === 'deny') {
+        log.info(`出站被策略拦下（${richVerdict.reason || 'deny'}）→ ${chatId}：${opts.sourceModule || opts.enginePolicy || ''}`)
+        return { missedAt: [], failed: 1, errors: ['出站被策略拦下。'], sent: '', sentCount: 0 }
+      }
+      if (richVerdict.tier === 'broker') {
+        settleOutbound(richVerdict, 'failed')
+        throw makeSendError('not-sent', 'broker-review-required', undefined, '出站策略要求代发')
+      }
+    }
+
     // 一段只有一个人明确 @ / 引用她时，第一条回复引用并 @ 那个人；多人同时叫她不猜。
     // 模型明确选了引用编号时尊重它，不再自动引用另一条。
     const refs = inGroup ? groupRefs.get(chatGid) || {} : {}
@@ -3545,9 +3697,16 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const failures = []
     const interacted = new Set()
     const sentTexts = [] // 实际成功发出的文字/语音正文：桥接与返回值只认这些，没发出去的话不能算说过
+    const sentItems = []
+    let interrupted = false
+    let degraded = ''
+    let lastItemError = null
     await failStore.run(failures, async () => {
       for (let i = 0; i < items.length; i++) {
-        if (disposed || (opts.shared && !opts.shared.isCurrent()) || (opts.isCurrent && !opts.isCurrent())) return
+        if (disposed || (opts.shared && !opts.shared.isCurrent()) || (opts.isCurrent && !opts.isCurrent())) {
+          if (rich) interrupted = true
+          return
+        }
         const it = items[i]
         const selected = it.replyTo ? refs[it.replyTo] : (!explicit && i === firstSendable ? opts.autoReply : null)
         const replyId = selected?.mid
@@ -3557,28 +3716,146 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         // 这条真发出去没有，看 outputScope 的 sent 计数有没有涨（sendSegments 只在真发/捕获时计数；
         // dry-run 与总开关关闭都不涨 → sentTexts 为空，她没说出口的话不能算说过）。#211 review 二轮。
         const sentBefore = outputScope.getStore().sent
-        if (it.kind === 'text') await sendText(chatId, it.value, replyId, missedAt, userId)
-        else if (it.kind === 'voice') {
-          if (cfg.voice.enabled && voiceAllowed) await sendVoice(chatId, it.value, replyId, userId)
-          else await sendText(chatId, it.value, replyId, missedAt, userId)
-        } else if (it.kind === 'sticker') await sendSticker(chatId, it.value, replyId, userId)
-        else if (it.kind === 'poke') { if (!opts.simulate) await pokeBack(chatId) }
-        else if (it.kind === 'image') {
-          if (localImageBlocked(chatId, it.value)) log.warn(`${chatId}：回复里的本机图片不在允许的目录里，没发`)
-          else await sendImage(chatId, it.value, replyId, userId)
+        const runItem = async () => {
+          if (it.kind === 'text') await sendText(chatId, it.value, replyId, missedAt, userId)
+          else if (it.kind === 'voice') {
+            const capVoiceOk = gateway?.caps?.(chatId)?.voice !== false && typeof tts?.speak === 'function'
+            if (cfg.voice.enabled && voiceAllowed && (!rich || capVoiceOk)) {
+              const ok = await sendVoice(chatId, it.value, replyId, userId)
+              if (!ok && rich && outputScope.getStore().sent > sentBefore) degraded ||= 'voice-fallback'
+            } else {
+              await sendText(chatId, it.value, replyId, missedAt, userId)
+              if (rich && outputScope.getStore().sent > sentBefore) degraded ||= 'voice-fallback'
+            }
+          } else if (it.kind === 'sticker') {
+            if (rich) {
+              if (!cfg.stickers?.enabled) {
+                failures.push('表情包功能已关闭，无法发送表情。')
+                return
+              }
+              const stickerCaps = gateway?.caps?.(chatId)
+              // sticker=false 但 image=true 时，网关会把表情降级成图片；不能提前拒绝。
+              if (stickerCaps?.sticker === false && stickerCaps?.image !== true) {
+                failures.push('目标平台不支持发送表情包。')
+                return
+              }
+              const matchedSticker = (it.value && typeof it.value === 'object') ? it.value : stickers.match?.(it.value)
+              if (!matchedSticker) {
+                failures.push(`表情库中未找到「${it.value}」。`)
+                return
+              }
+              const ok = await sendSticker(chatId, matchedSticker, replyId, userId, {
+                throwOnError: true,
+                ...(opts.isCurrent ? { isCurrent: opts.isCurrent } : {}),
+                onDegraded: kind => { if (kind === 'sticker-image') degraded ||= 'sticker-image' },
+              })
+              if (!ok && outputScope.getStore().sent <= sentBefore) {
+                failures.push(`表情「${matchedSticker.name || it.value}」发送失败。`)
+              }
+            } else {
+              await sendSticker(chatId, it.value, replyId, userId)
+            }
+          } else if (it.kind === 'poke') {
+            if (!opts.simulate) await pokeBack(chatId)
+          } else if (it.kind === 'image') {
+            if (rich) {
+              if (gateway?.caps?.(chatId)?.image === false) {
+                failures.push('目标平台不支持发送图片。')
+                return
+              }
+              if (localImageBlocked(chatId, it.value)) {
+                failures.push('本机图片路径不在允许发送的目录里。')
+                return
+              }
+              const result = await sendImage(chatId, it.value, replyId, userId, {
+                throwOnError: true,
+                ...(opts.isCurrent ? { isCurrent: opts.isCurrent } : {}),
+              })
+              if (!result && outputScope.getStore().sent <= sentBefore) failures.push('图片发送失败。')
+            } else {
+              if (localImageBlocked(chatId, it.value)) log.warn(`${chatId}：回复里的本机图片不在允许的目录里，没发`)
+              else await sendImage(chatId, it.value, replyId, userId)
+            }
+          }
         }
-        if (outputScope.getStore().sent > sentBefore) {
-          if (selected?.uid) interacted.add(String(selected.uid))
-          if ((it.kind === 'text' || it.kind === 'voice') && String(it.value || '').trim()) sentTexts.push(it.value)
+        if (rich) {
+          const failLenBefore = failures.length
+          try {
+            await runItem()
+          } catch (error) {
+            lastItemError = error
+            failures.push(error?.message || String(error))
+            if (outputScope.getStore().sent > sentBefore) sentItems.push(it)
+            if (error?.certainty === 'unknown' || sharedDeliveryFailureReason(error) === 'offline') {
+              const skipped = Math.max(0, items.length - i - 1)
+              for (let k = 0; k < skipped; k++) failures.push('前面消息未确认送达，后续气泡已停止发送')
+              break
+            }
+            continue
+          }
+          if (outputScope.getStore().sent > sentBefore) {
+            sentItems.push(it)
+            if (selected?.uid) interacted.add(String(selected.uid))
+            if ((it.kind === 'text' || it.kind === 'voice') && String(it.value || '').trim()) sentTexts.push(it.value)
+          } else if (failures.length === failLenBefore) {
+            if (opts.isCurrent && !opts.isCurrent()) {
+              interrupted = true
+              return
+            }
+            failures.push(`${it.kind === 'voice' ? '语音' : it.kind === 'sticker' ? '表情' : '消息'}未发送成功。`)
+          }
+        } else {
+          await runItem()
+          if (outputScope.getStore().sent > sentBefore) {
+            sentItems.push(it)
+            if (selected?.uid) interacted.add(String(selected.uid))
+            if ((it.kind === 'text' || it.kind === 'voice') && String(it.value || '').trim()) sentTexts.push(it.value)
+          }
+          if (i < items.length - 1 && !opts.simulate) await pause(bubbleDelay(items[i + 1].kind === 'text' ? items[i + 1].value : '') * mood().delay)
         }
-        if (i < items.length - 1 && !opts.simulate) await pause(bubbleDelay(items[i + 1].kind === 'text' ? items[i + 1].value : '') * mood().delay)
+        // 微信 ClawBot 的主动发送最小间隔为 3 秒；富内容多气泡不能连续打满频控。
+        if (rich && i < items.length - 1 && !opts.simulate
+          && parseChatId(chatId)?.platform === 'wechat-clawbot') {
+          await new Promise(resolve => setTimeout(resolve, 3200))
+        }
       }
     })
-    if (disposed || (opts.shared && !opts.shared.isCurrent()) || (opts.isCurrent && !opts.isCurrent())) return
-    if (outputScope.getStore().blocked && !outputScope.getStore().sent) return silenceTurn(chatId)
+    const sentCount = outputScope.getStore().sent
+    if (disposed || (opts.shared && !opts.shared.isCurrent()) || (opts.isCurrent && !opts.isCurrent()) || interrupted) {
+      settleOutbound(richVerdict, sentCount > 0 ? 'sent' : 'failed')
+      if (rich) {
+        if (sentCount > 0) {
+          const remaining = Math.max(0, items.length - sentItems.length)
+          if (remaining > 0) {
+            const extraFailures = failures.length ? failures : new Array(remaining).fill('发送途中授权或状态已变化')
+            const saidSent = itemsToLine(sentItems, (q) => stickers.match(q))
+            if (saidSent) logChat(chatId, 'bot', saidSent, '', { interaction: [...interacted], ...(opts.proactiveCause && { proactive: opts.proactiveCause }) })
+            return { missedAt, failed: extraFailures.length, errors: extraFailures, sent: sentTexts.join(' '), sentCount, ...(degraded ? { degraded } : {}) }
+          }
+        } else {
+          return undefined
+        }
+      } else {
+        return
+      }
+    }
+    if (rich) {
+      if (sentCount === 0 && lastItemError) {
+        settleOutbound(richVerdict, lastItemError?.certainty === 'unknown' ? 'uncertain' : 'failed')
+        throw lastItemError
+      }
+      settleOutbound(richVerdict, sentCount > 0 ? 'sent' : 'failed')
+    }
+    if (!rich && outputScope.getStore().blocked && !sentCount) return silenceTurn(chatId)
     if (opts.simulate) return items
     // 一条都没发出去：不记流水，她没说出口的话不能算说过
-    if (failures.length && failures.length >= items.filter((i) => i.kind !== 'poke').length) return { missedAt, failed: failures.length, errors: failures, sent: sentTexts.join(' ') }
+    if (failures.length && failures.length >= items.filter((i) => i.kind !== 'poke').length) {
+      if (rich && sentCount > 0) {
+        const saidSent = itemsToLine(sentItems, (q) => stickers.match(q))
+        if (saidSent) logChat(chatId, 'bot', saidSent, '', { interaction: [...interacted], ...(opts.proactiveCause && { proactive: opts.proactiveCause }) })
+      }
+      return { missedAt, failed: failures.length, errors: failures, sent: sentTexts.join(' '), sentCount, ...(degraded ? { degraded } : {}) }
+    }
     if (inGroup) {
       const gid = chatGid
       const said = (groupSaid.get(gid) || []).filter((t) => Date.now() - t < 3600_000)
@@ -3589,16 +3866,16 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (sentTexts.length && typeof opts.onDelivered === 'function') {
       try { opts.onDelivered() } catch (error) { log.warn('发送回执处理出错：', error.message) }
     }
-    const said = itemsToLine(items, (q) => stickers.match(q))
+    const said = itemsToLine(rich ? sentItems : items, (q) => stickers.match(q))
     logChat(chatId, 'bot', said, '', { interaction: [...interacted], ...(opts.proactiveCause && { proactive: opts.proactiveCause }) })
     // 不是这个聊天自己那一轮发的（主人在私聊里让她去群里说、扩展模块代发）：记下来，下次这个聊天交给她时告诉她自己说过什么。
     // 只记实际发出去的文本（sentTexts），且试运行（dryRun）没真发也不记——她没说出口的话不能算说过（#211 review）。
-    if (!opts.own && sentTexts.length && !cfg.dryRun) saidElsewhere.set(chatId, [...(saidElsewhere.get(chatId) || []), { at: Date.now(), text: sentTexts.join(' ').slice(0, 300) }].slice(-5))
+    if (!rich && !opts.own && sentTexts.length && !cfg.dryRun) saidElsewhere.set(chatId, [...(saidElsewhere.get(chatId) || []), { at: Date.now(), text: sentTexts.join(' ').slice(0, 300) }].slice(-5))
     lastChatAt = Date.now()
     if (parseChatId(chatId)?.kind === 'private') touchPrivateAt(chatId, lastChatAt)
     if (isOwnerPrivateChat(ownerRef(), chatId)) lastBotToOwner = { at: Date.now(), text: items.filter((i) => i.kind === 'text' || i.kind === 'voice').map((i) => i.value).join('\n') }
     onActivity?.({ kind: 'out', chatId, reply: text, userText: opts.userText || '' })
-    return { missedAt, failed: failures.length, errors: failures, sent: sentTexts.join(' ') }
+    return { missedAt, failed: failures.length, errors: failures, sent: sentTexts.join(' '), sentCount, ...(degraded ? { degraded } : {}) }
   }
 
   // ---------- 盯 DSH 会话：一轮结束就发 ----------
@@ -6719,6 +6996,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     sharedStatus,
     preflightSharedRecovery,
     recoverSharedFromCheckpoint,
+    canSendToSharedPlatform,
+    sendToSharedPlatform,
     prepareLegacyHistory,
     confirmLegacyHistory,
     // 给模块用的出站清洗（和 QQ 投递同一套：工具标记 + 提示词复读 + 格式变体）。

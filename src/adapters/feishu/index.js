@@ -1713,7 +1713,7 @@ export function createFeishuAdapter(options = {}) {
           } else {
             // receive_id_type 按 ID 前缀判定（ou_/on_/oc_），认不出才退回 kind
             const idType = receiveIdTypeOf(chat.id, isGroup ? 'chat_id' : 'open_id')
-            r = await api('POST', `${PATH_SEND_MESSAGE}?receive_id_type=${idType}`, { receive_id: String(chat.id || ''), ...payload }, { timeoutMs })
+            r = await api('POST', `${PATH_SEND_MESSAGE}?receive_id_type=${idType}`, { receive_id: String(chat.id || ''), ...payload }, { timeoutMs, beforeDispatch })
           }
         } catch (error) {
           throw classifyThrown(error)

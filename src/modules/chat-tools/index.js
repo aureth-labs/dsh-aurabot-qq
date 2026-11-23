@@ -2,7 +2,7 @@
 // 提供历史消息查询（chat_history，按 message.history.read 能力动态挂撤）、
 // 本地聊天流水搜索（search_chatlog）、主动跨聊天发消息（send_message）与发文件（send_file）。
 
-import { defineTool, str, int } from '../../tools/tools.js'
+import { defineTool, str, int, bool } from '../../tools/tools.js'
 import { normalizeChatId, parseChatId, sameChat } from '../../gateway/address.js'
 import { allowMatches, isOwner } from '../../chat/access.js'
 import { renderParts } from '../../gateway/render.js'
@@ -212,6 +212,32 @@ export default {
       const curAddr = curCid ? parseChatId(curCid) : null
       const crossRead = cfg.group?.crossRead || 'private'
       const tools = []
+
+      if (chat.kind === 'private' && gw && hub?.canSendToSharedPlatform?.(sessionId, chat.chatId)) {
+        tools.push(defineTool({
+          name: 'send_to_platform',
+          description: '仅在主人明确要求时，把消息另发给主人自己已绑定的其他平台私聊（默认支持 ||| 多条气泡、<voice>…</voice> 语音、<sticker:名字> 表情、![图片](地址) 图片，传 rich:false 则按纯文本原样发送；仅正式共享私聊可用，试运行/调试模式不会真正发到其他平台）。当前聊天请直接回复。多个已绑定账号或连接无法确定时请先向主人确认。',
+          properties: {
+            platform: str('目的平台，如 qq、飞书、微信 / wechat-clawbot、qqbot / QQ官方机器人、bridge'),
+            text: str('要发送的内容；默认支持 ||| 分多条、<voice>…</voice> 发语音、<sticker:名字> 发表情、![图片](地址或本地路径) 发图片'),
+            instance: str('可选。指定平台的连接实例，例如 qq#2'),
+            account: str('可选。主人在指定平台已绑定的账号'),
+            rich: bool('可选，默认 true（解析 ||| 拆条、<voice> 语音、<sticker:名字> 表情、![图片] 图片）；需要原样发送纯文本时传 false'),
+          },
+          required: ['platform', 'text'],
+          execute: (args, exec) => hub.sendToSharedPlatform(sessionId, chat.chatId, args, exec),
+          render: (_args, result) => {
+            const note = result.degraded === 'voice-fallback'
+              ? '（语音已降级为文字发送）'
+              : result.degraded === 'sticker-image'
+                ? '（表情已降级为图片发送）'
+                : ''
+            return [{ type: 'text', text: result.ok
+              ? `已发送到 ${result.platform}（${result.instance}，账号 ${result.account}）${note}`
+              : result.message }]
+          },
+        }))
+      }
 
       if (historyAvailable(chat, features)) {
         tools.push(defineTool({
@@ -491,10 +517,14 @@ export default {
     })
 
     if (typeof api.context === 'function') {
-      api.context(({ chat, features: chatFeatures }) => {
+      api.context(({ chat, sessionId, features: chatFeatures }) => {
         if (!chat || chat.kind === 'system') return ''
-        if (!historyAvailable(chat, chatFeatures)) return ''
-        return '- 想翻这个聊天更早的记录，用 chat_history。'
+        const lines = []
+        if (historyAvailable(chat, chatFeatures)) lines.push('- 想翻这个聊天更早的记录，用 chat_history。')
+        if (chat.kind === 'private' && api.core?.gateway && hub?.canSendToSharedPlatform?.(sessionId, chat.chatId)) {
+          lines.push('- 只有主人明确要求把消息另发到其他平台时才调用 send_to_platform，不得自行决定另发；当前聊天直接回复。')
+        }
+        return lines.join('\n')
       })
     }
 
