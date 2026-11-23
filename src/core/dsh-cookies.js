@@ -9,11 +9,48 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { normalizeToolPath } from './tools.js'
+import { compareVersions } from './update.js'
 
 const WIN = process.platform === 'win32'
+const NATIVE_CLEANUP_MIN_VERSION = '0.2.2'
+const NATIVE_CLEANUP_MIN_PRERELEASE = ['rc', '2']
+const DSH_VERSION = /^v?((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/
+const NUMERIC_IDENTIFIER = /^\d+$/
 const SCRIPT_PATH = fileURLToPath(new URL('../scripts/clean-dsh-cookies.py', import.meta.url))
 const AUTH_FILTER = "host_key IN ('127.0.0.1', 'localhost', '[::1]', '::1') AND name GLOB 'dsh-auth-*'"
 const DSH_IMAGE = 'DeepSeek Harness.exe'
+
+function comparePrerelease(ids, minimum) {
+  for (let i = 0; i < Math.min(ids.length, minimum.length); i++) {
+    const a = ids[i]
+    const b = minimum[i]
+    if (a === b) continue
+    const aNumeric = NUMERIC_IDENTIFIER.test(a)
+    const bNumeric = NUMERIC_IDENTIFIER.test(b)
+    if (aNumeric !== bNumeric) return aNumeric ? -1 : 1
+    if (aNumeric && a.length !== b.length) return a.length - b.length
+    // SemVer 的文本标识符按 ASCII 顺序比较，等长数字也可直接比较。
+    return a < b ? -1 : 1
+  }
+  return ids.length - minimum.length
+}
+
+export function isDshCookieCleanupManaged(env = process.env) {
+  // DSH Desktop 在启动 Host 子进程时传入当前桌面构建版本。
+  const version = DSH_VERSION.exec(String(env.DSH_CLIENT_VERSION || '').trim())
+  if (!version) return false
+  const [, core, prerelease] = version
+  const ids = prerelease?.split('.') ?? []
+  if (ids.some(id => /^0\d+$/.test(id))) return false
+
+  const order = compareVersions(core, NATIVE_CLEANUP_MIN_VERSION)
+  if (order !== 0) return order > 0
+  return !ids.length || comparePrerelease(ids, NATIVE_CLEANUP_MIN_PRERELEASE) >= 0
+}
+
+function cleanupEnabled(cfg) {
+  return cfg?.security?.cleanDshCookiesOnExit === true && !isDshCookieCleanupManaged()
+}
 
 function exe(name) {
   return WIN ? `${name}.exe` : name
@@ -94,7 +131,7 @@ function onProcessExit() {
   if (!current) return
   try {
     const cfg = current.getConfig?.() || {}
-    if (cfg?.security?.cleanDshCookiesOnExit !== true) return
+    if (!cleanupEnabled(cfg)) return
     if (!WIN) return
     const python = findPython(cfg)
     if (!python) {
@@ -137,7 +174,7 @@ export function installDshCookieCleanup({ getConfig, dataDir, log, scriptPath = 
   }
   return {
     scriptPath,
-    enabled: () => getConfig?.()?.security?.cleanDshCookiesOnExit === true,
+    enabled: () => cleanupEnabled(getConfig?.()),
   }
 }
 

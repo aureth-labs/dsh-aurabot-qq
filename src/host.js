@@ -96,7 +96,7 @@ import { createWechatClawbotAdapter, startQrLogin, pollQrStatus, DEFAULT_BASE_UR
 import { createBridgeAdapter } from './adapters/bridge/index.js'
 import { ensureUpgradedStorage } from './features/import-qq.js'
 import { clearToolsCache, listTools, probeTool } from './core/tools.js'
-import { installDshCookieCleanup, findPython } from './core/dsh-cookies.js'
+import { installDshCookieCleanup, findPython, isDshCookieCleanupManaged } from './core/dsh-cookies.js'
 import { runToolInstall, toolJobs } from './core/tools-managed.js'
 import { startQuickTunnel, stopQuickTunnel, tunnelState } from './core/quick-tunnel.js'
 import { createHandover } from './features/handover.js'
@@ -682,12 +682,12 @@ export function apply(ctx, opts = {}) {
     catch { log.warn('初始化主人授权记录失败，本次启动使用会话授权') }
   }
   // DSH 退出后清理累积的 dsh-auth-* Cookie；默认关闭，只在开关打开时拉起 helper。
-  installDshCookieCleanup({
+  const dshCookieCleanup = installDshCookieCleanup({
     getConfig: () => cfg,
     dataDir: () => dataDir(),
     log: logger.child('dsh-cookies'),
   })
-  if (cfg.security?.cleanDshCookiesOnExit && process.platform === 'win32' && !findPython(cfg)) {
+  if (dshCookieCleanup.enabled() && process.platform === 'win32' && !findPython(cfg)) {
     log.warn('DSH Cookie 清理已开启，但没找到 Python；退出时不会执行清理')
   }
   const configuredSelfInstances = (conf) => {
@@ -3942,6 +3942,7 @@ export function apply(ctx, opts = {}) {
       startedAt: STARTED_AT,
       apiVersion: API_VERSION,
       config: publicConfig(cfg),
+      dshCookieCleanupManaged: isDshCookieCleanupManaged(),
       platforms: platformInstancesSummary(),
       onebot: { state: onebotState, login, endpoint: { httpUrl: endpoint().httpUrl, wsUrl: endpoint().wsUrl }, problem: onebotState === 'connected' && loginOk ? '' : await connectionProblem(), warmup: gatewayWarmSince ? { since: gatewayWarmSince, seconds: Math.max(0, Math.round((Date.now() - gatewayWarmSince) / 1000)), phase: warmupPhase.phase || '', label: warmupPhase.label || '' } : null },
       outbox: outbox.status(),

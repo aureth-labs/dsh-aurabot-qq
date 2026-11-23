@@ -10100,6 +10100,8 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     function Security({ st, draft, setDraft }) {
       const f = useField(draft, setDraft)
       const mode = (draft.security && draft.security.ssrfMode) || 'strict'
+      const dshCookieCleanupManaged = st.dshCookieCleanupManaged === true
+      const cleanCookiesOnExit = !dshCookieCleanupManaged && draft.security?.cleanDshCookiesOnExit === true
       const picked = draft.update && draft.update.unstable
       const unstable = typeof picked === 'boolean' ? picked : String(st.version).includes('-')
       return h('div', { className: 'ab-grid' },
@@ -10108,14 +10110,19 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         h(Card, { title: '危险命令确认', right: f.sw('security.dangerConfirm'), desc: '打开后，ta在私聊里要执行终端危险命令（删根目录、格式化、关机、下载后直接执行等）之前，会先发 QQ 私聊问你；你回复「确认」才执行，回复「取消」或 60 秒没回就拦下。默认开；只拦真正致命的命令，普通删除/构建/改文件不受影响。' }),
         h(Card, {
           title: '退出 DSH 后清理 Cookie',
-          desc: 'DSH Desktop 每次重启都会在 Chromium Cookie 库里留下 dsh-auth-*；累积超过一定数量后，DSH 可能因为 Cookie 过多而无法正常启动。打开后，完全退出 DSH 时会自动备份并清理这些 Cookie，只清理 localhost / 127.0.0.1 / ::1 下的 dsh-auth-*，其他 Cookie 不动。',
+          desc: dshCookieCleanupManaged
+            ? 'DSH Desktop 0.2.2-rc.2 及以上会在启动后自行清理旧的 dsh-auth-* Cookie。'
+            : '旧版 DSH Desktop 每次重启可能在 Chromium Cookie 库里留下 dsh-auth-*；累积过多会影响启动。打开后，完全退出 DSH 时会自动备份并清理 localhost / 127.0.0.1 / ::1 下的 dsh-auth-*。',
         },
-          h(Row, { label: '退出 DSH 后自动清理 dsh-auth Cookie', hint: '默认关闭。需要 Python（可在「外置工具」检查）；清理前会备份，保留最近 5 份。DSH 还在托盘里时不会动 Cookie。' },
+          h(Row, { label: '退出 DSH 后自动清理 dsh-auth Cookie', hint: dshCookieCleanupManaged
+            ? '当前由 DSH Desktop 管理。插件暂停退出清理，并保留你原来的开关设置。'
+            : '默认关闭。需要 Python（可在「外置工具」检查）；清理前会备份，保留最近 5 份。DSH 还在托盘里时不会动 Cookie。' },
             h(Switch, {
-              on: (draft.security && draft.security.cleanDshCookiesOnExit) === true,
+              on: cleanCookiesOnExit,
+              disabled: dshCookieCleanupManaged,
               onChange: (v) => setDraft(setPath(draft, 'security.cleanDshCookiesOnExit', v)),
             })),
-          (draft.security && draft.security.cleanDshCookiesOnExit) === true
+          dshCookieCleanupManaged ? null : cleanCookiesOnExit
             ? h('div', { className: 'ab-note warn' }, '开启后，完全退出 DSH 时会清理本机 DSH 认证 Cookie；下次打开 DSH 可能需要重新登录。清理日志在插件数据目录的 dsh-cookie-cleanup.log，备份在 dsh-cookie-backups/。')
             : h('div', { className: 'ab-note' }, '关闭时不做任何清理。DSH 桌面端仍在运行时不会强行改 Cookie 数据库。'),
         ),

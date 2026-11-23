@@ -11,6 +11,8 @@ import {
   buildCleanupArgs,
   cookieDatabasePath,
   findPython,
+  installDshCookieCleanup,
+  isDshCookieCleanupManaged,
   silentPython,
 } from '../src/core/dsh-cookies.js'
 import { normalize, mergeFromPanel, publicConfig } from '../src/core/config.js'
@@ -22,6 +24,38 @@ test('DSH Cookie 清理：默认关闭、配置归一化、面板保存与回显
   const merged = mergeFromPanel(normalize({}), { security: { cleanDshCookiesOnExit: true } })
   assert.equal(merged.security.cleanDshCookiesOnExit, true)
   assert.equal(publicConfig(merged).security.cleanDshCookiesOnExit, true)
+})
+
+test('DSH Cookie 清理：仅在确认桌面宿主版本已支持时交给宿主', () => {
+  const cases = [
+    [undefined, false],
+    ['', false],
+    ['unknown', false],
+    ['0.2.1-rc.5', false],
+    ['0.2.2-beta.1.2', false],
+    ['0.2.2-rc.1', false],
+    ['0.2.2-rc.1.12', false],
+    ['0.2.2-rc.1+build.7', false],
+    ['0.2.2-rc.2', true],
+    ['0.2.2-rc.2.1', true],
+    ['0.2.2-rc.2-dev', true],
+    ['0.2.2-rc.10', true],
+    ['0.2.2-rc.2+build.007-local', true],
+    ['0.2.2+001.007', true],
+    ['0.2.3-alpha.2', true],
+    ['0.2.3-beta.1.2', true],
+    ['0.2.3-rc.1.12+build.7', true],
+    ['00.2.3', false],
+    ['0.02.3', false],
+    ['0.2.03', false],
+    ['0.2.3-rc.02', false],
+    ['0.2.3-alpha..1', false],
+    ['0.2.3-rc.2_extra', false],
+    ['0.2.3+meta..1', false],
+  ]
+  for (const [version, expected] of cases) {
+    assert.equal(isDshCookieCleanupManaged({ DSH_CLIENT_VERSION: version }), expected, String(version))
+  }
 })
 
 test('DSH Cookie 清理：数据库路径、过滤条件与 helper 参数', () => {
@@ -62,6 +96,54 @@ test('DSH Cookie 清理：安全防护面板提供开关与风险说明', () => 
   assert.match(client, /security\.cleanDshCookiesOnExit/)
   assert.match(client, /dsh-auth-\*/)
   assert.match(client, /保留最近 5 份/)
+})
+
+test('DSH Cookie 清理：宿主提供接管状态，面板在接管时禁用旧开关', () => {
+  const client = readFileSync(new URL('../client/client.js', import.meta.url), 'utf8')
+  const host = readFileSync(new URL('../src/host.js', import.meta.url), 'utf8')
+  const start = client.indexOf('退出 DSH 后清理 Cookie')
+  const end = client.indexOf('SSRF 防护', start)
+  assert.ok(start >= 0 && end > start)
+  const card = client.slice(start, end)
+  assert.match(client, /st\.dshCookieCleanupManaged/)
+  assert.match(client, /const cleanCookiesOnExit = !dshCookieCleanupManaged && draft\.security\?\.cleanDshCookiesOnExit === true/)
+  assert.match(card, /on:\s*cleanCookiesOnExit/)
+  assert.match(card, /disabled:\s*dshCookieCleanupManaged/)
+  assert.match(host, /isDshCookieCleanupManaged\(\)/)
+  assert.match(host, /\bdshCookieCleanupManaged\b/)
+})
+
+test('DSH Cookie 清理：新版宿主 /state 保留既有退出清理偏好', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aurabot-dsh-cookie-state-'))
+  const previousEnv = {
+    AURABOT_DATA_DIR: process.env.AURABOT_DATA_DIR,
+    DSH_HOME: process.env.DSH_HOME,
+    DSH_CLIENT_VERSION: process.env.DSH_CLIENT_VERSION,
+  }
+  t.after(() => {
+    for (const [key, value] of Object.entries(previousEnv)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    rmSync(dir, { recursive: true, force: true })
+  })
+  process.env.AURABOT_DATA_DIR = dir
+  process.env.DSH_HOME = dir
+  process.env.DSH_CLIENT_VERSION = '0.2.2-rc.2'
+  writeFileSync(join(dir, 'config.json'), JSON.stringify({ security: { cleanDshCookiesOnExit: true } }))
+  const { createFakeDsh } = await import('./helpers/fake-dsh.js')
+  const { apply } = await import('../src/host.js')
+  const dsh = createFakeDsh({ brain: () => '' })
+  try {
+    apply(dsh.ctx)
+    const status = (await dsh.call('/state')).json()
+    assert.equal(status.dshCookieCleanupManaged, true)
+    assert.equal(status.config.security.cleanDshCookiesOnExit, true)
+  } finally {
+    // The exit listener outlives plugin disposal. Disable the fixture before restoring the host environment.
+    installDshCookieCleanup({ getConfig: () => ({}) })
+    dsh.dispose()
+  }
 })
 
 test('DSH Cookie 清理：Python helper 只删除 localhost 的 dsh-auth-* 并保留备份', (t) => {
@@ -110,7 +192,7 @@ test('DSH Cookie 清理：Python helper 只删除 localhost 的 dsh-auth-* 并�
   assert.doesNotMatch(query.stdout, /dsh-auth-a/)
 })
 
-test('DSH Cookie 清理：进程 exit 时能拉起 detached helper（真实子进程）', async (t) => {
+test('DSH Cookie 清理：真实子进程仅在旧版桌面宿主退出时启动 helper', async (t) => {
   if (process.platform !== 'win32') return t.skip('Windows only')
   const python = findPython({})
   if (!python) return t.skip('Python not available')
@@ -125,33 +207,58 @@ test('DSH Cookie 清理：进程 exit 时能拉起 detached helper（真实子�
   ].join('\n'))
   const moduleUrl = new URL('../src/core/dsh-cookies.js', import.meta.url).href
   const code = [
-    `import { installDshCookieCleanup } from ${JSON.stringify(moduleUrl)}`,
-    'installDshCookieCleanup({',
+    `import assert from 'node:assert/strict'`,
+    `import childProcess from 'node:child_process'`,
+    `import { writeFileSync } from 'node:fs'`,
+    `import { syncBuiltinESMExports } from 'node:module'`,
+    `import { join } from 'node:path'`,
+    'const realSpawn = childProcess.spawn',
+    'childProcess.spawn = (...args) => {',
+    '  writeFileSync(join(process.env.DATA_DIR, "spawn-attempt"), "spawned")',
+    '  return realSpawn(...args)',
+    '}',
+    'syncBuiltinESMExports()',
+    `const { installDshCookieCleanup } = await import(${JSON.stringify(moduleUrl)})`,
+    'const cleanup = installDshCookieCleanup({',
     '  getConfig: () => ({ security: { cleanDshCookiesOnExit: true }, tools: { python: { path: process.env.PYTHON_PATH } } }),',
     '  dataDir: () => process.env.DATA_DIR,',
     '  scriptPath: process.env.HELPER_SCRIPT,',
     '  log: { info() {}, warn() {} },',
     '})',
+    'assert.equal(cleanup.enabled(), process.env.EXPECT_COOKIE_HELPER === "1")',
     'process.exit(0)',
   ].join('\n')
-  const child = spawn(process.execPath, ['--input-type=module', '-e', code], {
-    env: {
-      ...process.env,
-      PYTHON_PATH: python,
-      DATA_DIR: dir,
-      HELPER_SCRIPT: fakeScript,
-    },
-    stdio: 'ignore',
-    windowsHide: true,
-  })
-  const status = await new Promise((resolve, reject) => {
-    child.once('error', reject)
-    child.once('exit', resolve)
-  })
-  assert.equal(status, 0)
-  const log = join(dir, 'dsh-cookie-cleanup.log')
-  const deadline = Date.now() + 5000
-  while (!existsSync(log) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100))
-  assert.equal(existsSync(log), true, 'detached Python helper 应在 Node 退出后启动')
-  assert.match(readFileSync(log, 'utf8'), /helper-started/)
+  for (const [version, expected] of [[undefined, true], ['0.2.2-rc.1', true], ['0.2.2-rc.2', false]]) {
+    await t.test(version ?? '未提供版本', async () => {
+      const dataDir = mkdtempSync(join(dir, 'run-'))
+      const env = {
+        ...process.env,
+        EXPECT_COOKIE_HELPER: expected ? '1' : '0',
+        PYTHON_PATH: python,
+        DATA_DIR: dataDir,
+        HELPER_SCRIPT: fakeScript,
+      }
+      if (version === undefined) delete env.DSH_CLIENT_VERSION
+      else env.DSH_CLIENT_VERSION = version
+      const child = spawn(process.execPath, ['--input-type=module', '-e', code], {
+        env,
+        stdio: ['ignore', 'ignore', 'inherit'],
+        windowsHide: true,
+      })
+      const status = await new Promise((resolve, reject) => {
+        child.once('error', reject)
+        child.once('exit', resolve)
+      })
+      assert.equal(status, 0)
+      assert.equal(existsSync(join(dataDir, 'spawn-attempt')), expected)
+      const log = join(dataDir, 'dsh-cookie-cleanup.log')
+      if (expected) {
+        const deadline = Date.now() + 5000
+        while (!existsSync(log) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100))
+        assert.match(readFileSync(log, 'utf8'), /helper-started/)
+      } else {
+        assert.equal(existsSync(log), false)
+      }
+    })
+  }
 })
