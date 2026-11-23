@@ -1789,6 +1789,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [legacyReview, setLegacyReview] = useState(null)
       const [recoveryCheck, setRecoveryCheck] = useState(null)
       const [recoveryRetry, setRecoveryRetry] = useState(0)
+      const [steerLimitDraft, setSteerLimitDraft] = useState(null)
       useEffect(() => {
         let alive = true
         const tick = () => get('/platforms').then((r) => { if (alive) setData(r) }).catch(() => {})
@@ -1799,6 +1800,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const list = (data && data.instances) || []
       const owner = data && data.owner
       const multiPrivate = data?.multiPrivate
+      const steerLimit = steerLimitDraft ?? String(multiPrivate?.steerMaxPerTurn ?? 0)
+      const steerLimitValue = Number(steerLimit)
+      const steerLimitValid = Boolean(steerLimit.trim()) && Number.isInteger(steerLimitValue) && steerLimitValue >= 0 && steerLimitValue <= 100
       const changingShared = busy === 'multi-private' || busy === 'multi-private-recover'
       const sharedState = busy === 'multi-private-recover' ? 'recovering' : multiPrivate?.state
       const recoverKey = multiPrivate?.enabled && sharedState === 'paused' && multiPrivate.recoverable
@@ -1860,6 +1864,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             setData(current => current && { ...current, multiPrivate: result })
           }
           if (result.ok) reload()
+          return result
         } finally { setBusy('') }
       }
       const reviewSharedHistory = async () => {
@@ -2258,6 +2263,26 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             disabled: changingShared || (!multiPrivate.enabled && !multiPrivate.available),
             onChange: () => changeShared({ enabled: !multiPrivate.enabled }),
           })),
+          h(Row, { label: '允许插入消息', hint: '同一平台实例、账号和私聊的连续消息可插入当前轮。关闭后按到达顺序排队。' }, h(Switch, {
+            on: multiPrivate.steerEnabled !== false,
+            disabled: changingShared,
+            onChange: () => changeShared({
+              steerEnabled: multiPrivate.steerEnabled === false, steerMaxPerTurn: multiPrivate.steerMaxPerTurn ?? 0,
+            }, '/settings'),
+          })),
+          h(Row, { label: '每轮最多插入', hint: '0 表示不限制，可填 0–100 的整数。' }, h('div', { className: 'ab-flex' },
+            h('input', {
+              className: 'ab-input sm', 'aria-label': '每轮最多插入', type: 'number', min: 0, max: 100, step: 1,
+              value: steerLimit, disabled: changingShared, onChange: (event) => setSteerLimitDraft(event.target.value),
+            }),
+            h(Btn, {
+              small: true, disabled: changingShared || !steerLimitValid || steerLimitValue === (multiPrivate.steerMaxPerTurn ?? 0),
+              onClick: async () => {
+                const result = await changeShared({ steerEnabled: multiPrivate.steerEnabled !== false, steerMaxPerTurn: steerLimitValue }, '/settings')
+                if (result.ok) setSteerLimitDraft(null)
+              },
+            }, '应用'),
+          )),
           h('div', { className: 'ab-small ab-muted' }, multiPrivate.available && multiPrivate.binding
             ? '基座及模型使用主账号 · ' + platformLabel(multiPrivate.binding.platform) + ' · ' + multiPrivate.binding.account
             : ({

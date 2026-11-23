@@ -19,14 +19,16 @@ export function isSharedHostContext(message) {
   }
 }
 
-function matchesStep(messages, turn, first) {
+function matchesMessage(message, expected) {
+  return message?.role === 'user' && message.id === expected.id
+    && isDeepStrictEqual(message.source, expected.source)
+    && isDeepStrictEqual(message.content, expected.content)
+}
+
+function matchesStep(messages, expected) {
   if (!Array.isArray(messages)) return false
   const direct = messages.filter(message => !isSharedHostContext(message))
-  if (!first) return direct.length === 0
-  const [message] = direct
-  return direct.length === 1 && message?.role === 'user' && message.id === turn.message.id
-    && isDeepStrictEqual(message.source, turn.message.source)
-    && isDeepStrictEqual(message.content, turn.message.content)
+  return direct.length === expected.length && direct.every((message, index) => matchesMessage(message, expected[index]))
 }
 
 // lookup returns undefined for ordinary sessions, null for idle managed sessions,
@@ -42,14 +44,19 @@ export function registerSharedTurnGuard(ctx, { lookup, isAuthorized, onAccepted,
       if (belongs) onRejected(active)
       return { kind: 'reject' }
     }
-    if (!valid() || !matchesStep(messages, active, first)) return reject()
+    if (!valid()) return reject()
+    const injected = first ? [] : [...(active.injectedMessages?.values() || [])]
+      .filter(entry => entry.claimed && !entry.accepted)
+    const expected = first ? [active.message] : injected.map(entry => entry.message)
+    if (!matchesStep(messages, expected)) return reject()
 
     const decision = await next()
     if (decision.kind === 'reject') {
       onRejected(active)
       return decision
     }
-    if (!valid() || !matchesStep(decision.messages, active, first)) return reject()
+    if (!valid() || !matchesStep(decision.messages, expected)) return reject()
+    for (const entry of injected) entry.accepted = true
     onAccepted(active)
     return decision
   }, { prepend: true })

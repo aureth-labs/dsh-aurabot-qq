@@ -116,6 +116,37 @@ test('共享核验点状态先预检，恢复校验模式和当前候选', async
   assert.equal(result.checkpoint, 12)
 })
 
+test('共享私聊插入设置默认开启，专用接口校验并持久化', async (t) => {
+  const { normalize, mergeFromPanel } = configMod
+  assert.equal(normalize({}).sharedSteerEnabled, true)
+  assert.equal(normalize({}).sharedSteerMaxPerTurn, 0)
+  assert.equal(normalize({ sharedSteerEnabled: false }).sharedSteerEnabled, false)
+  for (const [value, expected] of [['3', 3], [100, 100], [-1, 0], [101, 0], ['NaN', 0]]) {
+    assert.equal(normalize({ sharedSteerMaxPerTurn: value }).sharedSteerMaxPerTurn, expected)
+  }
+  const fake = fakeDshMod.createFakeDsh({ brain: async () => '' })
+  const { getConfig } = hostMod.apply(fake.ctx)
+  t.after(() => fake.dispose())
+  const path = '/platforms/multi-private/settings'
+  for (const steerMaxPerTurn of [-1, 101, 1.5, '3', null]) {
+    assert.equal((await fake.call(path, { steerEnabled: false, steerMaxPerTurn })).json().ok, false)
+  }
+  assert.equal((await fake.call(path, { steerEnabled: 'false', steerMaxPerTurn: 3 })).json().ok, false)
+  assert.equal(getConfig().sharedSteerEnabled, true)
+  assert.equal(getConfig().sharedSteerMaxPerTurn, 0)
+
+  assert.equal((await fake.call(path, { steerEnabled: false, steerMaxPerTurn: 3 })).json().ok, true)
+  assert.equal(getConfig().sharedSteerEnabled, false)
+  assert.equal(getConfig().sharedSteerMaxPerTurn, 3)
+  const status = (await fake.call('/platforms/multi-private')).json()
+  assert.equal(status.steerEnabled, false)
+  assert.equal(status.steerMaxPerTurn, 3)
+  assert.equal(mergeFromPanel(getConfig(), { sharedSteerEnabled: true, sharedSteerMaxPerTurn: 99 }).sharedSteerMaxPerTurn, 3)
+  assert.equal((await fake.call(path, { steerEnabled: true, steerMaxPerTurn: 0 })).json().ok, true)
+  assert.equal(getConfig().sharedSteerEnabled, true)
+  assert.equal(getConfig().sharedSteerMaxPerTurn, 0)
+})
+
 test('P4-1: config.js 三分支 ownerAuthorization 规则与 mergeFromPanel 防篡改', () => {
   const {
     DEFAULTS,

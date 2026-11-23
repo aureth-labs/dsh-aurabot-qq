@@ -259,7 +259,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   let sharedAuditCursor = ''
   const sharedAuditPriority = new Set()
   let sharedAuditTimer
-  let sharedTail = Promise.resolve()
+  const sharedPending = []
+  let sharedRunning = false
+  let sharedActiveTurn
   function indexSharedOwnership(data) {
     sharedManaged.clear()
     if (!data) return
@@ -1805,6 +1807,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       recoverKey: recovery.recoverable
         ? historyFingerprint([mode, data.routingRevision, branch.generation, branch.sessionId, recovery.recoverCheckpoint])
         : '',
+      steerEnabled: getConfig().sharedSteerEnabled !== false,
+      steerMaxPerTurn: getConfig().sharedSteerMaxPerTurn ?? 0,
       lastDeliveryFailure: delivery,
       legacyHistoryAvailable: Boolean(review),
       legacyHistoryChanged: Boolean(review?.legacyPrefix),
@@ -1839,15 +1843,118 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (!sharedDedupe.seen(task.ingress.instance, task.ingress.messageId)) return
     task.sourceKey = JSON.stringify([task.ingress.platform, task.ingress.account])
     task.sourceRevision = sharedSourceRevisions.get(task.sourceKey) || 0
+    task.laneKey = JSON.stringify([task.ingress.instance, task.ingress.platform, task.ingress.account, task.chat.chatId])
     const state = sharedSessions.sync(task.scope)
     task.generation = state.sessions[task.scope.mode].generation
     task.routingRevision = state.routingRevision
-    const job = sharedTail.then(async () => {
+    return enqueueSharedTask(task, async () => {
       if (await runShared(task) === 'ordinary') return task.fallback(() => !disposed && sharedSenderCurrent(task)
         && sharedSessions.read().sessions[task.scope.mode].generation === task.generation)
     })
-    sharedTail = job.catch(error => log.warn('共享私聊失败：', error.message))
-    return job
+  }
+
+  function enqueueSharedTask(task, run) {
+    return new Promise((resolve, reject) => {
+      sharedPending.push({ task, run, resolve, reject })
+      if (sharedActiveTurn) void drainSharedLane(sharedActiveTurn)
+      kickSharedScheduler()
+    })
+  }
+
+  function kickSharedScheduler() {
+    if (disposed || sharedRunning) return
+    const entry = sharedPending.shift()
+    if (!entry) return
+    sharedRunning = true
+    void Promise.resolve().then(entry.run).then(entry.resolve, error => {
+      log.warn('共享私聊任务失败：', error.message)
+      entry.reject(error)
+    }).finally(() => {
+      sharedRunning = false
+      kickSharedScheduler()
+    })
+  }
+
+  function canSteerShared(turn, task) {
+    const cfg = getConfig()
+    if (cfg.sharedSteerEnabled === false || sharedActiveTurn !== turn || !turn.admitted
+      || turn.finished || turn.blocked || turn.task.proactive || !task.laneKey || task.laneKey !== turn.task.laneKey
+      || typeof turn.agent.steer !== 'function' || !sharedAuthorized(turn) || !sharedSenderCurrent(task)) return false
+    const { mode } = turn.scope
+    const state = sharedSessions.read()
+    const max = cfg.sharedSteerMaxPerTurn ?? 0
+    return state.enabled && state.mode === mode && mode === task.scope.mode && !sharedSessions.isRecovering(mode)
+      && state.sessions[mode].generation === task.generation && task.generation === turn.branch.generation
+      && state.routingRevision === task.routingRevision && task.routingRevision === turn.task.routingRevision
+      && (!max || turn.steerCount < max)
+  }
+
+  async function drainSharedLane(turn) {
+    if (turn.draining || !turn.task.laneKey) return
+    turn.draining = true
+    try {
+      while (true) {
+        // 在真正提交前保留原队列位置。若准备期间轮次结束，调度器仍按到达顺序取走此任务。
+        const entry = sharedPending.find(item => item.task.laneKey === turn.task.laneKey)
+        // 最早的消息本轮插入失败时，后续同源消息也留在队列里，避免越过它。
+        if (!entry || entry === turn.rejectedEntry || !canSteerShared(turn, entry.task)) return
+        try {
+          const prepared = await prepareSharedMessage(entry.task, turn)
+          if (!canSteerShared(turn, entry.task)) return
+          const index = sharedPending.indexOf(entry)
+          if (index < 0) return
+          if (prepared && !submitSharedSteer(turn, entry.task, prepared)) {
+            turn.rejectedEntry = entry
+            return
+          }
+          sharedPending.splice(index, 1)
+          entry.resolve()
+        } catch (error) {
+          turn.rejectedEntry = entry
+          log.warn('共享私聊插入失败：', error.message)
+          return
+        }
+      }
+    } finally { turn.draining = false }
+  }
+
+  function submitSharedSteer(turn, task, { message, memory }) {
+    const { agent, injectedMessages, sources } = turn
+    const registered = { message: structuredClone(message), claimed: false, accepted: false }
+    injectedMessages.set(message.id, registered)
+    const state = turnState.get(sessionKey(turn.branch.sessionId))
+    const previous = { memoryLength: sources.memory.length, userText: sources.userText, wantVoice: turn.wantVoice, lastText: state?.lastText }
+    // 宿主可能在 steer 返回前同步开始下一步，届时提示防护已需要识别插入消息的来源。
+    for (const block of memory) sources.memory.push(block)
+    sources.userText = [sources.userText, task.userText].filter(Boolean).join('\n')
+    turn.wantVoice ||= task.wantVoice
+    if (state) state.lastText = sources.userText
+    let failure
+    try {
+      withPromptCapture(sources, () => agent.steer(message))
+    } catch (error) {
+      failure = error
+      log.warn('DSH 共享私聊插入失败：', error.message)
+    }
+    try {
+      const queuedForNextTurn = agent.inbox.nextTurn.some(item => item.id === message.id)
+      const queuedForStep = agent.inbox.nextStep.some(item => item.id === message.id)
+      const removed = queuedForNextTurn && agent.inbox.remove(message.id)
+      if (removed || (failure && !queuedForStep && !registered.claimed && !queuedForNextTurn)) {
+        injectedMessages.delete(message.id)
+        sources.memory.length = previous.memoryLength
+        sources.userText = previous.userText
+        turn.wantVoice = previous.wantVoice
+        if (state) state.lastText = previous.lastText
+        return false
+      }
+    } catch (error) {
+      turn.blocked = true
+      log.warn('无法核对共享插入结果：', error.message)
+    }
+    // steer 是同步提交。缺少明确的未提交证据时，避免再次投递同一条消息。
+    turn.steerCount++
+    return true
   }
 
   function primaryCanSpeak(binding) {
@@ -1889,7 +1996,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     }
     const current = () => !disposed && sharedSenderCurrent(task)
       && sharedSessions.read().sessions[scope.mode].generation === task.generation
-    const job = sharedTail.then(async () => {
+    const result = await enqueueSharedTask(task, async () => {
       if (!current()) return
       try {
         if (!primaryCanSpeak(scope.binding)) return 'ordinary'
@@ -1902,8 +2009,6 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         return task.started ? { ok: false, error: error.message } : 'ordinary'
       }
     })
-    sharedTail = job.catch(error => log.warn('共享主动搭话失败：', error.message))
-    const result = await job
     if (result === 'ordinary' && current()) {
       log.info('共享分支准备失败，主动搭话使用普通会话')
       return pushToSession(chat, content, senderId, { ...ordinaryOpts, assertAuthorized() {
@@ -1929,43 +2034,73 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     return executeShared(task, latest, selected)
   }
 
+  async function sharedPromptContent(task, turn) {
+    const { chat, ingress, proactive, content } = task
+    if (hooks?.prompt) {
+      try {
+        const next = await hooks.prompt(content, { chat, sessionId: turn.branch.sessionId, senderId: ingress?.account || '', recentMessages: [], ...(proactive && { proactive: true }) })
+        if (next === null || Array.isArray(next)) return next
+      } catch (error) { log.warn('扩展模块改写共享私聊提示失败：', error.message) }
+    }
+    return content
+  }
+
+  function prepareSharedMessage(task, turn) {
+    let prepared = task.prepared
+    if (prepared?.agent !== turn.agent) {
+      prepared = { agent: turn.agent, content: sharedPromptContent(task, turn) }
+      task.prepared = prepared
+    }
+    if (prepared.result) return prepared.result
+    prepared.result = (async () => {
+      const promptContent = await prepared.content
+      if (promptContent === null) return null
+      const content = await dropUnseenImages(turn.primaryChat, promptContent, turn.target)
+      if (disposed || !sharedSenderCurrent(task)
+        || sharedSessions.read().sessions[task.scope.mode].generation !== task.generation) return null
+      const admitted = await admit(turn.agent, cleanContent([...content, { type: 'text', text: currentTimeLine() }]))
+      const memory = []
+      for (const block of admitted.filter(item => item.type === 'text')) {
+        for (const range of memoryPromptRanges(block.text, { toEndOfText: true })) memory.push(block.text.slice(range.start, range.end))
+      }
+      const source = task.proactive ? { kind: 'aurabot-proactive', form: 'proactive', proactive: true } : { kind: SOURCE_KIND }
+      const message = { id: randomUUID(), role: 'user', content: admitted, source: { ...source, speaker: { role: 'owner', chat: 'private' } } }
+      return { message, memory }
+    })().catch(error => {
+      // 允许排队后的轮次重新准备内容，同时复用已完成的扩展模块改写。
+      delete prepared.result
+      throw error
+    })
+    return prepared.result
+  }
+
   async function executeShared(task, latest, { agent, branch }) {
     const { chat, ingress, proactive } = task
     const key = sessionKey(branch.sessionId)
-    const turn = { task, scope: latest, branch, agent, calls: new Set(), send: Promise.resolve(), reply: { text: '' } }
+    const turn = {
+      task, scope: latest, branch, agent, calls: new Set(), send: Promise.resolve(), reply: { text: '' },
+      steerCount: 0, injectedMessages: new Map(), wantVoice: task.wantVoice,
+    }
     sharedTurns.set(key, turn)
+    sharedActiveTurn = turn
     const isCurrent = () => sharedTurns.get(key) === turn && sharedAuthorized(turn) && !turn.blocked
     const timeout = turnMaxMs()
     let timer
     try {
-      const primaryChat = chatFromId(latest.binding.chatId)
-      const target = await resolveTarget(primaryChat)
+      turn.primaryChat = chatFromId(latest.binding.chatId)
+      const target = turn.target = await resolveTarget(turn.primaryChat)
       if (!isCurrent()) return
       if (sharedSessions.read().routingRevision !== task.routingRevision) return 'ordinary'
       if (target && !applyModel(agent, target)) return 'ordinary'
       if (target) sessionTarget.set(key, target)
       mount(agent, chat, latest.level, turn)
       running.set(chat.chatId, key)
-      let content = task.content
-      if (hooks?.prompt) {
-        try {
-          const next = await hooks.prompt(content, { chat, sessionId: branch.sessionId, senderId: ingress?.account || '', recentMessages: [], ...(proactive && { proactive: true }) })
-          if (next === null) return
-          if (Array.isArray(next)) content = next
-        } catch (error) { log.warn('扩展模块改写共享私聊提示失败：', error.message) }
-      }
-      content = await dropUnseenImages(primaryChat, content, target)
-      if (!isCurrent()) return
-      const admitted = await admit(agent, cleanContent([...content, { type: 'text', text: currentTimeLine() }]))
-      if (!isCurrent()) return
+      const prepared = await prepareSharedMessage(task, turn)
+      if (!isCurrent() || !prepared) return
       if (sharedSessions.read().routingRevision !== task.routingRevision || (proactive && !primaryCanSpeak(latest.binding))) return 'ordinary'
       const previousSources = sourcesFor(chat.chatId)
-      const sources = { ...previousSources, system: new Map(previousSources.system), memory: [], context: '', userText: task.userText }
-      for (const block of admitted.filter(item => item.type === 'text')) {
-        for (const range of memoryPromptRanges(block.text, { toEndOfText: true })) sources.memory.push(block.text.slice(range.start, range.end))
-      }
-      const source = proactive ? { kind: 'aurabot-proactive', form: 'proactive', proactive: true } : { kind: SOURCE_KIND }
-      const message = { id: randomUUID(), role: 'user', content: admitted, source: { ...source, speaker: { role: 'owner', chat: 'private' } } }
+      const { message, memory } = prepared
+      const sources = { ...previousSources, system: new Map(previousSources.system), memory, context: '', userText: task.userText }
       turn.message = structuredClone(message)
       turn.sources = sources
       turnState.set(key, { lastTurn: -1, text: '', lastText: task.userText, senders: new Set(ingress ? [ingress.account] : []), platform: ingress?.platform || latest.binding.platform })
@@ -2023,6 +2158,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       await turn.send
       log.warn('共享私聊轮次失败：', error.message)
     } finally {
+      if (sharedActiveTurn === turn) sharedActiveTurn = null
       clearTimeout(timer)
       stopTyping(key)
       clearSlowNotices(key)
@@ -2073,10 +2209,10 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
 
   function enqueueSharedOutput(turn, text, interim = false) {
     if (!text || turn.blocked) return
-    const { chat, ingress, wantVoice, userText } = turn.task
+    const { chat, ingress } = turn.task
     const isCurrent = () => !turn.blocked && sharedAuthorized(turn)
     turn.send = turn.send.then(() => isCurrent() && withPromptCapture(turn.sources, () => deliver(chat.chatId, text, {
-      interim, wantVoice, userText, own: true, shared: {
+      wantVoice: turn.wantVoice, userText: turn.sources.userText, own: true, interim, shared: {
         messageId: ingress.messageId, isCurrent,
         onDeliveryError: error => noteSharedDeliveryFailure(turn, 'reply', error),
       },
@@ -2086,9 +2222,15 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   function onSharedSessionEvent(key, event) {
     const turn = sharedTurns.get(key)
     const data = event?.data
-    if (!turn || turn.dshTurn === undefined || data?.turn !== turn.dshTurn || !sharedAuthorized(turn)) return
+    if (!turn || turn.dshTurn === undefined || data?.turn !== turn.dshTurn) return
     if (event.type === 'turn/end') {
       turn.finished = true
+      for (const [id, entry] of turn.injectedMessages) {
+        if (entry.accepted) continue
+        turn.blocked = true
+        try { turn.agent.inbox.remove(id) } catch (error) { log.warn('清理未接收的共享插入失败：', error.message) }
+      }
+      if (!sharedAuthorized(turn)) return
       if (turn.admitted) turn.verifiedSeq = event.seq
       if (data.reason?.kind !== 'completed' || !turn.admitted || turn.blocked) {
         turn.blocked = true
@@ -2104,7 +2246,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       turn.finalText = text
       return
     }
-    if (!turn.admitted || turn.blocked) return
+    if (!turn.admitted || turn.blocked || !sharedAuthorized(turn)) return
     if (event.type === 'tool/call') {
       const id = data.callId ?? data.id
       if (id) turn.calls.add(id)
@@ -2125,11 +2267,12 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       const text = assistantReplyText(data.message)
       const st = turnState.get(key)
       if (st) st.text = text
-      if (!turn.task.proactive && getConfig().chat?.everyStep && text) {
+      const everyStep = getConfig().chat?.everyStep
+      if (!turn.task.proactive && everyStep && text) {
         const previous = takeInterim(turn.reply, { turn: data.turn, step: data.step, text })
         enqueueSharedOutput(turn, previous, true)
       }
-      turn.reply.text = text || (getConfig().chat?.everyStep ? turn.reply.text : '')
+      turn.reply.text = text || (everyStep ? turn.reply.text : '')
     }
   }
 
@@ -6462,6 +6605,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     sharedLiveCheckpoints.clear()
     sharedDeliveryFailures.clear()
     sharedAuditPriority.clear()
+    for (const entry of sharedPending.splice(0)) entry.resolve()
     for (const turn of sharedTurns.values()) turn.agent.cancel({ kind: 'user' })
     for (const off of sharedListeners.splice(0)) off()
     // 三审 #177：常驻的子智能体父级 agent 一并置空——插件重装/重启后下次 spawn 重新建，
@@ -6537,8 +6681,10 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       lookup: agent => sharedOwns(agent?.session?.id) ? (activeFor(agent)?.message ? activeFor(agent) : null) : undefined,
       isAuthorized: turn => !turn.blocked && sharedAuthorized(turn),
       onAccepted: turn => {
+        const first = !turn.admitted
         turn.admitted = true
         startTyping(sessionKey(turn.branch.sessionId), turn.task.chat)
+        if (first) void drainSharedLane(turn)
       },
       onRejected: turn => {
         turn.blocked = true
@@ -6548,6 +6694,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     sharedListeners.push(dsh.on('agent/inbox/claimed', ({ agent, message, turn }) => {
       const active = activeFor(agent)
       if (active?.message?.id === message.id && active.dshTurn === undefined) active.dshTurn = turn
+      const injected = active?.injectedMessages.get(message.id)
+      if (injected && active.dshTurn === turn) injected.claimed = true
     }))
     sharedListeners.push(dsh.on('tools/pre-execute', async (exec, next) => {
       if (!sharedOwns(exec.agent?.session?.id)) return next()

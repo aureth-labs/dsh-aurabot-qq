@@ -89,6 +89,15 @@ test('平台页可以添加尚未配置的平台', () => {
   assert.ok(host.includes("route('/platforms/add'"), '宿主缺添加平台路由')
 })
 
+test('共享私聊可独立设置连续消息插入开关和每轮上限', () => {
+  assert.ok(client.includes("label: '允许插入消息'"))
+  assert.ok(client.includes("label: '每轮最多插入'"))
+  assert.match(client, /steerLimitDraft \?\? String\(multiPrivate\?\.steerMaxPerTurn \?\? 0\)/)
+  assert.match(client, /type: 'number', min: 0, max: 100, step: 1/)
+  assert.match(client, /steerMaxPerTurn: steerLimitValue \}, '\/settings'\)/)
+  assert.ok(host.includes("route('/platforms/multi-private/settings'"))
+})
+
 test('平台卡片可以移除：启用/连接中禁用，移除前二次确认', () => {
   assert.ok(client.includes("post('/platforms/remove'"), '面板缺移除平台请求')
   assert.ok(client.includes('window.confirm(`确定移除平台'), '移除前缺确认框')

@@ -5636,6 +5636,16 @@ export function apply(ctx, opts = {}) {
     setConfig({ ...getConfig(), multiPlatformPrivateSession: body.enabled })
     return { ok: true, ...hub.sharedStatus(), message: body.enabled ? '已开启多平台私聊' : '已切回普通会话' }
   })
+  route('/platforms/multi-private/settings', async req => {
+    if (req.method !== 'POST') return { ok: false, message: '仅支持 POST' }
+    const { steerEnabled, steerMaxPerTurn } = await readBody(req)
+    if (typeof steerEnabled !== 'boolean') return { ok: false, message: '允许插入消息必须是布尔值' }
+    if (!Number.isInteger(steerMaxPerTurn) || steerMaxPerTurn < 0 || steerMaxPerTurn > 100) {
+      return { ok: false, message: '每轮最多插入数必须是 0–100 的整数' }
+    }
+    setConfig({ ...getConfig(), sharedSteerEnabled: steerEnabled, sharedSteerMaxPerTurn: steerMaxPerTurn })
+    return { ok: true, ...hub.sharedStatus(), message: '已保存共享私聊插入设置' }
+  })
   for (const action of ['prepare', 'confirm']) {
     route('/platforms/multi-private/legacy/' + action, async req => {
       if (req.method !== 'POST') return { ok: false, message: '仅支持 POST' }

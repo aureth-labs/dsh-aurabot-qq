@@ -33,7 +33,9 @@ import { createGateway } from '../../src/gateway/index.js'
 import { createIdentity } from '../../src/gateway/identity.js'
 import { fixedSharedPrimary } from '../../src/gateway/shared-private-route.js'
 import { checkMigrationPersistencePreflight, verifyPersistedInboxMessage } from '../../src/core/qq-gateway-migration.js'
+import { currentPromptSources } from '../../src/security/leak-guard.js'
 import { makeFakeAdapter } from '../helpers/fake-adapter.js'
+import { fakeFactory } from '../gateway/helpers.js'
 
 const fixtures: Array<{ ctx: Context; cwd: string }> = []
 afterEach(async () => {
@@ -278,6 +280,225 @@ it('keeps direct QQ on ordinary DSH and OneBot replies when the saved shared swi
     identity.close?.()
   }
 }, 15_000)
+
+it('steers only the active private source and keeps the remaining shared tasks in arrival order', async () => {
+  const h = await harness({ responses: [
+    textResponse('插入期间的可见回复'), textResponse('合并后的 QQ 回复'),
+    textResponse('微信独立回复'), textResponse('第二个实例回复'), textResponse('第二个账号回复'),
+    textResponse('超出上限的 QQ 回复'), textResponse('主动搭话'),
+    toolCallResponse('hold-2', 'hold_shared_turn', {}), textResponse('失败前轮回复'), textResponse('重排后的回复'),
+    toolCallResponse('hold-3', 'hold_shared_turn', {}, '中间草稿'), textResponse('关闭后首条回复'), textResponse('关闭后排队回复'),
+    toolCallResponse('hold-4', 'hold_shared_turn', {}), textResponse('准备失败前轮回复'), textResponse('准备重试后回复'),
+  ] })
+  vi.stubEnv('AURABOT_DATA_DIR', h.cwd)
+  const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() }
+  const identity = createIdentity({ dataDir: join(h.cwd, 'identity'), log })
+  const owner = identity.claimOwner('qq', '10001')
+  identity.link('wechat-clawbot', 'owner_wx', owner, 'owner')
+  identity.link('qq', '10002', owner, 'owner')
+  const cfg = normalize({
+    enabled: true, dryRun: false, ownerLevel: 'social', ownerPersonId: owner, ownerQQ: '10001',
+    ownerAuthorization: { owner, revision: '11111111-2222-4333-8444-555555555555' }, multiPlatformPrivateSession: true,
+    ownerPrimary: { platform: 'qq', instance: 'qq', account: '10001' },
+    platforms: { qq: { enabled: true }, 'qq#2': { enabled: true }, 'wechat-clawbot': { enabled: true } },
+    workspaceDir: h.cwd, merge: { enabled: false }, voice: { enabled: false }, stickers: { enabled: false },
+    chat: { everyStep: true, thinkingGuard: { enabled: false } },
+  })
+  const gateway = createGateway({ config: cfg, dataDir: (...path) => join(h.cwd, ...path), identity, log })
+  const qqFactory = fakeFactory({ id: 'qq', self: { account: '20001' } })
+  const wx = makeFakeAdapter({ id: 'wechat-clawbot', caps: { proactive: 'none' } })
+  gateway.register(qqFactory)
+  gateway.register(() => wx)
+  await gateway.sync()
+  const qq = qqFactory.get(1)
+  const qqOther = qqFactory.get(2)
+  const send = vi.spyOn(gateway, 'send')
+  const sessionId = SessionId('session-shared-steer')
+  h.ctx.provide('sessionController', {
+    create: async () => {
+      await h.ctx.agentLoop.create(sessionId, { provider: 'mock', model: 'mock' }, { cwd: h.cwd })
+      return { sessionId }
+    },
+    fork: vi.fn(), rename: vi.fn(),
+    resolveAgent: async id => ({ agent: h.ctx.agents.get(id) }),
+  } as never)
+  h.ctx.workspaceRegistry.list = () => [{ id: 'workspace', path: h.cwd }]
+  const flush = vi.spyOn(h.ctx.sessions, 'flush').mockResolvedValue(true)
+  const firstPrompt = Promise.withResolvers<void>()
+  const releaseFirstPrompt = Promise.withResolvers<void>()
+  const firstStream = Promise.withResolvers<void>()
+  const releaseFirstStream = Promise.withResolvers<void>()
+  const stream = h.adapter.stream.bind(h.adapter)
+  vi.spyOn(h.adapter, 'stream').mockImplementationOnce(async function* (options) {
+    firstStream.resolve()
+    await releaseFirstStream.promise
+    yield* stream(options)
+  })
+  const tools = Array.from({ length: 3 }, () => ({ entered: Promise.withResolvers<void>(), release: Promise.withResolvers<void>() }))
+  let toolIndex = 0
+  const prompts: string[] = []
+  const steeredMemory = '【系统记忆】仅供插入的回归测试内容'
+  const retryText = '准备失败后重试的补充'
+  const hub = createHub({
+    dsh: h.ctx, getConfig: () => cfg, log, gateway, identity,
+    resolveSharedPrimary: () => fixedSharedPrimary({
+      cfg, identity, instances: gateway.instances(), instancesForAccount: gateway.routing.instancesForAccount,
+    }),
+    hooks: {
+      async prompt(content) {
+        const text = content.map(item => item.text).join('\n')
+        prompts.push(text)
+        if (text.includes('QQ 首条问题')) {
+          firstPrompt.resolve()
+          await releaseFirstPrompt.promise
+        }
+        if (text.includes('QQ群发前的补充')) return [...content, { type: 'text', text: steeredMemory }]
+        if (text.includes(retryText)) {
+          const prepared = [...content]
+          vi.spyOn(prepared, 'filter').mockImplementationOnce(() => { throw new Error('transient preparation failure') })
+          return prepared
+        }
+        return text.includes('丢弃这条补充') ? null : content
+      },
+    },
+    buildTools: () => [defineContentToolFixture({
+      name: 'hold_shared_turn', description: 'Pause the fixture turn', parameters: {},
+      async execute() {
+        const gate = tools[toolIndex++]
+        gate.entered.resolve()
+        await gate.release.promise
+        return [{ type: 'text', text: 'continue' }]
+      },
+    })],
+  })
+  const off = h.ctx.on('session/event', hub.onSessionEvent)
+  const submitted: Promise<unknown>[] = []
+  const stop = gateway.onMessage(message => { submitted.push(hub.onGatewayMessage(message)) })
+  const submit = async (id: string, content: string, adapter = qq, account = adapter === wx ? 'owner_wx' : '10001') => {
+    const index = submitted.length
+    adapter.pushInbound({
+      messageId: id, chat: { kind: 'private', id: account },
+      sender: { account, name: '主人' }, parts: [{ type: 'text', text: content }],
+    })
+    await vi.waitFor(() => expect(submitted).toHaveLength(index + 1))
+    return { done: submitted[index] }
+  }
+  try {
+    const first = await submit('qq-1', 'QQ 首条问题')
+    await firstPrompt.promise
+    const agent = h.ctx.agents.get(sessionId)!
+    const hostSteer = agent.steer.bind(agent)
+    let firstSteerSources: { userText: string, memory: string[] } | undefined
+    const steer = vi.spyOn(agent, 'steer').mockImplementationOnce(message => {
+      const sources = currentPromptSources()
+      if (sources) firstSteerSources = { userText: sources.userText, memory: [...sources.memory] }
+      return hostSteer(message)
+    })
+    const other = await submit('wx-1', '微信的独立问题', wx)
+    const otherInstance = await submit('qq-alt', '另一个 QQ 实例的消息', qqOther)
+    const otherAccount = await submit('qq-account', '另一个 QQ 账号的消息', qq, '10002')
+    const second = await submit('qq-2', 'QQ群发前的补充')
+    releaseFirstPrompt.resolve()
+    await firstStream.promise
+    await second.done
+    expect(steer).toHaveBeenCalledTimes(1)
+    expect(firstSteerSources?.userText).toContain('QQ 首条问题')
+    expect(firstSteerSources?.userText).toContain('QQ群发前的补充')
+    expect(firstSteerSources?.memory).toContain(steeredMemory)
+    const filtered = await submit('qq-filtered', '丢弃这条补充')
+    await filtered.done
+    expect(steer).toHaveBeenCalledTimes(1)
+    const third = await submit('qq-3', 'QQ生成期间的补充')
+    await third.done
+    expect(steer).toHaveBeenCalledTimes(2)
+    cfg.sharedSteerMaxPerTurn = 2
+    const overLimit = await submit('qq-over', '达到上限后排队的消息')
+    const delivered = vi.fn()
+    const proactive = hub.pushProactiveToSession({ chatId: 'qq:private:10001', kind: 'private', userId: '10001' },
+      [{ type: 'text', text: '计划中的主动搭话' }], '', { route: { chatId: 'qq:private:10001' }, onDelivered: delivered })
+    expect(steer).toHaveBeenCalledTimes(2)
+    expect(send).not.toHaveBeenCalled()
+    releaseFirstStream.resolve()
+    await Promise.all([first.done, other.done, otherInstance.done, otherAccount.done, overLimit.done, proactive])
+    expect(delivered).toHaveBeenCalledTimes(1)
+    expect(send.mock.calls.map(([message]) => message.inResponseTo || null))
+      .toEqual(['qq-1', 'qq-1', 'wx-1', 'qq-alt', 'qq-account', 'qq-over', null])
+    expect(qq.sent[0].payload.parts[0].text).toBe('插入期间的可见回复')
+    expect(qq.sent[1].payload.parts[0].text).toBe('合并后的 QQ 回复')
+    expect(qqOther.sent[0].payload.inResponseTo).toBe('qq-alt')
+    expect(qq.sent.find(record => record.payload.inResponseTo === 'qq-account')?.payload.chat.id).toBe('10002')
+    expect(h.adapter.requests).toHaveLength(7)
+    const merged = JSON.stringify(h.adapter.requests[1].messages)
+    expect(merged).toContain('QQ群发前的补充')
+    expect(merged).toContain('QQ生成期间的补充')
+    expect(merged).not.toContain('丢弃这条补充')
+    expect(merged).not.toContain('微信的独立问题')
+    expect(merged).not.toContain('另一个 QQ 实例的消息')
+    expect(merged).not.toContain('另一个 QQ 账号的消息')
+    expect(merged).not.toContain('达到上限后排队的消息')
+    expect(merged).not.toContain('计划中的主动搭话')
+    const ends = agent.session.snapshotEvents().filter(event => event.type === 'turn/end')
+    expect(ends).toHaveLength(6)
+    expect(ends[0].data.reason.kind).toBe('completed')
+    expect(flush).toHaveBeenCalledTimes(6)
+    const map = JSON.parse(await readFile(join(h.cwd, 'sessions.json'), 'utf8'))
+    expect(map.multiPrivate.sessions.live.verifiedThroughSeq).toBe(ends.at(-1)!.seq)
+
+    const beforeFailure = await submit('qq-failure-first', '插入失败测试首条')
+    await tools[0].entered.promise
+    const rejectedText = '重排时复用准备好的补充'
+    let rejectedSources: ReturnType<typeof currentPromptSources>
+    let textBeforeRejection: string | undefined
+    steer.mockImplementationOnce(() => {
+      rejectedSources = currentPromptSources()
+      textBeforeRejection = rejectedSources?.userText
+      throw new Error('host rejected steer')
+    })
+    const failed = await submit('qq-failed-steer', rejectedText)
+    await vi.waitFor(() => expect(steer).toHaveBeenCalledTimes(3))
+    expect(textBeforeRejection).toContain(rejectedText)
+    expect(rejectedSources?.userText).toContain('插入失败测试首条')
+    expect(rejectedSources?.userText).not.toContain(rejectedText)
+    tools[0].release.resolve()
+    await Promise.all([beforeFailure.done, failed.done])
+    expect(qq.sent.slice(-2).map(record => record.payload.inResponseTo)).toEqual(['qq-failure-first', 'qq-failed-steer'])
+    expect(prompts.filter(text => text.includes(rejectedText))).toHaveLength(1)
+    expect(JSON.stringify(h.adapter.requests[8].messages)).not.toContain(rejectedText)
+    expect(JSON.stringify(h.adapter.requests[9].messages)).toContain(rejectedText)
+
+    const beforeDisabled = await submit('qq-disabled-first', '关闭开关测试首条')
+    await tools[1].entered.promise
+    cfg.sharedSteerEnabled = false
+    const disabled = await submit('qq-disabled-next', '关闭开关后单独排队')
+    tools[1].release.resolve()
+    await Promise.all([beforeDisabled.done, disabled.done])
+    expect(steer).toHaveBeenCalledTimes(3)
+    expect(qq.sent.slice(-2).map(record => record.payload.inResponseTo)).toEqual(['qq-disabled-first', 'qq-disabled-next'])
+    expect(qq.sent.at(-2)?.payload.parts[0].text).toBe('关闭后首条回复')
+
+    cfg.sharedSteerEnabled = true
+    const beforeRetry = await submit('qq-prepare-first', '准备失败测试首条')
+    await tools[2].entered.promise
+    const retry = await submit('qq-prepare-retry', retryText)
+    await vi.waitFor(() => expect(log.warn).toHaveBeenCalledWith('共享私聊插入失败：', 'transient preparation failure'))
+    tools[2].release.resolve()
+    await Promise.all([beforeRetry.done, retry.done])
+    expect(steer).toHaveBeenCalledTimes(3)
+    expect(qq.sent.slice(-2).map(record => record.payload.inResponseTo)).toEqual(['qq-prepare-first', 'qq-prepare-retry'])
+    expect(prompts.filter(text => text.includes(retryText))).toHaveLength(1)
+    expect(JSON.stringify(h.adapter.requests.at(-2)?.messages)).not.toContain(retryText)
+    expect(JSON.stringify(h.adapter.requests.at(-1)?.messages)).toContain(retryText)
+  } finally {
+    releaseFirstPrompt.resolve()
+    releaseFirstStream.resolve()
+    for (const gate of tools) gate.release.resolve()
+    stop()
+    off()
+    hub.dispose()
+    await gateway.stopAll()
+    identity.close?.()
+  }
+}, 30_000)
 
 it('queues two platforms on one DSH session and preserves reply credentials for slow tools and failures', async () => {
   const h = await harness({
@@ -1010,13 +1231,30 @@ it('recovers the verified shared prefix with the real DSH controller and reopens
     }, { timeout: 5000 })
     expect(ctx.workspaceRegistry.archivedSessionIds).toContain(childId)
     const inboundAfterRecovery = '核验点恢复后的 QQ 消息'
-    await host.send('qq', 'after-checkpoint-recovery', inboundAfterRecovery)
+    const steeredAfterRecovery = '恢复分支正在回复时的同源补充'
+    const resume = Promise.withResolvers<void>()
+    let atBoundary = false
+    const offStopping = ctx.on('agent/turn-stopping', async ({ agent }) => {
+      if (agent.session.id !== recoveredId || atBoundary) return
+      atBoundary = true
+      await resume.promise
+    })
+    const reply = host.send('qq', 'after-checkpoint-recovery', inboundAfterRecovery)
+    try {
+      await vi.waitFor(() => expect(atBoundary).toBe(true), { timeout: 5000 })
+      await host.send('qq', 'steered-after-checkpoint-recovery', steeredAfterRecovery)
+    } finally {
+      resume.resolve()
+      offStopping()
+    }
+    await reply
     expect(host.qq.sent.map(record => record.payload.inResponseTo)).toEqual(['after-checkpoint-recovery'])
     expect(host.hub.sharedStatus().state).toBe('active')
     const afterInbound = (await readMap()).multiPrivate.sessions.live
     expect(afterInbound.sessionId).toBe(recoveredId)
     expect(afterInbound.verifiedThroughSeq).toBeGreaterThan(recoveredCheckpoint)
     expect(JSON.stringify(recovered.deriveMessages())).toContain(inboundAfterRecovery)
+    expect(JSON.stringify(recovered.deriveMessages())).toContain(steeredAfterRecovery)
 
     await host.close()
     await ctx.fiber.dispose()
@@ -1032,6 +1270,7 @@ it('recovers the verified shared prefix with the real DSH controller and reopens
     expect(ctx.sessions.get(recoveredId)?.header.parentSession).toBe(childId)
     const reopenedMessages = JSON.stringify(host.adapter.requests.at(-1)?.messages)
     expect(reopenedMessages).toContain(inboundAfterRecovery)
+    expect(reopenedMessages).toContain(steeredAfterRecovery)
     expect(reopenedMessages).not.toContain(unverifiedText)
     expect(host.qq.sent).toEqual([])
     expect(host.wx.sent.map(record => record.payload.inResponseTo)).toEqual(['after-recovered-restart'])
