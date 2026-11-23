@@ -132,6 +132,7 @@ dsh plugin --profile <profile> add github:aureth-labs/dsh-aurabot-qq
 | 文档 | 内容 |
 |---|---|
 | [用户手册](docs/USER-MANUAL.md) | 安装后的每一项配置、QQ 命令、面板说明——**先看这个** |
+| [通讯平台接入指南与规范](docs/PLATFORM-INTEGRATION.md) | 新增平台/实例/适配器的分层、能力、共享会话、安全、测试和 AI 贡献规范 |
 | [写模块教程](docs/MODULE-TUTORIAL.md) | 从零写一个模块；怎么热重载、怎么套用改写挂钩 |
 | [模块 API](src/modules/API.md) | 扩展接口、工具、上下文、命令行、定时任务完整说明 |
 | [语义检索（Embedding）](docs/EMBEDDING.md) | 支持的服务、配置、维度/批量/超时、隐私与排错 |
