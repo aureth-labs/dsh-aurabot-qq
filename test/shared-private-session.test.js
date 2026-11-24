@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -907,4 +907,392 @@ test('send_to_platform 富内容扩展：|||<wbr>、voice 降级、sticker、图
   assert.equal(qq.sent.every((x) => x.payload.parts[0].text === '好的，帮你看了'), true)
   const sessionsState = hub.sharedStatus().state
   assert.ok(sessionsState)
+})
+
+async function setupSharedProactiveHarness(t, {
+  primary = { platform: 'qq', instance: 'qq', account: '10001' },
+  fallbackOrder = [{ platform: 'feishu', instance: 'feishu', account: 'ou_owner' }],
+  fallback = true,
+  qqWhoamiFn,
+  feishuWhoamiFn,
+  onCreateAgent,
+  onGenerate,
+} = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'aurabot-shared-proactive-'))
+  const prevDir = process.env.AURABOT_DATA_DIR
+  process.env.AURABOT_DATA_DIR = dir
+  const log = { info() {}, debug() {}, warn() {}, error() {}, child() { return this } }
+  const id = createIdentity({ dataDir: join(dir, 'identity'), log })
+  const ownerId = id.claimOwner('qq', '10001')
+  id.link('feishu', 'ou_owner', ownerId, 'owner')
+
+  const cfg = normalize({
+    enabled: true,
+    dryRun: false,
+    ownerLevel: 'social',
+    ownerPersonId: ownerId,
+    ownerQQ: '10001',
+    ownerAuthorization: { owner: ownerId, revision: '11111111-2222-4333-8444-555555555555' },
+    multiPlatformPrivateSession: true,
+    ownerPrimary: { mode: 'fixed', ...primary, fallback, fallbackOrder },
+    platforms: { qq: { enabled: true }, feishu: { enabled: true } },
+    voice: { enabled: false },
+    stickers: { enabled: false },
+    merge: { enabled: false },
+    chat: { thinkingGuard: { enabled: false } },
+  })
+  const gateway = createGateway({ config: cfg, dataDir: (...p) => join(dir, ...p), identity: id, log })
+  const qq = makeFakeAdapter({ id: 'qq', self: { account: '20001' }, caps: { proactive: 'free' } })
+  const feishu = makeFakeAdapter({ id: 'feishu', self: { account: 'fs_bot_1' }, caps: { text: true, voice: 'file', image: true, proactive: 'free' } })
+  if (qqWhoamiFn) qq.whoami = qqWhoamiFn(qq.whoami.bind(qq))
+  if (feishuWhoamiFn) feishu.whoami = feishuWhoamiFn(feishu.whoami.bind(feishu))
+  gateway.register(() => qq)
+  gateway.register(() => feishu)
+  await gateway.sync()
+
+  const listeners = new Map()
+  const emit = (name, ...args) => { for (const fn of listeners.get(name) || []) fn(...args) }
+  const agents = new Map()
+  let seqCounter = 0
+  let createCount = 0
+  let flushCount = 0
+  let lastTurnEndSeq = null
+
+  function makeAgent(sessionId) {
+    let dshTurn = 0
+    let idleChain = Promise.resolve()
+    const session = {
+      id: sessionId,
+      seq: 0,
+      inheritedEventCount: 0,
+      events: [],
+      isOwnSeq: () => true,
+      eventAt: (i) => session.events[i],
+    }
+    const agent = {
+      id: sessionId,
+      session,
+      inbox: { nextTurn: [], nextStep: [], remove() {} },
+      cancel() {},
+      ctx: {
+        tools: { register: () => () => {}, restrict: () => () => {} },
+        systemPrompt: { context: () => () => {} },
+      },
+      whenIdle: () => idleChain,
+      followup(msg) {
+        idleChain = idleChain.then(async () => {
+          dshTurn++
+          const myTurn = dshTurn
+          emit('agent/inbox/claimed', { agent, message: msg, turn: myTurn })
+          const splicedSeq = seqCounter++
+          session.seq = splicedSeq + 1
+          session.events[splicedSeq] = { type: 'agent/inbox/spliced', seq: splicedSeq, data: { inserted: [{ id: msg.id }] } }
+          emit('session/event', session, session.events[splicedSeq])
+          for (const fn of listeners.get('agent/pre-step') || []) {
+            await fn(
+              { agent, messages: [msg], turn: myTurn, step: 1, signal: new AbortController().signal },
+              async () => ({ kind: 'allow', messages: [msg] }),
+            )
+          }
+          if (onGenerate) await onGenerate({ agent, session, msg, myTurn })
+          const endSeq = seqCounter++
+          lastTurnEndSeq = endSeq
+          session.seq = endSeq + 1
+          session.events[endSeq] = { type: 'turn/end', seq: endSeq, data: { turn: myTurn, reason: { kind: 'completed' } } }
+          emit('session/event', session, { type: 'assistant/message', data: { turn: myTurn, message: { content: [{ type: 'text', text: `主动搭话-${myTurn}` }] } } })
+          emit('session/event', session, session.events[endSeq])
+        })
+        return idleChain
+      },
+    }
+    agents.set(sessionId, agent)
+    return agent
+  }
+
+  const wsObj = { id: 'workspace', path: dir, title: 'Aurabot · QQ', sessionIds: [], async attachSession() {} }
+  const dsh = {
+    on(name, fn) {
+      if (!listeners.has(name)) listeners.set(name, new Set())
+      listeners.get(name).add(fn)
+      return () => listeners.get(name).delete(fn)
+    },
+    get: (name) => dsh.services?.[name],
+    agents: { get: (idKey) => agents.get(idKey) },
+    sessions: { flush: async () => { flushCount++; return true } },
+    attachments: { admitPromptContent: async (c) => c },
+    workspaceRegistry: { list: () => [wsObj], get: (idKey) => (idKey === wsObj.id ? wsObj : null), create: async () => wsObj, archiveSession: async () => {}, archivedSessionIds: [], unarchiveSession: async () => {} },
+    services: {
+      sessionProjections: {},
+      sessionController: {
+        create: async () => {
+          if (onCreateAgent) await onCreateAgent()
+          const sid = `s-shared-pro-${++createCount}`
+          makeAgent(sid)
+          return { sessionId: sid }
+        },
+        resolveAgent: async (idKey) => ({ agent: agents.get(idKey) || makeAgent(idKey) }),
+        fork: async () => ({ sessionId: `s-fork-${++createCount}` }),
+        rename: async () => {},
+      },
+    },
+  }
+
+  const resolveRoute = ({ sharedBinding } = {}) => {
+    const candidates = sharedBinding
+      ? [
+          { platform: sharedBinding.platform, instance: sharedBinding.instance, account: sharedBinding.account },
+          ...(cfg.ownerPrimary?.fallback ? (cfg.ownerPrimary.fallbackOrder || []) : []),
+        ]
+      : [{ ...primary }]
+    for (const c of candidates) {
+      const inst = gateway.instances().find((x) => x.instance === c.instance && x.platform === c.platform)
+      if (inst && inst.enabled && inst.state === 'connected' && inst.caps?.proactive !== 'none') {
+        return {
+          chatId: `${c.instance}:private:${c.account}`,
+          target: c,
+          blocked: false,
+          reason: c.platform === sharedBinding?.platform && c.account === sharedBinding?.account ? 'ok' : 'fallback-used',
+          fallbackUsed: !(c.platform === sharedBinding?.platform && c.account === sharedBinding?.account),
+        }
+      }
+    }
+    return { chatId: '', blocked: true, reason: 'primary-offline', target: primary, fallbackUsed: false }
+  }
+
+  const hub = createHub({
+    dsh,
+    getConfig: () => cfg,
+    log,
+    gateway,
+    identity: id,
+    resolveOwnerRoute: resolveRoute,
+    resolveSharedPrimary: () => fixedSharedPrimary({ cfg, identity: id, instances: gateway.instances() }),
+  })
+  const offSession = dsh.on('session/event', hub.onSessionEvent)
+  const stopGw = gateway.onMessage((m) => { hub.onGatewayMessage(m) })
+  const readSessionsJson = () => JSON.parse(readFileSync(join(dir, 'sessions.json'), 'utf8'))
+
+  t.after(async () => {
+    offSession()
+    stopGw()
+    hub.dispose()
+    await gateway.stopAll()
+    id.close?.()
+    if (prevDir === undefined) delete process.env.AURABOT_DATA_DIR
+    else process.env.AURABOT_DATA_DIR = prevDir
+    try { rmSync(dir, { recursive: true, force: true }) } catch {}
+  })
+
+  return {
+    dir, cfg, gateway, qq, feishu, hub, id, readSessionsJson,
+    stats: () => ({ createCount, flushCount, lastTurnEndSeq }),
+  }
+}
+
+test('共享主动回退 P2 #1：目标 connected 但 whoami 未完成时拒绝选择与投递，重连验号期间同样暂缓', async (t) => {
+  let feishuGate = Promise.withResolvers()
+  t.after(() => feishuGate.resolve())
+  const { gateway, qq, feishu, hub, stats } = await setupSharedProactiveHarness(t, {
+    feishuWhoamiFn: (orig) => async () => {
+      await feishuGate.promise
+      return orig()
+    },
+  })
+
+  qq.disconnect()
+  const inst = () => gateway.instances().find((x) => x.instance === 'feishu')
+  assert.equal(inst()?.state, 'connected')
+  assert.equal(inst()?.self, null, '初连 whoami 未完成前 self 必须为 null')
+
+  // 即使 resolveOwnerRoute 只检查 state=connected，hub.canProactiveTarget 也必须以 self.account 为空拒绝投递
+  const previewPending = hub.resolveSharedProactiveRoute({ record: false })
+  assert.equal(previewPending?.deferred, true)
+  assert.equal(previewPending?.chatId, '')
+  const pushPending = await hub.pushProactiveToSession(null, [{ type: 'text', text: '测试搭话' }], '', {
+    route: { chatId: 'feishu:private:ou_owner', fallbackUsed: true },
+  })
+  assert.equal(pushPending.ok, false)
+  assert.equal(pushPending.deferred, true)
+  assert.equal(feishu.sent.length, 0)
+  assert.equal(stats().createCount, 0, 'whoami 未完成时不得创建共享会话或生成内容')
+
+  // 放行首次 whoami -> 允许回退投递到 feishu
+  feishuGate.resolve()
+  for (let i = 0; i < 50 && !inst()?.self?.account; i++) await new Promise((r) => setTimeout(r, 10))
+  assert.equal(inst()?.self?.account, 'fs_bot_1')
+  const previewReady = hub.resolveSharedProactiveRoute({ record: false })
+  assert.equal(previewReady?.chatId, 'feishu:private:ou_owner')
+  assert.equal(previewReady?.fallbackUsed, true)
+  const pushOk = await hub.pushProactiveToSession(null, [{ type: 'text', text: '验号后搭话' }], '', { route: previewReady })
+  assert.equal(pushOk.ok, true)
+  assert.equal(pushOk.delivered, true)
+  assert.equal(feishu.sent.length, 1)
+
+  // 重连后 self 重新清空，在新一轮 whoami 完成前再次拒绝
+  feishuGate = Promise.withResolvers()
+  feishu.disconnect()
+  feishu.reconnect()
+  assert.equal(inst()?.state, 'connected')
+  assert.equal(inst()?.self, null)
+  assert.equal(hub.resolveSharedProactiveRoute({ record: false })?.deferred, true)
+  const pushReconnectPending = await hub.pushProactiveToSession(null, [{ type: 'text', text: '重连验号中' }], '', {
+    route: { chatId: 'feishu:private:ou_owner', fallbackUsed: true },
+  })
+  assert.equal(pushReconnectPending.deferred, true)
+  assert.equal(feishu.sent.length, 1)
+
+  feishuGate.resolve()
+  for (let i = 0; i < 50 && !inst()?.self?.account; i++) await new Promise((r) => setTimeout(r, 10))
+  assert.equal(hub.resolveSharedProactiveRoute({ record: false })?.chatId, 'feishu:private:ou_owner')
+})
+
+test('共享主动回退 P2 #2：投递前已完成 DSH flush 但 checkpoint 在投递完成后推进，生成中目标断开不误记送达', async (t) => {
+  let genGate = null
+  let genEntered = null
+  const { gateway, qq, feishu, hub, readSessionsJson, stats } = await setupSharedProactiveHarness(t, {
+    onGenerate: async () => {
+      genEntered?.resolve()
+      if (genGate) await genGate.promise
+    },
+  })
+
+  qq.disconnect()
+  const route = hub.resolveSharedProactiveRoute({ record: false })
+  assert.equal(route?.chatId, 'feishu:private:ou_owner')
+
+  // 1) 挂起 gateway.send，检查投递未完成前已 flush 但 sessions.json verifiedThroughSeq 尚未推进
+  const sendStarted = Promise.withResolvers()
+  const releaseSend = Promise.withResolvers()
+  t.after(() => { releaseSend.resolve(); genGate?.resolve() })
+  const origSend = gateway.send.bind(gateway)
+  gateway.send = async (...args) => {
+    sendStarted.resolve()
+    await releaseSend.promise
+    return origSend(...args)
+  }
+  let deliveredCount = 0
+  const pendingPush = hub.pushProactiveToSession(null, [{ type: 'text', text: '先生成再投递' }], '', {
+    route,
+    onDelivered: () => { deliveredCount++ },
+  })
+  await sendStarted.promise
+  assert.equal(stats().flushCount >= 1, true, '投递前应已持久化/flush DSH 会话')
+  assert.equal(
+    readSessionsJson().multiPrivate.sessions.live.verifiedThroughSeq ?? null,
+    null,
+    '投递结果确定前不得提前推进 verifiedThroughSeq',
+  )
+  releaseSend.resolve()
+  gateway.send = origSend
+  const okRes = await pendingPush
+  assert.equal(okRes.ok, true)
+  assert.equal(okRes.delivered, true)
+  assert.equal(deliveredCount, 1)
+  const afterDeliveredMap = readSessionsJson().multiPrivate
+  assert.equal(afterDeliveredMap.primaryBinding.platform, 'qq')
+  assert.equal(afterDeliveredMap.sessions.live.verifiedThroughSeq, stats().lastTurnEndSeq)
+  const firstDelivery = hub.sharedStatus().lastProactiveDelivery
+  assert.equal(firstDelivery?.platform, 'feishu')
+  assert.equal(firstDelivery?.fallbackUsed, true)
+
+  // 2) 生成阶段目标断开 -> 返回 deferred，不调 onDelivered、不覆盖 lastProactiveDelivery，已核验历史同步进 checkpoint
+  genGate = Promise.withResolvers()
+  genEntered = Promise.withResolvers()
+  const prevOnGen = stats().lastTurnEndSeq
+  const pendingDrop = hub.pushProactiveToSession(null, [{ type: 'text', text: '生成途中断线' }], '', {
+    route,
+    onDelivered: () => { deliveredCount++ },
+  })
+  const entered = await Promise.race([
+    genEntered.promise.then(() => ({ entered: true })),
+    pendingDrop.then((res) => ({ entered: false, res })),
+  ])
+  assert.equal(entered.entered, true, `unexpected early return before onGenerate: ${JSON.stringify(entered)}`)
+  feishu.disconnect()
+  genGate.resolve()
+  genGate = null
+  genEntered = null
+  const dropRes = await pendingDrop
+  assert.equal(dropRes.ok, false)
+  assert.equal(dropRes.deferred, true)
+  assert.equal(deliveredCount, 1)
+  assert.equal(feishu.sent.length, 1)
+  assert.deepEqual(hub.sharedStatus().lastProactiveDelivery, firstDelivery)
+  assert.ok(readSessionsJson().multiPrivate.sessions.live.verifiedThroughSeq > prevOnGen)
+})
+
+test('共享主动回退 P2 #3：withDefaultQqWork 在准备/生成/投递全程护航 QQ 迁移，且迁移暂停时拒绝回退', async (t) => {
+  // 场景 A：共享主账号为默认 qq，回退飞书 -> 在 ensure / generate / send 全程持有 defaultQqWork
+  const createGate = Promise.withResolvers()
+  const genGate = Promise.withResolvers()
+  const createReached = Promise.withResolvers()
+  const genReached = Promise.withResolvers()
+  t.after(() => { createGate.resolve(); genGate.resolve() })
+  const hA = await setupSharedProactiveHarness(t, {
+    primary: { platform: 'qq', instance: 'qq', account: '10001' },
+    fallbackOrder: [{ platform: 'feishu', instance: 'feishu', account: 'ou_owner' }],
+    onCreateAgent: async () => { createReached.resolve(); await createGate.promise },
+    onGenerate: async () => { genReached.resolve(); await genGate.promise },
+  })
+  hA.qq.disconnect()
+  const sendReached = Promise.withResolvers()
+  const sendGate = Promise.withResolvers()
+  t.after(() => sendGate.resolve())
+  const origSendA = hA.gateway.send.bind(hA.gateway)
+  hA.gateway.send = async (...args) => { sendReached.resolve(); await sendGate.promise; return origSendA(...args) }
+
+  assert.equal(hA.hub.isDefaultQqTransportIdle(), true)
+  const routeA = hA.hub.resolveSharedProactiveRoute({ record: false })
+  const pushA = hA.hub.pushProactiveToSession(null, [{ type: 'text', text: '场景A' }], '', { route: routeA })
+  await createReached.promise
+  assert.equal(hA.hub.isDefaultQqTransportIdle(), false, 'ensure 创建会话阶段必须持有 defaultQqWork')
+  createGate.resolve()
+  await genReached.promise
+  assert.equal(hA.hub.isDefaultQqTransportIdle(), false, '模型生成阶段必须持有 defaultQqWork')
+  genGate.resolve()
+  await sendReached.promise
+  assert.equal(hA.hub.isDefaultQqTransportIdle(), false, '即使实际向 feishu 投递也必须持续持有 defaultQqWork')
+  sendGate.resolve()
+  assert.equal((await pushA).delivered, true)
+  assert.equal(hA.hub.isDefaultQqTransportIdle(), true)
+
+  // 场景 C：QQ 迁移暂停托管期间（即使 feishu 在线且可回退），预览与触发都必须返回 qq-ownership-paused
+  hA.hub.setDefaultQqTransportPaused(true)
+  const pausedPreview = hA.hub.resolveSharedProactiveRoute({ record: false })
+  assert.equal(pausedPreview?.deferred, true)
+  assert.equal(pausedPreview?.reason, 'qq-ownership-paused')
+  const pausedPush = await hA.hub.pushProactiveToSession(null, [{ type: 'text', text: '迁移暂停期' }], '', {
+    route: { chatId: 'feishu:private:ou_owner', fallbackUsed: true },
+  })
+  assert.equal(pausedPush.deferred, true)
+  assert.equal(pausedPush.reason, 'qq-ownership-paused')
+  assert.equal(hA.feishu.sent.length, 1, '迁移暂停期间不得经共享主动链路发消息')
+
+  // 场景 B：共享主账号为 feishu，回退到默认 qq -> 同样在生成和投递阶段持有 defaultQqWork
+  const genGateB = Promise.withResolvers()
+  const genReachedB = Promise.withResolvers()
+  t.after(() => genGateB.resolve())
+  const hB = await setupSharedProactiveHarness(t, {
+    primary: { platform: 'feishu', instance: 'feishu', account: 'ou_owner' },
+    fallbackOrder: [{ platform: 'qq', instance: 'qq', account: '10001' }],
+    onGenerate: async () => { genReachedB.resolve(); await genGateB.promise },
+  })
+  hB.feishu.disconnect()
+  const sendReachedB = Promise.withResolvers()
+  const sendGateB = Promise.withResolvers()
+  t.after(() => sendGateB.resolve())
+  const origSendB = hB.gateway.send.bind(hB.gateway)
+  hB.gateway.send = async (...args) => { sendReachedB.resolve(); await sendGateB.promise; return origSendB(...args) }
+
+  const routeB = hB.hub.resolveSharedProactiveRoute({ record: false })
+  assert.equal(routeB?.chatId, 'qq:private:10001')
+  const pushB = hB.hub.pushProactiveToSession(null, [{ type: 'text', text: '场景B' }], '', { route: routeB })
+  await genReachedB.promise
+  assert.equal(hB.hub.isDefaultQqTransportIdle(), false, '回退投递目标为默认 qq 时生成阶段必须持有 defaultQqWork')
+  genGateB.resolve()
+  await sendReachedB.promise
+  assert.equal(hB.hub.isDefaultQqTransportIdle(), false, '回退向默认 qq 投递阶段必须持有 defaultQqWork')
+  sendGateB.resolve()
+  assert.equal((await pushB).delivered, true)
+  assert.equal(hB.hub.isDefaultQqTransportIdle(), true)
 })

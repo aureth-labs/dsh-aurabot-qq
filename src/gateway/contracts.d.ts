@@ -545,3 +545,144 @@ export interface InstanceConfig {
  *   gateway + snowluma.{httpUrl,wsUrl,httpToken,wsToken,dir,…}  →  platforms.qq.{backend,…}
  *   旧配置 QQ 号 → 启动时 identity.claimOwner('qq', rawOwner)（已有主人则跳过）
  */
+
+// ───────────────────────── 10. 统一认证（QR / Device Code / OAuth） ─────────────────────────
+
+export type AuthMethod = 'qr-app' | 'qr-link' | 'device-code' | 'oauth-callback' | 'manual'
+
+export type AuthSessionState =
+  | 'starting'
+  | 'qr_ready'
+  | 'device_code_ready'
+  | 'polling'
+  | 'slow_down'
+  | 'domain_switched'
+  | 'authorized'
+  | 'saving'
+  | 'succeeded'
+  | 'expired'
+  | 'cancelled'
+  | 'error'
+
+export type AuthErrorStage =
+  | 'auth.begin'
+  | 'auth.qr.encode'
+  | 'auth.qr.expire'
+  | 'auth.poll'
+  | 'auth.slow_down'
+  | 'auth.cancel'
+  | 'auth.verify'
+  | 'auth.save'
+  | 'auth.connect'
+
+export interface AuthErrorDetail {
+  code: string
+  stage: AuthErrorStage
+  message: string
+  retryable: boolean
+  platform?: Platform
+}
+
+export interface AuthMethodDescriptor {
+  method: AuthMethod
+  label: string
+  description?: string
+  defaultTtlMs?: number
+  defaultPollIntervalMs?: number
+  paramFields?: Array<{ key: string; label?: string; type?: string; hint?: string; default?: unknown }>
+}
+
+export interface AuthSessionView {
+  sessionId: string
+  platform: Platform
+  instance: Instance
+  method: AuthMethod
+  state: AuthSessionState
+  expiresAt: number
+  pollIntervalMs: number
+  qrDataUri?: string
+  verificationUrl?: string
+  userCode?: string
+  domain?: string
+  scanned?: boolean
+  message: string
+  self?: { account: string; name?: string }
+  error?: AuthErrorDetail
+  meta?: Record<string, unknown>
+}
+
+export interface AuthCompletion {
+  configPatch: Record<string, unknown>
+  secretPatch: Record<string, string>
+  self?: { account: string; name?: string }
+  meta?: Record<string, unknown>
+}
+
+export interface AuthDriverStartResult {
+  state?: 'qr_ready' | 'device_code_ready' | 'polling'
+  driverSession: Record<string, unknown>
+  qrContent?: string
+  qrDataUri?: string
+  verificationUrl?: string
+  userCode?: string
+  domain?: string
+  expiresAt?: number
+  expiresInMs?: number
+  pollIntervalMs?: number
+  message?: string
+  meta?: Record<string, unknown>
+}
+
+export type AuthDriverPollResult =
+  | {
+    state: 'polling' | 'slow_down' | 'domain_switched'
+    driverSession?: Record<string, unknown>
+    qrContent?: string
+    qrDataUri?: string
+    verificationUrl?: string
+    userCode?: string
+    domain?: string
+    expiresAt?: number
+    expiresInMs?: number
+    pollIntervalMs?: number
+    scanned?: boolean
+    message?: string
+    meta?: Record<string, unknown>
+  }
+  | {
+    state: 'authorized'
+    completion: AuthCompletion
+    message?: string
+  }
+  | {
+    state: 'expired' | 'cancelled'
+    message?: string
+  }
+
+export interface PlatformAuthDriver {
+  platform: Platform
+  methods: AuthMethodDescriptor[]
+  allowedConfigKeys?: string[]
+  sensitiveDriverSessionKeys?: string[]
+  validateInstance?(instance: Instance): boolean
+  start(ctx: {
+    instance: Instance
+    method: AuthMethod
+    params: Record<string, unknown>
+    currentConfig: Record<string, unknown>
+    signal: AbortSignal
+  }): Promise<AuthDriverStartResult>
+  poll(ctx: {
+    instance: Instance
+    method: AuthMethod
+    driverSession: Record<string, unknown>
+    currentConfig: Record<string, unknown>
+    signal: AbortSignal
+  }): Promise<AuthDriverPollResult>
+  cancel?(ctx: {
+    instance: Instance
+    method: AuthMethod
+    driverSession: Record<string, unknown>
+    reason: string
+  }): Promise<void> | void
+}

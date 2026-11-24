@@ -2,6 +2,13 @@
 // 验证 PlatformAdapter.fetch? 可选重载、Gateway.fetch 重载顺序、必填 Gateway.features / onCapsChanged 与负向收窄约束。
 
 import type {
+  AuthCompletion,
+  AuthDriverPollResult,
+  AuthErrorDetail,
+  AuthErrorStage,
+  AuthMethod,
+  AuthSessionState,
+  AuthSessionView,
   Caps,
   Feature,
   FetchRequest,
@@ -11,6 +18,7 @@ import type {
   Gateway,
   Part,
   PlatformAdapter,
+  PlatformAuthDriver,
 } from '../../src/gateway/contracts.js'
 
 declare const capsSample: Caps
@@ -90,3 +98,58 @@ export async function verifyContractTypes() {
 
   return { m, f, h, media, badForward, badHistory, badMsg, badIdType, noSender, emptyAccount, feat, off }
 }
+
+// 4. Phase 0 统一认证契约正反校验
+export const validAuthDriver: PlatformAuthDriver = {
+  platform: 'wechat-clawbot',
+  methods: [{ method: 'qr-link', label: '微信扫码登录', defaultTtlMs: 600_000, defaultPollIntervalMs: 2000 }],
+  allowedConfigKeys: ['botId', 'baseUrl', 'routeTag'],
+  async start() {
+    return {
+      state: 'qr_ready',
+      qrContent: 'https://example.com/qr/1',
+      driverSession: { qrcode: 'q1' },
+    }
+  },
+  async poll(): Promise<AuthDriverPollResult> {
+    return {
+      state: 'authorized',
+      completion: {
+        configPatch: { botId: 'b1' },
+        secretPatch: { botToken: 'secret-value' },
+        self: { account: 'b1', name: 'Bot' },
+      } satisfies AuthCompletion,
+    }
+  },
+}
+
+export const validAuthView: AuthSessionView = {
+  sessionId: 'auth-1',
+  platform: 'wechat-clawbot',
+  instance: 'wechat-clawbot',
+  method: 'qr-link',
+  state: 'qr_ready',
+  expiresAt: Date.now() + 60_000,
+  pollIntervalMs: 2000,
+  qrDataUri: 'data:image/svg+xml;base64,AAAA',
+  message: '请扫码',
+  error: {
+    code: 'qr-encode-failed',
+    stage: 'auth.qr.encode',
+    message: '编码失败',
+    retryable: true,
+    platform: 'wechat-clawbot',
+  } satisfies AuthErrorDetail,
+}
+
+// @ts-expect-error AuthMethod 仅允许预定义认证方式
+export const badAuthMethod: AuthMethod = 'magic-link'
+
+// @ts-expect-error AuthSessionState 仅允许状态机预定义状态
+export const badAuthState: AuthSessionState = 'confirmed'
+
+// @ts-expect-error AuthErrorStage 仅允许 auth.* 预定义阶段
+export const badAuthStage: AuthErrorStage = 'auth.unknown'
+
+// @ts-expect-error AuthCompletion.secretPatch 键值必须为 string
+export const badAuthCompletion: AuthCompletion = { configPatch: {}, secretPatch: { botToken: 123 } }

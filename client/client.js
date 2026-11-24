@@ -1714,70 +1714,372 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       )
     }
 
-    function WechatClawbotQrBox({ instance = 'wechat-clawbot', baseUrl = '', routeTag = '', hasToken = false, toast, onConfirmed }) {
-      const [qr, setQr] = useState(null) // { sessionId, qrDataUri, qrcodeUrl, state, message }
-      const [busy, setBusy] = useState(false)
-      useEffect(() => {
-        if (!qr?.sessionId || (qr.state !== 'wait' && qr.state !== 'scaned')) return undefined
-        let alive = true
-        const timer = setInterval(async () => {
-          try {
-            const r = await post('/platforms/wechat-clawbot/qr/status', { sessionId: qr.sessionId })
-            if (!alive) return
-            if (r.state === 'confirmed') {
-              clearInterval(timer)
-              setQr({ sessionId: '', qrDataUri: '', qrcodeUrl: '', state: 'confirmed', message: r.message || '扫码成功，已保存凭证' })
-              toast && toast(r.message || '微信扫码登录成功', 'ok')
-              onConfirmed && onConfirmed(r)
-              return
-            }
-            if (r.state === 'expired' || r.ok === false) {
-              clearInterval(timer)
-              setQr((cur) => cur ? { ...cur, sessionId: '', state: r.state || 'error', message: r.message || '二维码已过期' } : cur)
-              return
-            }
-            setQr((cur) => cur ? { ...cur, state: r.state, message: r.message } : cur)
-          } catch (e) {}
-        }, 2000)
-        return () => { alive = false; clearInterval(timer) }
-      }, [qr?.sessionId, qr?.state])
+    const AUTH_DISPLAY_STATES = ['qr_ready', 'device_code_ready', 'polling', 'slow_down', 'domain_switched']
 
-      const beginQr = async () => {
+    /**
+     * 平台认证纯轮询调度器（不依赖 React 状态字段变化，递归 setTimeout 持续驱动并支持断网退避重试）。
+     */
+    function createAuthPollLoop({
+      sessionId,
+      initialDelayMs = 2000,
+      pollFn,
+      onUpdate,
+      onComplete,
+      onError,
+      schedule = setTimeout,
+      cancelSchedule = clearTimeout,
+      maxConsecutiveErrors = 5,
+    } = {}) {
+      let stopped = false
+      let timer = null
+      let currentDelayMs = Math.max(500, Number(initialDelayMs) || 2000)
+      let consecutiveErrors = 0
+
+      const clearTimer = () => {
+        if (timer !== null) {
+          try { cancelSchedule(timer) } catch {}
+          timer = null
+        }
+      }
+
+      const scheduleNext = (delayMs) => {
+        if (stopped) return
+        clearTimer()
+        const waitMs = Math.max(500, Number(delayMs) || currentDelayMs || 2000)
+        timer = schedule(() => {
+          timer = null
+          return tick()
+        }, waitMs)
+      }
+
+      const handleTransientError = (message) => {
+        if (stopped) return
+        consecutiveErrors++
+        if (consecutiveErrors >= Math.max(1, Number(maxConsecutiveErrors) || 5)) {
+          stopped = true
+          clearTimer()
+          onError && onError({
+            ok: false,
+            state: 'error',
+            error: { code: 'network-poll-failed', stage: 'auth.poll', retryable: true, message },
+            message,
+          })
+          return
+        }
+        const backoffMs = Math.min(10_000, currentDelayMs * Math.min(3, consecutiveErrors + 1))
+        onUpdate && onUpdate({
+          transientError: true,
+          message: `网络或宿主暂不可达，将在 ${Math.ceil(backoffMs / 1000)} 秒后重试（${consecutiveErrors}/${maxConsecutiveErrors}）：${message}`,
+        })
+        scheduleNext(backoffMs)
+      }
+
+      async function tick() {
+        if (stopped) return
+        let r
+        try {
+          r = await pollFn(sessionId)
+        } catch (err) {
+          handleTransientError(err?.message || '轮询请求异常')
+          return
+        }
+        if (stopped) return
+        if (!r || typeof r !== 'object') {
+          handleTransientError('轮询返回格式无效')
+          return
+        }
+        // post() 在网络异常时会 resolve `{ ok: false, message: '连不上插件：...' }`（无 state 且无 error），需退避重调而不是静默卡死
+        if (!r.state && r.ok === false && !r.error) {
+          handleTransientError(r.message || '连接插件失败')
+          return
+        }
+        if (r.state === 'succeeded') {
+          stopped = true
+          clearTimer()
+          onComplete && onComplete(r)
+          return
+        }
+        if (r.state === 'expired' || r.state === 'cancelled' || r.state === 'error' || r.ok === false) {
+          stopped = true
+          clearTimer()
+          onError && onError(r)
+          return
+        }
+        consecutiveErrors = 0
+        if (Number.isFinite(Number(r.pollIntervalMs)) && Number(r.pollIntervalMs) > 0) {
+          currentDelayMs = Math.max(500, Number(r.pollIntervalMs))
+        }
+        onUpdate && onUpdate(r)
+        scheduleNext(currentDelayMs)
+      }
+
+      return {
+        start() {
+          if (stopped || !sessionId) return
+          scheduleNext(currentDelayMs)
+        },
+        stop() {
+          if (stopped) return
+          stopped = true
+          clearTimer()
+        },
+        isStopped() {
+          return stopped
+        },
+      }
+    }
+
+    function PlatformAuthQrBox({
+      platform,
+      instance,
+      method = 'qr-link',
+      params = {},
+      hasToken = false,
+      startLabel = '扫码登录',
+      restartLabel = '重新扫码登录',
+      readyHint = '请使用手机扫描二维码或打开授权链接完成认证',
+      savedHint = '已保存凭证（会话过期或换号时可点此重新认证）',
+      alt = '平台登录二维码',
+      toast,
+      onConfirmed,
+      onError,
+    }) {
+      const [session, setSession] = useState(null)
+      const [busy, setBusy] = useState(false)
+      const activeSidRef = useRef('')
+      const unmountedRef = useRef(false)
+      const pollLoopRef = useRef(null)
+      const initialDelayRef = useRef(2000)
+      const callbacksRef = useRef({ toast, onConfirmed, onError })
+      callbacksRef.current = { toast, onConfirmed, onError }
+
+      const stopPollLoop = () => {
+        if (pollLoopRef.current) {
+          pollLoopRef.current.stop()
+          pollLoopRef.current = null
+        }
+      }
+
+      const cancelRemote = useCallback((sid, reason = 'cancelled') => {
+        if (!sid) return Promise.resolve()
+        if (activeSidRef.current === sid) activeSidRef.current = ''
+        return post('/platforms/auth/cancel', { sessionId: sid, reason }).catch(() => {})
+      }, [])
+
+      useEffect(() => {
+        unmountedRef.current = false
+        return () => {
+          unmountedRef.current = true
+          stopPollLoop()
+          const sid = activeSidRef.current
+          if (sid) {
+            activeSidRef.current = ''
+            post('/platforms/auth/cancel', { sessionId: sid, reason: 'unmount' }).catch(() => {})
+          }
+        }
+      }, [])
+
+      const activeSessionId = session?.sessionId && AUTH_DISPLAY_STATES.includes(session.state)
+        ? session.sessionId
+        : ''
+
+      useEffect(() => {
+        stopPollLoop()
+        if (!activeSessionId) return undefined
+        const loop = createAuthPollLoop({
+          sessionId: activeSessionId,
+          initialDelayMs: initialDelayRef.current,
+          pollFn: (sid) => post('/platforms/auth/poll', { sessionId: sid }),
+          onComplete: (r) => {
+            if (unmountedRef.current || activeSidRef.current !== activeSessionId) return
+            activeSidRef.current = ''
+            setSession({
+              sessionId: '',
+              state: 'succeeded',
+              qrDataUri: '',
+              verificationUrl: '',
+              userCode: '',
+              domain: '',
+              pollIntervalMs: Number(r.pollIntervalMs) || 2000,
+              message: r.message || '认证成功，已保存凭证',
+              self: r.self || null,
+              meta: r.meta || null,
+            })
+            callbacksRef.current.toast && callbacksRef.current.toast(r.message || '认证成功，已保存凭证', 'ok')
+            callbacksRef.current.onConfirmed && callbacksRef.current.onConfirmed(r)
+          },
+          onError: (r) => {
+            if (unmountedRef.current || activeSidRef.current !== activeSessionId) return
+            activeSidRef.current = ''
+            setSession((cur) => ({
+              ...(cur || {}),
+              sessionId: '',
+              qrDataUri: '',
+              verificationUrl: '',
+              userCode: '',
+              state: r.state || 'error',
+              error: r.error || null,
+              message: r.message || r.error?.message || '认证已结束，请重新生成',
+            }))
+            if (r.state === 'error' || r.ok === false) {
+              callbacksRef.current.onError && callbacksRef.current.onError(r)
+            }
+          },
+          onUpdate: (r) => {
+            if (unmountedRef.current || activeSidRef.current !== activeSessionId) return
+            if (r.transientError) {
+              setSession((cur) => cur ? { ...cur, message: r.message || cur.message } : cur)
+              return
+            }
+            setSession((cur) => ({
+              ...(cur || {}),
+              sessionId: activeSessionId,
+              state: r.state || 'polling',
+              qrDataUri: r.qrDataUri !== undefined ? r.qrDataUri : (cur?.qrDataUri || ''),
+              verificationUrl: r.verificationUrl !== undefined ? r.verificationUrl : (cur?.verificationUrl || ''),
+              userCode: r.userCode !== undefined ? r.userCode : (cur?.userCode || ''),
+              domain: r.domain !== undefined ? r.domain : (cur?.domain || ''),
+              scanned: typeof r.scanned === 'boolean' ? r.scanned : cur?.scanned,
+              pollIntervalMs: Number(r.pollIntervalMs) || cur?.pollIntervalMs || 2000,
+              expiresAt: Number(r.expiresAt) || cur?.expiresAt || 0,
+              message: r.message || cur?.message || '',
+            }))
+          },
+        })
+        pollLoopRef.current = loop
+        loop.start()
+        return () => {
+          loop.stop()
+          if (pollLoopRef.current === loop) pollLoopRef.current = null
+        }
+      }, [activeSessionId])
+
+      const beginAuth = async () => {
         if (busy) return
         setBusy(true)
+        stopPollLoop()
+        const prevSid = activeSidRef.current
+        if (prevSid) {
+          activeSidRef.current = ''
+          await cancelRemote(prevSid, 'restart')
+        }
         try {
-          const r = await post('/platforms/wechat-clawbot/qr/start', { instance, baseUrl, routeTag })
-          if (r.ok === false) {
-            toast && toast(r.message || '获取二维码失败', 'err')
-            setQr({ sessionId: '', qrDataUri: '', qrcodeUrl: '', state: 'error', message: r.message || '获取二维码失败' })
+          const r = await post('/platforms/auth/start', {
+            platform,
+            ...(instance ? { instance } : {}),
+            method,
+            params,
+          })
+          if (unmountedRef.current) {
+            if (r?.sessionId) cancelRemote(r.sessionId, 'unmount-after-start')
             return
           }
-          setQr({
-            sessionId: r.sessionId,
-            qrDataUri: r.qrDataUri,
-            qrcodeUrl: r.qrcodeUrl || '',
-            state: r.state || 'wait',
-            message: r.message || '请用手机微信扫描二维码',
+          if (r.ok === false || r.state === 'error') {
+            activeSidRef.current = ''
+            const msg = r.message || r.error?.message || '获取登录信息失败'
+            toast && toast(msg, 'err')
+            setSession({
+              sessionId: '',
+              qrDataUri: '',
+              verificationUrl: '',
+              userCode: '',
+              state: 'error',
+              error: r.error || null,
+              message: msg,
+            })
+            onError && onError(r)
+            return
+          }
+          const nextDelay = Math.max(500, Number(r.pollIntervalMs) || 2000)
+          initialDelayRef.current = nextDelay
+          activeSidRef.current = r.sessionId || ''
+          setSession({
+            sessionId: r.sessionId || '',
+            state: r.state || 'qr_ready',
+            qrDataUri: r.qrDataUri || '',
+            verificationUrl: r.verificationUrl || '',
+            userCode: r.userCode || '',
+            domain: r.domain || '',
+            pollIntervalMs: nextDelay,
+            expiresAt: Number(r.expiresAt) || 0,
+            scanned: r.scanned,
+            message: r.message || readyHint,
           })
-        } finally { setBusy(false) }
+        } finally {
+          if (!unmountedRef.current) setBusy(false)
+        }
       }
+
+      const cancelAuth = async () => {
+        const sid = activeSidRef.current || session?.sessionId
+        if (!sid) return
+        stopPollLoop()
+        await cancelRemote(sid, 'user-cancelled')
+        if (!unmountedRef.current) {
+          setSession({
+            sessionId: '',
+            qrDataUri: '',
+            verificationUrl: '',
+            userCode: '',
+            state: 'cancelled',
+            message: '已取消本次认证',
+          })
+        }
+      }
+
+      const isActive = Boolean(session?.sessionId && AUTH_DISPLAY_STATES.includes(session.state))
+      const safeLink = isActive && session?.verificationUrl && /^https?:\/\//i.test(session.verificationUrl) ? session.verificationUrl : ''
 
       return h('div', { style: { padding: '10px 12px', marginBottom: 10, borderRadius: 8, border: '1px solid var(--ab-line)', background: 'var(--ab-bg-soft, rgba(0,0,0,0.02))' } },
         h('div', { className: 'ab-flex', style: { alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
-          h(Btn, { small: true, kind: 'primary', disabled: busy, onClick: beginQr },
-            busy ? '生成中…' : (hasToken || qr?.state === 'confirmed' ? '重新扫码登录微信' : '微信扫码登录')),
+          h(Btn, { small: true, kind: 'primary', disabled: busy, onClick: beginAuth },
+            busy ? '生成中…' : (isActive ? '重新生成' : (hasToken || session?.state === 'succeeded' ? restartLabel : startLabel))),
+          isActive ? h(Btn, { small: true, disabled: busy, onClick: cancelAuth }, '取消') : null,
           h('span', { className: 'ab-small ab-muted' },
-            hasToken && (!qr || qr.state === 'confirmed') ? '已保存扫码凭证（会话过期或换号时可点此重新扫码）' : '通过腾讯官方 iLink 协议扫码授权个人微信')),
-        qr && (qr.qrDataUri || qr.message) ? h('div', { style: { marginTop: 10 } },
-          qr.qrDataUri && (qr.state === 'wait' || qr.state === 'scaned')
-            ? h('img', { src: qr.qrDataUri, width: 200, height: 200, alt: '微信 ClawBot 登录二维码', style: { display: 'block', background: '#fff', padding: 6, borderRadius: 8, border: '1px solid var(--ab-line)' } })
+            hasToken && (!session || session.state === 'succeeded') ? savedHint : readyHint)),
+        session && (isActive || session.message) ? h('div', { style: { marginTop: 10 } },
+          isActive && session.qrDataUri
+            ? h('img', { src: session.qrDataUri, width: 200, height: 200, alt, style: { display: 'block', background: '#fff', padding: 6, borderRadius: 8, border: '1px solid var(--ab-line)' } })
             : null,
-          h('div', { className: cx('ab-small', qr.state === 'confirmed' ? '' : (qr.state === 'expired' || qr.state === 'error' ? 'ab-note warn' : 'ab-muted')), style: { marginTop: 6 } },
-            qr.message || ''),
-          qr.qrcodeUrl && (qr.state === 'wait' || qr.state === 'scaned')
-            ? h('div', { className: 'ab-small ab-muted', style: { marginTop: 4, wordBreak: 'break-all' } }, '链接：' + qr.qrcodeUrl)
+          isActive && session.userCode
+            ? h('div', { style: { marginTop: 8, fontFamily: 'monospace', fontSize: 18, fontWeight: 700, letterSpacing: 2 } }, '授权码：' + session.userCode)
+            : null,
+          isActive && session.domain
+            ? h('div', { className: 'ab-small ab-muted', style: { marginTop: 4 } }, '认证节点：' + session.domain)
+            : null,
+          h('div', { className: cx('ab-small', session.state === 'succeeded' ? '' : (session.state === 'expired' || session.state === 'error' ? 'ab-note warn' : 'ab-muted')), style: { marginTop: 6 } },
+            session.message || ''),
+          safeLink
+            ? h('div', { className: 'ab-small ab-muted', style: { marginTop: 4, wordBreak: 'break-all' } },
+              '授权链接：',
+              h('a', { href: safeLink, target: '_blank', rel: 'noopener noreferrer' }, safeLink))
             : null,
         ) : null)
+    }
+
+    function WechatClawbotQrBox({ instance = 'wechat-clawbot', baseUrl = '', routeTag = '', hasToken = false, toast, onConfirmed }) {
+      return h(PlatformAuthQrBox, {
+        platform: 'wechat-clawbot',
+        instance,
+        method: 'qr-link',
+        params: { baseUrl, routeTag },
+        hasToken,
+        startLabel: '微信扫码登录',
+        restartLabel: '重新扫码登录微信',
+        readyHint: '通过腾讯官方 iLink 协议扫码授权个人微信',
+        savedHint: '已保存扫码凭证（会话过期或换号时可点此重新扫码）',
+        alt: '微信 ClawBot 登录二维码',
+        toast,
+        onConfirmed: (r) => {
+          onConfirmed && onConfirmed({
+            ...r,
+            state: 'confirmed',
+            botId: r.meta?.botId || r.self?.account || '',
+            baseUrl: r.meta?.baseUrl || '',
+            userId: r.meta?.userId || '',
+          })
+        },
+      })
     }
 
     /** U1：平台页。平台端声明的 settings 自动生成表单；开关即时生效，不需要重启。 */
@@ -1800,6 +2102,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const list = (data && data.instances) || []
       const owner = data && data.owner
       const multiPrivate = data?.multiPrivate
+      const lastProactiveDelivery = multiPrivate?.lastProactiveDelivery
       const steerLimit = steerLimitDraft ?? String(multiPrivate?.steerMaxPerTurn ?? 0)
       const steerLimitValue = Number(steerLimit)
       const steerLimitValid = Boolean(steerLimit.trim()) && Number.isInteger(steerLimitValue) && steerLimitValue >= 0 && steerLimitValue <= 100
@@ -2331,6 +2634,11 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
               offline: '平台离线', 'reply-expired': '原回复凭据已失效', 'reply-limit': '原消息回复次数已用完',
               revoked: '轮次授权已撤销', uncertain: '平台未确认送达',
             }[multiPrivate.lastDeliveryFailure.reason] || '发送失败'),
+          ) : null,
+          lastProactiveDelivery ? h('div', { className: 'ab-small ab-muted' },
+            '最近一次共享主动投递 · ' + ownerTargetText(lastProactiveDelivery)
+            + (lastProactiveDelivery.fallbackUsed ? ' · 按优先级回退' : ' · 主账号')
+            + ' · ' + new Date(lastProactiveDelivery.at).toLocaleString(),
           ) : null,
           multiPrivate.enabled && multiPrivate.sourceAuthorizationChanged
             ? h('div', { className: 'ab-note warn' }, '旧历史的主人授权已失效。当前授权下可从空会话开始，原历史可在 DSH 查看。')
@@ -3159,7 +3467,11 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const primaryKey = JSON.stringify(st && st.config ? st.config.ownerPrimary : null)
       const platformsKey = JSON.stringify(st && st.config ? st.config.platforms : null)
       const onebotState = st && st.onebot ? st.onebot.state : ''
-      useEffect(() => { refreshPeople() }, [primaryKey, platformsKey, onebotState])
+      const proactiveRouteKey = JSON.stringify([
+        st?.config?.ownerPersonId, st?.config?.enabled, st?.config?.multiPlatformPrivateSession, st?.config?.dryRun, st?.config?.debug,
+        st?.platforms?.map(({ instance, state, enabled, caps }) => [instance, state, enabled, caps?.proactive]),
+      ])
+      useEffect(() => { refreshPeople() }, [primaryKey, platformsKey, onebotState, proactiveRouteKey])
       // 保持与旧 VM 测试 Hook 槽位兼容：新增交互 Hook 一律放在现有 useEffect 之后
       const [dragState, setDragState] = useState(null)
       const dragKeyRef = useRef('')
@@ -3347,21 +3659,22 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           : ((x.instance && x.instance !== x.platform) ? `${platformLabel(x.platform)} · ${x.instance}` : (x.name || platformLabel(x.platform) || x.instance))
       )
 
-      const proRoute = peopleInfo && peopleInfo.resolvedProactiveRoute
+      const sharedProRoute = peopleInfo?.resolvedSharedProactiveRoute
+      const proRoute = sharedProRoute || peopleInfo?.resolvedProactiveRoute
       const noticeRoute = peopleInfo && peopleInfo.resolvedNoticeRoute
       const fallbackPreview = peopleInfo && peopleInfo.resolvedFallbackPreview
       const lastBlocked = peopleInfo && peopleInfo.lastBlockedRoute
       const hasUnsavedPrimary = Boolean(st && st.config && JSON.stringify(pref) !== JSON.stringify(st.config.ownerPrimary))
       const fallbackPreviewNode = (() => {
         if (!fallbackPreview) return null
-        const switchLine = `普通主动消息回退：${fallbackPreview.proactiveFallbackEnabled ? '开启' : '关闭'}｜系统通知回退：${fallbackPreview.noticeFallbackEnabled ? '开启' : '关闭'}`
+        const switchLine = `普通主动聊天和共享主动搭话回退：${fallbackPreview.proactiveFallbackEnabled ? '开启' : '关闭'}｜系统通知回退：${fallbackPreview.noticeFallbackEnabled ? '开启' : '关闭'}`
         let detail = ''
         let cls = 'ab-small ab-muted'
         if (fallbackPreview.reason === 'ok' && fallbackPreview.available) {
           const targetTxt = ownerTargetText(fallbackPreview.target) || fallbackPreview.chatId
           detail = fallbackPreview.proactiveFallbackEnabled
             ? `主账号不可用时下一可用顺位：${targetTxt}`
-            : `主账号不可用时下一可用顺位（当前仅系统通知会改发，普通主动聊天仍暂停）：${targetTxt}`
+            : `主账号不可用时下一可用顺位（当前仅系统通知会改发，主动搭话会暂缓）：${targetTxt}`
           if (!fallbackPreview.proactiveFallbackEnabled) cls = 'ab-note warn'
         } else if (fallbackPreview.reason === 'fallback-disabled') {
           cls = 'ab-note warn'
@@ -3387,6 +3700,10 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       })()
       const routeStatusNode = (() => {
         if (!proRoute) return null
+        if (sharedProRoute?.deferred) {
+          return h('div', { className: 'ab-note warn', style: { width: '100%' } },
+            '当前主动搭话目标：暂无可用账号，本次将暂缓。')
+        }
         if (proRoute.blocked) {
           const targetDesc = ownerTargetText(proRoute.target) || ownerPrimaryLabel(pref)
           const reasonMap = {
@@ -3398,18 +3715,17 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             ? '；系统重要通知仍允许回退其他在线平台'
             : '；系统重要通知同样已关闭回退'
           return h('div', { className: cx('ab-note', (pref.noticeFallback !== false && noticeRoute && !noticeRoute.blocked) ? 'warn' : 'err'), style: { width: '100%' } },
-            (reasonMap[proRoute.reason] || `当前主人主账号（${targetDesc}）不可用（${proRoute.reason}），普通主动消息已暂停发送`) + noticeDesc)
+            '当前主动搭话目标：暂无。' + (reasonMap[proRoute.reason] || `当前主人主账号（${targetDesc}）不可用（${proRoute.reason}），普通主动消息已暂停发送`) + noticeDesc)
         }
         if (proRoute.chatId) {
           const desc = ownerTargetText(proRoute.target) || proRoute.chatId
-          if (proRoute.fallbackUsed) {
-            return h('div', { className: 'ab-note warn', style: { width: '100%' } }, '主人主账号当前不可用，已按回退策略路由至：' + desc)
-          }
-          return h('div', { className: 'ab-small ab-muted', style: { width: '100%' } },
-            '当前主动消息将发往主人账号：' + desc + (lastBlocked ? `（最近曾阻塞：${lastBlocked.reason}）` : ''))
+          return h('div', { className: proRoute.fallbackUsed ? 'ab-note warn' : 'ab-small ab-muted', style: { width: '100%' } },
+            '当前主动搭话目标：' + desc + (sharedProRoute ? ' · 共享会话' : '')
+            + (proRoute.fallbackUsed ? ' · 按优先级回退' : '')
+            + (!sharedProRoute && lastBlocked ? `（最近曾阻塞：${lastBlocked.reason}）` : ''))
         }
         return h('div', { className: 'ab-note warn', style: { width: '100%' } },
-          proRoute.reason === 'no-owner' ? '尚未认领主人身份，当前无法发送主动消息' : '当前没有可用的在线平台可发送主动消息')
+          '当前主动搭话目标：暂无。' + (proRoute.reason === 'no-owner' ? '请先认领主人身份。' : '没有可用的在线平台。'))
       })()
 
       const testSend = async () => {
@@ -3464,7 +3780,6 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
                   '当前配置的主账号（' + ownerPrimaryLabel(pref) + '）已解绑或不在可用列表中，请在下方列表点击「设为主账号」重新指定，或切换为「未单独指定 / 跟随最近」。')
                 : null,
               hasUnsavedPrimary ? h('div', { className: 'ab-small', style: { color: 'var(--ab-warn)' } }, '有未保存的主账号或顺位改动，请点击底部「保存设置」后再生效/测试。') : null,
-              routeStatusNode,
               testResult ? h('div', { className: cx('ab-note', testResult.ok ? '' : (testResult.blocked ? 'warn' : 'err')), style: { width: '100%' } },
                 (testResult.message || '') + (testResult.fallbackUsed ? '（本次通过回退平台发出）' : '')) : null,
               orderedOptions.length
@@ -3598,15 +3913,16 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
                   ? h(Btn, { small: true, kind: 'ghost', onClick: resetPriorityOrder }, '恢复默认顺序')
                   : null,
                 h('span', { className: 'ab-small ab-muted' },
-                  (!hasCustomOrder && orderedOptions.length > 0 ? '当前使用默认全量顺位；调序或移出账号后将启用自定义子集顺位。' : '')
-                  + '固定主账号始终最优先；恢复在线后不会抢在主账号前，其余顺位仅决定不可用时的备选顺序。'),
+                  (!hasCustomOrder && orderedOptions.length > 0 ? '普通主动聊天使用默认全量顺位。共享主动搭话的回退使用已保存的顺位。调序或移出账号后可保存自定义顺位。' : '')
+                  + '固定主账号在线时优先接收，其余顺位用于回退。'),
               ),
               unboundInstances.length
                 ? h('div', { className: 'ab-small ab-muted' }, '另有平台实例尚未绑定主人接收账号：' + unboundInstances.map(unboundInstLabel).join('、') + '（请用你的账号向该实例发一条私聊以完成绑定，绑定后自动加入排序）')
                 : null,
+              routeStatusNode,
               fallbackPreviewNode,
             )),
-          h(Row, { label: '主人主账号不可用时，允许普通主动聊天改发其他在线平台', hint: '默认关闭。仅针对「固定主账号」模式：关闭时若固定主账号离线或未绑定，她会暂停主动搭话、汇报等普通主动消息，绝不串发；开启时按「接收优先级」顺序改发。' }, f.sw('ownerPrimary.fallback')),
+          h(Row, { label: '主账号不可用时，允许普通主动聊天和共享主动搭话按接收优先级改发', hint: '默认关闭，适用于固定主账号。开启时按「接收优先级」顺序改发。共享主动搭话继续使用共享会话，发往已保存顺位中下一个可主动发送的网关账号。没有可用账号时，本次搭话暂缓。' }, f.sw('ownerPrimary.fallback')),
           h(Row, { label: '主人主账号不可用时，允许系统重要通知与自测提醒改发其他在线平台（不含无会话危险操作）', hint: '默认开启。仅针对「固定主账号」模式，影响系统提醒与「测试发送给主人主账号」；无归属会话的危险操作与授权仍按原地 fail-closed 处理。' }, f.sw('ownerPrimary.noticeFallback')),
           h(Row, { label: '主人 QQ 号（可选）', hint: '仅在使用 QQ 网关或兼容旧 QQ 功能时填写；纯飞书 / QQ 官方机器人 / 通用桥主人认主后可留空。修改此项会重置当前敏感命令授权代次。' }, f.text('ownerQQ', { placeholder: ownerPersonId ? '纯非 QQ 平台可留空' : '例如 123456789' })),
           h(Row, { label: 'ta怎么称呼你' }, f.text('ownerName', { placeholder: '主人' })),
@@ -11044,6 +11360,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     exports.inject = inject
     exports.AurabotPage = AurabotPage
     exports.WhaleIcon = WhaleIcon
+    exports.createAuthPollLoop = createAuthPollLoop
     return module.exports
   },
 })

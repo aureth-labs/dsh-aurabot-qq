@@ -179,6 +179,25 @@
 | 其余含 `ownerQQ` 的文件 | I3 |
 | `test/contract/`、`test/helpers/fake-adapter.js`、`test/replay/` | P0 建，之后各包只加自己的用例文件 |
 
+## 十之二、平台认证驱动契约（Phase 0）
+
+扫码、Device Code 等交互式登录统一直连宿主通用认证层（`src/gateway/auth.js` 与 `src/core/qr.js`），`PlatformAdapter` 仍保持 `contract: 1` 不变；新平台只实现 `PlatformAuthDriver` 并由宿主注册，禁止各自新增 `/platforms/<id>/qr/*` 私有路由。**谁守：G1、U1、各平台端。**
+
+1. **统一 Host API 与面板发现**：`POST /platforms/auth/start`、`POST /platforms/auth/poll`、`POST /platforms/auth/cancel`；`GET /platforms` 通过 `authMethods` 投影当前已注册平台的认证方式列表。`client/client.js` 统一通过 `PlatformAuthQrBox` 与 `createAuthPollLoop` 消费该协议（连贯相同 `polling` 状态与瞬断退避重试均持续轮询）。
+2. **契约与状态机（`src/gateway/contracts.d.ts` 第十节）**：
+   - `AuthMethod`：`qr-app` | `qr-link` | `device-code` | `oauth-callback` | `manual`（其中 `oauth-callback`、`manual` 在 Phase 0 先占位，暂未提供实际驱动）。
+   - `AuthSessionState`：`starting` → `qr_ready` | `device_code_ready` → `polling` → `slow_down` | `domain_switched` → `authorized` → `saving` → `succeeded`，终态包含 `succeeded` / `expired` / `cancelled` / `error`。
+   - `AuthErrorStage`：`auth.begin` / `auth.qr.encode` / `auth.qr.expire` / `auth.poll` / `auth.slow_down` / `auth.cancel` / `auth.verify` / `auth.save` / `auth.connect`。
+3. **可见字段与零泄漏边界**：
+   - `AuthSessionView` 仅暴露白名单字段：`sessionId`、`platform`、`instance`、`method`、`state`、`expiresAt`、`pollIntervalMs`、`message`、可选 `domain`/`scanned`/`self`/`error`/`meta`，且 `qrDataUri`/`verificationUrl`/`userCode` 仅在活跃展示态（`qr_ready`/`device_code_ready`/`polling`/`slow_down`/`domain_switched`）返回，终态一律清除。
+   - 驱动私有状态保存在 `driverSession`，不向视图投影；`deviceCode`/`qrcode`/token/secret 以及驱动经 `sensitiveDriverSessionKeys` 声明的临时凭据键，与 `secretPatch` 一并进入日志和错误脱敏。
+   - **严禁**把二维码内容/Data URI、`verificationUrl`、`deviceCode`、`qrcode` 或 `secret` 写入 config、日志、记忆、聊天流水或模型上下文/提示词。
+4. **`configPatch` / `secretPatch` 与身份核验**：
+   - `configPatch` 只允许非敏感配置（受驱动 `allowedConfigKeys` 约束），拒绝敏感字段与 `deviceCode`/`qrDataUri`/`qrcodeUrl` 等临时认证字段；`secretPatch` 键必须登记在 `PLATFORM_SECRET_KEYS` 且为字符串，由宿主统一落盘并 `registerSecret`。
+   - 落盘启用实例后，宿主必须等待实例真实进入 `connected` 且拿到非空 `self.account` 并与预期账号核验一致；未连上、`stopped`/`unconfigured`/`disconnected`、超时或 `whoami` 不符时自动停用并断开实例，以 `auth.verify` 返回失败。
+   - 认证流程**只配置机器人凭据**，绝不自动认主、不修改现有主人绑定、不改动共享私聊会话与 checkpoint。
+5. **Phase 0 当前范围与兼容**：目前内置认证驱动为 `wechat-clawbot`（`qr-link`）；旧 `/platforms/wechat-clawbot/qr/start` 与 `/platforms/wechat-clawbot/qr/status` 仅作委托 `platformAuth` 的向后兼容包装，后续平台不得仿效。
+
 ## 十一、分支与合并
 
 1. 新仓库的集成分支叫 `dev`，所有包合到 `dev`。`main` 在第一个测试版之前不动。测试版从 `beta` 分支发。

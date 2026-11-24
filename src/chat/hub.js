@@ -11,7 +11,7 @@ import { homedir, tmpdir } from 'node:os'
 import { spawn } from 'node:child_process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { isDeepStrictEqual } from 'node:util'
-import { ownerAuthorizationRevision } from '../core/config.js'
+import { normalizeFallbackOrderList, ownerAuthorizationRevision } from '../core/config.js'
 import { dataDir, readJson, writeJson } from '../core/store.js'
 import { isDefiniteFailure } from '../onebot/client.js'
 import { parseMessageEvent, gifFrames, segmentsOf } from './inbound.js'
@@ -256,6 +256,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   const sharedArchiveJobs = new Map()
   const sharedLiveCheckpoints = new Map()
   const sharedDeliveryFailures = new Map()
+  const sharedProactiveDeliveries = new Map()
   const legacyHistoryTickets = new Map()
   let sharedAudit = { state: 'pending' }
   let sharedAuditCursor = ''
@@ -280,6 +281,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     onRetired: sid => {
       sharedLiveCheckpoints.delete(sid)
       sharedDeliveryFailures.delete(sid)
+      sharedProactiveDeliveries.delete(sid)
       sharedAuditPriority.add(sid)
       queueMicrotask(() => { void archiveSharedRetired(sid) })
     },
@@ -1652,6 +1654,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     for (const [sid, failure] of sharedDeliveryFailures) {
       if (failure.sourceKey === key) sharedDeliveryFailures.delete(sid)
     }
+    for (const [sid, delivery] of sharedProactiveDeliveries) {
+      if (delivery.platform === platform && delivery.account === account) sharedProactiveDeliveries.delete(sid)
+    }
     const data = map()
     let changed = false
     for (const [chatId, entry] of Object.entries(data.chats)) {
@@ -1889,6 +1894,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const recovery = sharedRecoveryStatus(scope, data)
     const delivery = data.ownerAuthorizationRevision === scope.ownerAuthorizationRevision
       ? sharedDeliveryFailures.get(branch.sessionId)?.status : undefined
+    const proactiveDelivery = available && data.ownerAuthorizationRevision === scope.ownerAuthorizationRevision
+      ? sharedProactiveDeliveries.get(branch.sessionId) : null
     return {
       enabled: getConfig().multiPlatformPrivateSession === true, available: Boolean(available), mode,
       binding: primary?.binding, reason,
@@ -1901,6 +1908,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       steerEnabled: getConfig().sharedSteerEnabled !== false,
       steerMaxPerTurn: getConfig().sharedSteerMaxPerTurn ?? 0,
       lastDeliveryFailure: delivery,
+      lastProactiveDelivery: proactiveDelivery && identity.lookup(proactiveDelivery.platform, proactiveDelivery.account) === scope.ownerPersonId
+        ? proactiveDelivery : null,
       legacyHistoryAvailable: Boolean(review),
       legacyHistoryChanged: Boolean(review?.legacyPrefix),
       sourceAuthorizationChanged: Boolean(snapshot
@@ -2048,68 +2057,135 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     return true
   }
 
-  function primaryCanSpeak(binding) {
-    const caps = gateway?.caps?.(binding.chatId)
-    return caps && caps.proactive !== 'none'
-      && gateway.instances().some(item => item.instance === binding.instance && item.state === 'connected')
+  function canProactiveTarget(binding, scope) {
+    if (!gateway || isDefaultQqPaused(binding.chatId) || identity?.lookup(binding.platform, binding.account) !== scope.ownerPersonId) return false
+    const caps = gateway.caps?.(binding.chatId)
+    if (caps?.proactive !== 'free' && caps?.proactive !== 'limited') return false
+    const instances = gateway.instances().filter(item => item.platform === binding.platform)
+    const known = gateway.routing?.instancesForAccount?.(binding.platform, binding.account) || []
+    if ((known.length || instances.length > 1) && !known.includes(binding.instance)) return false
+    return instances.some(item => {
+      const selfAccount = String(item.self?.account || '').trim()
+      return item.instance === binding.instance && item.enabled && !item.legacy
+        && item.state === 'connected' && selfAccount && selfAccount !== binding.account
+    })
   }
 
   function sharedProactiveEnabled(cfg) {
     return cfg.enabled && cfg.multiPlatformPrivateSession && (!cfg.dryRun || cfg.debug)
   }
 
-  function proactiveScope(chat, route) {
+  function sharedProactiveContext() {
     const cfg = getConfig()
-    if (!sharedProactiveEnabled(cfg) || !gateway || !sharedSupported()
-      || !route?.chatId || route.blocked || route.fallbackUsed || !sameChat(chat.chatId, route.chatId)) return null
+    if (!sharedProactiveEnabled(cfg) || !gateway || !sharedSupported()) return null
     const primary = resolveSharedPrimary?.()
-    if (!primary?.ok || !sameChat(primary.binding.chatId, route.chatId)) return null
-    if (!primaryCanSpeak(primary.binding)) return null
-    const scope = sharedScope(primary)
-    return scope.ownerAuthorizationRevision && !sharedSessions.isRecovering(scope.mode) ? scope : null
+    if (!primary?.ok) return null
+    const scope = sharedScope(primary, { reconcile: false })
+    if (!scope.ownerAuthorizationRevision || sharedSessions.isRecovering(scope.mode)) return null
+    const state = sharedSessions.read()
+    if (state.ownerAuthorizationRevision === scope.ownerAuthorizationRevision
+      && isDeepStrictEqual(state.primaryBinding, scope.binding) && state.level === scope.level && state.preset === scope.preset
+      && ['paused', 'recovering'].includes(state.sessions[scope.mode].state)) return null
+    return scope
+  }
+
+  const deferredProactive = (reason = 'delivery-unavailable', error = '主账号与备用账号当前都不可用，本次主动搭话已暂缓') =>
+    ({ ok: false, deferred: true, retryable: true, reason, error })
+
+  function allowedProactiveFallback(binding) {
+    const pref = getConfig().ownerPrimary
+    return pref?.fallback === true && normalizeFallbackOrderList(pref.fallbackOrder).some(item =>
+      item.platform === binding.platform && item.instance === binding.instance && item.account === binding.account)
+  }
+
+  function resolveSharedDelivery(route, scope) {
+    if (isDefaultQqPaused(scope.binding.chatId)) {
+      return deferredProactive('qq-ownership-paused', '默认 QQ 正在切换连接托管，本次主动搭话已暂缓')
+    }
+    if (route?.blocked || !route?.chatId) return deferredProactive(route?.reason || 'no-route', route?.deferred ? route.error : undefined)
+    const chatId = normalizeChatId(route.chatId)
+    const addr = chatId && parseChatId(chatId)
+    if (addr?.kind !== 'private') return deferredProactive('not-private')
+    const binding = { platform: addr.platform, instance: addr.instance, account: addr.id, chatId }
+    const fallbackUsed = !sameChat(chatId, scope.binding.chatId)
+    if (fallbackUsed && !allowedProactiveFallback(binding)) return deferredProactive('fallback-not-configured')
+    if (!canProactiveTarget(binding, scope)) return deferredProactive('target-unavailable')
+    return { ok: true, binding, fallbackUsed }
+  }
+
+  function resolveSharedProactiveRoute({ record = true } = {}) {
+    const scope = sharedProactiveContext()
+    if (!scope) return null
+    if (isDefaultQqPaused(scope.binding.chatId)) {
+      return { chatId: '', ...deferredProactive('qq-ownership-paused', '默认 QQ 正在切换连接托管，本次主动搭话已暂缓') }
+    }
+    const route = resolveOwnerRouteInjected?.({ purpose: 'proactive', record, sharedBinding: scope.binding })
+    const delivery = resolveSharedDelivery(route, scope)
+    if (!delivery.ok) return { chatId: '', ...delivery }
+    return {
+      chatId: delivery.binding.chatId,
+      target: delivery.binding,
+      blocked: false,
+      reason: delivery.fallbackUsed ? 'fallback-used' : 'ok',
+      fallbackUsed: delivery.fallbackUsed,
+    }
+  }
+
+  function sharedProactiveDeliveryCurrent(task) {
+    const { binding, fallbackUsed, gateway: targetGateway, sourceRevision } = task.delivery
+    const key = JSON.stringify([binding.platform, binding.account])
+    return targetGateway === gateway && sourceRevision === (sharedSourceRevisions.get(key) || 0)
+      && (!fallbackUsed || allowedProactiveFallback(binding)) && canProactiveTarget(binding, task.scope)
   }
 
   async function pushProactiveToSession(chat, content, senderId = '', opts = {}) {
     assertActive()
-    if (!getConfig().enabled) {
-      const outcome = { ok: false, error: 'Aurabot 已关闭' }
+    const finish = outcome => {
       opts.onTurnEnd?.(outcome)
       return outcome
     }
+    if (!getConfig().enabled) return finish({ ok: false, error: 'Aurabot 已关闭' })
     const { route, ...ordinaryOpts } = opts
-    const scope = proactiveScope(chat, route)
-    if (!scope) return pushToSession(chat, content, senderId, ordinaryOpts)
-    const state = sharedSessions.sync(scope)
-    const task = {
-      proactive: true, chat: { ...chat, ...chatFromId(scope.binding.chatId), instance: scope.binding.instance },
-      scope, content, userText: textOf({ content }), onDelivered: opts.onDelivered,
-      routingRevision: state.routingRevision, generation: state.sessions[scope.mode].generation,
+    const scope = sharedProactiveContext()
+    if (!scope) {
+      if (!chat?.chatId) return finish({ ok: false, reason: route?.reason || 'no-route', error: '当前没有可用的主动搭话账号' })
+      return withDefaultQqWork(chat.chatId, () => pushToSession(chat, content, senderId, ordinaryOpts), rejectPausedQq)
     }
-    const current = () => !disposed && sharedSenderCurrent(task)
-      && sharedSessions.read().sessions[scope.mode].generation === task.generation
-    const result = await enqueueSharedTask(task, async () => {
-      if (!current()) return
-      try {
-        if (!primaryCanSpeak(scope.binding)) return 'ordinary'
-        const selected = await sharedSessions.ensure(scope)
-        if (!current()) return
-        if (!selected.ok) return 'ordinary'
-        return await executeShared(task, scope, selected)
-      } catch (error) {
-        log.warn('共享主动搭话失败：', error.message)
-        return task.started ? { ok: false, error: error.message } : 'ordinary'
+    const delivery = resolveSharedDelivery(route, scope)
+    if (!delivery.ok) return finish(delivery)
+    // The primary determines the shared session. A default QQ delivery also uses the transport lease.
+    const workChatId = isDefaultInstanceChat(scope.binding.chatId) ? scope.binding.chatId : delivery.binding.chatId
+    const result = await withDefaultQqWork(workChatId, queueSharedProactive,
+      () => deferredProactive('qq-ownership-paused', '默认 QQ 正在切换连接托管，本次主动搭话已暂缓'))
+    return finish(result && result !== 'ordinary' ? result : deferredProactive('cancelled', '共享主动搭话已取消'))
+
+    function queueSharedProactive() {
+      const key = JSON.stringify([delivery.binding.platform, delivery.binding.account])
+      delivery.gateway = gateway
+      delivery.sourceRevision = sharedSourceRevisions.get(key) || 0
+      reconcileLegacyPrivateOwnershipProof()
+      const state = sharedSessions.sync(scope)
+      const task = {
+        proactive: true,
+        chat: { ...chatFromId(scope.binding.chatId), instance: scope.binding.instance, ...(chat?.nickname && { nickname: chat.nickname }) },
+        delivery, scope, content, userText: textOf({ content }), onDelivered: opts.onDelivered,
+        routingRevision: state.routingRevision, generation: state.sessions[scope.mode].generation,
       }
-    })
-    if (result === 'ordinary' && current()) {
-      log.info('共享分支准备失败，主动搭话使用普通会话')
-      return pushToSession(chat, content, senderId, { ...ordinaryOpts, assertAuthorized() {
-        ordinaryOpts.assertAuthorized?.()
-        if (!current()) throw new Error('主动搭话授权已变更')
-      } })
+      const current = () => !disposed && sharedSenderCurrent(task)
+        && sharedSessions.read().sessions[scope.mode].generation === task.generation
+      return enqueueSharedTask(task, async () => {
+        if (!current() || !sharedProactiveDeliveryCurrent(task)) return deferredProactive()
+        try {
+          const selected = await sharedSessions.ensure(scope)
+          if (!current() || !sharedProactiveDeliveryCurrent(task)) return deferredProactive()
+          if (!selected.ok) return deferredProactive(selected.reason, '共享会话暂不可用，本次主动搭话已暂缓')
+          return await executeShared(task, scope, selected)
+        } catch (error) {
+          log.warn('共享主动搭话失败：', error.message)
+          return task.started ? { ok: false, error: error.message } : deferredProactive('session-unavailable', '共享会话暂不可用，本次主动搭话已暂缓')
+        }
+      })
     }
-    const outcome = result && result !== 'ordinary' ? result : { ok: false, error: '主动搭话已取消' }
-    opts.onTurnEnd?.(outcome)
-    return outcome
   }
 
   async function runShared(task) {
@@ -2165,6 +2241,49 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     return prepared.result
   }
 
+  async function prepareSharedCheckpoint(turn) {
+    if (turn.verifiedSeq === undefined || !sharedAuthorized(turn)) return null
+    const { agent, scope, branch, verifiedSeq } = turn
+    let persisted = false
+    try { persisted = await dsh.sessions?.flush?.(agent.session) }
+    catch (error) { log.warn('共享会话检查点未持久化：', error.message) }
+    return () => {
+      if (!sharedAuthorized(turn)) return
+      sharedLiveCheckpoints.set(branch.sessionId, { session: agent.session, seq: verifiedSeq })
+      if (persisted) {
+        try { sharedSessions.checkpoint(scope.mode, branch.sessionId, branch.generation, verifiedSeq) }
+        catch (error) { log.warn('共享会话检查点未持久化：', error.message) }
+      }
+    }
+  }
+
+  async function deliverSharedProactive(turn, isCurrent) {
+    const { task, scope, branch, sources } = turn
+    if (!turn.finished || !isCurrent()) return { ok: false, error: '共享主动搭话未完成' }
+    if (scope.mode === 'debug' || !turn.finalText) return { ok: true, delivered: false }
+    const { binding, fallbackUsed } = task.delivery
+    const canDeliver = () => isCurrent() && sharedProactiveDeliveryCurrent(task)
+    if (!canDeliver()) return deferredProactive()
+    const delivered = await withPromptCapture(sources, () => deliver(binding.chatId, turn.finalText, {
+      own: true, proactive: true, proactiveCause: 'speakup', isCurrent: canDeliver,
+      userText: task.userText, preserveReceipts: true,
+    }))
+    if (delivered?.sentCount > 0) {
+      const { platform, instance, account } = binding
+      if (sharedAuthorized(turn) && identity.lookup(platform, account) === task.scope.ownerPersonId) {
+        sharedProactiveDeliveries.set(branch.sessionId, { at: Date.now(), platform, instance, account, fallbackUsed })
+      }
+      if (fallbackUsed) log.info(`共享主动搭话已按接收优先级改发 ${platform}/${instance}/${account}`)
+      try { task.onDelivered?.() } catch (error) { log.warn('发送回执处理出错：', error.message) }
+      return delivered.failed
+        ? { ok: false, delivered: true, error: '共享主动搭话已送达部分内容，后续消息未发出' }
+        : { ok: true, delivered: true }
+    }
+    if (!canDeliver()) return deferredProactive()
+    if (delivered?.failed) return { ok: false, delivered: false, error: '共享主动搭话投递失败' }
+    return { ok: true, delivered: false }
+  }
+
   async function executeShared(task, latest, { agent, branch }) {
     const { chat, ingress, proactive } = task
     const key = sessionKey(branch.sessionId)
@@ -2188,7 +2307,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       running.set(chat.chatId, key)
       const prepared = await prepareSharedMessage(task, turn)
       if (!isCurrent() || !prepared) return
-      if (sharedSessions.read().routingRevision !== task.routingRevision || (proactive && !primaryCanSpeak(latest.binding))) return 'ordinary'
+      if (sharedSessions.read().routingRevision !== task.routingRevision) return proactive ? deferredProactive() : 'ordinary'
+      if (proactive && !sharedProactiveDeliveryCurrent(task)) return deferredProactive()
       const previousSources = sourcesFor(chat.chatId)
       const { message, memory } = prepared
       const sources = { ...previousSources, system: new Map(previousSources.system), memory, context: '', userText: task.userText }
@@ -2215,27 +2335,13 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         if (pending) agent.inbox.remove(message.id)
         sharedFailure(turn)
       }
-      if (turn.verifiedSeq !== undefined && sharedAuthorized(turn)) {
-        sharedLiveCheckpoints.set(branch.sessionId, { session: agent.session, seq: turn.verifiedSeq })
-        try {
-          if (await dsh.sessions?.flush?.(agent.session) && sharedAuthorized(turn)) {
-            sharedSessions.checkpoint(latest.mode, branch.sessionId, branch.generation, turn.verifiedSeq)
-          }
-        } catch (error) { log.warn('共享会话检查点未持久化：', error.message) }
-      }
+      const commitCheckpoint = await prepareSharedCheckpoint(turn)
       if (proactive) {
-        if (!turn.finished || !isCurrent()) return { ok: false, error: '共享主动搭话未完成' }
-        // 调试轮次的输出留在共享调试会话里。
-        if (latest.mode === 'debug') return { ok: true }
-        const canDeliver = () => isCurrent() && primaryCanSpeak(latest.binding)
-        if (!canDeliver()) return { ok: false, error: '主账号当前无法主动发送' }
-        const delivered = turn.finalText && await withPromptCapture(sources, () => deliver(chat.chatId, turn.finalText, {
-          own: true, proactive: true, proactiveCause: 'speakup', isCurrent: canDeliver,
-          userText: task.userText, onDelivered: task.onDelivered,
-        }))
-        if (delivered?.failed) log.warn('共享主动搭话投递失败')
-        return { ok: canDeliver() && !delivered?.failed }
+        // Flush before sending for recovery, then attest the turn once the delivery attempt has settled.
+        try { return await deliverSharedProactive(turn, isCurrent) }
+        finally { commitCheckpoint?.() }
       }
+      commitCheckpoint?.()
       enqueueSharedOutput(turn, turn.finalText)
       await turn.send
     } catch (error) {
@@ -3823,10 +3929,10 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const sentCount = outputScope.getStore().sent
     if (disposed || (opts.shared && !opts.shared.isCurrent()) || (opts.isCurrent && !opts.isCurrent()) || interrupted) {
       settleOutbound(richVerdict, sentCount > 0 ? 'sent' : 'failed')
-      if (rich) {
+      if (rich || opts.preserveReceipts) {
         if (sentCount > 0) {
           const remaining = Math.max(0, items.length - sentItems.length)
-          if (remaining > 0) {
+          if (remaining > 0 || opts.preserveReceipts) {
             const extraFailures = failures.length ? failures : new Array(remaining).fill('发送途中授权或状态已变化')
             const saidSent = itemsToLine(sentItems, (q) => stickers.match(q))
             if (saidSent) logChat(chatId, 'bot', saidSent, '', { interaction: [...interacted], ...(opts.proactiveCause && { proactive: opts.proactiveCause }) })
@@ -6881,6 +6987,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     legacyHistoryTickets.clear()
     sharedLiveCheckpoints.clear()
     sharedDeliveryFailures.clear()
+    sharedProactiveDeliveries.clear()
     sharedAuditPriority.clear()
     for (const entry of sharedPending.splice(0)) entry.resolve()
     for (const turn of sharedTurns.values()) turn.agent.cancel({ kind: 'user' })
@@ -6929,7 +7036,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       if (isDefaultInstanceChat(key.slice(0, key.lastIndexOf(':')))) return false
     }
     for (const turn of sharedTurns.values()) {
-      if (isDefaultInstanceChat(turn.task?.chat?.chatId)) return false
+      if (isDefaultInstanceChat(turn.task?.chat?.chatId) || isDefaultInstanceChat(turn.task?.delivery?.binding?.chatId)) return false
     }
     return true
   }
@@ -7066,7 +7173,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     sendSegments: trackQqSend(sendSegments),
     sendParts: trackQqSend(sendParts),
     pushToSession: (chat, ...args) => withDefaultQqWork(chat?.chatId, () => pushToSession(chat, ...args), rejectPausedQq),
-    pushProactiveToSession: (chat, ...args) => withDefaultQqWork(chat?.chatId, () => pushProactiveToSession(chat, ...args), rejectPausedQq),
+    resolveSharedProactiveRoute,
+    pushProactiveToSession,
     receiveOwnerMessage: (chatId, ...args) => withDefaultQqWork(chatId, () => receiveOwnerMessage(chatId, ...args), rejectPausedQq),
     get titleFilter() { return titleFilter },
     runSystemTurn,

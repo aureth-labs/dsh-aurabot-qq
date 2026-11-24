@@ -262,7 +262,8 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
   function handleState(run, state, detail) {
     if (runs.get(run.instance) !== run) return
     run.connectionGeneration++
-    if (isHeld(run.instance)) run.self = null
+    // A reconnect must prove this connection's identity before exposing a usable account.
+    if (state === 'connected' || isHeld(run.instance)) run.self = null
     run.state = state
     run.detail = detail
     run.connectionChanges.dispatchEvent(new Event('change'))
@@ -309,14 +310,14 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
       return false
     }
     if (!stillConnected()) return false
-    run.self = me
+    const account = String(me?.account ?? '')
     const cfg = run.rawConfig || {}
     const expected = cfg.selfId ?? cfg.account ?? cfg.selfAccount
-    if (expected != null && String(expected) !== String(me.account)) {
-      logger.warn(`实例 ${run.instance} whoami 不符：登录的是 ${me.account}，配置的是 ${expected}，断开`)
+    if (expected != null && String(expected) !== account) {
+      logger.warn(`实例 ${run.instance} whoami 不符：登录的是 ${account}，配置的是 ${expected}，断开`)
       try { await run.adapter.stop() } catch (error) { logger.warn('断开失败：', error?.message || error) }
       run.state = 'disconnected'
-      run.detail = `whoami 不符：登录的是 ${me.account}，配置的是 ${expected}`
+      run.detail = `whoami 不符：登录的是 ${account}，配置的是 ${expected}`
       logState(run, run.state, run.detail)
       // 标记「这个实例不会自己好」：再连也还是同一个错账号。出站时不当成可重连的断线，
       // 直接抛 not-sent 且不入队（否则队列会在每次重连时空转一轮，还可能发错人）。
@@ -325,6 +326,7 @@ export function createGateway({ config, dataDir, http, identity, log, now = Date
       emitCapsChanged(run.instance, { platform: run.platform, state: run.state, caps: run.caps })
       return false
     }
+    run.self = account.trim() ? me : null
     return true
   }
 

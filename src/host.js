@@ -89,10 +89,11 @@ import { parseChatId, normalizeChatId, formatChatId } from './gateway/address.js
 import { fixedSharedPrimary } from './gateway/shared-private-route.js'
 import { createIdentity } from './gateway/identity.js'
 import { createGateway } from './gateway/index.js'
+import { createPlatformAuthManager, AuthError } from './gateway/auth.js'
 import { createQqAdapter } from './adapters/qq/index.js'
 import { createFeishuAdapter } from './adapters/feishu/index.js'
 import { createQqbotAdapter } from './adapters/qqbot/index.js'
-import { createWechatClawbotAdapter, startQrLogin, pollQrStatus, DEFAULT_BASE_URL as WECHAT_CLAWBOT_BASE_URL } from './adapters/wechat-clawbot/index.js'
+import { createWechatClawbotAdapter, createWechatClawbotAuthDriver } from './adapters/wechat-clawbot/index.js'
 import { createBridgeAdapter } from './adapters/bridge/index.js'
 import { ensureUpgradedStorage } from './features/import-qq.js'
 import { clearToolsCache, listTools, probeTool } from './core/tools.js'
@@ -1145,19 +1146,20 @@ export function apply(ctx, opts = {}) {
   /** 纯只读评估单个主人目标（含传统直连 QQ 与网关多实例隔离校验）。 */
   function evaluateOwnerTarget(spec, ctx) {
     const implicitLegacyQq = Boolean(spec?.implicitLegacyQq)
+    const useLegacyDefault = !ctx.gatewayOnly && legacyQqActive()
     let targetInstance = String(spec?.instance || '').trim()
     let targetPlatform = implicitLegacyQq ? defaultPlatform : String(spec?.platform || '').trim()
     let matchedInst = null
 
     if (targetInstance) {
-      if (targetInstance === defaultPlatform && legacyQqActive()) {
+      if (targetInstance === defaultPlatform && useLegacyDefault) {
         targetPlatform = defaultPlatform
       } else {
         matchedInst = ctx.managedInstances.find((x) => x.instance === targetInstance) || null
         targetPlatform = matchedInst?.platform || targetPlatform || String(targetInstance).split('#')[0] || ''
       }
     } else {
-      if (targetPlatform === defaultPlatform && legacyQqActive() && !ctx.hasDefInGateway) {
+      if (targetPlatform === defaultPlatform && useLegacyDefault && !ctx.hasDefInGateway) {
         targetInstance = defaultPlatform
       } else {
         const same = ctx.managedInstances.filter((x) => x.platform === targetPlatform)
@@ -1201,7 +1203,7 @@ export function apply(ctx, opts = {}) {
 
     const target = { platform: targetPlatform, instance: targetInstance || targetPlatform, account: acc }
     if (!failReason) {
-      if (targetInstance === defaultPlatform && legacyQqActive() && !ctx.hasDefInGateway) {
+      if (targetInstance === defaultPlatform && useLegacyDefault && !ctx.hasDefInGateway) {
         if (onebotState === 'connected' && !wrongAccount) {
           return {
             ok: true,
@@ -1214,8 +1216,12 @@ export function apply(ctx, opts = {}) {
         failReason = 'primary-offline'
       } else {
         const st = matchedInst || ctx.managedInstances.find((x) => x.instance === targetInstance) || null
-        if (!st || !st.enabled || st.state !== 'connected') {
+        const unavailableDefault = ctx.gatewayOnly && targetInstance === defaultPlatform
+          && (legacyQqOwnsConnection() || qqOwnershipTransfer || isQqRecoveryPaused())
+        if (unavailableDefault || !st || !st.enabled || st.state !== 'connected') {
           failReason = 'primary-offline'
+        } else if (ctx.gatewayOnly && !String(st.self?.account || '').trim()) {
+          failReason = 'primary-identity-pending'
         } else {
           const knownInsts = platformGateway?.routing?.instancesForAccount?.(targetPlatform, acc) || []
           if (st.self?.account && String(st.self.account) === String(acc)) {
@@ -1291,7 +1297,7 @@ export function apply(ctx, opts = {}) {
    * - 返回 { chatId, blocked, reason, target, fallbackUsed }
    * - 严禁在本函数内调用 setFixed 或写 router.json
    */
-  function resolveOwnerRoute({ purpose = 'proactive', record = true } = {}) {
+  function resolveOwnerRoute({ purpose = 'proactive', record = true, sharedBinding } = {}) {
     const owner = identity.owner()
     if (!owner) return { chatId: '', blocked: false, reason: 'no-owner', target: null, fallbackUsed: false }
 
@@ -1318,6 +1324,18 @@ export function apply(ctx, opts = {}) {
         target: res.target,
         fallbackUsed,
       }
+    }
+    if (sharedBinding) {
+      // 共享搭话只在已绑定的网关私聊间回退。通用路由的隐式尾选仍供普通会话使用。
+      const sharedCtx = { ...ctx, gatewayOnly: true }
+      const primary = evaluateOwnerTarget({ ...sharedBinding, requireExplicitAccount: true }, sharedCtx)
+      if (primary.ok) return finishOk(primary, 'ok', false)
+      if (pref.fallback === true) {
+        const fallback = pickFromFallbackOrder(orderList, sharedCtx, primary.target)
+        if (fallback) return finishOk(fallback, 'fallback-used', true)
+      }
+      if (record) recordBlockedRoute(primary.failReason, primary.target, purpose)
+      return { chatId: '', blocked: true, reason: primary.failReason, target: primary.target, fallbackUsed: false }
     }
     const legacyOrGatewayTail = (isFallback) => {
       if (platformGateway) {
@@ -1603,6 +1621,13 @@ export function apply(ctx, opts = {}) {
       ]) {
         try { platformGateway.register(() => factory()) } catch (error) { logger.child('gateway').warn(`注册平台端 ${id} 失败：`, error?.message || error) }
       }
+      if (Array.isArray(opts?.adapters)) {
+        for (const extraFactory of opts.adapters) {
+          if (typeof extraFactory === 'function') {
+            try { platformGateway.register(() => extraFactory()) } catch (error) { logger.child('gateway').warn('注册注入平台端失败：', error?.message || error) }
+          }
+        }
+      }
       syncOwnerFixedCleanup(platformGateway, { allowMigrate: true })
       // 接线要等 hub 建好；这里只登记，由下面的 effect 在 hub 就绪后订阅
       gatewayReady?.(platformGateway)
@@ -1611,6 +1636,137 @@ export function apply(ctx, opts = {}) {
       platformGateway = null
     }
     return platformGateway
+  }
+  const platformAuth = createPlatformAuthManager({
+    getInstanceConfig: (instance) => (getConfig().platforms || {})[instance] || {},
+    applyCompletion: async ({ platform, instance, method, configPatch, secretPatch }) => {
+      if (!platformGateway) ensureGateway()
+      const curPlats = getConfig().platforms || {}
+      const curInst = curPlats[instance] || {}
+      const entry = (platformGateway?.catalog?.() || []).find((x) => x.id === platform)
+      const defaults = {}
+      for (const s of entry?.settings || []) {
+        if (s.default !== undefined && curInst[s.key] === undefined) defaults[s.key] = s.default
+      }
+      for (const val of Object.values(secretPatch || {})) {
+        if (val) registerSecret(val)
+      }
+      const nextInst = {
+        ...defaults,
+        ...curInst,
+        ...configPatch,
+        ...secretPatch,
+        enabled: true,
+        authMode: method,
+      }
+      setConfig(mergeFromPanel(getConfig(), { platforms: { [instance]: nextInst } }))
+    },
+    syncInstance: async () => {
+      if (!platformGateway) ensureGateway()
+      await platformGateway?.sync?.()
+    },
+    verifyInstance: async ({ instance, expectedSelf }) => {
+      const disableFailedInstance = async () => {
+        setConfig(mergeFromPanel(getConfig(), { platforms: { [instance]: { enabled: false } } }))
+        try { await platformGateway?.sync?.() } catch {}
+      }
+      if (!platformGateway) {
+        await disableFailedInstance()
+        return { ok: false, code: 'gateway-unavailable', message: '多平台网关尚未初始化，认证核验失败', retryable: true }
+      }
+      const verifyTimeoutMs = Math.max(100, Number(opts?.authVerifyTimeoutMs) || 8000)
+      const deadline = Date.now() + verifyTimeoutMs
+      let wakeUp = null
+      const offState = platformGateway.onState?.((status) => {
+        if (status?.instance === instance && wakeUp) wakeUp()
+      })
+      let lastInst = null
+      try {
+        while (true) {
+          const inst = (platformGateway.instances?.() || []).find((x) => x.instance === instance)
+          lastInst = inst
+          if (!inst) {
+            await disableFailedInstance()
+            return { ok: false, code: 'instance-not-found', message: `网关中未找到实例 ${instance}，认证核验失败`, retryable: false }
+          }
+          if (inst.state === 'unconfigured' || inst.state === 'stopped') {
+            await disableFailedInstance()
+            return {
+              ok: false,
+              code: 'instance-not-connected',
+              message: inst.detail || `实例 ${instance} 尚未就绪（${inst.state}），认证核验失败`,
+              retryable: true,
+            }
+          }
+          if (inst.state === 'disconnected') {
+            await disableFailedInstance()
+            const whoamiErr = /whoami/i.test(String(inst.detail || ''))
+            return {
+              ok: false,
+              code: whoamiErr ? 'whoami-mismatch' : 'instance-disconnected',
+              message: inst.detail || `实例 ${instance} 连接已断开，认证核验失败`,
+              retryable: true,
+            }
+          }
+          if (inst.state === 'connected') {
+            const actualAccount = String(inst.self?.account || '').trim()
+            if (actualAccount) {
+              if (expectedSelf?.account && actualAccount !== String(expectedSelf.account)) {
+                await disableFailedInstance()
+                return {
+                  ok: false,
+                  code: 'whoami-mismatch',
+                  message: `账号身份核验不一致：实际连接为 ${actualAccount}，预期为 ${expectedSelf.account}`,
+                  retryable: true,
+                }
+              }
+              return { ok: true, self: inst.self }
+            }
+          }
+          const remaining = deadline - Date.now()
+          if (remaining <= 0) break
+          await new Promise((resolve) => {
+            let timer = null
+            const done = () => {
+              if (wakeUp === done) wakeUp = null
+              if (timer !== null) { clearTimeout(timer); timer = null }
+              resolve()
+            }
+            wakeUp = done
+            timer = setTimeout(done, Math.min(20, remaining))
+            timer.unref?.()
+          })
+        }
+      } finally {
+        wakeUp = null
+        try { offState?.() } catch {}
+      }
+      const finalInst = (platformGateway.instances?.() || []).find((x) => x.instance === instance) || lastInst
+      await disableFailedInstance()
+      if (finalInst?.state === 'connected') {
+        return {
+          ok: false,
+          code: 'whoami-timeout',
+          message: `等待实例 ${instance} 完成账号身份（whoami）核验超时`,
+          retryable: true,
+        }
+      }
+      return {
+        ok: false,
+        code: 'connect-timeout',
+        message: finalInst?.detail || `等待实例 ${instance} 建立连接超时（当前状态：${finalInst?.state || 'unknown'}）`,
+        retryable: true,
+      }
+    },
+    registerSecret,
+    redact,
+    log: logger.child('auth'),
+  })
+  platformAuth.register(createWechatClawbotAuthDriver({
+    getClient: () => opts?.wechatQrClient || opts?.wechatClient,
+  }))
+  if (Array.isArray(opts?.authDrivers)) {
+    for (const driver of opts.authDrivers) platformAuth.register(driver)
   }
   let gatewayReady = null
   // 配置里已经有启用的平台：启动时就建，面板与入站立刻可用
@@ -3638,6 +3794,7 @@ export function apply(ctx, opts = {}) {
     hub.dispose()
     bridge.dispose()
     mods.dispose()
+    Promise.resolve(platformAuth?.dispose?.()).catch(() => {})
     onebot.stop()
     snowluma.dispose()
   }, 'aurabot: 收尾')
@@ -5327,6 +5484,7 @@ export function apply(ctx, opts = {}) {
       owner: identity.owner(),
       instances: list,
       catalog: platformGateway?.catalog?.() || [],
+      authMethods: platformAuth.listMethods(),
       candidates: [...platformCandidates.values()].sort((a, b) => b.at - a.at).slice(0, 10),
       configs: Object.fromEntries(list.map((x) => [x.instance, pubPlats[x.instance] || {}])),
       ui: { platformsCollapsed: getConfig().ui?.platformsCollapsed || {} },
@@ -5854,111 +6012,127 @@ export function apply(ctx, opts = {}) {
     try { await platformGateway?.sync?.() } catch (error) { log.warn('保存平台设置后同步失败：', error.message) }
     return { ...platformView(), message: '平台设置已保存' }
   })
-  const wechatQrSessions = new Map()
-  const validateWechatQrBaseUrl = (raw) => {
-    const uStr = String(raw || WECHAT_CLAWBOT_BASE_URL).trim().replace(/\/+$/, '')
-    let u
-    try { u = new URL(uStr) } catch { return { error: 'iLink 接口地址格式不对' } }
-    const localHost = u.hostname === '127.0.0.1' || u.hostname === 'localhost' || u.hostname === '::1'
-    if (u.protocol !== 'https:' && !(u.protocol === 'http:' && localHost)) {
-      return { error: 'iLink 接口地址必须使用 https://（仅本地测试允许 http://localhost）' }
+  route('/platforms/auth/start', async (req) => {
+    const b = await readBody(req)
+    const platform = String(b.platform || '').trim()
+    const method = String(b.method || '').trim()
+    const instance = b.instance !== undefined ? String(b.instance || '').trim() : ''
+    const params = b.params && typeof b.params === 'object' && !Array.isArray(b.params) ? b.params : {}
+    try {
+      const view = await platformAuth.start({
+        platform,
+        ...(instance ? { instance } : {}),
+        method,
+        params,
+      })
+      return { ok: true, ...view }
+    } catch (error) {
+      const detail = error instanceof AuthError
+        ? error.toDetail(redact)
+        : {
+          code: String(error?.code || 'auth-start-failed'),
+          stage: 'auth.begin',
+          message: redact(error?.message || '启动认证失败'),
+          retryable: true,
+          ...(platform ? { platform } : {}),
+        }
+      return { ok: false, state: 'error', error: detail, message: detail.message }
     }
-    return { url: uStr }
-  }
+  })
+  route('/platforms/auth/poll', async (req) => {
+    const b = await readBody(req)
+    const sessionId = String(b.sessionId || '').trim()
+    try {
+      const view = await platformAuth.poll({ sessionId })
+      if (view.state === 'succeeded') {
+        return { ...platformView(), ...view, ok: true }
+      }
+      if (view.state === 'error') {
+        return { ...view, ok: false, message: view.error?.message || view.message }
+      }
+      return { ...view, ok: true }
+    } catch (error) {
+      const detail = error instanceof AuthError
+        ? error.toDetail(redact)
+        : {
+          code: String(error?.code || 'auth-poll-failed'),
+          stage: 'auth.poll',
+          message: redact(error?.message || '轮询认证状态失败'),
+          retryable: true,
+        }
+      const state = detail.stage === 'auth.qr.expire' ? 'expired' : 'error'
+      return { ok: false, sessionId, state, error: detail, message: detail.message }
+    }
+  })
+  route('/platforms/auth/cancel', async (req) => {
+    const b = await readBody(req)
+    const sessionId = String(b.sessionId || '').trim()
+    const reason = String(b.reason || 'user-cancelled').trim()
+    const view = await platformAuth.cancel({ sessionId, reason })
+    return { ok: true, ...view }
+  })
+  // 向后兼容旧版微信 ClawBot 扫码路由（底层统一委托给 platformAuth）
   route('/platforms/wechat-clawbot/qr/start', async (req) => {
     const b = await readBody(req)
     const instance = String(b.instance || 'wechat-clawbot').trim() || 'wechat-clawbot'
-    if (!/^wechat-clawbot(?:#[a-z0-9_-]+)?$/.test(instance)) {
-      return { ok: false, message: '实例名必须为 wechat-clawbot 或 wechat-clawbot#<别名>' }
-    }
-    const current = (getConfig().platforms || {})[instance] || {}
-    const checkedUrl = validateWechatQrBaseUrl(b.baseUrl || current.baseUrl || WECHAT_CLAWBOT_BASE_URL)
-    if (checkedUrl.error) return { ok: false, message: checkedUrl.error }
-    const routeTag = String(b.routeTag ?? current.routeTag ?? '').trim()
     try {
-      const now = Date.now()
-      for (const [sid, s] of wechatQrSessions) {
-        if (now - s.createdAt > 10 * 60_000) wechatQrSessions.delete(sid)
-      }
-      if (wechatQrSessions.size >= 20) wechatQrSessions.delete(wechatQrSessions.keys().next().value)
-      const qr = await startQrLogin({
-        baseUrl: checkedUrl.url,
-        routeTag,
-        client: opts?.wechatQrClient || opts?.wechatClient,
-      })
-      const sessionId = randomUUID()
-      wechatQrSessions.set(sessionId, {
-        qrcode: qr.qrcode,
-        baseUrl: qr.baseUrl,
-        routeTag,
+      const view = await platformAuth.start({
+        platform: 'wechat-clawbot',
         instance,
-        createdAt: now,
+        method: 'qr-link',
+        params: {
+          ...(b.baseUrl ? { baseUrl: b.baseUrl } : {}),
+          ...(b.routeTag !== undefined ? { routeTag: b.routeTag } : {}),
+          ...(b.botType ? { botType: b.botType } : {}),
+        },
       })
       return {
         ok: true,
-        sessionId,
-        instance,
-        qrDataUri: qr.qrDataUri,
-        qrcodeUrl: qr.qrcodeUrl,
+        sessionId: view.sessionId,
+        instance: view.instance,
+        qrDataUri: view.qrDataUri || '',
+        qrcodeUrl: view.verificationUrl || '',
         state: 'wait',
-        message: '请用手机微信扫描二维码，并点击确认登录',
+        message: view.message || '请用手机微信扫描二维码，并点击确认登录',
       }
     } catch (error) {
-      return { ok: false, message: error?.message || '获取微信登录二维码失败' }
+      return { ok: false, message: redact(error?.message || '获取微信登录二维码失败') }
     }
   })
   route('/platforms/wechat-clawbot/qr/status', async (req) => {
     const b = await readBody(req)
     const sessionId = String(b.sessionId || '').trim()
-    const session = sessionId ? wechatQrSessions.get(sessionId) : null
-    if (!session) {
-      return { ok: false, state: 'expired', message: '扫码会话不存在或已过期，请重新生成二维码' }
-    }
     try {
-      const r = await pollQrStatus({
-        baseUrl: session.baseUrl,
-        qrcode: session.qrcode,
-        routeTag: session.routeTag,
-        client: opts?.wechatQrClient || opts?.wechatClient,
-      })
-      if (r.state === 'confirmed') {
-        wechatQrSessions.delete(sessionId)
-        if (!platformGateway) ensureGateway()
-        const curPlats = getConfig().platforms || {}
-        const curInst = curPlats[session.instance] || {}
-        const entry = (platformGateway?.catalog?.() || []).find((x) => x.id === 'wechat-clawbot')
-        const defaults = {}
-        for (const s of entry?.settings || []) {
-          if (s.default !== undefined && curInst[s.key] === undefined) defaults[s.key] = s.default
-        }
-        const nextInst = {
-          ...defaults,
-          ...curInst,
-          enabled: true,
-          botToken: r.botToken,
-          ...(r.botId ? { botId: r.botId } : {}),
-          ...(r.baseUrl ? { baseUrl: r.baseUrl } : {}),
-          ...(session.routeTag ? { routeTag: session.routeTag } : {}),
-        }
-        registerSecret(r.botToken)
-        setConfig(mergeFromPanel(getConfig(), { platforms: { [session.instance]: nextInst } }))
-        try { await platformGateway?.sync?.() } catch (error) { log.warn('微信扫码后同步网关失败：', error.message) }
+      const view = await platformAuth.poll({ sessionId })
+      if (view.state === 'succeeded') {
         return {
           ...platformView(),
           ok: true,
           state: 'confirmed',
-          botId: r.botId || '',
-          baseUrl: r.baseUrl || '',
-          userId: r.userId || '',
-          message: '微信扫码登录成功，已保存凭证并启动连接',
+          botId: String(view.meta?.botId || view.self?.account || ''),
+          baseUrl: String(view.meta?.baseUrl || ''),
+          userId: String(view.meta?.userId || ''),
+          message: view.message || '微信扫码登录成功，已保存凭证并启动连接',
         }
       }
-      if (r.state === 'expired') {
-        wechatQrSessions.delete(sessionId)
+      if (view.state === 'expired') {
+        return { ok: true, state: 'expired', message: view.message || '二维码已过期，请重新生成' }
       }
-      return { ok: true, state: r.state, message: r.message }
+      if (view.state === 'cancelled') {
+        return { ok: false, state: 'expired', message: view.message || '扫码会话已取消，请重新生成二维码' }
+      }
+      if (view.state === 'error') {
+        return { ok: false, message: view.error?.message || view.message || '查询微信扫码状态失败' }
+      }
+      if (view.scanned === true) {
+        return { ok: true, state: 'scaned', message: view.message || '已扫码，请在手机微信上点击确认登录' }
+      }
+      return { ok: true, state: 'wait', message: view.message || '等待手机微信扫码…' }
     } catch (error) {
-      return { ok: false, message: error?.message || '查询微信扫码状态失败' }
+      if (error?.code === 'session-not-found') {
+        return { ok: false, state: 'expired', message: '扫码会话不存在或已过期，请重新生成二维码' }
+      }
+      return { ok: false, message: redact(error?.message || '查询微信扫码状态失败') }
     }
   })
   route('/platforms/claim', async (req) => {
@@ -6117,6 +6291,7 @@ export function apply(ctx, opts = {}) {
       ownerPrimary: getConfig().ownerPrimary,
       ownerAccountOptions: buildOwnerAccountOptions(owner),
       resolvedProactiveRoute: resolveOwnerRoute({ purpose: 'proactive', record: false }),
+      resolvedSharedProactiveRoute: hub.resolveSharedProactiveRoute({ record: false }),
       resolvedNoticeRoute: resolveOwnerRoute({ purpose: 'notice', record: false }),
       resolvedFallbackPreview: computeFallbackPreview(),
       lastBlockedRoute,
@@ -6293,6 +6468,7 @@ export function apply(ctx, opts = {}) {
       ownerAccountOptions: buildOwnerAccountOptions(afterOwner),
       config: publicConfig(getConfig()),
       resolvedProactiveRoute: resolveOwnerRoute({ purpose: 'proactive', record: false }),
+      resolvedSharedProactiveRoute: hub.resolveSharedProactiveRoute({ record: false }),
       resolvedNoticeRoute: resolveOwnerRoute({ purpose: 'notice', record: false }),
       resolvedFallbackPreview: computeFallbackPreview(),
       lastBlockedRoute,
@@ -6535,6 +6711,7 @@ export function apply(ctx, opts = {}) {
     hub, qqOwnership, snowluma, getConfig, setConfig, logger, modules: mods, bridge, resolveOwnerRoute, routeOwner, proactHealth: () => lastBlockedRoute, ready,
     get onebot() { return legacyOnebot() },
     get gateway() { return platformGateway },
+    platformAuth,
     get stickers() { return use('stickers') },
     get qzone() { return use('diary') },
     get mood() { return use('mood') },

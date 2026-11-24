@@ -37,7 +37,7 @@ beforeEach(() => {
   freshDataDir('aurabot-p3-case-')
 })
 
-async function startHost(t, { dataDir = process.env.AURABOT_DATA_DIR, seedConfig, seedOwnerAccounts = [], configureDsh } = {}) {
+async function startHost(t, { dataDir = process.env.AURABOT_DATA_DIR, seedConfig, seedOwnerAccounts = [], configureDsh, configureBridgeAdapter } = {}) {
   process.env.AURABOT_DATA_DIR = dataDir
   const seedId = createIdentity({ dataDir: join(dataDir, 'gateway'), log: { info() {}, warn() {}, debug() {} } })
   const ownerPerson = seedId.claimOwner('qq', '10001')
@@ -76,7 +76,11 @@ async function startHost(t, { dataDir = process.env.AURABOT_DATA_DIR, seedConfig
     applied.gateway.register(() => {
       const adapter = makeFakeAdapter({ id: 'bridge', name: 'Bridge' })
       const origStart = adapter.start
-      adapter.start = async (ctx) => { adapters.set(ctx.instance, adapter); return origStart(ctx) }
+      adapter.start = async (ctx) => {
+        adapters.set(ctx.instance, adapter)
+        configureBridgeAdapter?.(ctx.instance, adapter)
+        return origStart(ctx)
+      }
       return adapter
     })
     applied.gateway.register(() => {
@@ -683,7 +687,7 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
     // 页面文本应含主账号阻塞告警和两个回退开关文案
     const fullText = textOf(tree)
     assert.match(fullText, /普通主动消息已暂停发送/)
-    assert.match(fullText, /允许普通主动聊天改发其他在线平台/)
+    assert.match(fullText, /允许普通主动聊天和共享主动搭话按接收优先级改发/)
     assert.match(fullText, /允许系统重要通知与自测提醒改发其他在线平台/)
 
     // 点击「测试发送给主人主账号」与切换 fallback 开关
@@ -691,7 +695,7 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
     assert.ok(testSendBtn)
     await testSendBtn.props.onClick()
     assert.ok(posted.some((x) => x.url === '/aurabot/api/test-send'))
-    const fbRow = collectNodes(tree, (n) => n.type?.name === 'Row' && String(n.props?.label || '').includes('允许普通主动聊天改发其他在线平台'))[0]
+    const fbRow = collectNodes(tree, (n) => n.type?.name === 'Row' && String(n.props?.label || '').includes('允许普通主动聊天和共享主动搭话按接收优先级改发'))[0]
     assert.ok(fbRow)
     const fbSw = collectNodes(fbRow, (n) => n.type?.name === 'Switch')[0]
     fbSw.props.onChange(true)
@@ -705,6 +709,7 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
         multiPrivate: {
           enabled: true, available: true, state: 'active', mode: 'live', retiredCount: 0,
           lastDeliveryFailure: { kind: 'failure-notice', platform: 'wechat-clawbot', at: 1767225600000, reason: 'offline' },
+          lastProactiveDelivery: { platform: 'bridge', instance: 'bridge#2', account: 'b_acc', at: 1767225600000, fallbackUsed: true },
         },
       }, // data
       '', // busy
@@ -749,6 +754,7 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
     assert.match(platText, /当前主人主账号：QQ · 10001/)
     assert.match(platText, /设为主人 bridge#2 主账号/)
     assert.match(platText, /最近一次失败回执投递异常 · 微信 ClawBot · .* · 平台离线/)
+    assert.match(platText, /最近一次共享主动投递 · 通用桥（bridge#2） · b_acc · 按优先级回退/)
 
     const unobsQuickBtn = collectNodes(platTree, (n) => n.type?.name === 'Btn' && textOf(n.children).includes('bridge 未观测'))[0]
     assert.ok(unobsQuickBtn)
@@ -816,6 +822,7 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
         ok: true,
         ownerAccountOptions: prioOptions,
         resolvedProactiveRoute: { chatId: '', blocked: true, reason: 'primary-offline', target: { platform: 'bridge', instance: 'bridge#2', account: 'b_acc' }, fallbackUsed: false },
+        resolvedSharedProactiveRoute: { chatId: '', deferred: true, retryable: true, reason: 'primary-offline' },
         resolvedNoticeRoute: { chatId: 'private:10001', blocked: false, reason: 'fallback-used', target: { platform: 'qq', instance: 'qq', account: '10001' }, fallbackUsed: true },
         resolvedFallbackPreview: {
           available: true,
@@ -856,8 +863,9 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
     assert.doesNotMatch(prioText, /当前主账号（首选 · 固定首位）/)
     assert.doesNotMatch(prioText, /当前固定主账号：/)
     assert.match(prioText, /仅支持回复（将跳过）/)
-    assert.match(prioText, /普通主动消息回退：关闭｜系统通知回退：开启/)
+    assert.match(prioText, /普通主动聊天和共享主动搭话回退：关闭｜系统通知回退：开启/)
     assert.match(prioText, /仅系统通知会改发/)
+    assert.match(prioText, /当前主动搭话目标：暂无可用账号，本次将暂缓/)
     assert.match(prioText, /QQ 官方机器人（请用你的账号向该实例发一条私聊以完成绑定/)
     assert.doesNotMatch(prioText, /99999_stale/, 'UI 不应展示已解绑的 stale 账号')
 
@@ -1154,6 +1162,11 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
         ...prioOptions,
         { key: 'feishu:feishu#2:ou_nop', platform: 'feishu', instance: 'feishu#2', account: 'ou_nop', state: 'connected', enabled: true, canProactive: false, multiInstance: true, observed: false, unlinkedOnInstance: true },
       ],
+      resolvedSharedProactiveRoute: {
+        chatId: 'bridge#2:private:b_acc',
+        target: { platform: 'bridge', instance: 'bridge#2', account: 'b_acc' },
+        fallbackUsed: true,
+      },
       resolvedFallbackPreview: {
         available: true,
         reason: 'recent-preview',
@@ -1182,6 +1195,7 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
     assert.match(multiUnboundText, /个人飞书 2（feishu#2）/, 'feishu 已绑定时未观测的 feishu#2 仍须提示未绑定')
     assert.doesNotMatch(multiUnboundText, /工作飞书 1/, '已绑定的 feishu 实例不应重复出现在未绑定提示中')
     assert.match(multiUnboundText, /当前优先：最近私聊平台（QQ · 10001）；若不可用则顺延：通用桥（bridge#2） · b_acc/)
+    assert.match(multiUnboundText, /当前主动搭话目标：通用桥（bridge#2） · b_acc · 共享会话 · 按优先级回退/)
 
     // 预览 reason === 'fallback-disabled' 渲染校验
     hook = 0
@@ -1205,7 +1219,7 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
       toast() {},
     })
     const disabledText = textOf(disabledTree)
-    assert.match(disabledText, /普通主动消息回退：关闭｜系统通知回退：关闭/)
+    assert.match(disabledText, /普通主动聊天和共享主动搭话回退：关闭｜系统通知回退：关闭/)
     assert.match(disabledText, /回退开关均关闭，不会自动发送/)
 
     // 验证 AurabotPage 真实 save() 入口：
@@ -1488,4 +1502,98 @@ test('P3-7: resolvedFallbackPreview 全状态矩阵（ok/仅系统通知/fallbac
   assert.equal(rRecent.resolvedFallbackPreview.reason, 'recent-preview')
   assert.equal(rRecent.resolvedFallbackPreview.currentTarget?.instance, 'bridge#2')
   assert.equal(rRecent.resolvedFallbackPreview.candidateTarget?.instance, 'bridge')
+})
+
+test('共享主动搭话预览只使用网关主账号和显式接收优先级', async (t) => {
+  const { fake, applied, adapters, ownerPerson } = await startHost(t, {
+    seedOwnerAccounts: [['bridge', 'b_primary'], ['bridge', 'b_backup'], ['feishu', 'ou_passive']],
+    seedConfig: {
+      multiPlatformPrivateSession: true,
+      ownerPrimary: { mode: 'fixed', platform: 'bridge', instance: 'bridge#2', account: 'b_primary', fallback: true },
+    },
+    configureDsh(ctx) {
+      ctx.services.sessionController.fork = async () => { throw new Error('路由预览不应创建共享会话') }
+      ctx.services.sessionProjections = {}
+    },
+  })
+  const { gateway } = applied
+  gateway.routing.noteSeen(ownerPerson, 'bridge#2:private:b_primary', Date.now())
+  gateway.routing.noteSeen(ownerPerson, 'bridge:private:b_backup', Date.now())
+  const preview = async () => (await fake.call('/platforms/people')).json().resolvedSharedProactiveRoute
+  assert.equal((await preview())?.chatId, 'bridge#2:private:b_primary')
+  adapters.get('bridge#2').setCaps({ proactive: 'none' })
+  const noOrder = await preview()
+  assert.equal(noOrder?.deferred, true)
+  assert.equal(noOrder.chatId, '')
+
+  const before = applied.getConfig()
+  applied.setConfig({ ...before, ownerPrimary: { ...before.ownerPrimary, fallbackOrder: [
+    { platform: 'qq', instance: 'qq', account: '10001' },
+    { platform: 'feishu', instance: 'feishu', account: 'ou_passive' },
+    { platform: 'bridge', instance: 'bridge', account: 'b_backup' },
+  ] } })
+  const fallback = await preview()
+  assert.equal(fallback?.chatId, 'bridge:private:b_backup')
+  assert.equal(fallback.fallbackUsed, true)
+  const disabled = (await fake.call('/platforms/owner/primary', { fallback: false })).json().resolvedSharedProactiveRoute
+  assert.equal(disabled?.deferred, true)
+  assert.equal(disabled.chatId, '')
+})
+
+test('共享主动搭话跳过每次连接中仍在等待 whoami 的备用实例', async (t) => {
+  let whoami = Promise.withResolvers()
+  const firstIdentity = { account: 'bridge_first_bot' }
+  t.after(() => whoami.resolve(firstIdentity))
+  const { fake, applied, adapters, ownerPerson } = await startHost(t, {
+    seedOwnerAccounts: [['bridge', 'b_primary'], ['bridge', 'b_first'], ['bridge', 'b_second']],
+    seedConfig: {
+      multiPlatformPrivateSession: true,
+      platforms: { bridge: { enabled: true }, 'bridge#2': { enabled: true }, 'bridge#3': { enabled: true } },
+      ownerPrimary: { mode: 'fixed', platform: 'bridge', instance: 'bridge#2', account: 'b_primary', fallback: true },
+    },
+    configureDsh(ctx) {
+      ctx.services.sessionController.fork = async () => { throw new Error('路由预览不应创建共享会话') }
+      ctx.services.sessionProjections = {}
+    },
+    configureBridgeAdapter(instance, adapter) {
+      if (instance === 'bridge') adapter.whoami = () => whoami.promise
+    },
+  })
+
+  const { gateway } = applied
+  gateway.routing.noteSeen(ownerPerson, 'bridge#2:private:b_primary', Date.now())
+  gateway.routing.noteSeen(ownerPerson, 'bridge:private:b_first', Date.now())
+  gateway.routing.noteSeen(ownerPerson, 'bridge#3:private:b_second', Date.now())
+  adapters.get('bridge#2').setCaps({ proactive: 'none' })
+  const before = applied.getConfig()
+  applied.setConfig({ ...before, ownerPrimary: { ...before.ownerPrimary, fallbackOrder: [
+    { platform: 'bridge', instance: 'bridge', account: 'b_first' },
+    { platform: 'bridge', instance: 'bridge#3', account: 'b_second' },
+  ] } })
+
+  const preview = async () => (await fake.call('/platforms/people')).json().resolvedSharedProactiveRoute
+  const first = () => gateway.instances().find(item => item.instance === 'bridge')
+  const expectSecond = async () => {
+    assert.equal(first()?.state, 'connected')
+    const route = await preview()
+    assert.equal(route?.chatId, 'bridge#3:private:b_second')
+    assert.equal(route.fallbackUsed, true)
+  }
+  const completeWhoami = async () => {
+    whoami.resolve(firstIdentity)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(first()?.self?.account, firstIdentity.account)
+    assert.equal((await preview())?.chatId, 'bridge:private:b_first')
+  }
+
+  assert.equal(first()?.self, null)
+  await expectSecond()
+  await completeWhoami()
+
+  const firstAdapter = adapters.get('bridge')
+  whoami = Promise.withResolvers()
+  firstAdapter.disconnect()
+  firstAdapter.reconnect()
+  await expectSecond()
+  await completeWhoami()
 })

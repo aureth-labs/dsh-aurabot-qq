@@ -1133,6 +1133,8 @@ const SECRETS = [['snowluma', 'webuiPassword'], ['snowluma', 'httpToken'], ['sno
 export const PLATFORM_SECRET_KEYS = Object.freeze([
   'botToken', 'appSecret', 'clientSecret', 'encryptKey', 'verificationToken', 'botSecret',
   'secret', 'token', 'httpToken', 'wsToken',
+  'appToken', 'signingSecret', 'encodingAesKey', 'corpSecret', 'aesKey',
+  'apiKey', 'accessToken', 'refreshToken', 'password', 'privateKey', 'webhookSecret',
 ])
 // 扩展模块设置里的密码类字段（模块加载时登记）：['ext', 模块id, 字段]
 const extraSecrets = new Map()

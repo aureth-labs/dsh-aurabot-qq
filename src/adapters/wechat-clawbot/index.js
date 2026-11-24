@@ -16,12 +16,13 @@ import { assertPublicUrl } from '../../core/net.js'
 import { ensureDir } from '../../core/store.js'
 import { sanitizeFeaturesInput } from '../../gateway/features.js'
 import { assertReplyCurrent } from '../../gateway/errors.js'
+import { AuthError } from '../../gateway/auth.js'
 import {
   checkMediaConstraints,
   classifyTransportError,
   createProactiveRateLimiter,
   createSendError,
-  encodeQrSvgDataUri,
+  renderQrDataUri,
   extForMime,
   formatWechatErrorSummary,
   inferMimeFromBytes,
@@ -281,6 +282,20 @@ export function createIlinkHttpClient({ fetchImpl = globalThis.fetch } = {}) {
 // ───────────────────────── 扫码登录（独立可测函数，供宿主机路由调用） ─────────────────────────
 
 /**
+ * 校验微信 iLink 接口根地址（仅允许 https://；本地调试允许 http://localhost / 127.0.0.1 / ::1）。
+ */
+export function validateWechatBaseUrl(raw = DEFAULT_BASE_URL) {
+  const uStr = String(raw || DEFAULT_BASE_URL).trim().replace(/\/+$/, '')
+  let u
+  try { u = new URL(uStr) } catch { return { error: 'iLink 接口地址格式不对' } }
+  const localHost = u.hostname === '127.0.0.1' || u.hostname === 'localhost' || u.hostname === '::1'
+  if (u.protocol !== 'https:' && !(u.protocol === 'http:' && localHost)) {
+    return { error: 'iLink 接口地址必须使用 https://（仅本地测试允许 http://localhost）' }
+  }
+  return { url: uStr }
+}
+
+/**
  * 向腾讯 iLink 请求登录二维码，并本地渲染成 SVG Data URI。
  */
 export async function startQrLogin({
@@ -289,6 +304,7 @@ export async function startQrLogin({
   routeTag = '',
   client = createIlinkHttpClient(),
   timeoutMs = DEFAULT_TIMEOUT_MS,
+  signal,
 } = {}) {
   const root = normalizeBaseUrl(baseUrl, DEFAULT_BASE_URL)
   const url = `${root}${PATH_QR_CODE}?bot_type=${encodeURIComponent(String(botType || DEFAULT_BOT_TYPE))}`
@@ -297,19 +313,50 @@ export async function startQrLogin({
     url,
     headers: buildIlinkHeaders({ routeTag, includeAuth: false }),
     timeoutMs,
+    ...(signal ? { signal } : {}),
   })
   if (r.status < 200 || r.status >= 300 || !r.json) {
-    throw new Error(formatWechatErrorSummary('获取微信登录二维码失败', r.status, r.json?.errmsg || r.text))
+    throw new AuthError({
+      code: `ilink-http-${r.status || 'err'}`,
+      stage: 'auth.begin',
+      message: formatWechatErrorSummary('获取微信登录二维码失败', r.status, r.json?.errmsg || r.text),
+      retryable: true,
+      platform: PLATFORM_ID,
+    })
   }
   if (Number(r.json.errcode || r.json.ret || 0) !== 0 && !r.json.qrcode) {
-    throw new Error(formatWechatErrorSummary('获取微信登录二维码失败', r.json.errcode ?? r.json.ret, r.json.errmsg))
+    throw new AuthError({
+      code: `ilink-err-${r.json.errcode ?? r.json.ret}`,
+      stage: 'auth.begin',
+      message: formatWechatErrorSummary('获取微信登录二维码失败', r.json.errcode ?? r.json.ret, r.json.errmsg),
+      retryable: true,
+      platform: PLATFORM_ID,
+    })
   }
   const qrcode = String(r.json.qrcode || '').trim()
   const content = String(r.json.qrcode_img_content || '').trim()
   if (!qrcode || !content) {
-    throw new Error('iLink 未返回有效的二维码数据（缺少 qrcode 或 qrcode_img_content）')
+    throw new AuthError({
+      code: 'invalid-qr-payload',
+      stage: 'auth.begin',
+      message: 'iLink 未返回有效的二维码数据（缺少 qrcode 或 qrcode_img_content）',
+      retryable: true,
+      platform: PLATFORM_ID,
+    })
   }
-  const qrDataUri = /^data:image\//i.test(content) ? content : encodeQrSvgDataUri(content)
+  let qrDataUri
+  try {
+    qrDataUri = renderQrDataUri(content)
+  } catch (error) {
+    throw new AuthError({
+      code: 'qr-encode-failed',
+      stage: 'auth.qr.encode',
+      message: `生成微信登录二维码失败：${error?.message || error}`,
+      retryable: true,
+      platform: PLATFORM_ID,
+      cause: error,
+    })
+  }
   return {
     ok: true,
     qrcode,
@@ -328,6 +375,7 @@ export async function pollQrStatus({
   routeTag = '',
   client = createIlinkHttpClient(),
   timeoutMs = DEFAULT_TIMEOUT_MS,
+  signal,
 } = {}) {
   const code = String(qrcode || '').trim()
   if (!code) throw new Error('缺少 qrcode 参数')
@@ -338,15 +386,50 @@ export async function pollQrStatus({
     url,
     headers: buildIlinkHeaders({ routeTag, includeAuth: false }),
     timeoutMs,
+    ...(signal ? { signal } : {}),
   })
   if (r.status < 200 || r.status >= 300 || !r.json) {
-    throw new Error(formatWechatErrorSummary('查询微信扫码状态失败', r.status, r.json?.errmsg || r.text))
+    throw new AuthError({
+      code: `ilink-http-${r.status || 'err'}`,
+      stage: 'auth.poll',
+      message: formatWechatErrorSummary('查询微信扫码状态失败', r.status, r.json?.errmsg || r.text),
+      retryable: false,
+      platform: PLATFORM_ID,
+    })
+  }
+  const rawErrCode = r.json.errcode ?? r.json.ret
+  const errCode = rawErrCode !== undefined && rawErrCode !== null && rawErrCode !== '' ? Number(rawErrCode) : 0
+  if (errCode === SESSION_EXPIRED_ERRCODE) {
+    throw new AuthError({
+      code: 'session-expired-14',
+      stage: 'auth.poll',
+      message: '微信 iLink 会话已过期（-14），请重新生成二维码扫码',
+      retryable: false,
+      platform: PLATFORM_ID,
+    })
+  }
+  if (errCode !== 0 && !r.json.status) {
+    throw new AuthError({
+      code: `ilink-err-${errCode}`,
+      stage: 'auth.poll',
+      message: formatWechatErrorSummary('查询微信扫码状态失败', errCode, r.json.errmsg),
+      retryable: false,
+      platform: PLATFORM_ID,
+    })
   }
   const rawState = String(r.json.status || 'wait').toLowerCase()
   const state = rawState === 'scanned' ? 'scaned' : rawState
   if (state === 'confirmed') {
     const botToken = String(r.json.bot_token || '').trim()
-    if (!botToken) throw new Error('微信已确认授权，但返回里缺少 bot_token')
+    if (!botToken) {
+      throw new AuthError({
+        code: 'missing-bot-token',
+        stage: 'auth.poll',
+        message: '微信已确认授权，但返回里缺少 bot_token',
+        retryable: false,
+        platform: PLATFORM_ID,
+      })
+    }
     return {
       ok: true,
       state: 'confirmed',
@@ -364,6 +447,104 @@ export async function pollQrStatus({
     return { ok: true, state: 'scaned', message: '已扫码，请在手机微信上点击确认登录' }
   }
   return { ok: true, state: 'wait', message: '等待手机微信扫码…' }
+}
+
+/**
+ * 微信 ClawBot 统一认证驱动（实现 PlatformAuthDriver 契约，method = 'qr-link'）。
+ */
+export function createWechatClawbotAuthDriver({
+  getClient,
+  defaultClient,
+  validateBaseUrl = validateWechatBaseUrl,
+} = {}) {
+  const resolveClient = () => {
+    const c = (typeof getClient === 'function' ? getClient() : null) || defaultClient
+    return c || undefined
+  }
+  return {
+    platform: PLATFORM_ID,
+    methods: [
+      {
+        method: 'qr-link',
+        label: '微信扫码登录',
+        description: '通过腾讯官方 iLink 协议扫码授权个人微信',
+        defaultTtlMs: 10 * 60_000,
+        defaultPollIntervalMs: 2000,
+      },
+    ],
+    allowedConfigKeys: ['botId', 'baseUrl', 'routeTag'],
+    sensitiveDriverSessionKeys: ['qrcode'],
+    validateInstance: (instance) => /^wechat-clawbot(?:#[a-z0-9_-]+)?$/.test(String(instance || '')),
+    async start({ params = {}, currentConfig = {}, signal }) {
+      const checked = validateBaseUrl(params?.baseUrl || currentConfig?.baseUrl || DEFAULT_BASE_URL)
+      if (checked.error) {
+        throw new AuthError({
+          code: 'invalid-base-url',
+          stage: 'auth.begin',
+          message: checked.error,
+          retryable: false,
+          platform: PLATFORM_ID,
+        })
+      }
+      const routeTag = String(params?.routeTag ?? currentConfig?.routeTag ?? '').trim()
+      const botType = String(params?.botType ?? currentConfig?.botType ?? DEFAULT_BOT_TYPE).trim() || DEFAULT_BOT_TYPE
+      const qr = await startQrLogin({
+        baseUrl: checked.url,
+        botType,
+        routeTag,
+        client: resolveClient(),
+        signal,
+      })
+      return {
+        state: 'qr_ready',
+        driverSession: {
+          qrcode: qr.qrcode,
+          baseUrl: qr.baseUrl,
+          routeTag,
+        },
+        qrDataUri: qr.qrDataUri,
+        verificationUrl: /^https?:\/\//i.test(qr.qrcodeUrl) ? qr.qrcodeUrl : '',
+        message: '请用手机微信扫描二维码，并点击确认登录',
+        meta: { baseUrl: qr.baseUrl },
+      }
+    },
+    async poll({ driverSession = {}, signal }) {
+      const r = await pollQrStatus({
+        baseUrl: driverSession.baseUrl || DEFAULT_BASE_URL,
+        qrcode: driverSession.qrcode,
+        routeTag: driverSession.routeTag || '',
+        client: resolveClient(),
+        signal,
+      })
+      if (r.state === 'confirmed') {
+        return {
+          state: 'authorized',
+          completion: {
+            configPatch: {
+              ...(r.botId ? { botId: r.botId } : {}),
+              ...(r.baseUrl ? { baseUrl: r.baseUrl } : {}),
+              ...(driverSession.routeTag ? { routeTag: String(driverSession.routeTag) } : {}),
+            },
+            secretPatch: { botToken: r.botToken },
+            ...(r.botId ? { self: { account: r.botId } } : {}),
+            meta: {
+              botId: r.botId || '',
+              baseUrl: r.baseUrl || '',
+              userId: r.userId || '',
+            },
+          },
+          message: '微信扫码登录成功，已保存凭证并启动连接',
+        }
+      }
+      if (r.state === 'expired') {
+        return { state: 'expired', message: r.message }
+      }
+      if (r.state === 'scaned') {
+        return { state: 'polling', scanned: true, message: r.message }
+      }
+      return { state: 'polling', scanned: false, message: r.message }
+    },
+  }
 }
 
 // ───────────────────────── 入站消息翻译（纯翻译，不编内容） ─────────────────────────

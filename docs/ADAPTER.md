@@ -147,6 +147,16 @@ test('<平台名> 平台端过全套契约', async () => {
 - `test/helpers/fake-adapter.js` —— 内存假平台端：给你的中枢 / 网关 / 模块测试当平台用
   （`makeFakeAdapter(overrides)`，能注入入站、记录出站 `adapter.sent`、按指令抛
   `not-sent` / `unknown`、模拟断线重连、运行中改 caps）。它自己先过了全套契约。
+- `test/helpers/fake-auth-drivers.js` 与 `test/helpers/qr-decoder.js` —— 通用认证驱动测试夹具（`qr-app` / `device-code` / `slow_down` / `expired` / `cancel` / `domain_switched`）与独立 ISO/IEC 18004 二维码解码/RS 伴随式校验器。
+
+## 平台扫码 / 设备码认证驱动（可选 · Phase 0 起）
+
+如果平台需要扫码登录（`qr-app` / `qr-link`）或设备码（`device-code`）自动获取凭证：
+
+1. **契约独立于 `PlatformAdapter.contract: 1`**：保持 `adapter.contract = 1` 不变，另导出一个实现 [contracts.d.ts](../src/gateway/contracts.d.ts) `PlatformAuthDriver` 的工厂（参考 `createWechatClawbotAuthDriver`），由 [src/host.js](../src/host.js) 注册进 `platformAuth`；`src/gateway/auth.js` 不直接 `import src/adapters/*`。
+2. **禁止自建私有路由与面板代码**：Host 统一提供 `/platforms/auth/start|poll|cancel`，面板统一通过 `PlatformAuthQrBox`（内部由 `createAuthPollLoop` 驱动）渲染二维码、授权链接和验证码（旧 `/platforms/wechat-clawbot/qr/*` 只是历史兼容包装，禁止作为新平台模板）。
+3. **只吐临时链接与 `completion`**：需要展示二维码时优先在 `start` / `domain_switched` 返回 `qrContent`（由宿主调用本地 `src/core/qr.js` 转 SVG Data URI，不经外网制码服务）；临时登录态放在 `driverSession`（额外敏感键写入 `sensitiveDriverSessionKeys`）；授权完成后只返回 `{ configPatch, secretPatch, self, meta }`，秘钥键必须在 `PLATFORM_SECRET_KEYS` 中。
+4. **验证与人工验收**：除跑通驱动与宿主 `verifyInstance` 测试外，带二维码生成变更的平台还需执行第三方 `jsqr` 独立解码基准 `npm run test:qr-decode`，并在真机/手机客户端实扫面板展示的二维码，确认能正确识别出目标授权 URL 并完成登录。
 
 ## 新平台接入检查清单（工具面与能力）
 

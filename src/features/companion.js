@@ -215,15 +215,24 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory, identity, 
   }
   const ownerId = () => identity?.owner?.() || null
   const ownerRoute = () => {
+    const shared = hub.resolveSharedProactiveRoute?.()
+    if (shared) return shared
     if (typeof resolveOwnerRoute === 'function') return resolveOwnerRoute({ purpose: 'proactive' })
     const cid = typeof routeOwner === 'function' ? routeOwner() : hub?.ownerChat?.()
     return cid ? { chatId: String(cid), blocked: false, reason: 'ok' } : { chatId: '', blocked: false, reason: 'no-route' }
   }
-  const resolveOwnerChat = () => {
-    const r = ownerRoute()
-    return r && !r.blocked ? (String(r.chatId || '') || null) : null
+  const ownerChat = (route, nickname) => {
+    if (!route?.chatId || route.blocked) return null
+    const chatId = String(route.chatId)
+    const addr = parseChatId(chatId)
+    if (addr?.kind !== 'private') return null
+    return { chatId, kind: 'private', platform: addr.platform, instance: addr.instance, userId: addr.id, nickname }
   }
   const ownerMuted = () => isOwnerChatMuted(identity, isMuted)
+  const pushOwner = (chat, content, route, opts) => {
+    if (typeof hub.pushProactiveToSession === 'function') return hub.pushProactiveToSession(chat, content, '', { ...opts, route })
+    return chat ? hub.pushToSession(chat, content, '', opts) : route
+  }
 
   // ---------------- 她的小闹钟 ----------------
   // 每条提醒都是她自己在对话里设的一次性闹钟；到点只负责把她叫醒，不直接替她发消息。
@@ -231,7 +240,7 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory, identity, 
   const REMINDER_GRACE_MS = 15 * 60_000
   const REMINDER_RETRY_MS = 5 * 60_000
   const REMINDER_WAIT_MS = 4 * 60_000
-  let reminderBusy = false
+  let tickBusy = false
 
   const reminderFile = () => dataDir(REMINDER_FILE)
   const two = (n) => String(n).padStart(2, '0')
@@ -316,12 +325,13 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory, identity, 
   function reminderPrompt(reminder, owner) {
     return `【系统提醒，不是${owner}说的话】你之前给自己定的小闹钟到时间了：${reminder.atText}「${reminder.note}」。现在可以主动找${owner}说这件事；如果你觉得现在不适合打扰，就只回 [沉默]。`
   }
-  async function attemptReminder(reminder, now = Date.now()) {
+  async function attemptReminder(reminder) {
     const cfg = getConfig()
-    const chatId = resolveOwnerChat()
-    const parsed = chatId ? parseChatId(chatId) : null
-    const userId = String(parsed?.id || '')
-    if (!chatId || !userId || !ownerId() || !cfg.enabled || cfg.speakUp?.enabled === false || !cfg.speakUp?.reminderEnabled) return
+    if (!ownerId() || !cfg.enabled || cfg.speakUp?.enabled === false || !cfg.speakUp?.reminderEnabled) return
+    const route = ownerRoute()
+    const owner = cfg.ownerName || '主人'
+    const chat = ownerChat(route, owner)
+    if (!chat && !route?.deferred) return
     const outcome = await new Promise((resolve) => {
       let settled = false
       const timer = setTimeout(() => finish({ ok: false, error: '等回复超时' }), REMINDER_WAIT_MS)
@@ -333,13 +343,11 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory, identity, 
         resolve(result || { ok: false, error: '没有结果' })
       }
       try {
-        const waiting = hub.pushToSession(
-          { chatId, kind: parsed?.kind || 'private', userId, nickname: cfg.ownerName || '主人' },
-          [{ type: 'text', text: reminderPrompt(reminder, cfg.ownerName || '主人') }],
-          '',
-          { onTurnEnd: finish },
+        const waiting = pushOwner(chat, [{ type: 'text', text: reminderPrompt(reminder, owner) }], route, { onTurnEnd: finish })
+        Promise.resolve(waiting).then(
+          (result) => { if (typeof result?.ok === 'boolean') finish(result) },
+          (error) => finish({ ok: false, error: error?.message || String(error) }),
         )
-        Promise.resolve(waiting).catch((error) => finish({ ok: false, error: error?.message || String(error) }))
       } catch (error) {
         finish({ ok: false, error: error?.message || String(error) })
       }
@@ -347,7 +355,7 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory, identity, 
     const live = loadReminders()
     const current = live.find((r) => r.id === reminder.id)
     if (!current) return
-    if (outcome.ok) {
+    if (!outcome.deferred && (outcome.ok || outcome.delivered === true)) {
       saveReminders(live.filter((r) => r.id !== reminder.id))
       log.info(`小闹钟触发：${reminder.atText} ${reminder.note}`)
       return
@@ -373,13 +381,11 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory, identity, 
     log.warn(`小闹钟触发失败，5 分钟后重试：${reminder.atText}（${current.lastError}）`)
   }
   async function tickReminders(now = Date.now()) {
-    if (reminderBusy) return false
     const cfg = getConfig()
-    if (!cfg.enabled || cfg.speakUp?.enabled === false || !cfg.speakUp?.reminderEnabled) return false
+    if (!cfg.enabled || cfg.debug || cfg.speakUp?.enabled === false || !cfg.speakUp?.reminderEnabled) return false
     const due = reminderList(now).find((r) => r.nextAt <= now)
     if (!due) return false
-    reminderBusy = true
-    try { await attemptReminder(due, now) } finally { reminderBusy = false }
+    await attemptReminder(due)
     return true
   }
 
@@ -412,30 +418,34 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory, identity, 
     } } : {}
   }
 
-  async function fire(reason = '定时', { nudge = false } = {}) {
+  async function fire(reason = '定时', { nudge = false, onDelivered } = {}, selectedRoute) {
     const cfg = getConfig()
     const ownId = ownerId()
     if (!cfg.enabled || !cfg.speakUp.enabled || !ownId || ownerMuted() || memory?.()?.dislikes?.(ownId)) return
-    const route = ownerRoute()
-    if (!route || route.blocked || !route.chatId) {
+    const route = selectedRoute ?? ownerRoute()
+    const owner = cfg.ownerName || '主人'
+    const chat = ownerChat(route, owner)
+    if (!chat) {
+      if (route?.deferred) return pushOwner(null, [], route, {})
       log.debug?.(`主动搭话跳过：${route?.blocked ? `主账号被阻塞（${route.reason}）` : '当前联系不上主人'}`)
       return { ok: false, blocked: Boolean(route?.blocked), reason: route?.reason || 'no-route' }
     }
-    const targetChat = String(route.chatId)
-    const addr = parseChatId(targetChat)
     const followUp = !nudge ? memory?.()?.dueFollowUp?.(ownId) : null
-    const owner = cfg.ownerName || '主人'
     const idle = Math.round((Date.now() - lastPrivateAt()) / 60000)
     const angle = ANGLES[Math.floor(Math.random() * ANGLES.length)]
     const prompt = nudge
       ? `【系统提醒，不是${owner}说的话】你刚才跟${owner}说「${String(hub.lastBotToOwner?.text || '').slice(-60)}」，${owner}已经 ${idle} 分钟没回了。可以轻轻追一句（比如「人呢」「睡着啦？」，或者换个话题），别催、别抱怨；觉得${owner}在忙就只回 [沉默]。`
       : `【系统提醒，不是${owner}说的话】你已经 ${idle > 600 ? '很久' : idle + ' 分钟'}没和${owner}私聊了，想主动找${owner}说点什么。这次的由头可以是：${angle}。优先用手里真实的素材（最近做过的事、记忆里的、聊天流水里能查到的），没有真实素材就别硬找，也不要编；用你自己的口气，一两句就好，别用模板、别解释为什么来找；实在不想说就只回 [沉默]。`
     log.info(`主动搭话（${reason}）`)
-    const chat = { chatId: targetChat, kind: 'private', platform: addr?.platform || '', instance: addr?.instance || '', userId: addr?.id || '', nickname: owner }
     const content = [{ type: 'text', text: [prompt, followUpHint(followUp)].filter(Boolean).join('\n') }]
     const receipt = followUpReceipt(followUp)
-    if (hub.pushProactiveToSession) return hub.pushProactiveToSession(chat, content, '', { ...receipt, route })
-    await hub.pushToSession(chat, content, '', receipt)
+    if (onDelivered) {
+      const followUpDelivered = receipt.onDelivered
+      receipt.onDelivered = () => {
+        try { followUpDelivered?.() } finally { onDelivered() }
+      }
+    }
+    return pushOwner(chat, content, route, receipt)
   }
 
   const friendPersonId = (target) => (target ? (identity?.lookup?.(target.platform, target.id) || '') : '')
@@ -500,7 +510,7 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory, identity, 
     return false
   }
 
-  async function tick() {
+  async function runTick(ownerOnly) {
     const cfg = getConfig()
     const c = cfg.speakUp
     const ownId = ownerId()
@@ -509,7 +519,7 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory, identity, 
     if (cfg.ext?.purpose?.enabled === true) return // 目的引擎开着时由它主动找人，两套都跑同一个人会被找两次
     if (ownerMuted() || (ownId && memory?.()?.dislikes?.(ownId))) { // 主人在私聊里让她闭嘴了：只管主人这边，白名单照旧
       const s = load()
-      if (!(await tickFriends(cfg, s))) save(s)
+      if (ownerOnly || !(await tickFriends(cfg, s))) save(s)
       return
     }
     const s = load()
@@ -526,27 +536,49 @@ export function createSpeakUp({ getConfig, hub, log, isMuted, memory, identity, 
     const canOwnerFire = awake && idleOk && s.count < c.maxPerDay && Date.now() >= s.nextAt
     if (canOwnerNudge || canOwnerFire) {
       const route = ownerRoute()
-      if (route && !route.blocked && route.chatId) {
+      if (ownerChat(route)) {
         if (canOwnerNudge) {
-          s.nudgedFor = lb.at
-          save(s)
-          if (Math.random() < 0.5) await fire('追问', { nudge: true })
+          const result = Math.random() < 0.5 ? await fire('追问', { nudge: true }, route) : null
+          if (!result?.deferred) {
+            s.nudgedFor = lb.at
+            save(s)
+          }
           return
         }
-        s.count++
-        s.last = Date.now()
-        schedule(s, c)
         save(s)
-        await fire()
+        let counted = false
+        const onDelivered = () => {
+          if (counted || cfg.debug || cfg.dryRun) return
+          counted = true
+          const latest = load()
+          const day = new Date().toDateString()
+          if (latest.day !== day) Object.assign(latest, { day, count: 0 })
+          latest.count++
+          latest.last = Date.now()
+          schedule(latest, c)
+          save(latest)
+        }
+        const result = await fire('定时', { onDelivered }, route)
+        if (result?.ok && result.delivered !== false && !result.silent && !result.deferred) onDelivered()
+        if (!counted && !result?.deferred) {
+          schedule(s, c)
+          save(s)
+        }
         return
       }
     }
-    if (!(await tickFriends(cfg, s))) save(s)
+    if (ownerOnly || !(await tickFriends(cfg, s))) save(s)
+  }
+
+  async function tick({ ownerOnly = false } = {}) {
+    if (tickBusy) return
+    tickBusy = true
+    try { await runTick(ownerOnly) } finally { tickBusy = false }
   }
 
   return {
     tick,
-    fire,
+    fire: (reason, opts) => fire(reason, opts),
     state: () => ({ ...load(), reminders: reminderList() }),
     reminders: reminderList,
     addReminder,

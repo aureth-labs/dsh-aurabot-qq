@@ -38,7 +38,10 @@ export default {
       }
       return Boolean(api.core.onebot?.state && api.core.onebot.state !== 'connected')
     }
-    api.every(60_000, () => (gatewayIdle() ? undefined : speakUp.tick()), '主动搭话')
+    api.every(60_000, () => {
+      if (!gatewayIdle()) return speakUp.tick()
+      if (hub.resolveSharedProactiveRoute?.({ record: false })) return speakUp.tick({ ownerOnly: true })
+    }, '主动搭话')
     const ownerChat = (chat) => chat?.kind === 'private' && isOwner(api.core.identity, chat)
     // 工具常驻在主人私聊里；开关关着时执行层如实拒绝，避免开关切换后旧会话少了工具。
     api.tool(({ chat }) => {
@@ -89,6 +92,13 @@ export default {
     api.route('/speakup/fire', async () => {
       if (!api.config().enabled) return { ok: false, message: '先打开总开关' }
       const r = await speakUp.fire('手动')
+      if (r?.deferred) return {
+        ok: false,
+        deferred: true,
+        retryable: r.retryable === true,
+        reason: r.reason || '',
+        message: r.error || '主账号和备用账号当前都不可用，本次主动搭话已暂缓',
+      }
       if (r && r.ok === false) {
         return {
           ok: false,

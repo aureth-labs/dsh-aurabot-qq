@@ -7,7 +7,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-export { encodeQrMatrix, encodeQrSvg, encodeQrSvgDataUri } from './qr-svg.js'
+export { MAX_QR_UTF8_BYTES, encodeQrMatrix, encodeQrSvg, encodeQrSvgDataUri, isSafeQrImageDataUri, renderQrDataUri } from './qr-svg.js'
 
 const CONNECT_REFUSED_CODES = new Set([
   'ECONNREFUSED',

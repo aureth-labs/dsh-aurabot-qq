@@ -120,6 +120,43 @@ test('触发失败保留 15 分钟；重试开关关闭时直接丢弃', async (
   assert.equal(s.state().reminders.length, 0)
 })
 
+test('共享提醒无目标时按 5 分钟重试，收到部分送达回执后结束', async (t) => {
+  const { s, cfg, pushed, hub } = setup()
+  cfg.multiPlatformPrivateSession = true
+  let now = Date.now()
+  t.mock.method(Date, 'now', () => now)
+  const deferred = { ok: false, chatId: '', deferred: true, retryable: true, error: '两个账号都离线' }
+  const route = { chatId: 'feishu:private:ou_owner', fallbackUsed: true }
+  const calls = []
+  hub.resolveSharedProactiveRoute = () => calls.length ? route : deferred
+  hub.pushProactiveToSession = async (chat, content, _sender, opts) => {
+    calls.push({ chat, content, route: opts.route })
+    if (!chat) return deferred
+    opts.onTurnEnd({ ok: false, delivered: true, error: '后续消息未发出' })
+  }
+  makeDue(s)
+
+  await s.tick()
+  assert.equal(calls[0].chat, null)
+  assert.equal(calls[0].route, deferred)
+  const [reminder] = s.state().reminders
+  assert.equal(reminder.nextAt, now + 5 * 60_000)
+  assert.equal(reminder.expiresAt, now + 15 * 60_000)
+  assert.equal(reminder.lastError, deferred.error)
+
+  now += 4 * 60_000
+  await s.tick()
+  assert.equal(calls.length, 1)
+  now += 60_000
+  await s.tick()
+  assert.equal(calls.length, 2)
+  assert.equal(calls[1].chat.chatId, route.chatId)
+  assert.equal(calls[1].route, route)
+  assert.match(calls[1].content[0].text, /问主人晚饭吃了没/)
+  assert.equal(pushed.length, 0)
+  assert.equal(s.state().reminders.length, 0)
+})
+
 test('可以手动关闭指定提醒', () => {
   const { s } = setup()
   const r = s.addReminder(textOf(Date.now() + 3600_000), '带伞')
