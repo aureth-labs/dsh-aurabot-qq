@@ -103,7 +103,9 @@
 
 ## 三、用户要做的操作
 
-1. **建应用**：飞书开放平台 → 开发者后台 → 创建**企业自建应用**（长连接不支持商店应用）。
+> **快速路径（Phase 1A 扫码建应用）**：在 Aurabot 面板「通讯平台 → 飞书」或设置向导里可直接点击 **「飞书扫码创建应用」**（`qr-app` 驱动位于 [src/adapters/feishu/auth.js](../src/adapters/feishu/auth.js)）。该扫码流预设基础与媒体消息权限（`im:message.p2p_msg:readonly`、`im:message.group_at_msg:readonly`、`im:message.group_at_msg.include_bot:readonly`、`im:message:readonly`、`im:message:send_as_bot`、`im:resource`）及 `im.message.receive_v1` 事件，会自动写入 `appId`、`appSecret`（Host-only 落盘）与 `baseUrl`。对齐 `@larksuiteoapi/node-sdk@1.73.0`，若国际版 Lark 用户扫码触发 `domain_switched`，会保持当前 `deviceCode` 并将后续轮询自动切至 `accounts.larksuite.com` / `https://open.larksuite.com`（飞书扫码已完成真机测试；`domain_switched` 的 Lark 租户切换仍待真机验证）。注意：扫码只获取基础+媒体应用凭据，不会自动认主；`im:message.group_msg`（全群旁听）、`im:chat`（群管理）与 `cardkit:card:write` 等高阶/敏感权限仍需到飞书开放平台手动勾选；若企业租户要求发布审批，保存凭证后可能返回 `app-pending-publish` 提示，完成发布后在面板开启 **「启用这个实例」** 即可，无需重新扫码。下面是完整后台权限与手动配置清单：
+
+1. **建应用**：飞书开放平台 → 开发者后台 → 创建**企业自建应用**（长连接不支持商店应用），或通过上面「飞书扫码创建应用」一键创建。
 2. **开启机器人能力**：应用能力 → 添加应用能力 → 机器人。**不开启就没有发消息与收消息能力**
    （未开启会报 `230006` / `234007`）。
 3. **拿凭证**：应用详情 → 凭证与基础信息 → 记下 **App ID**（`cli_` 开头）与 **App Secret**。

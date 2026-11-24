@@ -91,8 +91,8 @@ import { createIdentity } from './gateway/identity.js'
 import { createGateway } from './gateway/index.js'
 import { createPlatformAuthManager, AuthError } from './gateway/auth.js'
 import { createQqAdapter } from './adapters/qq/index.js'
-import { createFeishuAdapter } from './adapters/feishu/index.js'
-import { createQqbotAdapter } from './adapters/qqbot/index.js'
+import { createFeishuAdapter, createFeishuAuthDriver } from './adapters/feishu/index.js'
+import { createQqbotAdapter, createQqbotAuthDriver } from './adapters/qqbot/index.js'
 import { createWechatClawbotAdapter, createWechatClawbotAuthDriver } from './adapters/wechat-clawbot/index.js'
 import { createBridgeAdapter } from './adapters/bridge/index.js'
 import { ensureUpgradedStorage } from './features/import-qq.js'
@@ -1665,10 +1665,22 @@ export function apply(ctx, opts = {}) {
       if (!platformGateway) ensureGateway()
       await platformGateway?.sync?.()
     },
-    verifyInstance: async ({ instance, expectedSelf }) => {
+    verifyInstance: async ({ platform, instance, method, expectedSelf }) => {
       const disableFailedInstance = async () => {
         setConfig(mergeFromPanel(getConfig(), { platforms: { [instance]: { enabled: false } } }))
         try { await platformGateway?.sync?.() } catch {}
+      }
+      const feishuPendingPublishDetail = (detail) => {
+        if (platform !== 'feishu' || method !== 'qr-app') return null
+        if (!/230006|99991663|99991672|1000040343|1000040344|未发布|待发布|审批|未启用机器人|forbidden|permission|not.?publish|not.?activat|bot.?not.?enable/i.test(detail)) {
+          return null
+        }
+        return {
+          ok: false,
+          code: 'app-pending-publish',
+          message: '飞书应用凭证已保存，但连接核验未通过（可能待企业管理员发布/审批、未开启机器人能力或缺少权限）。请在飞书开放平台完成发布与权限配置后，直接开启「启用这个实例」即可，无需重新扫码。详情：' + detail,
+          retryable: true,
+        }
       }
       if (!platformGateway) {
         await disableFailedInstance()
@@ -1691,20 +1703,26 @@ export function apply(ctx, opts = {}) {
           }
           if (inst.state === 'unconfigured' || inst.state === 'stopped') {
             await disableFailedInstance()
+            const detail = String(inst.detail || '')
+            const pending = inst.state === 'stopped' ? feishuPendingPublishDetail(detail) : null
+            if (pending) return pending
             return {
               ok: false,
               code: 'instance-not-connected',
-              message: inst.detail || `实例 ${instance} 尚未就绪（${inst.state}），认证核验失败`,
+              message: detail || `实例 ${instance} 尚未就绪（${inst.state}），认证核验失败`,
               retryable: true,
             }
           }
           if (inst.state === 'disconnected') {
             await disableFailedInstance()
-            const whoamiErr = /whoami/i.test(String(inst.detail || ''))
+            const detail = String(inst.detail || '')
+            const pending = feishuPendingPublishDetail(detail)
+            if (pending) return pending
+            const whoamiErr = /whoami/i.test(detail)
             return {
               ok: false,
               code: whoamiErr ? 'whoami-mismatch' : 'instance-disconnected',
-              message: inst.detail || `实例 ${instance} 连接已断开，认证核验失败`,
+              message: detail || `实例 ${instance} 连接已断开，认证核验失败`,
               retryable: true,
             }
           }
@@ -1764,6 +1782,12 @@ export function apply(ctx, opts = {}) {
   })
   platformAuth.register(createWechatClawbotAuthDriver({
     getClient: () => opts?.wechatQrClient || opts?.wechatClient,
+  }))
+  platformAuth.register(createFeishuAuthDriver({
+    getFetch: () => opts?.feishuAuthFetch,
+  }))
+  platformAuth.register(createQqbotAuthDriver({
+    getFetch: () => opts?.qqbotAuthFetch,
   }))
   if (Array.isArray(opts?.authDrivers)) {
     for (const driver of opts.authDrivers) platformAuth.register(driver)
@@ -6048,7 +6072,12 @@ export function apply(ctx, opts = {}) {
         return { ...platformView(), ...view, ok: true }
       }
       if (view.state === 'error') {
-        return { ...view, ok: false, message: view.error?.message || view.message }
+        return {
+          ...(view.error?.stage === 'auth.verify' ? platformView() : {}),
+          ...view,
+          ok: false,
+          message: view.error?.message || view.message,
+        }
       }
       return { ...view, ok: true }
     } catch (error) {

@@ -1356,5 +1356,12 @@ export function createQqbotAdapter(options = {}) {
   return adapter
 }
 
+export {
+  createQqbotAuthDriver,
+  buildQqbotConnectUrl,
+  decryptQqbotSecret,
+  QQBOT_BIND_STATUS,
+} from './auth.js'
+
 /** 默认导出：网关按 () => createQqbotAdapter() 注册 */
 export default createQqbotAdapter()

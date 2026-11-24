@@ -281,7 +281,7 @@ unknown   = 不知道发没发出去
 - **状态机与唯一会话**：同一 `instance + method` 仅允许一个活跃会话，重新 `start` 会中止旧会话 `AbortSignal` 并阻止迟到 `poll` 落盘；并发 `poll` 去重；尊重 `slow_down` 退避与 `domain_switched`；
 - **严格隔离**：`AuthSessionView` 绝不回传 `secret`、`deviceCode`、`qrcode` 或 `driverSession` 原文；终态隐藏二维码、`verificationUrl` 与 `userCode`；`configPatch` 禁止夹带敏感键或临时字段，所有秘钥必须走 `secretPatch` 且键在 `PLATFORM_SECRET_KEYS` 内；
 - **连接与身份门控**：凭据写入并触发 `gateway.sync()` 后，宿主 `verifyInstance` 必须等待实例到达 `connected` 且完成 `whoami`（`self.account` 非空且与预期一致），未连通、超时或不符一律停用实例并报错（`auth.verify`），同时绝不自动认主或触碰共享会话；
-- **独立解码基准与 Phase 0 现状**：二维码编码可通过 `npm run test:qr-decode` 经第三方 `jsqr` 对 V1–V16 矩阵与 SVG Data URI 独立还原原文；当前实际接入的平台驱动为 `wechat-clawbot`（`qr-link`），其余平台驱动（飞书 / QQBot / 钉钉 / 企业微信）与 `oauth-callback` / `manual` 会在后续 Phase 分批补齐。
+- **独立解码基准与阶段现状（Phase 1A）**：二维码编码可通过 `npm run test:qr-decode` 经第三方 `jsqr` 对 V1–V16 矩阵与 SVG Data URI 独立还原原文（含飞书 / QQBot 实际授权链接）；当前已落地 **Phase 0 + Phase 1A** 的平台认证驱动为 `wechat-clawbot`（`qr-link`）、`feishu`（`qr-app`，含 `im:message:readonly` 等基础与媒体收发权限）与 `qqbot`（`qr-app`，基于 `q.qq.com/lite/*` 等价连接器协议写入 `clientSecret`、与个人号 `qq` 严格隔离）；飞书与 QQBot 的基础扫码流程已完成真机测试（Lark `domain_switched` 仍待真机确认）；**Phase 1 尚未包含**钉钉（`dingtalk`）与企业微信智能机器人（`wecom`），它们连同 `oauth-callback` / `manual` 会在 **Phase 1B** 及后续阶段分批补齐。
 
 ## 10. 共享私聊会话
 
@@ -377,7 +377,8 @@ test/adapters/<platform>.test.js
 test/tool-naming.test.js
   多平台工具命名/可见性
 npm test
-test:types
+npm run test:types
+npm run test:qr-decode
 npm run test:host-compat -- <DSH 源码目录>
 ```
 
@@ -433,7 +434,7 @@ npm run test:host-compat -- <DSH 源码目录>
 - [ ] 平台/caps/features 缺失时有安全降级；
 - [ ] 共享会话回复凭据没有被跨平台复用；
 - [ ] 平台专属工具名没有污染通用工具面；
-- [ ] 单测、类型、全量、host-compat 的结果都已记录。
+- [ ] 单测、类型、QR 解码、全量、host-compat 的结果都已记录。
 
 ## 16. 常见坑
 

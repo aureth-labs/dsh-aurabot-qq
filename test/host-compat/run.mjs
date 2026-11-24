@@ -39,5 +39,6 @@ if (release) {
     process.exit(2)
   }
   run(aurabotRoot, [npm, 'run', 'test:types'])
+  run(aurabotRoot, [npm, 'run', 'test:qr-decode'])
   run(aurabotRoot, [npm, 'test'])
 }

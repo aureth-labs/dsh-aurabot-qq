@@ -267,6 +267,8 @@
 
 ## 二、权限与申请流程（用户要做的事）
 
+> **快速路径（Phase 1A 扫码创建/绑定）**：在 Aurabot 面板「通讯平台 → QQ 官方机器人」或设置向导里可直接点击 **「QQ 扫码创建/绑定机器人」**（`qr-app` 驱动位于 [src/adapters/qqbot/auth.js](../src/adapters/qqbot/auth.js)）。该驱动零依赖等价实现 `@tencent-connect/qqbot-connector@1.2.0` 的底层 `q.qq.com/lite/*` 非官方私有连接器协议，使用一次性 32 字节密钥做 AES-256-GCM 解包，只写入 `platforms.qqbot`（`appId` + `clientSecret`），**与个人号 OneBot `qq` 完全隔离，也不会自动认主**。目前该流程已通过 AES-256-GCM 加解密、状态机、宿主 mock 校验，并已完成一次真机手机 QQ 扫码测试；若官方变更或停用该接口，界面会提示直接回退使用下面的手动 `AppID / AppSecret` 配置流程：
+
 ### 第 1 步：注册与认证
 
 1. 打开 [QQ 开放平台](https://q.qq.com/#/)，用要当管理员的 QQ 登录。

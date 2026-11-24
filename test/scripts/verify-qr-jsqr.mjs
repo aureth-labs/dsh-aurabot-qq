@@ -6,6 +6,8 @@ import { existsSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { delimiter, dirname, join } from 'node:path'
 import { encodeQrMatrix, encodeQrSvgDataUri } from '../../src/core/qr.js'
+import { encodeFeishuAddons, FEISHU_QR_ADDONS } from '../../src/adapters/feishu/auth.js'
+import { buildQqbotConnectUrl } from '../../src/adapters/qqbot/auth.js'
 
 function loadJsQr() {
   const localReq = createRequire(import.meta.url)
@@ -101,11 +103,22 @@ const vectors = [
   { label: 'V15', expectedVersion: 15, text: 'https://open.example.com/v15?' + 'd'.repeat(370) },
   { label: 'V16', expectedVersion: 16, text: 'https://open.example.com/auth?' + 'z'.repeat(415) },
   { label: 'UTF8', expectedVersion: 5, text: 'https://aurabot.example.com/扫码登录?msg=你好世界&tag=v11' },
+  {
+    label: 'Feishu-QR',
+    text: `https://accounts.feishu.cn/oauth/v1/authorize?token=tok_feishu_sample_123456&from=sdk&source=node-sdk%2Faurabot&tp=sdk&createOnly=true&addons=${encodeFeishuAddons(FEISHU_QR_ADDONS)}`,
+  },
+  {
+    label: 'QQBot-QR',
+    text: buildQqbotConnectUrl('qqbot_bind_task_sample_123456', 'aurabot'),
+  },
 ]
 
 for (const v of vectors) {
   const encoded = encodeQrMatrix(v.text)
-  assert.equal(encoded.version, v.expectedVersion, `${v.label} 版本不匹配`)
+  if (v.expectedVersion !== undefined) {
+    assert.equal(encoded.version, v.expectedVersion, `${v.label} 版本不匹配`)
+  }
+  assert.ok(encoded.version >= 1 && encoded.version <= 16, `${v.label} 版本超出 V1–V16`)
 
   const matImg = paintMatrixToRgba(encoded.modules)
   const matDecoded = jsQR(matImg.rgba, matImg.dim, matImg.dim)

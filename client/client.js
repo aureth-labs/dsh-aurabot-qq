@@ -2029,6 +2029,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
 
       const isActive = Boolean(session?.sessionId && AUTH_DISPLAY_STATES.includes(session.state))
       const safeLink = isActive && session?.verificationUrl && /^https?:\/\//i.test(session.verificationUrl) ? session.verificationUrl : ''
+      const expiresAtText = isActive && Number(session?.expiresAt) > 0
+        ? new Date(Number(session.expiresAt)).toLocaleTimeString('zh-CN', { hour12: false })
+        : ''
 
       return h('div', { style: { padding: '10px 12px', marginBottom: 10, borderRadius: 8, border: '1px solid var(--ab-line)', background: 'var(--ab-bg-soft, rgba(0,0,0,0.02))' } },
         h('div', { className: 'ab-flex', style: { alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
@@ -2046,6 +2049,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             : null,
           isActive && session.domain
             ? h('div', { className: 'ab-small ab-muted', style: { marginTop: 4 } }, '认证节点：' + session.domain)
+            : null,
+          expiresAtText
+            ? h('div', { className: 'ab-small ab-muted', style: { marginTop: 4 } }, '有效期至：' + expiresAtText)
             : null,
           h('div', { className: cx('ab-small', session.state === 'succeeded' ? '' : (session.state === 'expired' || session.state === 'error' ? 'ab-note warn' : 'ab-muted')), style: { marginTop: 6 } },
             session.message || ''),
@@ -2079,6 +2085,54 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             userId: r.meta?.userId || '',
           })
         },
+      })
+    }
+
+    function FeishuQrBox({ instance = 'feishu', baseUrl = '', hasToken = false, toast, onConfirmed, onError }) {
+      const domain = /larksuite\.com/i.test(String(baseUrl || '')) ? 'lark' : 'feishu'
+      return h(PlatformAuthQrBox, {
+        platform: 'feishu',
+        instance,
+        method: 'qr-app',
+        params: { domain, ...(baseUrl ? { baseUrl } : {}) },
+        hasToken,
+        startLabel: '飞书扫码创建应用',
+        restartLabel: '重新扫码创建飞书应用',
+        readyHint: '通过飞书 / Lark 扫码一键创建企业自建应用（含私聊、群@、图片/文件/引用收发权限；全群旁听与群管理需另行审批）',
+        savedHint: '已保存飞书应用凭证（需更换应用时可重新扫码，或直接修改下方设置）',
+        alt: '飞书扫码创建应用二维码',
+        toast,
+        onConfirmed: (r) => {
+          onConfirmed && onConfirmed({
+            ...r,
+            appId: r.meta?.appId || r.configs?.[instance]?.appId || '',
+            baseUrl: r.meta?.baseUrl || r.configs?.[instance]?.baseUrl || '',
+          })
+        },
+        onError,
+      })
+    }
+
+    function QqbotQrBox({ instance = 'qqbot', hasToken = false, toast, onConfirmed, onError }) {
+      return h(PlatformAuthQrBox, {
+        platform: 'qqbot',
+        instance,
+        method: 'qr-app',
+        params: {},
+        hasToken,
+        startLabel: 'QQ 扫码创建/绑定机器人',
+        restartLabel: '重新 QQ 扫码绑定',
+        readyHint: '通过手机 QQ 扫码创建或绑定 QQ 官方机器人（写入 qqbot，与个人号 qq 隔离；扫码不可用时可直接在下方填 AppID / AppSecret）',
+        savedHint: '已保存 QQ 官方机器人凭证（换号或重新绑定时可点此重新扫码）',
+        alt: 'QQ 官方机器人扫码绑定二维码',
+        toast,
+        onConfirmed: (r) => {
+          onConfirmed && onConfirmed({
+            ...r,
+            appId: r.meta?.appId || r.configs?.[instance]?.appId || '',
+          })
+        },
+        onError,
       })
     }
 
@@ -2730,6 +2784,71 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
                 if (r.botId) nextDraft = setPath(nextDraft, 'platforms.' + inst.instance + '.botId', r.botId)
                 if (r.baseUrl) nextDraft = setPath(nextDraft, 'platforms.' + inst.instance + '.baseUrl', r.baseUrl)
                 setDraft(nextDraft)
+                reload()
+              },
+            }),
+          ) : null,
+          inst.platform === 'feishu' ? h(Fragment, null,
+            h('div', { className: 'ab-note', style: { marginBottom: 8 } },
+              '支持飞书扫码一键创建应用（预设私聊、群@、图片/文件/引用基础收发权限，不会自动认主；全群旁听 im:message.group_msg、群管理或租户审批仍需到飞书开放平台勾选发布后再启用）。也可直接在下方手动填写凭证。'),
+            h(FeishuQrBox, {
+              instance: inst.instance,
+              baseUrl: getPath(draft, 'platforms.' + inst.instance + '.baseUrl') || data?.configs?.[inst.instance]?.baseUrl || '',
+              hasToken: Boolean(
+                (getPath(draft, 'platforms.' + inst.instance + '.appId') || data?.configs?.[inst.instance]?.appId)
+                && (getPath(draft, 'platforms.' + inst.instance + '.appSecretSet') || data?.configs?.[inst.instance]?.appSecretSet),
+              ),
+              toast,
+              onConfirmed: (r) => {
+                setData(r)
+                let nextDraft = setPath(draft, 'platforms.' + inst.instance + '.appSecretSet', true)
+                if (r.appId) nextDraft = setPath(nextDraft, 'platforms.' + inst.instance + '.appId', r.appId)
+                if (r.baseUrl) nextDraft = setPath(nextDraft, 'platforms.' + inst.instance + '.baseUrl', r.baseUrl)
+                setDraft(nextDraft)
+                reload()
+              },
+              onError: (r) => {
+                if (!r?.instances) return
+                setData(r)
+                const savedCfg = r.configs?.[inst.instance]
+                if (savedCfg) {
+                  let nextDraft = draft
+                  if (savedCfg.appId) nextDraft = setPath(nextDraft, 'platforms.' + inst.instance + '.appId', savedCfg.appId)
+                  if (savedCfg.baseUrl) nextDraft = setPath(nextDraft, 'platforms.' + inst.instance + '.baseUrl', savedCfg.baseUrl)
+                  if (savedCfg.appSecretSet) nextDraft = setPath(nextDraft, 'platforms.' + inst.instance + '.appSecretSet', true)
+                  setDraft(nextDraft)
+                }
+                reload()
+              },
+            }),
+          ) : null,
+          inst.platform === 'qqbot' ? h(Fragment, null,
+            h('div', { className: 'ab-note', style: { marginBottom: 8 } },
+              '支持手机 QQ 扫码创建或绑定 QQ 官方机器人（仅写入 qqbot，与个人号 qq 完全隔离，不会自动认主）；若扫码绑定服务异常或接口调整，请直接在下方手动填写 AppID / AppSecret。'),
+            h(QqbotQrBox, {
+              instance: inst.instance,
+              hasToken: Boolean(
+                (getPath(draft, 'platforms.' + inst.instance + '.appId') || data?.configs?.[inst.instance]?.appId)
+                && (getPath(draft, 'platforms.' + inst.instance + '.clientSecretSet') || data?.configs?.[inst.instance]?.clientSecretSet),
+              ),
+              toast,
+              onConfirmed: (r) => {
+                setData(r)
+                let nextDraft = setPath(draft, 'platforms.' + inst.instance + '.clientSecretSet', true)
+                if (r.appId) nextDraft = setPath(nextDraft, 'platforms.' + inst.instance + '.appId', r.appId)
+                setDraft(nextDraft)
+                reload()
+              },
+              onError: (r) => {
+                if (!r?.instances) return
+                setData(r)
+                const savedCfg = r.configs?.[inst.instance]
+                if (savedCfg) {
+                  let nextDraft = draft
+                  if (savedCfg.appId) nextDraft = setPath(nextDraft, 'platforms.' + inst.instance + '.appId', savedCfg.appId)
+                  if (savedCfg.clientSecretSet) nextDraft = setPath(nextDraft, 'platforms.' + inst.instance + '.clientSecretSet', true)
+                  setDraft(nextDraft)
+                }
                 reload()
               },
             }),
@@ -10549,8 +10668,8 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     const WIZ_PLATFORM_MODES = [
       { id: 'qq', label: 'QQ（旧）', desc: '旧版直连：SnowLuma 或已有 OneBot；兼容旧配置，后续可手动迁移' },
       { id: 'qq-gateway', label: 'QQ（网关托管）', desc: '先完成一次旧版验号，再自动切换到多平台网关；推荐新装使用' },
-      { id: 'feishu', label: '飞书', desc: '企业自建应用，默认 WebSocket，不需要公网回调' },
-      { id: 'qqbot', label: 'QQ 官方机器人', desc: 'AppID + AppSecret，默认 WebSocket' },
+      { id: 'feishu', label: '飞书', desc: '企业自建应用，默认 WebSocket，不需要公网回调；支持扫码一键创建或手动填写凭证' },
+      { id: 'qqbot', label: 'QQ 官方机器人', desc: 'AppID + AppSecret，默认 WebSocket；支持手机 QQ 扫码创建/绑定或手动填写（与个人号 QQ 隔离）' },
       { id: 'wechat-clawbot', label: '微信 ClawBot', desc: '腾讯官方 iLink 长轮询，面板微信扫码即用（1:1 为主，不做群管）' },
       { id: 'bridge', label: '通用接入端', desc: '外部程序按 HTTP 长轮询接入，自建平台/脚本用' },
     ]
@@ -10995,6 +11114,79 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
                     ...(r.baseUrl ? { baseUrl: r.baseUrl } : {}),
                     botToken: '',
                   }))
+                  reload()
+                },
+              }),
+            ) : null,
+            mode === 'feishu' ? h(Fragment, null,
+              h('div', { className: 'ab-note', style: { marginBottom: 8 } },
+                '可直接使用「飞书扫码创建应用」自动获取 App ID / App Secret（预设私聊、群@、图片/文件/引用基础收发权限，不会自动认主；若提示待发布审批，或需全群旁听/群管理权限，请在飞书开放平台发布后点下一步，或直接在下方手动填写）。'),
+              h(FeishuQrBox, {
+                instance: platformInst?.instance || 'feishu',
+                baseUrl: String(platformValues.baseUrl || ''),
+                hasToken: Boolean(
+                  pdata?.configs?.[platformInst?.instance || 'feishu']?.appId
+                  && pdata?.configs?.[platformInst?.instance || 'feishu']?.appSecretSet,
+                ),
+                toast,
+                onConfirmed: (r) => {
+                  setPdata(r)
+                  setPlatformValues((prev) => ({
+                    ...prev,
+                    ...(r.appId ? { appId: r.appId } : {}),
+                    ...(r.baseUrl ? { baseUrl: r.baseUrl } : {}),
+                    appSecret: '',
+                  }))
+                  reload()
+                },
+                onError: (r) => {
+                  if (!r?.instances) return
+                  setPdata(r)
+                  const instName = platformInst?.instance || 'feishu'
+                  const savedCfg = r.configs?.[instName]
+                  if (savedCfg) {
+                    setPlatformValues((prev) => ({
+                      ...prev,
+                      ...(savedCfg.appId ? { appId: savedCfg.appId } : {}),
+                      ...(savedCfg.baseUrl ? { baseUrl: savedCfg.baseUrl } : {}),
+                      appSecret: '',
+                    }))
+                  }
+                  reload()
+                },
+              }),
+            ) : null,
+            mode === 'qqbot' ? h(Fragment, null,
+              h('div', { className: 'ab-note', style: { marginBottom: 8 } },
+                '可使用「QQ 扫码创建/绑定机器人」获取 qqbot 凭据（仅写入 qqbot，与个人号 qq 完全隔离，不会自动认主）；若扫码接口不可用，可直接在下方手动填写 AppID / AppSecret。'),
+              h(QqbotQrBox, {
+                instance: platformInst?.instance || 'qqbot',
+                hasToken: Boolean(
+                  pdata?.configs?.[platformInst?.instance || 'qqbot']?.appId
+                  && pdata?.configs?.[platformInst?.instance || 'qqbot']?.clientSecretSet,
+                ),
+                toast,
+                onConfirmed: (r) => {
+                  setPdata(r)
+                  setPlatformValues((prev) => ({
+                    ...prev,
+                    ...(r.appId ? { appId: r.appId } : {}),
+                    clientSecret: '',
+                  }))
+                  reload()
+                },
+                onError: (r) => {
+                  if (!r?.instances) return
+                  setPdata(r)
+                  const instName = platformInst?.instance || 'qqbot'
+                  const savedCfg = r.configs?.[instName]
+                  if (savedCfg?.appId) {
+                    setPlatformValues((prev) => ({
+                      ...prev,
+                      appId: savedCfg.appId,
+                      clientSecret: '',
+                    }))
+                  }
                   reload()
                 },
               }),

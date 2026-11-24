@@ -2105,4 +2105,6 @@ export function createFeishuAdapter(options = {}) {
   return adapter
 }
 
+export { createFeishuAuthDriver, FEISHU_QR_ADDONS, encodeFeishuAddons } from './auth.js'
+
 export default createFeishuAdapter()
