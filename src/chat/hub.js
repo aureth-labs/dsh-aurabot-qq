@@ -2127,8 +2127,10 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const key = sessionKey(session && session.id)
     // 回合结束时内存映射可能已空（刚重启），退回持久化的映射，别把这一轮丢了（#159）。
     // 中间段也一样要兜底：重启后第一段正文可能早于 turn/end 到达，拿不到 chatId 就整段丢了。
+    // 优先级：本轮开始时记下的 chatId > 内存映射 > sessions.json 里的持久映射。
+    const snap = turnState.get(key)?.chatId
     const found = sessionToChat.has(key) ? null : findSession(key)
-    const chatId = sessionToChat.get(key) || found?.chatId
+    const chatId = snap || sessionToChat.get(key) || found?.chatId
     if (!chatId || !event) return
     try { recordSessionUsage(key, chatId, event, sessionTarget.get(key)) } catch {}
     return personaScope.run(sessionPersona.get(key) || pnow(), () => onPersonaSessionEvent(key, chatId, event))
@@ -3473,6 +3475,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     assertActive(); opts.assertAuthorized?.()
     const key = sessionKey(sessionId)
     const st = turnState.get(key) || { lastTurn: -1, text: '', senders: new Set() }
+    // 回合开始时就把这条会话属于哪个聊天记下来（#159）：turn/end 定址不再只靠内存映射，
+    // 会话中途被重置、或映射被清掉时，这一轮也不会丢或串到别的聊天。
+    st.chatId = chat.chatId
     // 上一句也带上：相关记忆检索遇到「嗯嗯」这种短句时，用上一句一起找（#79 之后由模块在提示词里加）
     const prevText = st.lastText || st.prevText || ''
     const previousSources = sourcesFor(chat.chatId)
