@@ -7,6 +7,7 @@
 //   - gatewayMediaBytes 4xx/5xx/json 错误、超大限制、SSRF 拦截、拒绝本机 r.path
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -14,6 +15,8 @@ import { createHub } from '../src/chat/hub.js'
 import { createGateway } from '../src/gateway/index.js'
 import { createQqAdapter } from '../src/adapters/qq/index.js'
 import { createFeishuAdapter } from '../src/adapters/feishu/index.js'
+import { createWecomAdapter, encryptWecomFile, WECOM_WS_CMD } from '../src/adapters/wecom/index.js'
+import { createDingtalkAdapter } from '../src/adapters/dingtalk/index.js'
 import { makeIdentity } from './gateway/helpers.js'
 import { normalize } from '../src/core/config.js'
 import { createFakeDsh } from './helpers/fake-dsh.js'
@@ -663,4 +666,350 @@ test('Step 1A 复审：QQ path-only 经受控目录转 bytes 打通 gatewayMedia
   const qG3Blocked = await hG3ReadBlocked.hub.quotedInfo('99', { chatId: 'qq:private:10000001', userId: '10000001' })
   assert.equal(qG3Blocked.ok, false)
   assert.equal(qG3Blocked.failKind, 'permission')
+})
+
+test('Hub mergeInlineQuoteText：适配器内联 [引用：...] 不被 !q.ok 打脸，缓存命中时替换不可读占位', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aurabot-p1a-merge-quote-'))
+  const prevDir = process.env.AURABOT_DATA_DIR
+  process.env.AURABOT_DATA_DIR = dir
+  const cfg = normalize({
+    enabled: true,
+    dryRun: false,
+    setupDone: true,
+    botQQ: '',
+    ownerQQ: '',
+    voice: { enabled: false },
+    merge: { enabled: false },
+    stickers: { enabled: false, collect: false },
+    platforms: { wecom: { enabled: true } },
+    allow: {
+      private: ['zhangsan', 'wecom:private:zhangsan'],
+      groups: ['chat_q_1', 'wecom:group:chat_q_1'],
+    },
+  })
+  const gateway = createGateway({
+    config: cfg,
+    dataDir: (...p) => join(dir, 'gw', ...p),
+    identity: makeIdentity(),
+    log: silent,
+    replyHoldMs: 10,
+  })
+  const adapter = makeFakeAdapter({
+    id: 'wecom',
+    caps: { listenAllInGroup: false, features: { 'message.quote.read': false } },
+  })
+  gateway.register(() => adapter)
+  await gateway.sync()
+
+  const prompts = []
+  const dsh = createFakeDsh({
+    brain: async ({ text }) => {
+      prompts.push(String(text || ''))
+      return '收到'
+    },
+  })
+  const hub = createHub({
+    dsh: dsh.ctx,
+    getConfig: () => cfg,
+    log: silent,
+    gateway,
+    defaultPlatform: 'wecom',
+    isMuted: () => false,
+  })
+  const offEvent = dsh.ctx.on('session/event', hub.onSessionEvent)
+  const offMessage = gateway.onMessage((m) => hub.onGatewayMessage(m))
+  t.after(async () => {
+    offMessage()
+    offEvent()
+    hub.dispose()
+    await gateway.stopAll()
+    dsh.dispose()
+    if (prevDir === undefined) delete process.env.AURABOT_DATA_DIR
+    else process.env.AURABOT_DATA_DIR = prevDir
+  })
+
+  const waitForPromptCount = async (n, ms = 2000) => {
+    const end = Date.now() + ms
+    while (Date.now() < end) {
+      if (prompts.length >= n) return
+      await new Promise((r) => setTimeout(r, 20))
+    }
+    throw new Error(`等待 prompt #${n} 超时，当前数量=${prompts.length}`)
+  }
+
+  // 1) 私聊：adapter 自带 [引用：...] 且 message.quote.read=false，不能追加“内容没读到”矛盾提示
+  adapter.pushInbound({
+    chat: { kind: 'private', id: 'zhangsan' },
+    sender: { account: 'zhangsan', name: '张三' },
+    messageId: 'wc_priv_1',
+    replyTo: 'q_missing_priv',
+    parts: [{ type: 'text', text: '[引用：昨天那个需求文档]\n请按新版改一下' }],
+  })
+  await waitForPromptCount(1)
+  assert.match(prompts[0], /\[引用：昨天那个需求文档\]/)
+  assert.match(prompts[0], /请按新版改一下/)
+  assert.equal(/内容没读到|缺少读取权限/.test(prompts[0]), false, '已有引用摘要时不得附带未读到矛盾提示')
+
+  // 2) 群聊先缓存原消息 wc_cached_1，再发送带“引用正文不可读”占位的引用回复，验证替换成缓存正文
+  adapter.pushInbound({
+    chat: { kind: 'group', id: 'chat_q_1' },
+    sender: { account: 'lisi', name: '李四' },
+    messageId: 'wc_cached_1',
+    mentionedMe: true,
+    parts: [{ type: 'text', text: '把接口超时改到 30 秒' }],
+  })
+  await waitForPromptCount(2)
+
+  adapter.pushInbound({
+    chat: { kind: 'group', id: 'chat_q_1' },
+    sender: { account: 'zhangsan', name: '张三' },
+    messageId: 'wc_grp_hit',
+    replyTo: 'wc_cached_1',
+    mentionedMe: true,
+    parts: [{ type: 'text', text: '[引用：引用正文不可读]\n收到，按这个来' }],
+  })
+  await waitForPromptCount(3)
+  assert.match(prompts[2], /把接口超时改到 30 秒/)
+  assert.match(prompts[2], /收到，按这个来/)
+  assert.equal(/引用正文不可读/.test(prompts[2]), false, '缓存命中时应移除不可读占位')
+
+  // 3) 群聊未命中缓存但 adapter 自带摘要：不得追加“内容没读到”矛盾提示
+  adapter.pushInbound({
+    chat: { kind: 'group', id: 'chat_q_1' },
+    sender: { account: 'zhangsan', name: '张三' },
+    messageId: 'wc_grp_summary',
+    replyTo: 'q_missing_grp',
+    mentionedMe: true,
+    parts: [{ type: 'text', text: '[引用：部署步骤截图]\n这一步失败了' }],
+  })
+  await waitForPromptCount(4)
+  assert.match(prompts[3], /\[引用：部署步骤截图\]/)
+  assert.match(prompts[3], /这一步失败了/)
+  assert.equal(/内容没读到|缺少读取权限/.test(prompts[3]), false)
+})
+
+test('WeCom / DingTalk 引用原图端到端通道：引用图片进入 quoteImages（私聊+群聊）与 referenceImage("quote")，且不重复拼 [引用：[图片]]', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aurabot-p1a-quote-img-e2e-'))
+  const prevDir = process.env.AURABOT_DATA_DIR
+  process.env.AURABOT_DATA_DIR = dir
+
+  const png1x1 = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+    'base64',
+  )
+  const wcAesKey = Buffer.alloc(32, 0x5a).toString('base64')
+  const wcEncPng = encryptWecomFile(png1x1, wcAesKey)
+
+  class MiniMockWs extends EventEmitter {
+    constructor(u, onSend) {
+      super()
+      this.url = u
+      this.readyState = 0
+      this.closed = false
+      this.onSend = onSend
+      queueMicrotask(() => {
+        if (this.closed) return
+        this.readyState = 1
+        this.emit('open')
+      })
+    }
+    send(raw) {
+      this.onSend?.(this, JSON.parse(String(raw)))
+    }
+    close() {
+      if (this.closed) return
+      this.closed = true
+      this.readyState = 3
+      this.emit('close', 1000, 'closed')
+    }
+  }
+
+  const cfg = normalize({
+    enabled: true,
+    dryRun: false,
+    setupDone: true,
+    botQQ: '',
+    ownerQQ: '',
+    voice: { enabled: false },
+    merge: { enabled: false },
+    stickers: { enabled: false, collect: false },
+    platforms: {
+      wecom: { enabled: true, botId: 'wc_e2e_bot', secret: 'wc_e2e_sec', wsUrl: 'wss://openws.work.weixin.qq.com' },
+      dingtalk: { enabled: true, clientId: 'dt_e2e_bot', clientSecret: 'dt_e2e_sec' },
+    },
+    allow: {
+      private: ['zhangsan', 'wecom:private:zhangsan'],
+      groups: ['cid_dt_e2e', 'dingtalk:group:cid_dt_e2e'],
+    },
+  })
+
+  const gateway = createGateway({
+    config: cfg,
+    dataDir: (...p) => join(dir, 'gw', ...p),
+    identity: makeIdentity(),
+    log: silent,
+    replyHoldMs: 10,
+  })
+
+  const wecomAdapter = createWecomAdapter({
+    assertUrl: async () => {},
+    createWebSocket: (u) => new MiniMockWs(u, (sock, frame) => {
+      queueMicrotask(() => {
+        if (sock.closed) return
+        const reqId = frame.headers?.req_id
+        if (frame.cmd === WECOM_WS_CMD.SUBSCRIBE) {
+          sock.emit('message', JSON.stringify({ headers: { req_id: reqId }, errcode: 0, errmsg: 'ok' }))
+        } else {
+          sock.emit('message', JSON.stringify({ headers: { req_id: reqId }, errcode: 0, body: { msgid: `wc_ack_${reqId}` } }))
+        }
+      })
+    }),
+    fetchImpl: async (url) => {
+      if (String(url) === 'https://files.example.com/wc-quote.enc') {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => 'application/octet-stream' },
+          arrayBuffer: async () => wcEncPng.buffer.slice(wcEncPng.byteOffset, wcEncPng.byteOffset + wcEncPng.byteLength),
+        }
+      }
+      return { ok: false, status: 404, headers: { get: () => null }, body: null }
+    },
+  })
+
+  const dtJson = (body, status = 200) => ({
+    ok: status >= 200 && status < 300,
+    status,
+    headers: { get: () => 'application/json' },
+    async json() { return body },
+    async text() { return JSON.stringify(body) },
+  })
+  const dingtalkAdapter = createDingtalkAdapter({
+    assertUrl: async () => {},
+    createWebSocket: (u) => new MiniMockWs(u),
+    fetchImpl: async (url) => {
+      const u = String(url)
+      if (u.endsWith('/v1.0/gateway/connections/open')) return dtJson({ endpoint: 'wss://wss-open.dingtalk.com/connect', ticket: 'dt_t_1' })
+      if (u.endsWith('/v1.0/oauth2/accessToken')) return dtJson({ accessToken: 'dt_tok_1', expireIn: 7200 })
+      if (u.endsWith('/v1.0/robot/messageFiles/download')) return dtJson({ downloadUrl: 'https://files.dingtalk.com/dt-quote.png' })
+      if (u === 'https://files.dingtalk.com/dt-quote.png') {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => 'image/png' },
+          async arrayBuffer() { return png1x1.buffer.slice(png1x1.byteOffset, png1x1.byteOffset + png1x1.byteLength) },
+        }
+      }
+      if (u.includes('/robot/groupMessages/send') || u.startsWith('https://oapi.dingtalk.com/robot/sendBySession')) {
+        return dtJson({ processQueryKey: 'dt_ack_1' })
+      }
+      return dtJson({}, 404)
+    },
+  })
+
+  gateway.register(() => wecomAdapter)
+  gateway.register(() => dingtalkAdapter)
+  await gateway.sync()
+
+  const capturedTurns = []
+  const dsh = createFakeDsh({
+    brain: async ({ text, images }) => {
+      capturedTurns.push({ text: String(text || ''), images })
+      return '收到图片引用'
+    },
+  })
+  const hub = createHub({
+    dsh: dsh.ctx,
+    getConfig: () => cfg,
+    log: silent,
+    gateway,
+    defaultPlatform: 'qq',
+    isMuted: () => false,
+  })
+  const offEvent = dsh.ctx.on('session/event', hub.onSessionEvent)
+  const offMessage = gateway.onMessage((m) => hub.onGatewayMessage(m))
+  t.after(async () => {
+    offMessage()
+    offEvent()
+    hub.dispose()
+    await gateway.stopAll()
+    dsh.dispose()
+    if (prevDir === undefined) delete process.env.AURABOT_DATA_DIR
+    else process.env.AURABOT_DATA_DIR = prevDir
+  })
+
+  const waitForTurnCount = async (n, ms = 3000) => {
+    const end = Date.now() + ms
+    while (Date.now() < end) {
+      if (capturedTurns.length >= n) return
+      await new Promise((r) => setTimeout(r, 20))
+    }
+    throw new Error(`等待 turn #${n} 超时，当前=${capturedTurns.length}`)
+  }
+
+  // 1) WeCom 私聊：引用无 msgid 的加密图片 -> 原始 PNG 进 quoteImages，不重复显示 [引用：[图片]]，且 referenceImage('quote') 可读取
+  wecomAdapter.platform.deliver({
+    cmd: WECOM_WS_CMD.CALLBACK,
+    headers: { req_id: 'req_wc_e2e_1' },
+    body: {
+      msgid: 'wc_e2e_in_1',
+      chattype: 'single',
+      from: { userid: 'zhangsan', name: '张三' },
+      msgtype: 'text',
+      text: { content: '原图哪里不对' },
+      quote: {
+        msgtype: 'image',
+        image: { url: 'https://files.example.com/wc-quote.enc', aeskey: wcAesKey },
+      },
+      create_time: 1700000500,
+    },
+  })
+  await waitForTurnCount(1)
+  assert.equal(dsh.turns[0].images, 1)
+  assert.equal(capturedTurns[0].images.length, 1)
+  assert.equal(capturedTurns[0].images[0].mediaType, 'image/png')
+  assert.match(capturedTurns[0].text, /原图哪里不对/)
+  assert.match(capturedTurns[0].text, /（引用 .*（图片）.*另有 1 张图）/)
+  assert.equal(/\[引用：\[图片\]\]/.test(capturedTurns[0].text), false, 'q.ok=true 时应剥离重复 [引用：[图片]]')
+  const wcRefBytes = await hub.referenceImage({ chatId: 'wecom:private:zhangsan' }, 'quote')
+  assert.deepEqual(wcRefBytes, png1x1)
+
+  // 2) DingTalk 群聊（mentionedMe=true）：引用 repliedMsg picture -> 原始 PNG 进 quoteImages，不重复 [引用：[图片]]，且 referenceImage('quote') 可读取
+  dingtalkAdapter.platform.deliver({
+    msgId: 'dt_e2e_in_1',
+    createAt: 1700000600000,
+    conversationType: '2',
+    conversationId: 'cid_dt_e2e',
+    conversationTitle: '研发群',
+    senderStaffId: 'staff_dt_1',
+    senderId: '$:LWCP_v1:staff_dt_1',
+    senderNick: '李四',
+    robotCode: 'dt_e2e_bot',
+    chatbotUserId: '$:LWCP_v1:dt_bot',
+    isInAtList: true,
+    msgtype: 'text',
+    text: {
+      content: '帮我看下这张报错图',
+      isReplyMsg: true,
+      repliedMsg: {
+        msgId: 'dt_q_e2e_pic',
+        msgType: 'picture',
+        senderStaffId: 'staff_q_2',
+        senderNick: '王五',
+        createdAt: 1700000550,
+        content: JSON.stringify({ downloadCode: 'dc_e2e_quote' }),
+      },
+    },
+    sessionWebhook: 'https://oapi.dingtalk.com/robot/sendBySession?session=e2e',
+    sessionWebhookExpiredTime: Date.now() + 60_000,
+  })
+  await waitForTurnCount(2)
+  assert.equal(dsh.turns[1].images, 1)
+  assert.equal(capturedTurns[1].images.length, 1)
+  assert.equal(capturedTurns[1].images[0].mediaType, 'image/png')
+  assert.match(capturedTurns[1].text, /帮我看下这张报错图/)
+  assert.match(capturedTurns[1].text, /王五.*另有 1 张图/)
+  assert.equal(/\[引用：\[图片\]\]/.test(capturedTurns[1].text), false, 'q.ok=true 时应剥离重复 [引用：[图片]]')
+  const dtRefBytes = await hub.referenceImage({ chatId: 'dingtalk:group:cid_dt_e2e' }, 'quote')
+  assert.deepEqual(dtRefBytes, png1x1)
 })

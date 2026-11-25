@@ -4678,6 +4678,28 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const md = `${d.getMonth() + 1}月${d.getDate()}日${String(d.getHours()).padStart(2, '0')}时${String(d.getMinutes()).padStart(2, '0')}分`
     return d.getFullYear() === new Date().getFullYear() ? md : `${d.getFullYear()}年${md}`
   }
+  const UNREADABLE_QUOTE_RE = /^\[引用：引用(?:内容|正文)不可读\](?:\r?\n|$)/u
+  const INLINE_ADAPTER_QUOTE_RE = /^\[引用：[^\r\n]+\](?:\r?\n|$)/u
+
+  /** 合并适配器随正文内联提取的引用摘要与 Hub 引用读取结果：已有具体摘要时不被 `!q.ok` 否定文案打脸；`q.ok` 时移除重复或不可读内联前缀。 */
+  const mergeInlineQuoteText = (baseText, q, sep = '\n', emptyFallback = '') => {
+    const raw = String(baseText ?? '')
+    if (!q) return raw || emptyFallback
+    const trimmed = raw.trimStart()
+    if (UNREADABLE_QUOTE_RE.test(trimmed)) {
+      const cleaned = trimmed.replace(UNREADABLE_QUOTE_RE, '').trimStart()
+      return (cleaned || emptyFallback) + sep + quoteInline(q)
+    }
+    if (q.ok && INLINE_ADAPTER_QUOTE_RE.test(trimmed)) {
+      const cleaned = trimmed.replace(INLINE_ADAPTER_QUOTE_RE, '').trimStart()
+      return (cleaned || emptyFallback) + sep + quoteInline(q)
+    }
+    if (!q.ok && trimmed.startsWith('[引用：') && trimmed.includes(']')) {
+      return raw || emptyFallback
+    }
+    return (raw || emptyFallback) + sep + quoteInline(q)
+  }
+
   /** 引用说明：群聊接在某条消息后面，私聊单独一行。失败时明说没读到，让她可以如实讲。 */
   const quoteInline = (q) => {
     if (!q) return ''
@@ -5500,7 +5522,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const chatKindName = msg.kind === 'group' ? '群聊' : '私聊'
     const defaultChat = !msg.platform || msg.platform === defaultPlatform()
     const chatTag = defaultChat ? chatKindName : `${platformName}${chatKindName}`
-    const content = msg.kind === 'group' ? [] : [{ type: 'text', text: `【${chatTag}】[${clockLabel(now)}] ${msg.nickname}(${msg.userId})：` + (text || '（没有文字）') + (quoted ? '\n' + quoteInline(quoted) : '') }]
+    const content = msg.kind === 'group' ? [] : [{ type: 'text', text: `【${chatTag}】[${clockLabel(now)}] ${msg.nickname}(${msg.userId})：` + mergeInlineQuoteText(text, quoted, '\n', '（没有文字）') }]
     const imgs = await imagesOf(msg)
     if (disposed) return
     if (imgs.length && groupEntry) groupEntry.mediaPending = true // 这些图已经进 pending.images，groupPrompt 不用再带
@@ -5708,7 +5730,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       const infos = await Promise.all(need.map((x) => quotedInfo(x.replyId, chat)))
       need.forEach((x, i) => { x.quote = infos[i] })
     }
-    const line = (x) => `[${clockLabel(x.t)}] ${x.nick}(${x.uid})${x.at ? '@了你' : ''}：${x.text || '（图片/表情）'}${x.quote ? ' ' + quoteInline(x.quote) : ''}`
+    const line = (x) => `[${clockLabel(x.t)}] ${x.nick}(${x.uid})${x.at ? '@了你' : ''}：${mergeInlineQuoteText(x.text, x.quote, ' ', '（图片/表情）')}`
     // 新消息带编号，她想专门回某一条时可以引用；编号 → QQ 消息 ID 记下来，发的时候换成引用
     const refs = {}
     const numbered = fresh.map((x, i) => {
