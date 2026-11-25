@@ -21,6 +21,7 @@ import { decideGroupReply, engagedHint, pickAutoReply, pickDirectRequester, poli
 import { checkAllowed, levelFor, presetFor, isOwner, isOwnerPrivateChat, isOwnerChatMuted, groupOwnerTools } from './access.js'
 import { fetchImage, segmentBytes } from '../core/net.js'
 import { toMono16k } from '../voice/wav.js'
+import { isAmrBytes, estimateAmrDurationMs, estimateOggOpusDurationMs } from '../voice/audio-format.js'
 import { asrConfigured, transcribeAudio } from '../voice/asr.js'
 import { mimeOf } from './inbound.js'
 import { applyForwardBodies, forwardBody, readFetchedForward, readForward } from './forward.js'
@@ -2926,7 +2927,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
           replyTo = conv.replyTo
         }
         if (caps?.voice === 'native' && addrSeg?.platform !== defaultPlatform()) {
-          parts = await nativeVoiceParts(parts)
+          parts = await nativeVoiceParts(parts, addrSeg?.platform)
         }
         if (opts.textOnly && (replyTo || parts.some(part => part.type !== 'text'))) return settleOutboundFailed(verdict)
         if (caps?.proactive === 'none' && !responseTo && !force) {
@@ -3055,28 +3056,89 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   }
 
   /**
-   * 有些平台（飞书）只认 Opus 语音条。平台声明 voice='native' 时，
-   * 在出站前用共享 FFmpeg 把 MP3/AMR 等转成 Opus；没有 FFmpeg 或转码失败就保留原文件，
-   * 由平台端按文件发，不把语音丢掉。
+   * 平台声明 voice='native' 时，在出站前按目标平台要求用共享 FFmpeg 预先转码：
+   * - wecom / dingtalk：转成 8kHz 单声道 AMR-NB 并写入精确时长（durationMs）
+   * - 飞书等平台：转成 48kHz 单声道 Opus 并尽量写入 durationMs
+   * 没有 FFmpeg 或转码失败就保留原文件，由平台端按文件发，绝不把语音丢掉。
    */
-  async function nativeVoiceParts(parts) {
-    if (!Array.isArray(parts) || !parts.some((p) => p?.type === 'voice' && !isOpusPart(p))) return parts
+  async function nativeVoiceParts(parts, platform = '') {
+    if (!Array.isArray(parts) || !parts.some((p) => p?.type === 'voice')) return parts
+    const wantAmr = platform === 'wecom' || platform === 'dingtalk'
     const cfg = getConfig()
     const configured = String(cfg.tools?.ffmpeg?.path || cfg.bili?.ffmpegPath || '')
-    const ffmpeg = findFfmpeg(configured)
-    if (!ffmpeg) {
-      log.debug('语音转 Opus 跳过：没找到 ffmpeg')
-      return parts
+    let cachedFfmpeg
+    const getFfmpeg = () => {
+      if (cachedFfmpeg === undefined) cachedFfmpeg = findFfmpeg(configured)
+      return cachedFfmpeg
     }
+
     const out = []
     for (const part of parts) {
-      if (part?.type !== 'voice' || isOpusPart(part)) { out.push(part); continue }
+      if (part?.type !== 'voice') { out.push(part); continue }
       const media = part.media || {}
       let input = null
       try {
         if (Buffer.isBuffer(media.bytes)) input = media.bytes
         else if (media.bytes) input = Buffer.from(media.bytes)
         else if (media.path) input = readFileSync(media.path)
+      } catch {
+        input = null
+      }
+
+      if (wantAmr) {
+        if (input?.length && isAmrBytes(input)) {
+          const durationMs = Number(part.durationMs) || estimateAmrDurationMs(input)
+          out.push({
+            ...part,
+            ...(durationMs > 0 ? { durationMs } : {}),
+            media: { ...media, bytes: input, mime: 'audio/amr', name: 'voice.amr' },
+          })
+          continue
+        }
+        const ffmpeg = getFfmpeg()
+        if (!ffmpeg || !input?.length) {
+          if (!ffmpeg) log.debug('语音转 AMR 跳过：没找到 ffmpeg')
+          out.push(part)
+          continue
+        }
+        try {
+          const dir = mkdtempSync(join(tmpdir(), 'aurabot-voice-'))
+          const src = join(dir, 'in.audio')
+          const dst = join(dir, 'out.amr')
+          try {
+            writeFileSync(src, input)
+            await runFfmpeg(ffmpeg, ['-y', '-hide_banner', '-loglevel', 'error', '-i', src, '-vn', '-f', 'amr', '-acodec', 'libopencore_amrnb', '-ar', '8000', '-ac', '1', '-b:a', '12.2k', dst])
+            const bytes = readFileSync(dst)
+            if (!bytes.length || !isAmrBytes(bytes)) throw new Error('转码 AMR 结果无效')
+            const durationMs = estimateAmrDurationMs(bytes)
+            out.push({
+              ...part,
+              ...(durationMs > 0 ? { durationMs } : {}),
+              media: { ...media, bytes, mime: 'audio/amr', name: 'voice.amr' },
+            })
+            log.debug(`语音已转 AMR-NB（${Math.round(input.length / 1024)}KB → ${Math.round(bytes.length / 1024)}KB，${durationMs}ms）`)
+          } finally {
+            rmSync(dir, { recursive: true, force: true })
+          }
+        } catch (error) {
+          log.debug('语音转 AMR 失败，保留原文件：', error.message)
+          out.push(part)
+        }
+        continue
+      }
+
+      if (isOpusPart(part)) {
+        const durationMs = Number(part.durationMs) || (input?.length ? estimateOggOpusDurationMs(input) : 0)
+        out.push(durationMs > 0 ? { ...part, durationMs } : part)
+        continue
+      }
+      const ffmpeg = getFfmpeg()
+      if (!ffmpeg) {
+        log.debug('语音转 Opus 跳过：没找到 ffmpeg')
+        out.push(part)
+        continue
+      }
+      try {
         if (!input?.length) { out.push(part); continue }
         const dir = mkdtempSync(join(tmpdir(), 'aurabot-voice-'))
         const src = join(dir, 'in.audio')
@@ -3086,7 +3148,12 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
           await runFfmpeg(ffmpeg, ['-y', '-hide_banner', '-loglevel', 'error', '-i', src, '-vn', '-c:a', 'libopus', '-b:a', '48k', '-ar', '48000', '-ac', '1', dst])
           const bytes = readFileSync(dst)
           if (!bytes.length) throw new Error('转码结果为空')
-          out.push({ ...part, media: { ...media, bytes, mime: 'audio/opus', name: 'voice.opus' } })
+          const durationMs = Number(part.durationMs) || estimateOggOpusDurationMs(bytes)
+          out.push({
+            ...part,
+            ...(durationMs > 0 ? { durationMs } : {}),
+            media: { ...media, bytes, mime: 'audio/opus', name: 'voice.opus' },
+          })
           log.debug(`语音已转 Opus（${Math.round(input.length / 1024)}KB → ${Math.round(bytes.length / 1024)}KB）`)
         } finally {
           rmSync(dir, { recursive: true, force: true })
@@ -3179,9 +3246,13 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       return settleOutboundFailed(verdict)
     }
     try {
+      const sendCaps = gateway.caps?.(normId)
+      const outboundParts = sendCaps?.voice === 'native' && addr.platform !== defaultPlatform()
+        ? await nativeVoiceParts(cleaned, addr.platform)
+        : cleaned
       const sent = await gateway.send({
         chatId: normId,
-        parts: cleaned,
+        parts: outboundParts,
         replyTo: replyTo ?? replyId,
         inResponseTo,
         kind: queueKind === 'proactive' ? 'proactive' : queueKind === 'diary' ? 'diary' : 'reply',
@@ -3193,12 +3264,12 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       if (opts.proactiveGuard && (!sent?.messageId || sent.queued)) throw new Error('主动搭话未获得发送回执')
       if (sent?.messageId && !sent?.queued) {
         addSentId(normId, sent.messageId)
-        rememberRecentMessage({ chatId: normId, messageId: sent.messageId, at: Date.now(), sender: { account: selfAccountFor(normId), isBot: true }, parts: cleaned })
+        rememberRecentMessage({ chatId: normId, messageId: sent.messageId, at: Date.now(), sender: { account: selfAccountFor(normId), isBot: true }, parts: outboundParts })
       }
       bump('sent')
       if (outputScope.getStore()?.chatId === chatId || outputScope.getStore()?.chatId === normId) outputScope.getStore().sent++
       settleOutbound(verdict, 'sent')
-      if (opts.proactive && !opts.proactiveGuard) noteProactive(normId, partsToSegmentsFallback(cleaned), opts)
+      if (opts.proactive && !opts.proactiveGuard) noteProactive(normId, partsToSegmentsFallback(outboundParts), opts)
       if (sent?.queued) return { messageId: '', queued: true, queuedId: sent.messageId || '' }
       return { messageId: sent?.messageId ?? '', message_id: sent?.messageId ?? '', degraded: sent?.degraded }
     } catch (error) {

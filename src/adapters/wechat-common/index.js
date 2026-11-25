@@ -66,7 +66,7 @@ const MIME_TO_EXT = Object.freeze({
 })
 
 const SAFE_FFMPEG_TARGETS = Object.freeze({
-  amr: { ext: 'amr', args: ['-f', 'amr', '-acodec', 'libopencore_amrnb', '-ar', '8000', '-ac', '1'], mime: 'audio/amr' },
+  amr: { ext: 'amr', args: ['-f', 'amr', '-acodec', 'libopencore_amrnb', '-ar', '8000', '-ac', '1', '-b:a', '12.2k'], mime: 'audio/amr' },
   wav: { ext: 'wav', args: ['-f', 'wav', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1'], mime: 'audio/wav' },
   mp3: { ext: 'mp3', args: ['-f', 'mp3', '-acodec', 'libmp3lame', '-ar', '24000', '-ac', '1'], mime: 'audio/mpeg' },
 })
@@ -513,4 +513,50 @@ export function formatWechatErrorSummary(prefix, code, msg, secrets = []) {
     if (val.length >= 4 && out.includes(val)) out = out.split(val).join('***')
   }
   return out
+}
+
+/** 流式按上限读取 HTTP 响应字节，避免下载超大响应时先把完整体读入内存。 */
+export async function readResponseBytesBounded(response, maxBytes = 0) {
+  const cap = Number(maxBytes) > 0 ? Math.trunc(Number(maxBytes)) : 0
+  const clHeader = typeof response?.headers?.get === 'function'
+    ? response.headers.get('content-length')
+    : response?.headers?.['content-length']
+  const cl = clHeader != null && String(clHeader).trim() !== '' ? Number(clHeader) : NaN
+  if (cap > 0 && Number.isFinite(cl) && cl > cap) {
+    try { await response?.body?.cancel?.() } catch {}
+    return { ok: false, reason: 'too-large', size: cl }
+  }
+  if (typeof response?.body?.getReader === 'function') {
+    const reader = response.body.getReader()
+    const chunks = []
+    let total = 0
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (!value) continue
+        const buf = Buffer.isBuffer(value) ? value : Buffer.from(value.buffer, value.byteOffset, value.byteLength)
+        total += buf.length
+        if (cap > 0 && total > cap) {
+          try { await reader.cancel() } catch {}
+          return { ok: false, reason: 'too-large', size: total }
+        }
+        chunks.push(buf)
+      }
+    } finally {
+      try { reader.releaseLock?.() } catch {}
+    }
+    if (!total) return { ok: false, reason: 'empty', size: 0 }
+    const bytes = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, total)
+    return { ok: true, bytes, size: bytes.length }
+  }
+  const raw = typeof response?.arrayBuffer === 'function'
+    ? await response.arrayBuffer()
+    : response?.bytes
+  const bytes = Buffer.isBuffer(raw) ? raw : Buffer.from(raw || [])
+  if (!bytes.length) return { ok: false, reason: 'empty', size: 0 }
+  if (cap > 0 && bytes.length > cap) {
+    return { ok: false, reason: 'too-large', size: bytes.length }
+  }
+  return { ok: true, bytes, size: bytes.length }
 }
