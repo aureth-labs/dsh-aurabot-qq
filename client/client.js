@@ -1450,74 +1450,61 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const acc = String(o.account).trim()
       return `${plat}\0${inst}\0${acc}`
     }
-    const splitOwnerPriorityOptions = (options, fallbackOrder, pref = null) => {
-      const opts = Array.isArray(options) ? options.filter((o) => ownerOptionKey(o)) : []
-      const pinnedOpt = (pref && pref.mode !== 'recent' && (pref.platform || pref.instance))
-        ? (opts.find((o) => isOwnerOptionSelected(pref, o)) || null)
-        : null
-      const pinnedKey = pinnedOpt ? ownerOptionKey(pinnedOpt) : ''
-      const hasCustom = Array.isArray(fallbackOrder) && fallbackOrder.length > 0
-      if (!hasCustom) {
-        const ordered = pinnedOpt
-          ? [{ ...pinnedOpt, _inSavedOrder: false, _pinnedPrimary: true }, ...opts.filter((o) => ownerOptionKey(o) !== pinnedKey).map((o) => ({ ...o, _inSavedOrder: false, _pinnedPrimary: false }))]
-          : opts.map((o) => ({ ...o, _inSavedOrder: false, _pinnedPrimary: false }))
-        return {
-          customActive: false,
-          included: ordered,
-          excluded: [],
-        }
-      }
-      const byKey = new Map(opts.map((o) => [ownerOptionKey(o), o]))
-      const used = new Set(pinnedKey ? [pinnedKey] : [])
-      const restIncluded = []
-      for (const item of fallbackOrder) {
-        const k = ownerOptionKey(item)
-        if (!k || used.has(k)) continue
-        const hit = byKey.get(k)
-        if (hit) {
-          used.add(k)
-          restIncluded.push({ ...hit, _inSavedOrder: true, _pinnedPrimary: false })
-        }
-      }
-      const included = pinnedOpt
-        ? [{ ...pinnedOpt, _inSavedOrder: true, _pinnedPrimary: true }, ...restIncluded]
-        : restIncluded
-      const excluded = opts
-        .filter((o) => !used.has(ownerOptionKey(o)))
-        .map((o) => ({ ...o, _inSavedOrder: false, _pinnedPrimary: false }))
-      return { customActive: true, included, excluded }
-    }
-    const mergeOwnerPriorityOptions = (options, fallbackOrder, pref = null) => splitOwnerPriorityOptions(options, fallbackOrder, pref).included
-    const sanitizeFallbackOrderForOptions = (order, options) => {
+    const normalizeOwnerPriorityOrder = (order) => {
       if (!Array.isArray(order) || !order.length) return []
-      const validKeys = Array.isArray(options) ? new Set(options.map(ownerOptionKey).filter(Boolean)) : null
       const seen = new Set()
       const out = []
       for (const item of order) {
         const k = ownerOptionKey(item)
         if (!k || seen.has(k)) continue
-        if (validKeys && !validKeys.has(k)) continue
         seen.add(k)
         const [platform, instance, account] = k.split('\0')
         out.push({ platform, instance, account })
       }
       return out
     }
-    const prepareSaveBody = (rawDraft, ownerOptions = null, serverConfig = null) => {
+    const splitOwnerPriorityOptions = (options, fallbackOrder, pref = null) => {
+      const opts = Array.isArray(options) ? options.filter((o) => ownerOptionKey(o)) : []
+      const byKey = new Map(opts.map((o) => [ownerOptionKey(o), o]))
+      const saved = normalizeOwnerPriorityOrder(fallbackOrder)
+      const savedKeys = new Set(saved.map(ownerOptionKey))
+      let pinnedOpt = null
+      if (pref && pref.mode !== 'recent' && (pref.platform || pref.instance)) {
+        pinnedOpt = opts.find((o) => isOwnerOptionSelected(pref, o))
+        if (!pinnedOpt) {
+          const pinnedEntry = saved.find((o) => ownerOptionKey(o) === ownerOptionKey(pref))
+            || (pref.instance ? normalizeOwnerPriorityOrder([pref])[0] : null)
+          if (pinnedEntry) pinnedOpt = { ...pinnedEntry, _missingOwnerOption: true, selectable: false }
+        }
+      }
+      const pinnedKey = pinnedOpt ? ownerOptionKey(pinnedOpt) : ''
+      const included = []
+      if (pinnedOpt) {
+        included.push({ ...pinnedOpt, _inSavedOrder: savedKeys.has(pinnedKey), _pinnedPrimary: true })
+      }
+      for (const item of saved) {
+        const k = ownerOptionKey(item)
+        if (k === pinnedKey) continue
+        const option = byKey.get(k) || { ...item, _missingOwnerOption: true, selectable: false }
+        included.push({ ...option, _pinnedPrimary: false })
+      }
+      const excluded = opts.filter((option) => {
+        const key = ownerOptionKey(option)
+        return key !== pinnedKey && !savedKeys.has(key)
+      })
+      return { customActive: saved.length > 0, included, excluded }
+    }
+    const prepareSaveBody = (rawDraft, serverConfig = null) => {
       const { allow, commandAllow, capabilityAllow, ...body } = rawDraft || {}
       if (body.ownerPrimary && Array.isArray(body.ownerPrimary.fallbackOrder)) {
-        const normDraftOrder = sanitizeFallbackOrderForOptions(body.ownerPrimary.fallbackOrder, null)
-        const hasServerOrder = Boolean(serverConfig && serverConfig.ownerPrimary && Array.isArray(serverConfig.ownerPrimary.fallbackOrder))
-        const normServerOrder = hasServerOrder ? sanitizeFallbackOrderForOptions(serverConfig.ownerPrimary.fallbackOrder, null) : null
-        if (hasServerOrder && JSON.stringify(normDraftOrder) === JSON.stringify(normServerOrder)) {
-          // 未在面板改动顺位时省略 fallbackOrder，防止覆盖服务端刚自动追加的新绑定账号；stale 项由 /save 幂等清理
+        const normDraftOrder = normalizeOwnerPriorityOrder(body.ownerPrimary.fallbackOrder)
+        const serverOrder = serverConfig?.ownerPrimary?.fallbackOrder
+        if (Array.isArray(serverOrder) && JSON.stringify(normDraftOrder) === JSON.stringify(normalizeOwnerPriorityOrder(serverOrder))) {
+          // 未在面板改动顺位时省略 fallbackOrder，防止覆盖服务端刚自动追加的新绑定账号。
           const { fallbackOrder: _omit, ...restPrimary } = body.ownerPrimary
           body.ownerPrimary = restPrimary
-        } else if (Array.isArray(ownerOptions)) {
-          body.ownerPrimary = {
-            ...body.ownerPrimary,
-            fallbackOrder: sanitizeFallbackOrderForOptions(body.ownerPrimary.fallbackOrder, ownerOptions),
-          }
+        } else {
+          body.ownerPrimary = { ...body.ownerPrimary, fallbackOrder: normDraftOrder }
         }
       }
       return body
@@ -3570,18 +3557,13 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         h('path', { d: 'M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z' }))
     }
 
-    function GlobalAccess({ st, draft, setDraft, toast, onOwnerOptions }) {
+    function GlobalAccess({ st, draft, setDraft, toast }) {
       const f = useField(draft, setDraft)
       const [peopleInfo, setPeopleInfo] = useState(null)
       const [testSending, setTestSending] = useState(false)
       const [testResult, setTestResult] = useState(null)
       const refreshPeople = () => get('/platforms/people').then((r) => {
-        if (r && r.ok !== false) {
-          setPeopleInfo(r)
-          if (typeof onOwnerOptions === 'function' && Array.isArray(r.ownerAccountOptions)) {
-            onOwnerOptions(r.ownerAccountOptions)
-          }
-        }
+        if (r && r.ok !== false) setPeopleInfo(r)
       }).catch(() => {})
       const primaryKey = JSON.stringify(st && st.config ? st.config.ownerPrimary : null)
       const platformsKey = JSON.stringify(st && st.config ? st.config.platforms : null)
@@ -3628,7 +3610,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         const hasCustom = Array.isArray(pref.fallbackOrder) && pref.fallbackOrder.length > 0
         // 保留旧固定主账号作为紧随新主账号之后的备选顺位（即使历史自定义列表遗漏过旧主账号，也不让其悄然掉出回退）
         const nextOrder = hasCustom
-          ? sanitizeFallbackOrderForOptions([hit, ...(matchedOpt ? [matchedOpt] : []), ...pref.fallbackOrder], options)
+          ? normalizeOwnerPriorityOrder([hit, ...(matchedOpt ? [matchedOpt] : []), ...pref.fallbackOrder])
           : pref.fallbackOrder
         setDraft(setPath(draft, 'ownerPrimary', { ...pref, mode: 'fixed', platform: hit.platform, instance: hit.instance, account: hit.account, fallbackOrder: nextOrder }))
       }
@@ -3658,7 +3640,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const minEditableIdx = hasPinnedPrimary ? 1 : 0
       const reorderableCount = orderedOptions.length - minEditableIdx
       const applyFallbackOrder = (nextItems) => {
-        const cleaned = sanitizeFallbackOrderForOptions(nextItems, options)
+        const cleaned = normalizeOwnerPriorityOrder(nextItems.filter((item) => !item._pinnedPrimary || item._inSavedOrder))
         setDraft(setPath(draft, 'ownerPrimary', { ...pref, fallbackOrder: cleaned }))
       }
       const swapPriorityItems = (idxA, idxB) => {
@@ -3671,8 +3653,10 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       }
       const movePriorityItem = (fromIdx, toIdx) => swapPriorityItems(fromIdx, toIdx)
       swapLatestRef.current = { orderedOptions, swapPriorityItems, minEditableIdx }
+      const canRemovePriorityItem = (idx) => idx >= minEditableIdx && idx < orderedOptions.length
+        && (orderedOptions.length > 1 || orderedOptions[idx]._missingOwnerOption === true)
       const removePriorityItem = (idx) => {
-        if (idx < minEditableIdx || idx >= orderedOptions.length || orderedOptions.length <= 1) return
+        if (!canRemovePriorityItem(idx)) return
         const next = orderedOptions.filter((_, i) => i !== idx)
         applyFallbackOrder(next)
       }
@@ -3758,6 +3742,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         window.addEventListener('keydown', onKey)
       }
       const fallbackStatusBadge = (o) => {
+        if (o._missingOwnerOption) return { text: '当前账号列表未返回', cls: 'warn' }
         const selectable = isOwnerOptionSelectable(o)
         if (!o.canProactive) return { text: '仅支持回复（将跳过）', cls: '' }
         if (o.hasInstance === false) return { text: '未配置实例（将跳过）', cls: '' }
@@ -3905,7 +3890,6 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
                 ? h('div', { ref: prioListRef, className: cx('ab-prio-list', dragState ? 'dragging-active' : '') }, orderedOptions.map((o, idx) => {
                   const rowKey = ownerOptionKey(o)
                   const isPinned = Boolean(o._pinnedPrimary)
-                  const isPrimaryItem = isPinned || (pref.mode !== 'recent' && Boolean(pref.platform || pref.instance) && isOwnerOptionSelected(pref, o))
                   const selectable = isOwnerOptionSelectable(o)
                   const canDragRow = !isPinned && reorderableCount > 1
                   const badge = fallbackStatusBadge(o)
@@ -3978,12 +3962,12 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
                       : h('span', { className: cx('ab-prio-handle', canDragRow ? 'touch-drag' : ''), title: canDragRow ? '按住拖动到目标行可交换位置' : '当前无可交换位置的其他账号' }, '⋮⋮'),
                     h('span', { className: 'ab-badge' }, '#' + (idx + 1)),
                     h('div', { className: 'ab-prio-main' },
-                      h('span', null, '主人 · ' + platformLabel(o.platform) + instPart + ' · ' + o.account),
-                      isPrimaryItem ? h('span', { className: 'ab-badge mine', title: '固定主账号锁定在第一位，不可拖动、调序或移除' }, '当前主账号') : null,
+                      h('span', null, (o._missingOwnerOption ? '' : '主人 · ') + platformLabel(o.platform) + instPart + ' · ' + o.account),
+                      isPinned ? h('span', { className: 'ab-badge mine', title: '固定主账号锁定在第一位，不可拖动、调序或移除' }, '当前主账号') : null,
                       h('span', { className: cx('ab-badge', badge.cls) }, badge.text),
                     ),
                     h('div', { className: 'ab-prio-actions' },
-                      !isPrimaryItem
+                      !isPinned && !o._missingOwnerOption
                         ? h(Btn, { small: true, kind: 'ghost', disabled: !selectable, title: primaryBtnTitle, onClick: () => setPrimaryFromOption(o) }, '设为主账号')
                         : null,
                       h(Btn, { small: true, disabled: isPinned || idx <= minEditableIdx, onClick: () => movePriorityItem(idx, idx - 1) }, '上移'),
@@ -3991,37 +3975,33 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
                       h(Btn, {
                         small: true,
                         kind: 'ghost',
-                        disabled: isPinned || orderedOptions.length <= 1,
+                        disabled: !canRemovePriorityItem(idx),
                         title: isPinned
                           ? '固定主账号锁定在第一位，禁止移除'
-                          : (orderedOptions.length <= 1 ? '至少保留 1 个排序账号；如需取消自定义，请点「恢复默认顺序」' : '移出排序列表（自定义顺位下不参与自动回退）'),
+                          : (!canRemovePriorityItem(idx) ? '至少保留 1 个排序账号；如需取消自定义，请点「恢复默认顺序」' : '移出排序列表（自定义顺位下不参与自动回退）'),
                         onClick: () => removePriorityItem(idx),
                       }, '移出'),
                     ),
                   )
                 }))
                 : options.length
-                  ? h('div', { className: 'ab-note warn' }, '当前自定义列表中暂无有效已绑定账号；请从下方「加入排序」或点击「恢复默认顺序」。')
+                  ? h('div', { className: 'ab-small ab-muted' }, '暂无已加入优先排序的账号。')
                   : h('div', { className: 'ab-small ab-muted' }, '暂无已绑定的主人账号，请先到「通讯平台」发送私聊或认领主人。'),
               excludedOptions.length
                 ? h('div', { className: 'ab-prio-excluded' },
-                  h('div', { className: 'ab-small ab-muted', style: { marginBottom: 2 } }, '未加入优先排序的账号（自定义顺位生效中，将严格跳过以下账号）：'),
+                  h('div', { className: 'ab-small ab-muted', style: { marginBottom: 2 } }, '未加入优先排序的账号'),
                   excludedOptions.map((o) => {
                     const rowKey = ownerOptionKey(o)
-                    const isPrimaryItem = pref.mode !== 'recent' && Boolean(pref.platform || pref.instance) && isOwnerOptionSelected(pref, o)
                     const selectable = isOwnerOptionSelectable(o)
                     const badge = fallbackStatusBadge(o)
                     const instPart = (o.multiInstance || (o.instance && o.instance !== o.platform)) ? ` · ${o.instance}` : ''
                     return h('div', { key: 'ex:' + (o.key || rowKey), className: 'ab-prio-excluded-item', 'data-prio-excluded-key': rowKey },
                       h('div', { className: 'ab-prio-main' },
                         h('span', null, '主人 · ' + platformLabel(o.platform) + instPart + ' · ' + o.account),
-                        isPrimaryItem ? h('span', { className: 'ab-badge mine', title: '固定主账号仍然实际最优先，移出列表仅影响主账号以外顺位' }, '当前主账号（首选，仍优先于列表）') : null,
                         h('span', { className: cx('ab-badge', badge.cls) }, badge.text),
                       ),
                       h('div', { className: 'ab-prio-actions' },
-                        !isPrimaryItem
-                          ? h(Btn, { small: true, kind: 'ghost', disabled: !selectable, title: selectable ? '设为主人的固定主账号（固定在首位）' : '当前实例不支持主动消息或未观测到，无法设为主账号', onClick: () => setPrimaryFromOption(o) }, '设为主账号')
-                          : null,
+                        h(Btn, { small: true, kind: 'ghost', disabled: !selectable, title: selectable ? '设为主人的固定主账号（固定在首位）' : '当前实例不支持主动消息或未观测到，无法设为主账号', onClick: () => setPrimaryFromOption(o) }, '设为主账号'),
                         h(Btn, { small: true, kind: 'ghost', onClick: () => includePriorityItem(o) }, '加入排序'),
                       ),
                     )
@@ -4029,11 +4009,12 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
                 : null,
               h('div', { className: 'ab-flex', style: { gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
                 hasCustomOrder
-                  ? h(Btn, { small: true, kind: 'ghost', onClick: resetPriorityOrder }, '恢复默认顺序')
-                  : null,
+                  ? h(Btn, { small: true, kind: 'ghost', title: '保存后取消共享主动搭话的备用顺位', onClick: resetPriorityOrder }, '恢复默认顺序')
+                  : excludedOptions.length
+                    ? h(Btn, { small: true, kind: 'ghost', onClick: () => applyFallbackOrder(excludedOptions) }, '全部加入排序')
+                    : null,
                 h('span', { className: 'ab-small ab-muted' },
-                  (!hasCustomOrder && orderedOptions.length > 0 ? '普通主动聊天使用默认全量顺位。共享主动搭话的回退使用已保存的顺位。调序或移出账号后可保存自定义顺位。' : '')
-                  + '固定主账号在线时优先接收，其余顺位用于回退。'),
+                  '固定主账号在线时优先接收。共享主动搭话只使用已保存的顺位。'),
               ),
               unboundInstances.length
                 ? h('div', { className: 'ab-small ab-muted' }, '另有平台实例尚未绑定主人接收账号：' + unboundInstances.map(unboundInstLabel).join('、') + '（请用你的账号向该实例发一条私聊以完成绑定，绑定后自动加入排序）')
@@ -11303,8 +11284,6 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const dirtyRef = useRef(false)
       const saveRef = useRef(null)
       const pluginStartRef = useRef(0)
-      const ownerOptionsRef = useRef(null)
-      const onOwnerOptions = useCallback((opts) => { if (Array.isArray(opts)) ownerOptionsRef.current = opts }, [])
       const serverFallbackRef = useRef(null)
       // kind：ok / err / 不填 = 普通
       const toast = (m, kind) => {
@@ -11395,7 +11374,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       dirtyRef.current = dirty
       const setD = (d) => setDraft(d)
       const save = async (override) => {
-        const body = prepareSaveBody(override || draft, ownerOptionsRef.current, st && st.config)
+        const body = prepareSaveBody(override || draft, st && st.config)
         const r = await post('/save', body)
         if (r.ok === false) { toast(r.message || '保存失败', 'err'); return false }
         dirtyRef.current = false
@@ -11454,7 +11433,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             ? h('span', { className: 'ab-pill' }, 'OneBot ' + (qqConnected ? '已连接' : '未连接'))
             : null
       const persona = st.personas.find((p) => p.id === cfg.persona.current)
-      const props = { st, draft, setDraft: setD, toast, reload, go, openWizard: () => setWizardOpen(true), onOwnerOptions }
+      const props = { st, draft, setDraft: setD, toast, reload, go, openWizard: () => setWizardOpen(true) }
       const showWizard = !cfg.setupDone || wizardOpen
       // 标签页：内置的按模块在不在跑决定显示；自己写的模块有设置或面板的各占一页
       const mods = st.modules || []

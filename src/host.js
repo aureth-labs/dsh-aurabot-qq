@@ -764,6 +764,10 @@ export function apply(ctx, opts = {}) {
     }
     return normalizeFallbackOrderList(appended)
   }
+  const logFallbackOrderChange = (source, before, after) => {
+    if (isDeepStrictEqual(before, after)) return
+    logger.child('gateway').info(`接收优先级已变更（${source}）｜账号数 ${before.length} → ${after.length}`)
+  }
   // 启动期清理失效/已解绑 stale 及已知机器人自身账号；仅当配置 QQ 系本次启动新认领进身份库时才允许追加，绝不复活用户刻意排除的 QQ
   if ((cfg.ownerPrimary?.fallbackOrder?.length || 0) > 0) {
     const startupAccs = startupOwner ? (identity.accountsOf(startupOwner) || []) : []
@@ -776,9 +780,11 @@ export function apply(ctx, opts = {}) {
       allowAutoAppend: startupNewClaimedQq,
       instances: configuredSelfInstances(cfg),
     })
-    if (JSON.stringify(cleanedStartupOrder) !== JSON.stringify(cfg.ownerPrimary.fallbackOrder)) {
+    const before = cfg.ownerPrimary.fallbackOrder
+    if (!isDeepStrictEqual(cleanedStartupOrder, before)) {
       try {
         cfg = saveConfig({ ...cfg, ownerPrimary: { ...cfg.ownerPrimary, fallbackOrder: cleanedStartupOrder } }, cfg)
+        logFallbackOrderChange('启动校验', before, cfg.ownerPrimary.fallbackOrder)
       } catch (error) {
         logger.child('gateway').warn('启动清理失效接收优先级列表失败：', error?.message || error)
       }
@@ -816,9 +822,10 @@ export function apply(ctx, opts = {}) {
       for (const k of PLATFORM_SECRET_KEYS) registerSecret(p[k])
     }
   } // 含平台与云备份凭据，日志统一打码
-  const writeConfig = (next) => {
+  const writeConfig = (next, source = '配置写入') => {
     const before = cfg
     cfg = saveConfig(next, before)
+    logFallbackOrderChange(source, before.ownerPrimary.fallbackOrder, cfg.ownerPrimary.fallbackOrder)
     if (!isDeepStrictEqual(qqConfigFields(before), qqConfigFields(cfg))) qqOwnershipRevision++
     return before
   }
@@ -847,7 +854,7 @@ export function apply(ctx, opts = {}) {
     if (JSON.stringify(before.backup?.remote) !== JSON.stringify(cfg.backup?.remote)) scheduleRemoteBackup()
     return cfg
   }
-  const setConfig = (next) => {
+  const setConfig = (next, source) => {
     // 默认 QQ 托管权只由宿主内部的 QQ 切换事务提交。
     const candidate = normalize({ ...next, legacyQqEnabled: cfg.legacyQqEnabled })
     if (qqOwnershipTransfer && !isDeepStrictEqual(qqConfigFields(cfg), qqConfigFields(candidate))) {
@@ -860,7 +867,7 @@ export function apply(ctx, opts = {}) {
         throw Object.assign(new Error('网关托管的默认 QQ 使用原机器人号，换号需要单独切换'), { code: 'QQ_ACCOUNT_CHANGE_REQUIRES_SWITCH', status: 409 })
       }
     }
-    return publishConfig(writeConfig(candidate))
+    return publishConfig(writeConfig(candidate, source))
   }
   const syncOwnerPersonId = () => {
     const ownerNow = identity.owner() || ''
@@ -874,6 +881,7 @@ export function apply(ctx, opts = {}) {
     prevAccounts = [],
     allowAutoAppend = true,
     preferredInstanceByKey = null,
+    source = '主人账号变更',
   } = {}) => {
     const curPref = getConfig()?.ownerPrimary
     const curOrder = curPref?.fallbackOrder || []
@@ -896,7 +904,7 @@ export function apply(ctx, opts = {}) {
       lookupInstance: (plat, acc) => platformGateway?.routing?.instancesForAccount?.(plat, acc)?.[0] || '',
     })
     if (JSON.stringify(nextOrder) !== JSON.stringify(curOrder)) {
-      setConfig(mergeFromPanel(getConfig(), { ownerPrimary: { fallbackOrder: nextOrder } }))
+      setConfig(mergeFromPanel(getConfig(), { ownerPrimary: { fallbackOrder: nextOrder } }), source)
     }
     return nextOrder
   }
@@ -3019,7 +3027,7 @@ export function apply(ctx, opts = {}) {
     const offState = gw.onState?.(() => {
       const curOwner = identity.owner() || ''
       const curAccs = curOwner ? (identity.accountsOf(curOwner) || []) : []
-      syncOwnerFallbackOnAccountChange({ prevOwner: curOwner, prevAccounts: curAccs, allowAutoAppend: false })
+      syncOwnerFallbackOnAccountChange({ prevOwner: curOwner, prevAccounts: curAccs, allowAutoAppend: false, source: '网关状态校验' })
     })
     let capsRemountTimer = null
     const offCapsChanged = gw.onCapsChanged?.(() => {
@@ -4203,31 +4211,11 @@ export function apply(ctx, opts = {}) {
     const newPw = typeof body?.snowluma?.webuiPassword === 'string' ? body.snowluma.webuiPassword : ''
     if (body?.snowluma) delete body.snowluma.webuiPassword
 
-    const owner = identity.owner()
-    const beforeOrder = normalizeFallbackOrderList(before?.ownerPrimary?.fallbackOrder)
-    const hasBodyOrder = Boolean(body?.ownerPrimary && typeof body.ownerPrimary === 'object' && Object.hasOwn(body.ownerPrimary, 'fallbackOrder'))
-    const explicitOrderChange = hasBodyOrder && (
-      !Array.isArray(body.ownerPrimary.fallbackOrder)
-      || JSON.stringify(normalizeFallbackOrderList(body.ownerPrimary.fallbackOrder)) !== JSON.stringify(beforeOrder)
-    )
-    let saveWarnings = []
-    let nextBody = body
-    if (hasBodyOrder) {
-      const v = validateOwnerFallbackOrder(owner, body.ownerPrimary.fallbackOrder, { allowCleanNoOwner: !explicitOrderChange })
-      if (!v.ok) return { ok: false, message: v.message }
-      saveWarnings = [...v.warnings]
-      nextBody = { ...body, ownerPrimary: { ...body.ownerPrimary, fallbackOrder: v.list } }
-    }
-    let mergedNext = mergeFromPanel(cfg, nextBody)
-    if (!hasBodyOrder && (mergedNext.ownerPrimary?.fallbackOrder?.length || 0) > 0) {
-      const vCur = validateOwnerFallbackOrder(owner, mergedNext.ownerPrimary.fallbackOrder, { allowCleanNoOwner: true })
-      if (!vCur.ok) return { ok: false, message: vCur.message }
-      if (JSON.stringify(vCur.list) !== JSON.stringify(mergedNext.ownerPrimary.fallbackOrder)) {
-        mergedNext = { ...mergedNext, ownerPrimary: { ...mergedNext.ownerPrimary, fallbackOrder: vCur.list } }
-      }
-      saveWarnings = [...saveWarnings, ...vCur.warnings]
-    }
-    setConfig(mergedNext)
+    const order = validateOwnerFallbackOrder(identity.owner(), body?.ownerPrimary?.fallbackOrder)
+    if (!order.ok) return { ok: false, message: order.message }
+    const mergedNext = mergeFromPanel(before, body)
+    mergedNext.ownerPrimary = { ...mergedNext.ownerPrimary, fallbackOrder: order.list }
+    setConfig(mergedNext, '/save')
     let pw = null
     if (newPw && newPw !== before.snowluma.webuiPassword) pw = await snowluma.setPassword(newPw)
     const changedConn = before.gateway !== cfg.gateway || ['httpUrl', 'wsUrl', 'httpToken', 'wsToken', 'dir'].some((k) => before.snowluma[k] !== cfg.snowluma[k])
@@ -4252,8 +4240,7 @@ export function apply(ctx, opts = {}) {
         log.debug('建调试会话失败：', error.message)
       }
     }
-    const warnNote = saveWarnings.length ? '（' + saveWarnings.join('；') + '）' : ''
-    return { ...(await overview()), ...(saveWarnings.length ? { warnings: saveWarnings } : {}), message: '保存好了' + (pw ? '，' + pw.message : '') + debugNote + warnNote }
+    return { ...(await overview()), message: '保存好了' + (pw ? '，' + pw.message : '') + debugNote }
   })
 
   route('/debug/session', async () => {
@@ -4316,8 +4303,7 @@ export function apply(ctx, opts = {}) {
     const b = await readBody(req)
     const kind = b.kind === 'question' ? 'question' : 'approval'
     const value = b.value !== false
-    const c = loadConfig()
-    const notice = { ...(c.notice || {}) }
+    const notice = { ...cfg.notice }
     notice.workspaces = { ...(notice.workspaces || {}) }
     const ws = String(b.workspace || '').trim()
     if (ws) {
@@ -4328,7 +4314,7 @@ export function apply(ctx, opts = {}) {
     } else {
       notice[kind] = value
     }
-    setConfig({ notice })
+    setConfig({ ...cfg, notice })
     return { ok: true, notice }
   })
   route('/panel/purpose/config', async (req) => {
@@ -6196,45 +6182,31 @@ export function apply(ctx, opts = {}) {
     return { ...platformView(), ok: true, person, message: '已把这个账号认成主人' }
   })
 
-  function validateOwnerFallbackOrder(owner, rawList, { allowCleanNoOwner = false } = {}) {
-    if (rawList !== undefined && !Array.isArray(rawList)) {
-      return { ok: false, list: [], droppedStale: [], warnings: [], message: 'fallbackOrder 必须是数组' }
+  function validateOwnerFallbackOrder(owner, rawList) {
+    const saved = getConfig().ownerPrimary.fallbackOrder
+    if (rawList === undefined) return { ok: true, list: saved }
+    if (!Array.isArray(rawList)) return { ok: false, message: 'fallbackOrder 必须是数组' }
+    if (rawList.some((item) => !normalizeFallbackOrderList([item]).length)) {
+      return { ok: false, message: '接收优先级包含缺少平台或账号的条目，请修正后再保存' }
     }
-    const norm = normalizeFallbackOrderList(rawList)
-    if (!owner) {
-      if (!norm.length) return { ok: true, list: [], droppedStale: [], warnings: [], message: '' }
-      if (!allowCleanNoOwner) {
-        return { ok: false, list: [], droppedStale: [], warnings: [], message: '尚未认领主人身份，无法设置接收账号优先级' }
-      }
-      return {
-        ok: true,
-        list: [],
-        droppedStale: norm,
-        warnings: ['尚未认领主人身份，已清理无效的接收优先级列表'],
-        message: '',
-      }
-    }
+    const list = normalizeFallbackOrderList(rawList)
+    // 兼容仍会提交完整配置的面板。只有变动后的非空顺位需要校验当前账号归属。
+    if (!list.length || isDeepStrictEqual(list, saved)) return { ok: true, list }
+    if (!owner) return { ok: false, message: '尚未认领主人身份，无法设置接收账号优先级' }
     const ownerAccounts = identity.accountsOf(owner) || []
     const allInsts = [...knownPlatformInstances(), ...configuredSelfInstances(getConfig())]
-    const clean = []
-    const droppedStale = []
-    for (const item of norm) {
+    for (const item of list) {
       const exactInst = allInsts.find((x) => x.instance === item.instance)
       const checkInsts = exactInst ? [exactInst] : allInsts.filter((x) => x.platform === item.platform)
       if (checkInsts.some((inst) => inst?.self?.account && String(inst.self.account) === item.account)) {
-        return { ok: false, list: [], droppedStale: [], warnings: [], message: '不能把机器人自身账号放入接收优先级列表' }
+        return { ok: false, message: '不能把机器人自身账号放入接收优先级列表' }
       }
       const owned = ownerAccounts.some((a) => a && a.platform === item.platform && String(a.account) === item.account)
       if (!owned) {
-        droppedStale.push(item)
-        continue
+        return { ok: false, message: '接收优先级中有账号已解绑或不属于当前主人，请确认后再保存' }
       }
-      clean.push(item)
     }
-    const warnings = droppedStale.length
-      ? [`已自动移除 ${droppedStale.length} 个已解绑或非主人的接收优先级账号`]
-      : []
-    return { ok: true, list: clean, droppedStale, warnings, message: warnings[0] || '' }
+    return { ok: true, list }
   }
 
   const buildOwnerAccountOptions = (owner) => {
@@ -6415,22 +6387,11 @@ export function apply(ctx, opts = {}) {
       if (typeof b.noticeFallback !== 'boolean') return { ok: false, message: 'noticeFallback 必须是布尔值' }
       patch.noticeFallback = b.noticeFallback
     }
-    let warnings = []
     const owner = identity.owner()
-    if (b.fallbackOrder !== undefined) {
-      const v = validateOwnerFallbackOrder(owner, b.fallbackOrder, { allowCleanNoOwner: false })
-      if (!v.ok) return { ok: false, message: v.message }
-      patch.fallbackOrder = v.list
-      warnings = v.warnings
-    }
-    let merged = mergeFromPanel(getConfig(), { ownerPrimary: patch })
-    if (b.fallbackOrder === undefined && (merged.ownerPrimary?.fallbackOrder?.length || 0) > 0) {
-      const vCur = validateOwnerFallbackOrder(owner, merged.ownerPrimary.fallbackOrder, { allowCleanNoOwner: true })
-      if (vCur.ok && JSON.stringify(vCur.list) !== JSON.stringify(merged.ownerPrimary.fallbackOrder)) {
-        merged = { ...merged, ownerPrimary: { ...merged.ownerPrimary, fallbackOrder: vCur.list } }
-        warnings = [...warnings, ...vCur.warnings]
-      }
-    }
+    const order = validateOwnerFallbackOrder(owner, b.fallbackOrder)
+    if (!order.ok) return { ok: false, message: order.message }
+    patch.fallbackOrder = order.list
+    const merged = mergeFromPanel(getConfig(), { ownerPrimary: patch })
     const nextPref = merged.ownerPrimary
     const touchesPrimaryTarget = b.mode !== undefined || b.platform !== undefined || b.instance !== undefined || b.account !== undefined
     if (touchesPrimaryTarget && nextPref.mode === 'fixed' && (nextPref.platform || nextPref.instance || nextPref.account)) {
@@ -6489,7 +6450,7 @@ export function apply(ctx, opts = {}) {
         }
       }
     }
-    setConfig(merged)
+    setConfig(merged, '/platforms/owner/primary')
     const afterOwner = identity.owner()
     return {
       ok: true,
@@ -6501,8 +6462,7 @@ export function apply(ctx, opts = {}) {
       resolvedNoticeRoute: resolveOwnerRoute({ purpose: 'notice', record: false }),
       resolvedFallbackPreview: computeFallbackPreview(),
       lastBlockedRoute,
-      ...(warnings.length ? { warnings } : {}),
-      message: '已更新大肥鱼的主账号设置' + (warnings.length ? '（' + warnings.join('；') + '）' : ''),
+      message: '已更新大肥鱼的主账号设置',
     }
   })
   route('/platforms/import/preview', async (req) => {

@@ -471,7 +471,7 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
     )
     .replace(
       marker,
-      '    exports.panelTest = { GlobalAccess, Platforms, Access, ownerPrimaryLabel, splitOwnerPriorityOptions, mergeOwnerPriorityOptions, sanitizeFallbackOrderForOptions, prepareSaveBody, AurabotPage }\n' + marker,
+      '    exports.panelTest = { GlobalAccess, Platforms, AurabotPage }\n' + marker,
     )
 
   const posted = []
@@ -594,6 +594,7 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
       if (Array.isArray(node)) return node.map(textOf).join('')
       return [node.props?.label, node.props?.hint, textOf(node.children)].filter(Boolean).join(' ')
     }
+    const orderRows = (tree, attr) => collectNodes(tree, (n) => n.props?.[attr])
 
     const gaText = textOf(tree)
     assert.match(gaText, /主人的主账号与接收优先级/)
@@ -612,12 +613,13 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
     const treeRows = collectNodes(tree, (n) => n.props && n.props['data-prio-key'])
     assert.equal(treeRows[0].props['data-prio-pinned'], 'true')
     assert.ok(collectNodes(treeRows[0], (n) => n.props?.className === 'ab-prio-pin' && collectNodes(n, (s) => s.type?.name === 'PinIcon').length > 0).length === 1, '固定首位行应使用 PinIcon SVG 置顶图标')
-    const feishuRow0 = treeRows.find((r) => r.props['data-prio-key'] === 'feishu\x00feishu\x00ou_nop')
+    const candidates = orderRows(tree, 'data-prio-excluded-key')
+    const feishuRow0 = candidates.find((r) => r.props['data-prio-excluded-key'] === 'feishu\x00feishu\x00ou_nop')
     const feishuSetBtn = collectNodes(feishuRow0, (n) => n.type?.name === 'Btn' && textOf(n.children) === '设为主账号')[0]
     assert.equal(feishuSetBtn.props.disabled, true, '仅支持回复的实例必须禁用「设为主账号」')
 
     // 点击「QQ · 10001」行的「设为主账号」：切换为 QQ 并重置首位置顶预览状态
-    const qqRow0 = treeRows.find((r) => r.props['data-prio-key'] === 'qq\x00qq\x0010001')
+    const qqRow0 = candidates.find((r) => r.props['data-prio-excluded-key'] === 'qq\x00qq\x0010001')
     const qqSetBtn = collectNodes(qqRow0, (n) => n.type?.name === 'Btn' && textOf(n.children) === '设为主账号')[0]
     assert.ok(qqSetBtn && !qqSetBtn.props.disabled)
     qqSetBtn.props.onClick()
@@ -648,9 +650,9 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
       setDraft() {},
       toast() {},
     })
-    const rowsMulti = collectNodes(treeMulti, (n) => n.props && n.props['data-prio-key'])
-    const unobsRow = rowsMulti.find((r) => r.props['data-prio-key'] === 'bridge\x00bridge\x00b_acc')
-    const noInstRow = rowsMulti.find((r) => r.props['data-prio-key'] === 'qqbot\x00qqbot\x00qb_noinst')
+    const rowsMulti = orderRows(treeMulti, 'data-prio-excluded-key')
+    const unobsRow = rowsMulti.find((r) => r.props['data-prio-excluded-key'] === 'bridge\x00bridge\x00b_acc')
+    const noInstRow = rowsMulti.find((r) => r.props['data-prio-excluded-key'] === 'qqbot\x00qqbot\x00qb_noinst')
     assert.equal(collectNodes(unobsRow, (n) => n.type?.name === 'Btn' && textOf(n.children) === '设为主账号')[0].props.disabled, true)
     assert.equal(collectNodes(noInstRow, (n) => n.type?.name === 'Btn' && textOf(n.children) === '设为主账号')[0].props.disabled, true)
 
@@ -776,7 +778,8 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
     const fixedSelects = collectNodes(platTree, (n) => n.type === 'select' && collectNodes(n, (o) => o.type === 'option' && textOf(o) === '跟随最近').length > 0)
     assert.equal(fixedSelects.length, 1, '主人行不得渲染第二个冲突的固定平台下拉')
 
-    // 4) 账号接收优先级列表：全量账号渲染、首选徽标、开关/服务端预览（含 fallback-disabled 与仅通知回退）、未绑定实例提示、上移/下移/恢复默认与 DnD 拖拽，以及 AurabotPage.save 保存前剔除 stale
+    // 4) 账号接收优先级的展示、编辑与保存。
+    const missingAccount = { platform: 'qq', instance: 'qq', account: '99999_stale' }
     const prioCfg = {
       enabled: true,
       dryRun: false,
@@ -793,7 +796,7 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
         fallback: false,
         noticeFallback: true,
         fallbackOrder: [
-          { platform: 'qq', instance: 'qq', account: '99999_stale' }, // 已解绑 stale 项，应被隐藏且改动/保存时自动剔除
+          missingAccount,
           { platform: 'bridge', instance: 'bridge#2', account: 'b_acc' },
           { platform: 'qq', instance: 'qq', account: '10001' },
         ],
@@ -867,13 +870,13 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
     assert.match(prioText, /仅系统通知会改发/)
     assert.match(prioText, /当前主动搭话目标：暂无可用账号，本次将暂缓/)
     assert.match(prioText, /QQ 官方机器人（请用你的账号向该实例发一条私聊以完成绑定/)
-    assert.doesNotMatch(prioText, /99999_stale/, 'UI 不应展示已解绑的 stale 账号')
+    assert.match(prioText, /当前账号列表未返回/)
 
-    // 验证方案 B（可选子集）+ 固定主账号首位锁定：bridge#2 固定第 1 位，qq 在第 2 位，未入列的 feishu:ou_nop 在未参与自动回退区
+    // 固定主账号在首位，未返回的已保存账号仍出现在顺位中，未入列的候选留在列表外。
     const prioRows = collectNodes(prioTree, (n) => n.props && n.props['data-prio-key'])
     assert.deepEqual(
       prioRows.map((r) => r.props['data-prio-key']),
-      ['bridge\x00bridge#2\x00b_acc', 'qq\x00qq\x0010001'],
+      ['bridge\x00bridge#2\x00b_acc', 'qq\x00qq\x0099999_stale', 'qq\x00qq\x0010001'],
     )
     assert.equal(prioRows[0].props['data-prio-pinned'], 'true', '固定主账号必须在首位且标记 pinned')
     assert.equal(prioRows[0].props.onPointerDown, undefined, '固定主账号禁止拖动')
@@ -884,7 +887,7 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
       ['feishu\x00feishu\x00ou_nop'],
       '未入列账号不得混入活跃列表假装生效，必须落在未参与回退区域',
     )
-    assert.match(prioText, /未加入优先排序的账号/)
+    assert.ok(collectNodes(prioTree, (n) => n.type === 'div' && textOf(n.children) === '未加入优先排序的账号').length)
 
     // 校验固定主账号行（首行）上移/下移/移出全禁用，第 2 行「上移」也禁用（不可顶替第一位）
     const up0 = collectNodes(prioRows[0], (n) => n.type?.name === 'Btn' && textOf(n.children) === '上移')[0]
@@ -905,13 +908,30 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
     includeFeishuBtn.props.onClick()
     assert.deepEqual(JSON.parse(JSON.stringify(draftState.ownerPrimary.fallbackOrder)), [
       { platform: 'bridge', instance: 'bridge#2', account: 'b_acc' },
+      missingAccount,
       { platform: 'qq', instance: 'qq', account: '10001' },
       { platform: 'feishu', instance: 'feishu', account: 'ou_nop' },
     ])
 
-    // 验证「移出」非主账号仅剩固定主账号 1 项时，「移出」仍禁用
+    // 用户可以明确移出账号列表未返回的项。其他条目仍留在顺位中。
     draftState = JSON.parse(JSON.stringify(prioCfg))
-    const removeQqBtn = collectNodes(prioRows[1], (n) => n.type?.name === 'Btn' && textOf(n.children) === '移出')[0]
+    const removeMissingBtn = collectNodes(prioRows[1], (n) => n.type?.name === 'Btn' && textOf(n.children) === '移出')[0]
+    assert.equal(removeMissingBtn.props.disabled, false)
+    removeMissingBtn.props.onClick()
+    assert.deepEqual(JSON.parse(JSON.stringify(draftState.ownerPrimary.fallbackOrder)), [
+      { platform: 'bridge', instance: 'bridge#2', account: 'b_acc' },
+      { platform: 'qq', instance: 'qq', account: '10001' },
+    ])
+    hook = 0
+    refs.length = 0
+    const afterRemoveMissing = vmExport.panelTest.GlobalAccess({
+      st: prioSt,
+      draft: draftState,
+      setDraft: (d) => { draftState = d },
+      toast() {},
+    })
+    const qqRow = collectNodes(afterRemoveMissing, (n) => n.props?.['data-prio-key'] === 'qq\x00qq\x0010001')[0]
+    const removeQqBtn = collectNodes(qqRow, (n) => n.type?.name === 'Btn' && textOf(n.children) === '移出')[0]
     assert.ok(removeQqBtn)
     removeQqBtn.props.onClick()
     assert.deepEqual(JSON.parse(JSON.stringify(draftState.ownerPrimary.fallbackOrder)), [
@@ -956,9 +976,15 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
       0,
       '固定主账号绝不得出现在未加入排序区域',
     )
+    const addToExistingOrder = collectNodes(normalizedPinnedTree, (n) => n.type?.name === 'Btn' && textOf(n.children) === '加入排序')[0]
+    assert.ok(addToExistingOrder)
+    addToExistingOrder.props.onClick()
+    assert.deepEqual(JSON.parse(JSON.stringify(draftState.ownerPrimary.fallbackOrder)), [
+      { platform: 'qq', instance: 'qq', account: '10001' },
+      { platform: 'feishu', instance: 'feishu', account: 'ou_nop' },
+    ], '编辑已有顺位时不得写入仅用于固定展示的主账号')
 
-    // 复审 §3.1：当前固定主账号 bridge#2，自定义 fallbackOrder 仅含 [qq]（不含 bridge#2），
-    // 点击 qqbot「设为主账号」后，fallbackOrder 必须为 [qqbot, bridge#2, qq]（保留旧主账号为第 2 顺位备选）
+    // 切换固定主账号时，把旧主账号保留为第 2 顺位，并保留未返回的已保存账号。
     hook = 0
     refs.length = 0
     const savedOptsBackup = state[0].ownerAccountOptions
@@ -973,7 +999,7 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
       ...prioCfg,
       ownerPrimary: {
         ...prioCfg.ownerPrimary,
-        fallbackOrder: [{ platform: 'qq', instance: 'qq', account: '10001' }],
+        fallbackOrder: [{ platform: 'qq', instance: 'qq', account: '10001' }, missingAccount],
       },
     }
     const switchTree = vmExport.panelTest.GlobalAccess({
@@ -991,6 +1017,7 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
       { platform: 'qqbot', instance: 'qqbot', account: 'qb_1' },
       { platform: 'bridge', instance: 'bridge#2', account: 'b_acc' },
       { platform: 'qq', instance: 'qq', account: '10001' },
+      missingAccount,
     ], '切换固定主账号时，即使原自定义列表未写旧主账号，也必须把旧主账号保留为新主账号之后的备选顺位')
     state[0] = { ...state[0], ownerAccountOptions: savedOptsBackup }
 
@@ -1151,6 +1178,50 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
     assert.ok(resetBtn)
     resetBtn.props.onClick()
     assert.deepEqual(JSON.parse(JSON.stringify(draftState.ownerPrimary.fallbackOrder)), [])
+    const resetDraft = draftState
+    const renderOrder = (draft) => {
+      hook = 0
+      refs.length = 0
+      return vmExport.panelTest.GlobalAccess({
+        st: prioSt,
+        draft,
+        setDraft: (d) => { draftState = d },
+        toast() {},
+      })
+    }
+    const defaultTree = renderOrder(resetDraft)
+    assert.match(textOf(defaultTree), /共享主动搭话只使用已保存的顺位/)
+    assert.deepEqual(orderRows(defaultTree, 'data-prio-key').map((row) => row.props['data-prio-key']), ['bridge\x00bridge#2\x00b_acc'])
+    const defaultCandidates = orderRows(defaultTree, 'data-prio-excluded-key')
+    assert.deepEqual(defaultCandidates.map((row) => row.props['data-prio-excluded-key']), ['qq\x00qq\x0010001', 'feishu\x00feishu\x00ou_nop'])
+    const addFirst = collectNodes(defaultCandidates[0], (n) => n.type?.name === 'Btn' && textOf(n.children) === '加入排序')[0]
+    addFirst.props.onClick()
+    assert.deepEqual(JSON.parse(JSON.stringify(draftState.ownerPrimary.fallbackOrder)), [{ platform: 'qq', instance: 'qq', account: '10001' }])
+    draftState = resetDraft
+    const addAll = collectNodes(defaultTree, (n) => n.type?.name === 'Btn' && textOf(n.children) === '全部加入排序')[0]
+    assert.ok(addAll)
+    addAll.props.onClick()
+    assert.deepEqual(JSON.parse(JSON.stringify(draftState.ownerPrimary.fallbackOrder)), [
+      { platform: 'qq', instance: 'qq', account: '10001' },
+      { platform: 'feishu', instance: 'feishu', account: 'ou_nop' },
+    ])
+    const recentDefaultTree = renderOrder({
+      ...resetDraft,
+      ownerPrimary: { ...resetDraft.ownerPrimary, mode: 'recent', platform: '', instance: '', account: '' },
+    })
+    assert.equal(orderRows(recentDefaultTree, 'data-prio-key').length, 0)
+    assert.equal(orderRows(recentDefaultTree, 'data-prio-excluded-key').length, prioOptions.length)
+
+    // 账号列表暂时没有返回主账号时，仍能看到锁定的固定主账号行。
+    const fullPeople = state[0]
+    state[0] = { ...fullPeople, ownerAccountOptions: prioOptions.filter((o) => o.platform !== 'bridge') }
+    const missingPrimaryTree = renderOrder(resetDraft)
+    const missingPrimaryRows = orderRows(missingPrimaryTree, 'data-prio-key')
+    assert.equal(missingPrimaryRows.length, 1)
+    assert.equal(missingPrimaryRows[0].props['data-prio-key'], 'bridge\x00bridge#2\x00b_acc')
+    assert.equal(missingPrimaryRows[0].props['data-prio-pinned'], 'true')
+    assert.match(textOf(missingPrimaryRows[0]), /当前账号列表未返回/)
+    state[0] = fullPeople
 
     // 验证多实例平台已绑定 feishu 但 feishu#2 未绑定/未观测时，unboundInstances 按实例判断仍提示 feishu#2（审阅 §4.1）
     hook = 0
@@ -1230,9 +1301,6 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
     refs.length = 0
     state = [prioSt, '', dirtyCfgUnchangedOrder, 'access', null, false]
     const pageTree = vmExport.panelTest.AurabotPage()
-    const accessCallNode = collectNodes(pageTree, (n) => typeof n.props?.onOwnerOptions === 'function')[0]
-    assert.ok(accessCallNode, 'AurabotPage 应向当前页签传递 onOwnerOptions')
-    accessCallNode.props.onOwnerOptions(prioOptions)
     const saveBtn = collectNodes(pageTree, (n) => n.type?.name === 'Btn' && textOf(n.children) === '保存设置')[0]
     assert.ok(saveBtn, '修改主配置后应渲染底部「保存设置」按钮')
     await saveBtn.props.onClick()
@@ -1240,11 +1308,11 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
     assert.ok(savedUnchangedCall, '点击保存设置应调用 /aurabot/api/save')
     assert.equal(Object.hasOwn(savedUnchangedCall.body.ownerPrimary, 'fallbackOrder'), false, '未改动顺位时应省略 fallbackOrder 避免覆盖服务端新增')
 
-    // 2) 明确改动了 fallbackOrder 后保存：提交前主动剔除已解绑 stale 账号
+    // 2) 改动顺位后按草稿提交。账号列表尚未返回的条目仍在请求里，由服务端校验。
     posted.length = 0
     const dirtyCfgEditedOrder = JSON.parse(JSON.stringify(prioCfg))
     dirtyCfgEditedOrder.ownerPrimary.fallbackOrder = [
-      { platform: 'qq', instance: 'qq', account: '99999_stale' },
+      missingAccount,
       { platform: 'qq', instance: 'qq', account: '10001' },
       { platform: 'bridge', instance: 'bridge#2', account: 'b_acc' },
     ]
@@ -1252,15 +1320,21 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
     refs.length = 0
     state = [prioSt, '', dirtyCfgEditedOrder, 'access', null, false]
     const pageTree2 = vmExport.panelTest.AurabotPage()
-    const accessCallNode2 = collectNodes(pageTree2, (n) => typeof n.props?.onOwnerOptions === 'function')[0]
-    accessCallNode2.props.onOwnerOptions(prioOptions)
     const saveBtn2 = collectNodes(pageTree2, (n) => n.type?.name === 'Btn' && textOf(n.children) === '保存设置')[0]
     await saveBtn2.props.onClick()
     const savedEditedCall = posted.find((x) => x.url === '/aurabot/api/save')
-    assert.deepEqual(savedEditedCall.body.ownerPrimary.fallbackOrder, [
-      { platform: 'qq', instance: 'qq', account: '10001' },
-      { platform: 'bridge', instance: 'bridge#2', account: 'b_acc' },
-    ], '明确改动顺位保存时应在提交 /save 前主动剔除已解绑 stale 账号')
+    assert.deepEqual(savedEditedCall.body.ownerPrimary.fallbackOrder, dirtyCfgEditedOrder.ownerPrimary.fallbackOrder)
+
+    // 3) 用户点击「恢复默认顺序」后，显式提交空数组。
+    posted.length = 0
+    hook = 0
+    refs.length = 0
+    state = [prioSt, '', resetDraft, 'access', null, false]
+    const resetPage = vmExport.panelTest.AurabotPage()
+    const saveResetBtn = collectNodes(resetPage, (n) => n.type?.name === 'Btn' && textOf(n.children) === '保存设置')[0]
+    await saveResetBtn.props.onClick()
+    const savedResetCall = posted.find((x) => x.url === '/aurabot/api/save')
+    assert.deepEqual(savedResetCall.body.ownerPrimary.fallbackOrder, [])
   } finally {
     globalThis.fetch = origFetch
   }
@@ -1320,44 +1394,40 @@ test('P3-6: 成员变更（merge/unlink/claim）同步 fallbackOrder，与 valid
   await fake.call('/platforms/people/merge', { from: guestEmpty, into: ownerPerson, dryRun: false })
   assert.deepEqual(applied.getConfig().ownerPrimary.fallbackOrder, [], 'fallbackOrder 为空时 merge 不得擅自填入列表')
 
-  // 4) /save 与 /platforms/owner/primary 对非法/bot-self/stale 行为一致，且提前清洗后服务端零 warning
-  const badPrimary = (await fake.call('/platforms/owner/primary', { fallbackOrder: 'bad' })).json()
-  const badSave = (await fake.call('/save', { ownerPrimary: { fallbackOrder: 'bad' } })).json()
-  assert.equal(badPrimary.ok, false)
-  assert.equal(badSave.ok, false)
-  assert.match(badSave.message, /数组/)
-
-  const selfPrimary = (await fake.call('/platforms/owner/primary', {
-    fallbackOrder: [{ platform: 'bridge', instance: 'bridge#2', account: 'fake-bot' }],
-  })).json()
-  const selfSave = (await fake.call('/save', {
-    ownerPrimary: { fallbackOrder: [{ platform: 'bridge', instance: 'bridge#2', account: 'fake-bot' }] },
-  })).json()
-  assert.equal(selfPrimary.ok, false)
-  assert.equal(selfSave.ok, false)
-  assert.match(selfPrimary.message, /机器人自身/)
-  assert.match(selfSave.message, /机器人自身/)
-
-  // 含 stale 项保存 → 自动剔除并给 warning；提前剔除再保存 → 零 warning
-  const staleRes = (await fake.call('/save', {
-    ownerPrimary: {
-      fallbackOrder: [
-        { platform: 'bridge', instance: 'bridge#2', account: 'b_acc' },
-        { platform: 'feishu', instance: 'feishu', account: 'ou_unlinked_stale' },
-      ],
-    },
-  })).json()
-  assert.equal(staleRes.ok, true)
-  assert.ok(Array.isArray(staleRes.warnings) && staleRes.warnings.length > 0)
-  assert.deepEqual(staleRes.config.ownerPrimary.fallbackOrder, [
-    { platform: 'bridge', instance: 'bridge#2', account: 'b_acc' },
-  ])
-
+  // 4) 显式修改顺位时，两个保存入口都拒绝非法条目，保留已有顺位和本次请求的其他配置。
+  const bridgeOrder = { platform: 'bridge', instance: 'bridge#2', account: 'b_acc' }
+  const staleOrder = { platform: 'feishu', instance: 'feishu', account: 'ou_unlinked_stale' }
   const cleanSave = (await fake.call('/save', {
-    ownerPrimary: { fallbackOrder: [{ platform: 'bridge', instance: 'bridge#2', account: 'b_acc' }] },
+    ownerPrimary: { fallbackOrder: [bridgeOrder] },
   })).json()
   assert.equal(cleanSave.ok, true)
-  assert.equal(cleanSave.warnings, undefined, '提前剔除 stale 后服务端不应再产生额外 warning')
+  assert.deepEqual(cleanSave.config.ownerPrimary.fallbackOrder, [bridgeOrder])
+  const beforeNoticeToggle = applied.getConfig()
+  const toggledNotice = (await fake.call('/notice/toggle', { kind: 'approval', value: false })).json()
+  assert.equal(toggledNotice.ok, true)
+  assert.equal(toggledNotice.notice.approval, false)
+  assert.deepEqual(applied.getConfig(), {
+    ...beforeNoticeToggle,
+    notice: { ...beforeNoticeToggle.notice, approval: false },
+  })
+  const beforeInvalidSave = readFileSync(join(dir, 'config.json'), 'utf8')
+  const invalidOrders = [
+    ['bad', /数组/],
+    [[{}], /格式|完整|账号/],
+    [[{ ...bridgeOrder, account: 'fake-bot' }], /机器人自身/],
+    [[staleOrder], /解绑|绑定|主人/],
+    [[bridgeOrder, staleOrder], /解绑|绑定|主人/],
+  ]
+  for (const [fallbackOrder, message] of invalidOrders) {
+    const save = (await fake.call('/save', { ownerName: '无效顺位不应该修改此项', ownerPrimary: { fallbackOrder } })).json()
+    const primary = (await fake.call('/platforms/owner/primary', { noticeFallback: false, fallbackOrder })).json()
+    for (const result of [save, primary]) {
+      assert.equal(result.ok, false)
+      assert.match(result.message, message)
+    }
+    assert.deepEqual(applied.getConfig().ownerPrimary.fallbackOrder, [bridgeOrder])
+    assert.equal(readFileSync(join(dir, 'config.json'), 'utf8'), beforeInvalidSave)
+  }
 
   // 模拟：面板加载快照后只改 ownerName（未改排序），期间服务端自动追加了新绑定账号 → 保存 /save 不得覆盖服务端新增（审阅 §3.3 & §4.4）
   await fake.call('/platforms/people/unlink', { platform: 'qqbot', account: 'qb_keep_empty' })
@@ -1388,24 +1458,36 @@ test('P3-6: 成员变更（merge/unlink/claim）同步 fallbackOrder，与 valid
     { platform: 'qqbot', instance: 'qqbot', account: 'qb_server_added' },
   ], '服务端自动追加新账号后，面板未改排序直接保存其他设置不得覆盖新追加账号')
 
-  // 手工在配置残留 stale 项，然后调 /save 只改无关字段（body 不含 fallbackOrder）→ 同样顺带清掉 stale
+  // 账号暂未出现在身份库时，普通保存和主账号开关保存均保留原顺位。
+  const orderWithStale = [bridgeOrder, staleOrder]
   applied.setConfig({
     ...applied.getConfig(),
     ownerPrimary: {
       ...applied.getConfig().ownerPrimary,
-      fallbackOrder: [
-        { platform: 'bridge', instance: 'bridge#2', account: 'b_acc' },
-        { platform: 'feishu', instance: 'feishu', account: 'ou_stale_partial' },
-      ],
+      fallbackOrder: orderWithStale,
     },
   })
-  const partialSave = (await fake.call('/save', { ownerName: '不带fallbackOrder保存' })).json()
+  const partialSave = (await fake.call('/save', { ownerName: '仅保存昵称' })).json()
   assert.equal(partialSave.ok, true)
-  assert.deepEqual(partialSave.config.ownerPrimary.fallbackOrder, [
-    { platform: 'bridge', instance: 'bridge#2', account: 'b_acc' },
-  ])
+  assert.equal(partialSave.config.ownerName, '仅保存昵称')
+  assert.deepEqual(partialSave.config.ownerPrimary.fallbackOrder, orderWithStale)
+  const partialPrimary = (await fake.call('/platforms/owner/primary', { noticeFallback: false })).json()
+  assert.equal(partialPrimary.ok, true)
+  assert.equal(partialPrimary.config.ownerPrimary.noticeFallback, false)
+  assert.deepEqual(partialPrimary.config.ownerPrimary.fallbackOrder, orderWithStale)
+  const unchangedOrder = (await fake.call('/save', { ownerName: '旧版面板保存昵称', ownerPrimary: { fallbackOrder: orderWithStale } })).json()
+  assert.equal(unchangedOrder.ok, true)
+  assert.equal(unchangedOrder.config.ownerName, '旧版面板保存昵称')
+  assert.deepEqual(unchangedOrder.config.ownerPrimary.fallbackOrder, orderWithStale)
 
-  // 5) 无主人 + 磁盘旧 config 残留 fallbackOrder：保存无关设置不得被阻塞，且自动清空 stale
+  // 显式提交空数组仍然可以清空顺位。
+  const clearOrder = (await fake.call('/save', { ownerPrimary: { fallbackOrder: [] } })).json()
+  assert.equal(clearOrder.ok, true)
+  assert.deepEqual(clearOrder.config.ownerPrimary.fallbackOrder, [])
+  assert.deepEqual(JSON.parse(readFileSync(join(dir, 'config.json'), 'utf8')).ownerPrimary.fallbackOrder, [])
+  assert.ok(fake.logs.some((line) => line.includes('接收优先级已变更（/save）｜账号数 2 → 0')))
+
+  // 5) 启动清理仍可处理磁盘里的孤立顺位。一般保存不对已有顺位做这项清理。
   const dirNoOwner = freshDataDir('aurabot-p3-no-owner-save-')
   writeFileSync(join(dirNoOwner, 'config.json'), JSON.stringify(normalize({
     enabled: false,
@@ -1425,17 +1507,24 @@ test('P3-6: 成员变更（merge/unlink/claim）同步 fallbackOrder，与 valid
   })
   await appliedNoOwner.ready
   assert.deepEqual(appliedNoOwner.getConfig().ownerPrimary.fallbackOrder, [], '无主人启动后即应清空孤立 fallbackOrder')
-  // 若磁盘/内存仍有残留 stale fallbackOrder 且无 owner 时保存无关设置，绝不能阻塞保存并应一并清空
+  const orphanOrder = [{ platform: 'feishu', instance: 'feishu', account: 'ou_orphan_live_stale' }]
   appliedNoOwner.setConfig({
     ...appliedNoOwner.getConfig(),
     ownerPrimary: {
       ...appliedNoOwner.getConfig().ownerPrimary,
-      fallbackOrder: [{ platform: 'feishu', instance: 'feishu', account: 'ou_orphan_live_stale' }],
+      fallbackOrder: orphanOrder,
     },
   })
   const saveUnrelatedNoOwner = (await fakeNoOwner.call('/save', { ownerName: '游客改动' })).json()
   assert.equal(saveUnrelatedNoOwner.ok, true)
-  assert.deepEqual(appliedNoOwner.getConfig().ownerPrimary.fallbackOrder, [])
+  assert.deepEqual(saveUnrelatedNoOwner.config.ownerPrimary.fallbackOrder, orphanOrder)
+  const primaryUnrelatedNoOwner = (await fakeNoOwner.call('/platforms/owner/primary', { fallback: true })).json()
+  assert.equal(primaryUnrelatedNoOwner.ok, true)
+  assert.deepEqual(primaryUnrelatedNoOwner.config.ownerPrimary.fallbackOrder, orphanOrder)
+  const saveOrderNoOwner = (await fakeNoOwner.call('/save', { ownerPrimary: { fallbackOrder: [bridgeOrder] } })).json()
+  assert.equal(saveOrderNoOwner.ok, false)
+  assert.match(saveOrderNoOwner.message, /主人/)
+  assert.deepEqual(appliedNoOwner.getConfig().ownerPrimary.fallbackOrder, orphanOrder)
 })
 
 test('P3-7: resolvedFallbackPreview 全状态矩阵（ok/仅系统通知/fallback-disabled/no-route/recent）', async (t) => {
