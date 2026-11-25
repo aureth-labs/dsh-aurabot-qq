@@ -14,7 +14,7 @@
 
 | 概念 | 例子 | 谁负责 |
 |---|---|---|
-| Platform | `qq`、`feishu`、`qqbot`、`wechat-clawbot`、`bridge` | 适配器与网关 catalog |
+| Platform | `qq`、`feishu`、`qqbot`、`wechat-clawbot`、`dingtalk`、`wecom`、`bridge` | 适配器与网关 catalog |
 | Instance | `qq`、`qq#2`、`feishu` | 网关实例配置与路由 |
 | Account | 机器人自己的账号、主人绑定的账号 | identity + 平台事件 |
 | ChatId | `qq:private:10001`、`feishu:group:oc_xxx`、`qq#2:private:10002` | `gateway/address.js` 统一格式 |
@@ -281,7 +281,11 @@ unknown   = 不知道发没发出去
 - **状态机与唯一会话**：同一 `instance + method` 仅允许一个活跃会话，重新 `start` 会中止旧会话 `AbortSignal` 并阻止迟到 `poll` 落盘；并发 `poll` 去重；尊重 `slow_down` 退避与 `domain_switched`；
 - **严格隔离**：`AuthSessionView` 绝不回传 `secret`、`deviceCode`、`qrcode` 或 `driverSession` 原文；终态隐藏二维码、`verificationUrl` 与 `userCode`；`configPatch` 禁止夹带敏感键或临时字段，所有秘钥必须走 `secretPatch` 且键在 `PLATFORM_SECRET_KEYS` 内；
 - **连接与身份门控**：凭据写入并触发 `gateway.sync()` 后，宿主 `verifyInstance` 必须等待实例到达 `connected` 且完成 `whoami`（`self.account` 非空且与预期一致），未连通、超时或不符一律停用实例并报错（`auth.verify`），同时绝不自动认主或触碰共享会话；
-- **独立解码基准与阶段现状（Phase 1A）**：二维码编码可通过 `npm run test:qr-decode` 经第三方 `jsqr` 对 V1–V16 矩阵与 SVG Data URI 独立还原原文（含飞书 / QQBot 实际授权链接）；当前已落地 **Phase 0 + Phase 1A** 的平台认证驱动为 `wechat-clawbot`（`qr-link`）、`feishu`（`qr-app`，含 `im:message:readonly` 等基础与媒体收发权限）与 `qqbot`（`qr-app`，基于 `q.qq.com/lite/*` 等价连接器协议写入 `clientSecret`、与个人号 `qq` 严格隔离）；飞书与 QQBot 的基础扫码流程已完成真机测试（Lark `domain_switched` 仍待真机确认）；**Phase 1 尚未包含**钉钉（`dingtalk`）与企业微信智能机器人（`wecom`），它们连同 `oauth-callback` / `manual` 会在 **Phase 1B** 及后续阶段分批补齐。
+- **独立解码基准与阶段现状（Phase 1A + Phase 1B）**：二维码编码可通过 `npm run test:qr-decode` 经第三方 `jsqr` 对 V1–V16 矩阵与 SVG Data URI 独立还原原文（含飞书 / QQBot / 钉钉 / 企业微信授权链接）。当前已落地的平台适配器与认证驱动包括：
+  - **Phase 0**：`wechat-clawbot`（`qr-link`，腾讯 iLink 个人微信，含旧版 `/platforms/wechat-clawbot/qr/*` 兼容包装）；
+  - **Phase 1A**：`feishu`（`qr-app`，RFC 8628，含 `im:message:readonly` 等基础与媒体权限；基础扫码已真机验证，Lark `domain_switched` 待真机确认）与 `qqbot`（`qr-app`，基于 `q.qq.com/lite/*` 私有绑定协议写 `clientSecret`、与个人号 `qq` 隔离；基础扫码已真机验证）；
+  - **Phase 1B**：`dingtalk`（`device-code` 注册驱动 + DingTalk Stream 长连接适配器，写 `clientId` / `clientSecret`，`CAPS_DINGTALK` 全键诚实声明）与 `wecom`（`qr-link` 扫码驱动 + 企业微信智能机器人官方 WebSocket 适配器，支持 `aibot_subscribe`/心跳/分片上传/AES-256-CBC 32B PKCS#7 文件解密，与 `wechat-clawbot` 严格隔离）；两者已完成真实扫码创建连接、文字、图片和语音条测试，文本引用与图片引用均已复测正常；引用图片通过 `quoteCache`/`mediaCache` + `message.quote.read:true` 进入 `quoteImages`，无回调正文时保留不可读占位；群聊平台侧仅推送 @机器人 消息（`listenAllInGroup=false`），文件/视频、主动消息和长断网重连仍待补测。
+  - **后续**：`oauth-callback` / `manual` 驱动与 `Telegram` / `Slack` / `Discord` 等将在 **Phase 2** 及后续阶段分批接入。
 
 ## 10. 共享私聊会话
 
@@ -293,9 +297,11 @@ unknown   = 不知道发没发出去
 - 旧直连 QQ 是普通会话，不参与共享；
 - 所有平台共享同一个 DSH 会话；
 - 一条入站消息的回复使用该消息所在平台的回复凭据；
-- 主动搭话必须发到固定的主账号平台，不能回退到「最近平台」；
+- 主动搭话优先投递到固定主账号。开启回退时，备用目标来自已保存接收顺位中的已绑定网关私聊账号；
 - 跨平台另发消息必须显式指定目标，且只允许主人已绑定账号；
 - 适配器不能替 hub 决定共享路由。
+
+`/save` 和 `/platforms/owner/primary` 省略 `fallbackOrder` 时会保留已保存顺位，显式提交 `[]` 会清空。修改为非空顺位时，保存前校验账号归属和机器人自身账号。校验失败会拒绝该次保存。成功变更会记录来源及账号数量变化。
 
 新增平台若要参与共享私聊，至少要保证：
 
@@ -457,6 +463,8 @@ npm run test:host-compat -- <DSH 源码目录>
 - [ADAPTER-FEISHU.md](ADAPTER-FEISHU.md)
 - [ADAPTER-QQBOT.md](ADAPTER-QQBOT.md)
 - [ADAPTER-WECHAT-CLAWBOT.md](ADAPTER-WECHAT-CLAWBOT.md)
+- [ADAPTER-DINGTALK.md](ADAPTER-DINGTALK.md)
+- [ADAPTER-WECOM.md](ADAPTER-WECOM.md)
 - [网关契约类型](../src/gateway/contracts.d.ts)
 - [模块 API](../src/modules/API.md)
 - [用户手册](USER-MANUAL.md)
