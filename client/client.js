@@ -1413,7 +1413,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         h(Row, { label: 'HTTP 令牌' }, f.text('snowluma.httpToken', { type: 'password', placeholder: draft.snowluma.httpTokenSet ? '已保存' : '没有就留空' })))
     }
 
-    const PLATFORM_NAMES = { qq: 'QQ', feishu: '飞书', qqbot: 'QQ 官方机器人', 'wechat-clawbot': '微信 ClawBot', bridge: '通用桥' }
+    const PLATFORM_NAMES = { qq: 'QQ', feishu: '飞书', qqbot: 'QQ 官方机器人', 'wechat-clawbot': '微信 ClawBot', dingtalk: '钉钉', wecom: '企业微信', bridge: '通用桥' }
     const platformLabel = (name) => PLATFORM_NAMES[name] || name || '平台'
     const ownerTargetText = (t) => {
       if (!t) return ''
@@ -2117,6 +2117,52 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           onConfirmed && onConfirmed({
             ...r,
             appId: r.meta?.appId || r.configs?.[instance]?.appId || '',
+          })
+        },
+        onError,
+      })
+    }
+
+    function DingtalkQrBox({ instance = 'dingtalk', oapiBaseUrl = '', hasToken = false, toast, onConfirmed, onError }) {
+      return h(PlatformAuthQrBox, {
+        platform: 'dingtalk',
+        instance,
+        method: 'device-code',
+        params: oapiBaseUrl ? { registrationBaseUrl: oapiBaseUrl } : {},
+        hasToken,
+        startLabel: '钉钉扫码创建机器人',
+        restartLabel: '重新钉钉扫码创建',
+        readyHint: '通过手机钉钉扫码一键创建或绑定机器人（自动填写 Client ID / Client Secret，不会自动认主；也可直接在下方手动填写）',
+        savedHint: '已保存钉钉机器人凭证（更换应用或重新授权时可点此重新扫码）',
+        alt: '钉钉扫码创建机器人二维码',
+        toast,
+        onConfirmed: (r) => {
+          onConfirmed && onConfirmed({
+            ...r,
+            clientId: r.meta?.clientId || r.configs?.[instance]?.clientId || '',
+          })
+        },
+        onError,
+      })
+    }
+
+    function WecomQrBox({ instance = 'wecom', hasToken = false, toast, onConfirmed, onError }) {
+      return h(PlatformAuthQrBox, {
+        platform: 'wecom',
+        instance,
+        method: 'qr-link',
+        params: {},
+        hasToken,
+        startLabel: '企业微信扫码绑定机器人',
+        restartLabel: '重新企业微信扫码',
+        readyHint: '通过企业微信客户端扫码创建或绑定智能机器人（仅写入 wecom，与个人微信 wechat-clawbot 完全隔离，不会自动认主）',
+        savedHint: '已保存企业微信智能机器人凭证（更换机器人时可重新扫码，或直接修改下方设置）',
+        alt: '企业微信智能机器人扫码二维码',
+        toast,
+        onConfirmed: (r) => {
+          onConfirmed && onConfirmed({
+            ...r,
+            botId: r.meta?.botId || r.configs?.[instance]?.botId || '',
           })
         },
         onError,
@@ -2834,6 +2880,69 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
                   let nextDraft = draft
                   if (savedCfg.appId) nextDraft = setPath(nextDraft, 'platforms.' + inst.instance + '.appId', savedCfg.appId)
                   if (savedCfg.clientSecretSet) nextDraft = setPath(nextDraft, 'platforms.' + inst.instance + '.clientSecretSet', true)
+                  setDraft(nextDraft)
+                }
+                reload()
+              },
+            }),
+          ) : null,
+          inst.platform === 'dingtalk' ? h(Fragment, null,
+            h('div', { className: 'ab-note', style: { marginBottom: 8 } },
+              '支持手机钉钉扫码创建并绑定 Stream 机器人（不会自动认主）；扫码失败或已有企业自建应用时，也可直接在下方手动填写 Client ID / Client Secret。'),
+            h(DingtalkQrBox, {
+              instance: inst.instance,
+              oapiBaseUrl: getPath(draft, 'platforms.' + inst.instance + '.oapiBaseUrl') || data?.configs?.[inst.instance]?.oapiBaseUrl || '',
+              hasToken: Boolean(
+                (getPath(draft, 'platforms.' + inst.instance + '.clientId') || data?.configs?.[inst.instance]?.clientId)
+                && (getPath(draft, 'platforms.' + inst.instance + '.clientSecretSet') || data?.configs?.[inst.instance]?.clientSecretSet),
+              ),
+              toast,
+              onConfirmed: (r) => {
+                setData(r)
+                let nextDraft = setPath(draft, 'platforms.' + inst.instance + '.clientSecretSet', true)
+                if (r.clientId) nextDraft = setPath(nextDraft, 'platforms.' + inst.instance + '.clientId', r.clientId)
+                setDraft(nextDraft)
+                reload()
+              },
+              onError: (r) => {
+                if (!r?.instances) return
+                setData(r)
+                const savedCfg = r.configs?.[inst.instance]
+                if (savedCfg) {
+                  let nextDraft = draft
+                  if (savedCfg.clientId) nextDraft = setPath(nextDraft, 'platforms.' + inst.instance + '.clientId', savedCfg.clientId)
+                  if (savedCfg.clientSecretSet) nextDraft = setPath(nextDraft, 'platforms.' + inst.instance + '.clientSecretSet', true)
+                  setDraft(nextDraft)
+                }
+                reload()
+              },
+            }),
+          ) : null,
+          inst.platform === 'wecom' ? h(Fragment, null,
+            h('div', { className: 'ab-note', style: { marginBottom: 8 } },
+              '支持企业微信扫码创建或绑定智能机器人，采用官方 WebSocket 长连接（仅写入 wecom，与个人微信 wechat-clawbot 完全隔离，不会自动认主）；也可直接在下方手动填写 Bot ID / Secret。'),
+            h(WecomQrBox, {
+              instance: inst.instance,
+              hasToken: Boolean(
+                (getPath(draft, 'platforms.' + inst.instance + '.botId') || data?.configs?.[inst.instance]?.botId)
+                && (getPath(draft, 'platforms.' + inst.instance + '.secretSet') || data?.configs?.[inst.instance]?.secretSet),
+              ),
+              toast,
+              onConfirmed: (r) => {
+                setData(r)
+                let nextDraft = setPath(draft, 'platforms.' + inst.instance + '.secretSet', true)
+                if (r.botId) nextDraft = setPath(nextDraft, 'platforms.' + inst.instance + '.botId', r.botId)
+                setDraft(nextDraft)
+                reload()
+              },
+              onError: (r) => {
+                if (!r?.instances) return
+                setData(r)
+                const savedCfg = r.configs?.[inst.instance]
+                if (savedCfg) {
+                  let nextDraft = draft
+                  if (savedCfg.botId) nextDraft = setPath(nextDraft, 'platforms.' + inst.instance + '.botId', savedCfg.botId)
+                  if (savedCfg.secretSet) nextDraft = setPath(nextDraft, 'platforms.' + inst.instance + '.secretSet', true)
                   setDraft(nextDraft)
                 }
                 reload()
@@ -10652,6 +10761,8 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       { id: 'feishu', label: '飞书', desc: '企业自建应用，默认 WebSocket，不需要公网回调；支持扫码一键创建或手动填写凭证' },
       { id: 'qqbot', label: 'QQ 官方机器人', desc: 'AppID + AppSecret，默认 WebSocket；支持手机 QQ 扫码创建/绑定或手动填写（与个人号 QQ 隔离）' },
       { id: 'wechat-clawbot', label: '微信 ClawBot', desc: '腾讯官方 iLink 长轮询，面板微信扫码即用（1:1 为主，不做群管）' },
+      { id: 'dingtalk', label: '钉钉', desc: 'DingTalk Stream 长连接，无需公网回调；支持手机钉钉扫码创建或手动填写 Client ID / Secret' },
+      { id: 'wecom', label: '企业微信智能机器人', desc: '企业微信官方 WebSocket 长连接，无需公网回调；支持企业微信扫码或手动填写 Bot ID / Secret（与个人微信隔离）' },
       { id: 'bridge', label: '通用接入端', desc: '外部程序按 HTTP 长轮询接入，自建平台/脚本用' },
     ]
 
@@ -11166,6 +11277,77 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
                       ...prev,
                       appId: savedCfg.appId,
                       clientSecret: '',
+                    }))
+                  }
+                  reload()
+                },
+              }),
+            ) : null,
+            mode === 'dingtalk' ? h(Fragment, null,
+              h('div', { className: 'ab-note', style: { marginBottom: 8 } },
+                '可使用「钉钉扫码创建机器人」获取凭证并启动 DingTalk Stream 长连接（不会自动认主）；也可直接在下方手动填写 Client ID / Client Secret。'),
+              h(DingtalkQrBox, {
+                instance: platformInst?.instance || 'dingtalk',
+                oapiBaseUrl: String(platformValues.oapiBaseUrl || ''),
+                hasToken: Boolean(
+                  pdata?.configs?.[platformInst?.instance || 'dingtalk']?.clientId
+                  && pdata?.configs?.[platformInst?.instance || 'dingtalk']?.clientSecretSet,
+                ),
+                toast,
+                onConfirmed: (r) => {
+                  setPdata(r)
+                  setPlatformValues((prev) => ({
+                    ...prev,
+                    ...(r.clientId ? { clientId: r.clientId } : {}),
+                    clientSecret: '',
+                  }))
+                  reload()
+                },
+                onError: (r) => {
+                  if (!r?.instances) return
+                  setPdata(r)
+                  const instName = platformInst?.instance || 'dingtalk'
+                  const savedCfg = r.configs?.[instName]
+                  if (savedCfg?.clientId) {
+                    setPlatformValues((prev) => ({
+                      ...prev,
+                      clientId: savedCfg.clientId,
+                      clientSecret: '',
+                    }))
+                  }
+                  reload()
+                },
+              }),
+            ) : null,
+            mode === 'wecom' ? h(Fragment, null,
+              h('div', { className: 'ab-note', style: { marginBottom: 8 } },
+                '可使用「企业微信扫码绑定机器人」获取凭证并连接企业微信官方 WebSocket（仅写入 wecom，与个人微信 wechat-clawbot 隔离，不会自动认主）；也可直接在下方手动填写 Bot ID / Secret。'),
+              h(WecomQrBox, {
+                instance: platformInst?.instance || 'wecom',
+                hasToken: Boolean(
+                  pdata?.configs?.[platformInst?.instance || 'wecom']?.botId
+                  && pdata?.configs?.[platformInst?.instance || 'wecom']?.secretSet,
+                ),
+                toast,
+                onConfirmed: (r) => {
+                  setPdata(r)
+                  setPlatformValues((prev) => ({
+                    ...prev,
+                    ...(r.botId ? { botId: r.botId } : {}),
+                    secret: '',
+                  }))
+                  reload()
+                },
+                onError: (r) => {
+                  if (!r?.instances) return
+                  setPdata(r)
+                  const instName = platformInst?.instance || 'wecom'
+                  const savedCfg = r.configs?.[instName]
+                  if (savedCfg?.botId) {
+                    setPlatformValues((prev) => ({
+                      ...prev,
+                      botId: savedCfg.botId,
+                      secret: '',
                     }))
                   }
                   reload()

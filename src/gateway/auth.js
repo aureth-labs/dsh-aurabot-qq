@@ -81,7 +81,7 @@ const TRANSIENT_AUTH_CONFIG_KEYS = new Set([
   'expires_at',
   'sessionId',
 ])
-const DRIVER_SESSION_SECRET_KEY_RE = /(?:device_?code|qr_?code|bind_?key|secret|token|password|passwd|cookie|private_?key|aes_?key|encrypt_?key|api_?key|credential|auth_?code|ticket)/i
+const DRIVER_SESSION_SECRET_KEY_RE = /(?:device_?code|qr_?code|s_?code|bind_?key|secret|token|password|passwd|cookie|private_?key|aes_?key|encrypt_?key|api_?key|credential|auth_?code|ticket)/i
 
 const DEFAULT_TTL_MS = 10 * 60_000
 const DEFAULT_POLL_INTERVAL_MS = 2000

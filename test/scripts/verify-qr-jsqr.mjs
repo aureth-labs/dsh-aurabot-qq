@@ -8,6 +8,7 @@ import { delimiter, dirname, join } from 'node:path'
 import { encodeQrMatrix, encodeQrSvgDataUri } from '../../src/core/qr.js'
 import { encodeFeishuAddons, FEISHU_QR_ADDONS } from '../../src/adapters/feishu/auth.js'
 import { buildQqbotConnectUrl } from '../../src/adapters/qqbot/auth.js'
+import { DINGTALK_REGISTRATION_BASE_URL } from '../../src/adapters/dingtalk/auth.js'
 
 function loadJsQr() {
   const localReq = createRequire(import.meta.url)
@@ -110,6 +111,14 @@ const vectors = [
   {
     label: 'QQBot-QR',
     text: buildQqbotConnectUrl('qqbot_bind_task_sample_123456', 'aurabot'),
+  },
+  {
+    label: 'DingTalk-QR',
+    text: `${DINGTALK_REGISTRATION_BASE_URL}/app/registration/verify?user_code=DT-1234-5678&device_code=sample_dingtalk_token`,
+  },
+  {
+    label: 'WeCom-QR',
+    text: 'https://work.weixin.qq.com/ai/qc/auth?scode=sample_wecom_scode_123456&source=deepseek-harness',
   },
 ]
 

@@ -218,7 +218,7 @@ export default {
           name: 'send_to_platform',
           description: '仅在主人明确要求时，把消息另发给主人自己已绑定的其他平台私聊（默认支持 ||| 多条气泡、<voice>…</voice> 语音、<sticker:名字> 表情、![图片](地址) 图片，传 rich:false 则按纯文本原样发送；仅正式共享私聊可用，试运行/调试模式不会真正发到其他平台）。当前聊天请直接回复。多个已绑定账号或连接无法确定时请先向主人确认。',
           properties: {
-            platform: str('目的平台，如 qq、飞书、微信 / wechat-clawbot、qqbot / QQ官方机器人、bridge'),
+            platform: str('目的平台，如 qq、飞书 / feishu、微信 / wechat-clawbot、qqbot / QQ官方机器人、钉钉 / dingtalk、企业微信 / wecom、bridge'),
             text: str('要发送的内容；默认支持 ||| 分多条、<voice>…</voice> 发语音、<sticker:名字> 发表情、![图片](地址或本地路径) 发图片'),
             instance: str('可选。指定平台的连接实例，例如 qq#2'),
             account: str('可选。主人在指定平台已绑定的账号'),

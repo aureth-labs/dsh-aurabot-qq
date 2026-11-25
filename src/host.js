@@ -28,6 +28,7 @@ import { createHub, workspaceDirOf } from './chat/hub.js'
 import { normalizeSelection } from './chat/chat-model.js'
 import { grantOwner, moveWorkspace, realWorkspace } from './core/workspace-move.js'
 import { createLocal, fileOf, toImageBuffer } from './local/local.js'
+import { findFfmpegForConfig } from './core/img.js'
 import { createGroupRoles } from './chat/group-roles.js'
 import { defaultModel, askModel, modelReasoning, modelVision, clearReasoningCache, clearVisionCache } from './core/llm.js'
 import { mimeOf } from './chat/inbound.js'
@@ -94,6 +95,8 @@ import { createQqAdapter } from './adapters/qq/index.js'
 import { createFeishuAdapter, createFeishuAuthDriver } from './adapters/feishu/index.js'
 import { createQqbotAdapter, createQqbotAuthDriver } from './adapters/qqbot/index.js'
 import { createWechatClawbotAdapter, createWechatClawbotAuthDriver } from './adapters/wechat-clawbot/index.js'
+import { createDingtalkAdapter, createDingtalkAuthDriver } from './adapters/dingtalk/index.js'
+import { createWecomAdapter, createWecomAuthDriver } from './adapters/wecom/index.js'
 import { createBridgeAdapter } from './adapters/bridge/index.js'
 import { ensureUpgradedStorage } from './features/import-qq.js'
 import { clearToolsCache, listTools, probeTool } from './core/tools.js'
@@ -1073,7 +1076,7 @@ export function apply(ctx, opts = {}) {
   let platformGateway = null
   const platformCandidates = new Map() // 私聊里最近发话的人：首次向导用它认主
   const defaultPlatform = parseChatId('private:0')?.platform || ''
-  const platformLabel = (platform) => ({ qq: 'QQ', feishu: '飞书', qqbot: 'QQ 官方机器人', 'wechat-clawbot': '微信 ClawBot', bridge: '通用桥' })[platform] || platform
+  const platformLabel = (platform) => ({ qq: 'QQ', feishu: '飞书', qqbot: 'QQ 官方机器人', 'wechat-clawbot': '微信 ClawBot', dingtalk: '钉钉', wecom: '企业微信', bridge: '通用桥' })[platform] || platform
   const gatewayPlatforms = () => {
     const platforms = cfg.platforms || {}
     const qq = platforms[defaultPlatform]
@@ -1610,21 +1613,34 @@ export function apply(ctx, opts = {}) {
       } catch (error) {
         logger.child('gateway').warn('注册平台回调兜底路由失败：', error?.message || error)
       }
+      const adapterLocalDirs = () => {
+        const c = getConfig()
+        return [
+          workspaceDirOf(c),
+          dataDir(),
+          ...(Array.isArray(c?.files?.dirs) ? c.files.dirs : []),
+        ].filter(Boolean)
+      }
       for (const [factory, id] of [
         [createQqAdapter, 'qq'],
         [createFeishuAdapter, 'feishu'],
         [createQqbotAdapter, 'qqbot'],
         [() => createWechatClawbotAdapter({
           ...(opts?.wechatClient ? { client: opts.wechatClient } : {}),
-          allowedLocalDirs: () => {
-            const c = getConfig()
-            return [
-              workspaceDirOf(c),
-              dataDir(),
-              ...(Array.isArray(c?.files?.dirs) ? c.files.dirs : []),
-            ].filter(Boolean)
-          },
+          allowedLocalDirs: adapterLocalDirs,
         }), 'wechat-clawbot'],
+        [() => createDingtalkAdapter({
+          ...(opts?.dingtalkFetch ? { getFetch: () => opts.dingtalkFetch } : {}),
+          ...(opts?.dingtalkWs ? { createWebSocket: opts.dingtalkWs } : {}),
+          getFfmpegPath: () => findFfmpegForConfig(getConfig()),
+          allowedLocalDirs: adapterLocalDirs,
+        }), 'dingtalk'],
+        [() => createWecomAdapter({
+          ...(opts?.wecomFetch ? { getFetch: () => opts.wecomFetch } : {}),
+          ...(opts?.wecomWs ? { createWebSocket: opts.wecomWs } : {}),
+          getFfmpegPath: () => findFfmpegForConfig(getConfig()),
+          allowedLocalDirs: adapterLocalDirs,
+        }), 'wecom'],
         [createBridgeAdapter, 'bridge'],
       ]) {
         try { platformGateway.register(() => factory()) } catch (error) { logger.child('gateway').warn(`注册平台端 ${id} 失败：`, error?.message || error) }
@@ -1796,6 +1812,12 @@ export function apply(ctx, opts = {}) {
   }))
   platformAuth.register(createQqbotAuthDriver({
     getFetch: () => opts?.qqbotAuthFetch,
+  }))
+  platformAuth.register(createDingtalkAuthDriver({
+    getFetch: () => opts?.dingtalkAuthFetch,
+  }))
+  platformAuth.register(createWecomAuthDriver({
+    getFetch: () => opts?.wecomAuthFetch,
   }))
   if (Array.isArray(opts?.authDrivers)) {
     for (const driver of opts.authDrivers) platformAuth.register(driver)

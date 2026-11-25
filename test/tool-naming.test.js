@@ -16,7 +16,7 @@ import { makeIdentity } from './gateway/helpers.js'
 
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const TOOL_NAME_RE = /^[a-z][a-z0-9_]*$/
-const PLATFORM_PREFIX_RE = /^(qq|feishu|qqbot)_/
+const PLATFORM_PREFIX_RE = /^(qq|feishu|qqbot|dingtalk|wecom)_/
 const noopLog = { debug() {}, info() {}, warn() {}, error() {}, child() { return this } }
 
 assert.ok(BUILTINS.some((m) => m.id === 'group-admin'), 'group-admin 应已加入 BUILTINS')
