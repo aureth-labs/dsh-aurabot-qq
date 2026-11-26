@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { readJson } from '../src/core/store.js'
+import { readJson, renameWithRetrySync } from '../src/core/store.js'
 
 const dir = mkdtempSync(join(tmpdir(), 'aurabot-readjson-'))
 const file = (name) => join(dir, name)
@@ -35,4 +35,54 @@ test('空文件：重试后回落，fallback 是函数时照常调用', () => {
 test('只写了一半的 JSON：重试后回落，不抛错', () => {
   writeFileSync(file('half.json'), '{"a": 1')
   assert.deepEqual(readJson(file('half.json'), null), null)
+})
+
+test('renameWithRetrySync：瞬时 EPERM / EBUSY 会重试直到成功', () => {
+  const sleeps = []
+  let calls = 0
+  const codes = ['EPERM', 'EBUSY']
+  renameWithRetrySync('a.tmp', 'a.json', {
+    retries: 5,
+    sleep: (ms) => sleeps.push(ms),
+    rename: () => {
+      calls++
+      if (calls <= codes.length) throw Object.assign(new Error('locked'), { code: codes[calls - 1] })
+    },
+  })
+  assert.equal(calls, 3)
+  assert.deepEqual(sleeps, [20, 40])
+})
+
+test('renameWithRetrySync：非瞬时错误不重试直接抛出', () => {
+  const sleeps = []
+  let calls = 0
+  assert.throws(() => {
+    renameWithRetrySync('a.tmp', 'a.json', {
+      retries: 5,
+      sleep: (ms) => sleeps.push(ms),
+      rename: () => {
+        calls++
+        throw Object.assign(new Error('missing'), { code: 'ENOENT' })
+      },
+    })
+  }, { code: 'ENOENT' })
+  assert.equal(calls, 1)
+  assert.deepEqual(sleeps, [])
+})
+
+test('renameWithRetrySync：超过重试上限后抛出原始错误', () => {
+  const sleeps = []
+  let calls = 0
+  assert.throws(() => {
+    renameWithRetrySync('a.tmp', 'a.json', {
+      retries: 2,
+      sleep: (ms) => sleeps.push(ms),
+      rename: () => {
+        calls++
+        throw Object.assign(new Error('locked'), { code: 'EPERM' })
+      },
+    })
+  }, { code: 'EPERM' })
+  assert.equal(calls, 3)
+  assert.deepEqual(sleeps, [20, 40])
 })

@@ -1,7 +1,7 @@
 // 数据目录、JSON 读写（UTF-8 无 BOM、先写临时文件再改名）。
 
 import { randomUUID } from 'node:crypto'
-import { closeSync, fsyncSync, openSync, readFileSync, writeFileSync, writeSync, mkdirSync, renameSync, existsSync } from 'node:fs'
+import { closeSync, fsyncSync, openSync, readFileSync, writeFileSync, writeSync, mkdirSync, renameSync, existsSync, unlinkSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 
@@ -47,11 +47,37 @@ export function readJson(file, fallback) {
   return typeof fallback === 'function' ? fallback() : fallback
 }
 
+const TRANSIENT_RENAME_CODES = new Set(['EPERM', 'EBUSY', 'EACCES'])
+
+/**
+ * Windows 上杀毒 / 索引 / 同步盘会在文件刚写完或被短暂读取时占用句柄，
+ * 导致 renameSync 瞬时抛 EPERM / EBUSY / EACCES；有限次短退避重试，正常路径零开销。
+ */
+export function renameWithRetrySync(tmp, file, { rename = renameSync, sleep = sleepSync, retries = 5 } = {}) {
+  let lastError
+  for (let i = 0; i <= retries; i++) {
+    try {
+      rename(tmp, file)
+      return
+    } catch (error) {
+      lastError = error
+      if (!TRANSIENT_RENAME_CODES.has(error?.code) || i >= retries) throw error
+      sleep(20 * (i + 1))
+    }
+  }
+  throw lastError
+}
+
 export function writeJson(file, value) {
   ensureDir(dirname(file))
-  const tmp = `${file}.tmp-${process.pid}`
+  const tmp = `${file}.tmp-${process.pid}-${randomUUID().slice(0, 8)}`
   writeFileSync(tmp, JSON.stringify(value, null, 2), 'utf8')
-  renameSync(tmp, file)
+  try {
+    renameWithRetrySync(tmp, file)
+  } catch (error) {
+    try { unlinkSync(tmp) } catch {}
+    throw error
+  }
 }
 
 /** 原子写入 JSON 并对临时文件执行 fsync，避免进程崩溃留下截断内容。 */
@@ -69,7 +95,12 @@ export function writeJsonAtomicFsync(filePath, data, { mode = 0o600 } = {}) {
   } finally {
     closeSync(fd)
   }
-  renameSync(tmp, filePath)
+  try {
+    renameWithRetrySync(tmp, filePath)
+  } catch (error) {
+    try { unlinkSync(tmp) } catch {}
+    throw error
+  }
 }
 
 export { existsSync }
