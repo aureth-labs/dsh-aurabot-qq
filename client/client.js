@@ -1428,9 +1428,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         const userOff = ms.length ? ms.every((m) => m.enabled === false) : false
         const absent = !ms.length || ms.every((m) => m.availability === 'unloaded')
         // 平台受限：模块声明了 platforms，但当前连接里没有它支持的平台
-        const plats = ms.flatMap((m) => m.platforms || [])
+        const plats = [...new Set(ms.flatMap((m) => m.platforms || []).map((p) => String(p).trim()).filter(Boolean))]
         const conns = ((boot && boot.connections) || []).map((c) => String(c.platform || '').toLowerCase())
-        const limited = plats.length > 0 && conns.length > 0 && !plats.some((p) => conns.includes(String(p).toLowerCase()))
+        const limited = plats.length > 0 && conns.length > 0 && !plats.some((p) => p === '*' || conns.includes(p.toLowerCase()))
         let kind = 'ok'
         let reason = ''
         if (absent) { kind = 'absent' }

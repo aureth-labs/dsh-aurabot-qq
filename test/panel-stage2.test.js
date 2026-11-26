@@ -351,6 +351,38 @@ test('Manage：平台受限（模块声明 platforms 但连接里没有）→ bl
   assert.match(text(card), /看日志排障/)
 })
 
+test('Manage：声明 platforms: ["*"] 的跨平台模块不被误判为平台受限', () => {
+  const p = loadPanel()
+  const boot = {
+    modules: [
+      mkMod('voice', { running: 'builtin', availability: 'ready', platforms: ['*'] }),
+      mkMod('stickers', { running: 'builtin', availability: 'ready', platforms: ['*'] }),
+      mkMod('imagegen', { running: 'builtin', availability: 'ready', platforms: ['*'] }),
+      mkMod('bili', { running: 'builtin', availability: 'ready', platforms: ['*'] }),
+      mkMod('purpose', { running: 'builtin', availability: 'ready', platforms: ['*'] }),
+    ],
+    connections: [{ platform: 'qq' }, { platform: 'feishu' }],
+  }
+  const st = {
+    modules: [],
+    config: {
+      voice: { enabled: true },
+      stickers: { enabled: true },
+      imageGen: { enabled: true },
+      ext: { purpose: { enabled: true } },
+    },
+  }
+  const { tree } = p.render('Manage', { st, boot, draft: { modules: {} }, toast() {}, go() {}, reload() {} })
+  for (const snippet of ['让她用语音条说话', '会挑合适的表情', '按描述画图发给你', '逛 B站 / 抖音 / 小黑盒', '像人一样主动找你说话']) {
+    const card = featureCard(tree, snippet)
+    assert.ok(card, `卡片应渲染：${snippet}`)
+    const cardText = text(card)
+    assert.match(cardText, /可用/)
+    assert.match(cardText, /去设置/)
+    assert.doesNotMatch(cardText, /受限|需要 \*/)
+  }
+})
+
 test('Manage：开关走 /save 保存 modules.enabled；失败就地 toast，不刷新；草稿设置要带上', async () => {
   const p = loadPanel()
   const toasts = []
