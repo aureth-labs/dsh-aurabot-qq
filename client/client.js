@@ -7516,9 +7516,20 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       }
       const num = n => n.toLocaleString('zh-CN')
       function label(c) {
-        const id = c.id.replace(/^(?:group|private):/, ''), name = c.name
-        if (name === c.id || name === id) return (c.id.startsWith('group:') ? '群 ' : c.id.startsWith('private:') ? '私聊 ' : '') + id
-        return h(Fragment, null, name, !name.endsWith(id) && h('small', { className: 'ab-muted' }, ' · ' + id))
+        if (c.scope && Array.isArray(c.sources) && c.sources.length) {
+          const plats = [...new Set(c.sources.map((src) => {
+            const m = String(src || '').match(/^([a-z][a-z0-9-]*)(?:#[a-z0-9_-]+)?:/)
+            return m ? platformLabel(m[1]) : ''
+          }).filter(Boolean))]
+          return h(Fragment, null, c.name || '主人 · 多平台私聊', plats.length ? h('small', { className: 'ab-muted' }, ' · ' + plats.join(' / ')) : null)
+        }
+        const m = String(c.id || '').match(/^(?:([a-z][a-z0-9-]*)(?:#[a-z0-9_-]+)?:)?(group|private):(.+)$/)
+        const plat = m?.[1] ? platformLabel(m[1]) : ''
+        const kind = m?.[2] || '', rawId = m?.[3] || c.id
+        const id = plat && plat !== 'QQ' ? `${plat} ${rawId}` : rawId
+        const name = c.name
+        if (!name || name === c.id || name === rawId || name === id) return (kind === 'group' ? '群 ' : kind === 'private' ? '私聊 ' : '') + id
+        return h(Fragment, null, name, !name.endsWith(rawId) && h('small', { className: 'ab-muted' }, ' · ' + id))
       }
       return h('section', { 'aria-label': '整理进度', style: { margin: '12px 0' } },
         h('div', { className: 'ab-flex' }, h('strong', null, '整理进度'), h('div', { className: 'ab-spacer' }),
@@ -7530,7 +7541,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h('span', { className: 'ab-muted ab-small' }, ' · 今日已用 ' + num(data.used) + ' / ' + num(data.limit) + ' 批'),
           data.total > 0 && h('progress', { max: data.total, value: data.total - data.pending, 'aria-label': '纳入整理的流水已处理比例', style: { width: '100%', display: 'block', margin: '6px 0' } }),
           h('div', { className: 'ab-small ab-muted' }, '纳入整理的流水已处理 ' + num(data.total - data.pending) + ' / ' + num(data.total) + ' 行' + (data.outOfScope ? ' · 不纳入整理 ' + num(data.outOfScope) + ' 行' : '') + (data.oldest ? ' · 最早待整理 ' + data.oldest : '') + ' · ' + new Date(data.at).toLocaleTimeString() + ' 更新'),
-          (all ? data.chats : data.chats.slice(0, 5)).map(c => h('div', { key: c.id, style: { display: 'flex', gap: 8, justifyContent: 'space-between', marginTop: 7 } },
+          (all ? data.chats : data.chats.slice(0, 5)).map(c => h('div', { key: c.scope || c.id, style: { display: 'flex', gap: 8, justifyContent: 'space-between', marginTop: 7 } },
             h('span', { style: { minWidth: 0, overflowWrap: 'anywhere' } }, label(c)),
             h('b', { style: { whiteSpace: 'nowrap' } }, num(c.pending) + ' 行'))),
           data.chats.length > 5 && h(Btn, { small: true, onClick: () => setAll(!all) }, all ? '收起会话' : '查看全部 ' + data.chats.length + ' 个会话')))

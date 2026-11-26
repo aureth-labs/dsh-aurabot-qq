@@ -1,5 +1,7 @@
 // 记忆的纯规则；配置、业务和面板派生值共用，不包含存储。
 // 旧 1/2/3/0 的含义保留，补档使用新编号，读取老库无需改写时间或迁移。
+import { parseChatId } from '../gateway/address.js'
+
 export const FACT_TIERS = [
   { id: 4, label: '短暂', days: 1 },
   { id: 1, label: '琐碎', days: 7 },
@@ -27,5 +29,6 @@ export function strongerTier(previous, next, configured = {}) {
 export function memoryPlatforms(item) {
   const via = Array.isArray(item.via) ? item.via : item.via ? [item.via] : []
   const platforms = [...new Set([item.meta?.platform, ...via].filter((v) => typeof v === 'string' && v.trim()).map((v) => v.trim()))]
-  return platforms.length ? platforms : /^(private|group):/.test(String(item.chatId || '')) ? ['qq'] : ['unknown']
+  const plat = parseChatId(String(item.chatId || ''))?.platform
+  return platforms.length ? platforms : (plat ? [plat] : ['unknown'])
 }

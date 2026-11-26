@@ -671,6 +671,7 @@ export default {
       return { ok: true, message: '相处经验已保存' }
     })
     api.route('/memory/backlog', async () => ({ ok: true, ...await memory.backlog() }))
+    api.route('/memory/audit-shared', async () => ({ ok: true, ...(await memory.auditShared()) }))
     api.route('/memory/extract', async (req) => {
       const b = await http.body(req)
       // 立即整理一次：连今天的也提炼（今天的聊天流水不删，写日记还要用）
