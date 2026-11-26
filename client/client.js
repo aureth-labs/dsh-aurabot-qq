@@ -10534,9 +10534,40 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       )
     }
 
+    function ReplyDraftStatus({ sessionId, turn }) {
+      const start = turn?.start?.seq, end = turn?.end?.seq
+      const [result, setResult] = useState(null)
+      const identity = JSON.stringify([sessionId, start, end])
+      useEffect(() => {
+        let alive = true
+        setResult(null)
+        if (!sessionId || start == null || end == null) return
+        get('/reply-status?sessionId=' + encodeURIComponent(sessionId) + '&startSeq=' + start + '&endSeq=' + end)
+          .then(r => { if (alive && r.ok && r.status) setResult({ identity, value: r.status }) })
+        return () => { alive = false }
+      }, [identity])
+      if (result?.identity !== identity) return null
+      const status = result.value
+      const reasons = {
+        edited: '已采用精简后的回复', 'below-threshold': '篇幅较短，无需精简',
+        timeout: '精简等待超时，保留原稿', cancelled: '精简被取消，保留原稿',
+        'editor-failed': '精简服务出错，保留原稿', incomplete: '未取得完整精简结果',
+        'not-shorter': '精简结果没有更短', empty: '精简结果为空', 'empty-delivery': '精简结果没有可发送内容',
+        'voice-lost': '精简结果未保留语音', 'media-changed': '精简结果改变了附件',
+        'reply-target-changed': '精简结果改变了引用对象', 'mention-target-changed': '精简结果改变了提醒对象',
+        'no-model': '没有可用的精简模型', 'not-edited': '本条未经过精简', 'not-applied': '精简结果未用于本条回复',
+      }
+      return h('details', { className: 'ab-reply-status', style: { marginTop: 6, fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' } },
+        h('summary', { style: { cursor: 'pointer' } }, status.state === 'edited' ? '精简稿' : '原稿'),
+        h('div', { style: { marginTop: 4 } }, reasons[status.reason] || '本条保留原稿', ' · ',
+          status.before === status.after ? status.after + ' 字符' : status.before + ' → ' + status.after + ' 字符',
+          Number.isFinite(status.elapsedMs) ? ' · ' + (status.elapsedMs / 1000).toFixed(1) + ' 秒' : ''))
+    }
+
     function apply(ctx) {
       const slots = ctx.get('slots')
       if (slots === undefined) return
+      slots.inject('conversation.chat.turnTail', () => slots.register({ name: 'conversation.chat.turnTail', id: 'aurabot-reply-status', order: 11, select: props => props }, ReplyDraftStatus))
       // 写法同 DSH 自带的「自动化任务」（order 10）和「插件」（order 0）：排在它们后面
       slots.inject('main', () => slots.register({ name: 'main', key: PANEL_ID }, AurabotPage))
       slots.inject('sidebar.panellist', () => slots.register({ name: 'sidebar.panellist', id: PANEL_ID, order: 20, label: () => 'Aurabot' }, WhaleIcon))

@@ -452,4 +452,22 @@ return function Panel({ settings, save, toast }) {
 - **安全模式**：「已安装」页打开后，你写的模块一个都不加载，内置的全部恢复。用来判断「是我的模块的问题还是插件的问题」
 - 不会写？在「已安装」页点「复制给 DSH 的话」，粘给 DSH，写上你想要什么，它会读这份说明帮你写
 
-原话档案通过 `conversationContext.enabled` 显式开启，默认关闭。`prompt` 的 `recentMessages` 是当前输入之前的同一人物/聊天记录；关闭时为空。具体保留范围、微信历史资料接入和模块权限边界见 [对话上下文说明](../../docs/MEMORY-CONTEXT.md)。
+## 在 DSH 回复下显示稿件状态
+
+改写回复的模块可以用 `reply/status` 事件标记本条采用了原稿还是精简稿。标识只显示在 DSH 回复下方；不写入正文、不发送到 QQ，也不加入后续模型上下文。
+
+在最终内容确定后、DSH 保存该条 `assistant/message` 前报告：
+
+```js
+api.emit('reply/status', {
+  sessionId,                   // 当前 DSH 会话
+  userMessageId,               // 本轮实际消费的 Aurabot 来话 ID
+  state: 'edited',             // edited：精简稿；original：原稿
+  reason: 'edited',            // 原稿可用 timeout、cancelled、below-threshold 等原因
+  text: finalText,             // 用于与实际保存的回复核对，不会存进状态文件
+  before: originalText.length,
+  elapsedMs: Date.now() - startedAt,
+})
+```
+
+只有会话、来话 ID 和实际回复正文都对得上，才采用这份标识。未报告编辑结果的新回复显示“原稿”；没有记录的历史回复不推测状态。每个会话保留最近 2000 条标识，重启后仍可查看。

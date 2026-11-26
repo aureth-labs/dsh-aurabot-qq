@@ -21,6 +21,7 @@ import { loadConfig, saveConfig, commitConfig, configRevision, publicConfig, mer
 import { quietWindowOf } from './core/time-window.js'
 import { createLogger } from './core/logger.js'
 import { encodeResponse } from './core/http-compress.js'
+import { createReplyStatus } from './core/reply-status.js'
 import { registerSecret, redact } from './core/redact.js'
 import { createOneBotClient } from './onebot/client.js'
 import { createOutbox } from './onebot/outbox.js'
@@ -834,6 +835,13 @@ export function apply(ctx) {
     getConfig,
   }
   mods = createModules({ ctx, core, getConfig, setConfig, logger, version: VERSION, builtins: BUILTINS, personaMemoryRuntime })
+  const replyStatus = createReplyStatus({ chatOfSession: id => hub.chatOfSession(id), log })
+  mods.listen('reply/status', value => replyStatus.report(value))
+  ctx.effect(() => () => replyStatus.dispose(), 'aurabot: 回复稿件标识')
+  route('/reply-status', async req => {
+    const q = query(req)
+    return { ok: true, status: await replyStatus.read(q.sessionId, q.startSeq, q.endSeq) }
+  })
   bridge = createBridge({ ctx, getConfig, setConfig, hub, mods, log: logger.child('bridge'), version: VERSION, apiVersion: API_VERSION, overview: () => overview() })
   core.bridge = bridge
   core.modules = mods
@@ -1224,6 +1232,7 @@ export function apply(ctx) {
   // ---------- 盯会话：一轮结束就发回 QQ ----------
   ctx.effect(() => {
     const off = ctx.on('session/event', (session, event) => {
+      try { replyStatus.onEvent(session, event) } catch {}
       try {
         hub.onSessionEvent(session, event)
       } catch (error) {
