@@ -67,3 +67,29 @@ test('候选不足两条不发请求', async () => {
   assert.equal(one.length, 1)
   assert.equal(called, 0)
 })
+
+test('重排接口失败后退避：下一条消息不再等满超时，直接用原顺序', async () => {
+  const cfg = normalize({ memory: { vector: { baseUrl: 'https://api.siliconflow.cn/v1', apiKey: 'sk-v' }, rerank: { enabled: true } } })
+  let calls = 0
+  const fetchImpl = async () => { calls++; throw new Error('timeout') }
+  const r = createReranker({ getConfig: () => cfg, log, fetchImpl })
+  await assert.rejects(r.rank('主人喜欢吃什么', hits()))
+  assert.equal(calls, 1)
+  const again = await r.rank('主人喜欢吃什么', hits())
+  assert.equal(calls, 1, '退避期间不再请求')
+  assert.deepEqual(again.map((h) => h.it.id), ['a', 'b', 'c'])
+  assert.equal(r.backoff().failures, 1)
+  assert.ok(r.backoff().skipUntil > Date.now())
+})
+
+test('检索排序、手动测试各记一次服务上报的数值', async () => {
+  const {mkdtempSync,rmSync}=await import('node:fs'),{tmpdir}=await import('node:os'),{join}=await import('node:path')
+  const u=await import('../src/core/usage.js'); const dir=mkdtempSync(join(tmpdir(),'rerank-usage-'))
+  const old=process.env.AURABOT_DATA_DIR; process.env.AURABOT_DATA_DIR=dir; u.initUsage()
+  try {
+    const cfg=normalize({memory:{rerank:{enabled:true,baseUrl:'https://example.test/v1',model:'rank'}}})
+    const service=createReranker({getConfig:()=>cfg,log,fetchImpl:async()=>({ok:true,text:async()=>JSON.stringify({usage:{total_tokens:11},results:[{index:0,relevance_score:1},{index:1,relevance_score:0.5}]})})})
+    await service.rank('q',hits()); await service.test('q')
+    const [row]=u.usageReport({range:'all'}).current.byMemoryTask; assert.equal(row.key,'记忆检索排序'); assert.equal(row.runs,2); assert.equal(row.totalTokens,22)
+  } finally {u.closeUsage(); if(old===undefined) delete process.env.AURABOT_DATA_DIR; else process.env.AURABOT_DATA_DIR=old; rmSync(dir,{recursive:true,force:true})}
+})

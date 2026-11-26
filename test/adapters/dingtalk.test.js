@@ -869,7 +869,7 @@ test('dingtalk Stream 心跳保活：控制帧 ping/pong 重置 idle 看门狗�
     assert.equal(ctx.states.some(([s]) => s === 'disconnected'), false)
 
     respondPong = false
-    await delay(170)
+    for (let tries = 0; tries < 40 && sockets.length < 2; tries++) await delay(25)
     assert.ok(sockets.length >= 2, '停止响应 pong 的死连接仍应被 idle 看门狗重连')
     assert.ok(ctx.states.some(([s]) => s === 'disconnected'))
     await adapter.stop()

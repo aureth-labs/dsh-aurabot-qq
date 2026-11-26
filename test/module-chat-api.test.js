@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { createFakeDsh } from './helpers/fake-dsh.js'
 import { normalize } from '../src/core/config.js'
 import { createHub } from '../src/chat/hub.js'
+import { confirmedChatDelivery } from '../src/chat/receipts.js'
 import { buildWav } from '../src/voice/wav.js'
 import { makeTestIdentity } from './helpers/identity.js'
 
@@ -20,22 +21,33 @@ function setup(t, options = {}) {
   const cfg = normalize({ enabled: true, dryRun: false, setupDone: true, ownerQQ: OWNER, botQQ: '20002',
     allow: { private: ['10002'], groups: ['555'] }, voice: { enabled: false },
     stickers: { enabled: false }, conversationContext: { enabled: true }, model: { vision: 'on' }, merge: { enabled: false } })
-  const fake = createFakeDsh({ brain: async () => '' }), rows = [], calls = [], memory = [], activity = []
+  const fake = createFakeDsh({ brain: async () => '' }), rows = [], calls = [], memory = [], activity = [], deliveries = []
   const identity = makeTestIdentity(OWNER, 'qq')
   let muted = false
   const hub = createHub({ dsh: fake.ctx, getConfig: () => cfg,
     log: { info() {}, warn() {}, debug() {}, error() {} },
     identity, routeOwner: identity.routeOwner, defaultPlatform: 'qq',
-    onebot: { connected: true, async call(action, params) { calls.push({ action, params }); return { message_id: calls.length } } },
+    onebot: { connected: true, async call(action, params) {
+      calls.push({ action, params })
+      return options.onebotCall ? options.onebotCall(action, params) : { message_id: calls.length }
+    } },
     onMemoryCommand: (chat, text) => memory.push({ chat, text }), onActivity: (a) => activity.push(a),
-    isMuted: () => muted, hooks: { journal: (row) => rows.push(row), ...options.hooks } })
+    isMuted: () => muted, hooks: {
+      journal: (row) => rows.push(row),
+      deliveryScope: (chatId, personaId, botQQ) => ({ chatId, personaId, botQQ }),
+      delivery: (chatId, messageId, scope) => {
+        const receipt = confirmedChatDelivery(chatId, messageId, scope.botQQ)
+        if (receipt) deliveries.push(receipt)
+      },
+      ...options.hooks,
+    } })
   const off = fake.ctx.on('session/event', hub.onSessionEvent)
   t.after(() => {
     hub.dispose(); off(); fake.dispose()
     for (const [key, value] of [['AURABOT_DATA_DIR', before.data], ['AURABOT_WORKSPACE', before.workspace]]) { if (value === undefined) delete process.env[key]; else process.env[key] = value }
     rmSync(dir, { recursive: true, force: true })
   })
-  return { hub, cfg, fake, identity, rows, calls, memory, activity, mute: (value) => { muted = value } }
+  return { hub, cfg, fake, identity, rows, calls, memory, activity, deliveries, mute: (value) => { muted = value } }
 }
 
 test('流水通知与落盘同源：来源端标记不落盘，监听失败不影响写入，调试不通知', async (t) => {
@@ -89,6 +101,55 @@ test('外部主人输入复用已有会话、原话档案、即时记忆和来�
   await assert.rejects(s.hub.receiveOwnerMessage(CHAT, { text: '不绕暂停' }), { status: 403 })
   s.mute(false); s.cfg.enabled = false
   await assert.rejects(s.hub.receiveOwnerMessage(CHAT, { text: '不绕总开关' }), { status: 503 })
+})
+
+test('已确认的 OneBot 送达使用稳定来源 ID，模拟或失败不会产生回执', async (t) => {
+  let failed = false, current = true
+  const s = setup(t, { onebotCall: async () => {
+    if (failed) throw new Error('fixture transport failed')
+    return { message_id: -123 }
+  } })
+  const message = [{ type: 'text', data: { text: '送达测试' } }]
+  await s.hub.sendSegments(CHAT, message, '测试')
+  await s.hub.sendSegments(CHAT, message, '测试')
+  assert.equal(s.deliveries.length, 2)
+  const first = s.deliveries[0]
+  assert.equal(first.status, 'confirmed')
+  assert.equal(first.messageId, '-123')
+  assert.equal(first.chatId, CHAT)
+  assert.equal(first.platform, 'qq')
+  assert.equal(s.deliveries[1].originId, first.originId)
+  assert.ok(Object.isFrozen(first))
+  assert.equal('text' in first, false)
+  const captured = await s.hub.capture(() => s.hub.sendSegments(CHAT, message, '模拟'), { simulate: true })
+  assert.equal(captured.sent.closed, true, '模拟结束后捕获上下文必须作废')
+  s.cfg.dryRun = true
+  await s.hub.sendSegments(CHAT, message, '不发送')
+  s.cfg.dryRun = false
+  await s.hub.sendSegments(CHAT, message, '敏感', { sensitive: true })
+  failed = true
+  await s.hub.sendSegments(CHAT, message, '失败', { quiet: true })
+  failed = false
+  await s.hub.sendSegments(CHAT, message, '迟到', { isCurrent: () => {
+    const before = current
+    current = false
+    return before
+  } })
+  assert.equal(s.deliveries.length, 2)
+})
+
+test('QQ 入站流水通知提供来源 ID，原生日志保留原字段', async (t) => {
+  const s = setup(t)
+  await s.hub.onMessage({
+    post_type: 'message', message_type: 'private', sub_type: 'friend',
+    self_id: 20002, user_id: Number(OWNER), message_id: 9988,
+    sender: { user_id: Number(OWNER), nickname: '主人' },
+    message: [{ type: 'text', data: { text: '入站来源测试' } }],
+  })
+  const row = s.rows.find((entry) => entry.text === '入站来源测试')
+  assert.equal(row.originId, JSON.stringify(['in', CHAT, '20002', '9988']))
+  const logged = s.hub.chatLogOf(s.hub.chatLogDays()[0]).find((entry) => entry.text === row.text)
+  assert.equal('originId' in logged, false)
 })
 
 test('外部 WAV 直接走既有 DSH 识别，不调用 QQ 音频接口；撤销期间不写迟到流水或提交模型', async (t) => {

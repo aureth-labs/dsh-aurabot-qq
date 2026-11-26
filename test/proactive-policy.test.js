@@ -1,5 +1,6 @@
 // 出站策略源（proactive-policy）单测：
-//   purpose / speakup 两个策略源的 reserve→commit/release 口径、共享预算竞争、重启恢复。
+//   purpose 策略源的 reserve→commit/release 口径、共享预算竞争、重启恢复。
+//   P5（speakup → purpose 迁移）：speakup 策略源已删除，相关用例随之移除。
 // 全部走 dataDir 临时目录 + 冻结时钟，不打网络、不发消息。
 import { test, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
@@ -9,7 +10,6 @@ import { join } from 'node:path'
 
 import {
   createPurposePolicy,
-  createSpeakupPolicy,
   createSharedBudget,
   resetSharedBudgets,
 } from '../src/features/proactive-policy.js'
@@ -52,25 +52,6 @@ function purposePolicy({ cfg = baseCfg(), dir = freshDir(), clock, state, engine
     now: () => t,
     dataDir: dir,
     log: { warn() {}, info() {} },
-    identity: id,
-    owner: OWNER,
-    defaultPlatform: 'qq',
-    budget,
-  })
-  return { policy, cfg, dir, at: () => t, advance: (ms) => { t += ms } }
-}
-
-function speakupPolicy({ cfg = baseCfg(), dir = freshDir(), clock, speakup, lastPrivateAt, isMuted, budget } = {}) {
-  let t = clock ?? NOON
-  const id = makeTestIdentity(OWNER, 'qq', { personId: OWNER })
-  const policy = createSpeakupPolicy({
-    getConfig: () => cfg,
-    speakup,
-    now: () => t,
-    dataDir: dir,
-    log: { warn() {}, info() {} },
-    lastPrivateAt,
-    isMuted,
     identity: id,
     owner: OWNER,
     defaultPlatform: 'qq',
@@ -181,91 +162,9 @@ test('purpose: 生成尝试额度（沉默/失败也计入）与逻辑发言额�
   assert.equal(snapF.budget.used, 0)
 })
 
-// ---------------- 3. speakup：reserve 判定复刻 tick ----------------
+// ---------------- 3. 共享预算竞争（P5：speakup 源已删，改用两个 purpose 实例验证共享语义） ----------------
 
-test('speakup: reserve 判定复刻 awake && idleOk && count < maxPerDay && now >= nextAt', () => {
-  // 未启用 → quiet
-  const off = speakupPolicy({ cfg: { ...baseCfg(), speakUp: { ...baseCfg().speakUp, enabled: false } } })
-  assert.deepEqual(
-    (({ ok, reason, detail }) => ({ ok, reason, detail }))(off.policy.reserve({ at: NOON })),
-    { ok: false, reason: 'quiet', detail: 'disabled' },
-  )
-  resetSharedBudgets()
-
-  // 被禁言 → quiet
-  const muted = speakupPolicy({ isMuted: () => true })
-  assert.equal(muted.policy.reserve({ at: NOON }).reason, 'quiet')
-  assert.equal(muted.policy.reserve({ at: NOON }).detail, 'muted')
-  resetSharedBudgets()
-
-  // 睡着（3 点，清醒窗口 8~23）→ quiet / asleep
-  const nightCfg = {
-    ...baseCfg(),
-    speakUp: { ...baseCfg().speakUp, awakeFrom: 8, awakeTo: 23 },
-  }
-  const night = speakupPolicy({ cfg: nightCfg, clock: NIGHT })
-  const nightRes = night.policy.reserve({ at: NIGHT })
-  assert.equal(nightRes.ok, false)
-  assert.equal(nightRes.reason, 'quiet')
-  assert.equal(nightRes.detail, 'asleep')
-  resetSharedBudgets()
-
-  // 超过每日上限 → budget
-  const dirCount = freshDir()
-  mkdirSync(dirCount, { recursive: true })
-  writeFileSync(
-    join(dirCount, 'speakup-policy.json'),
-    JSON.stringify({ version: 1, day: '2026-01-15', count: 3, nextAt: 0, last: 0 }),
-  )
-  const atCapCfg = { ...baseCfg(), speakUp: { ...baseCfg().speakUp, maxPerDay: 3 } }
-  const atCap = speakupPolicy({ cfg: atCapCfg, dir: dirCount })
-  const capRes = atCap.policy.reserve({ at: NOON })
-  assert.equal(capRes.ok, false)
-  assert.equal(capRes.reason, 'budget')
-  assert.equal(capRes.detail, 'daily-max')
-  resetSharedBudgets()
-
-  // 间隔没到（nextAt 在未来）→ cooldown
-  const dirNext = freshDir()
-  writeFileSync(
-    join(dirNext, 'speakup-policy.json'),
-    JSON.stringify({ version: 1, day: '2026-01-15', count: 0, nextAt: NOON + 10 * MIN, last: 0 }),
-  )
-  const waiting = speakupPolicy({ dir: dirNext })
-  const waitRes = waiting.policy.reserve({ at: NOON })
-  assert.equal(waitRes.ok, false)
-  assert.equal(waitRes.reason, 'cooldown')
-  assert.equal(waitRes.detail, 'interval')
-  assert.equal(waitRes.nextAt, NOON + 10 * MIN)
-  resetSharedBudgets()
-
-  // 主人刚说完话（idle 不足）→ cooldown
-  const idleCfg = { ...baseCfg(), speakUp: { ...baseCfg().speakUp, idleMinutes: 40 } }
-  const active = speakupPolicy({ cfg: idleCfg, lastPrivateAt: () => NOON - 5 * MIN })
-  const idleRes = active.policy.reserve({ at: NOON })
-  assert.equal(idleRes.ok, false)
-  assert.equal(idleRes.reason, 'cooldown')
-  assert.equal(idleRes.detail, 'owner-active')
-  resetSharedBudgets()
-
-  // 四项都满足 → ok（且 reserve 不扣次数、不改 nextAt）
-  const readyCfg = { ...baseCfg(), speakUp: { ...baseCfg().speakUp, idleMinutes: 40, maxPerDay: 3 } }
-  const okCase = speakupPolicy({ cfg: readyCfg, lastPrivateAt: () => NOON - 120 * MIN })
-  const okRes = okCase.policy.reserve({ at: NOON })
-  assert.equal(okRes.ok, true, JSON.stringify(okRes))
-  const snap = okCase.policy.snapshot()
-  assert.equal(snap.count, 0, 'reserve 不占次数')
-  assert.equal(snap.nextAt, 0, 'reserve 不改 nextAt')
-  // commit 成功才 count++ 并重排 nextAt
-  const committed = okCase.policy.commit(okRes.reserveId, { outcome: 'sent' })
-  assert.equal(committed.ok, true)
-  assert.equal(committed.count, 1)
-  assert.ok(committed.nextAt >= NOON + 5 * MIN, 'commit 后重排 nextAt')
-})
-
-// ---------------- 4. 两策略源抢共享预算最后一个额度 ----------------
-
-test('共享预算: 两个策略源抢最后一个额度，只有一个 ok', () => {
+test('共享预算: 同 owner 同 dataDir 的两个实例抢最后一个额度，只有一个 ok', () => {
   const dir = freshDir()
   const cfg = {
     ...baseCfg(),
@@ -276,7 +175,7 @@ test('共享预算: 两个策略源抢最后一个额度，只有一个 ok', () 
     },
   }
   const p = purposePolicy({ cfg, dir })
-  const s = speakupPolicy({ cfg, dir, lastPrivateAt: () => NOON - 120 * MIN })
+  const s = purposePolicy({ cfg, dir })
 
   // 同一 ownerQQ + 同一 dataDir → 拿到同一份共享域
   assert.equal(p.policy.budget, s.policy.budget)
@@ -308,7 +207,7 @@ test('共享预算: 没给 dataDir 时退化为内存，不碰磁盘、且同 ow
   assert.equal(b1, b2)
   assert.equal(b1.snapshot().file, '')
   assert.equal(b1.tryAcquire({ reserveId: 'x', source: 'purpose', at: NOON }).ok, true)
-  const second = b1.tryAcquire({ reserveId: 'y', source: 'speakup', at: NOON })
+  const second = b1.tryAcquire({ reserveId: 'y', source: 'purpose-2', at: NOON })
   assert.equal(second.ok, false)
   assert.equal(second.reason, 'busy', '额度未设上限时并发仍只允许一个在途')
   assert.equal(b1.settle('x', { refund: false, at: NOON }).ok, true)
@@ -369,19 +268,11 @@ test('重复 commit / release → {ok:false, reason:"settled"}，不抛错', () 
   assert.equal(policy.reasonText('settled'), '这次预占已经结算过了')
 })
 
-test('speakup: 重复结算同样 settled，且 count 只加一次', () => {
-  const { policy } = speakupPolicy({ lastPrivateAt: () => NOON - 120 * MIN })
-  const r = policy.reserve({ at: NOON })
-  assert.equal(r.ok, true, JSON.stringify(r))
-  assert.equal(policy.commit(r.reserveId, { outcome: 'sent' }).ok, true)
-  assert.equal(policy.commit(r.reserveId, { outcome: 'sent' }).reason, 'settled')
-  assert.equal(policy.release(r.reserveId, {}).reason, 'settled')
-  assert.equal(policy.snapshot().count, 1)
-})
+// P5：speakup 重复结算用例随源删除；purpose 口径见上一用例。
 
 // ---------------- 7. uncertain 不退款 ----------------
 
-test('uncertain 不退款（purpose 与 speakup 口径一致）', () => {
+test('uncertain 不退款', () => {
   const p = purposePolicy({ cfg: baseCfg() })
   const pr = p.policy.reserve({ at: NOON })
   assert.equal(pr.ok, true, JSON.stringify(pr))
@@ -391,16 +282,6 @@ test('uncertain 不退款（purpose 与 speakup 口径一致）', () => {
   const pSnap = p.policy.snapshot()
   assert.equal(pSnap.speechCount, 1)
   assert.equal(pSnap.budget.used, 1)
-
-  resetSharedBudgets()
-  const s = speakupPolicy({ lastPrivateAt: () => NOON - 120 * MIN })
-  const sr = s.policy.reserve({ at: NOON })
-  assert.equal(sr.ok, true, JSON.stringify(sr))
-  const sc = s.policy.commit(sr.reserveId, { outcome: 'uncertain' })
-  assert.equal(sc.ok, true)
-  assert.equal(s.policy.snapshot().count, 1, 'uncertain 也占一次')
-  assert.equal(s.policy.snapshot().budget.used, 1)
-  resetSharedBudgets()
 })
 
 // ---------------- 8. 重启恢复 ----------------
@@ -443,21 +324,6 @@ test('重启恢复: 新实例读回持久状态后逻辑发言额度不被重复
   const aRes = a2.policy.reserve({ at: NOON + 60 * MIN })
   assert.equal(aRes.ok, false)
   assert.equal(aRes.detail, 'attempt-budget')
-
-  // speakup 次数同样跨重启保留
-  resetSharedBudgets()
-  const dir3 = freshDir()
-  const speakCfg = { ...baseCfg(), speakUp: { ...baseCfg().speakUp, idleMinutes: 0, maxPerDay: 1 } }
-  const s1 = speakupPolicy({ cfg: speakCfg, dir: dir3, lastPrivateAt: () => NOON - 120 * MIN })
-  const sr = s1.policy.reserve({ at: NOON })
-  assert.equal(sr.ok, true, JSON.stringify(sr))
-  s1.policy.commit(sr.reserveId, { outcome: 'sent' })
-  resetSharedBudgets()
-  const s2 = speakupPolicy({ cfg: speakCfg, dir: dir3, clock: NOON + 60 * MIN, lastPrivateAt: () => NOON - 120 * MIN })
-  assert.equal(s2.policy.snapshot().count, 1)
-  const sRes = s2.policy.reserve({ at: NOON + 60 * MIN })
-  assert.equal(sRes.ok, false)
-  assert.equal(sRes.detail, 'daily-max')
   resetSharedBudgets()
 })
 
@@ -544,9 +410,10 @@ test('四态与 reasonText: configured / running / ready / error', () => {
   assert.match(broken.policy.reasonText('error'), /错误/)
   resetSharedBudgets()
 
-  const ok = speakupPolicy({ lastPrivateAt: () => NOON - 120 * MIN })
+  // 四态 running/ready 循环（P5：speakup 侧已删，purpose 侧覆盖同一口径）
+  const ok = purposePolicy({ cfg: baseCfg() })
   assert.equal(ok.policy.state(), 'ready')
-  const r = ok.policy.reserve({ at: NOON })
+  const r = ok.policy.reserve({ to: `private:${OWNER}`, at: NOON })
   assert.equal(ok.policy.state(), 'running')
   ok.policy.release(r.reserveId, { reason: 'peek' })
   assert.equal(ok.policy.state(), 'ready')

@@ -1,7 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { clockAt } from '../src/chat/reply.js'
+import { clockAt, clockLabel } from '../src/chat/reply.js'
+import { flatHistory } from '../src/chat/identity.js'
 
 test('钟点统一按东八区压成 HH:MM', () => {
   assert.equal(clockAt(Date.UTC(2026, 10, 9, 13, 34)), '21:34')
@@ -21,7 +22,7 @@ test('私聊与群聊拼提示词时都带上钟点', () => {
     '私聊正文应挂 [HH:MM]',
   )
   // 群聊：每行都挂，之前的背景句和这一段新说的话都算
-  assert.ok(hub.includes('const line = (x) => `[${clockLabel(x.t)}] ${x.nick}'), '群聊每行应挂 [HH:MM]')
+  assert.ok(hub.includes('return `[${clockLabel(x.t)}] ${x.nick}'), '群聊每行应挂 [HH:MM]')
   // 引入不必逐字对上（不同分支的 import 还带着 itemsToLine 之类），只要求从 reply.js 引进来
   assert.match(hub, /import \{[^}]*\bclockLabel\b[^}]*\} from '\.\/reply\.js'/)
 })
@@ -42,9 +43,15 @@ test('跨天时补日期：昨天 / 更早 / 跨年', async () => {
 
 test('补看历史与跨会话转达也带时间标签', () => {
   const hub = readFileSync(new URL('../src/chat/hub.js', import.meta.url), 'utf8')
-  // 补看历史：用历史消息自带的秒级 time 换算，缺失时退回不带前缀
-  assert.match(hub, /const at = Number\(m\?\.time\) > 0 \? Number\(m\.time\) \* 1000 : 0/)
-  assert.match(hub, /out\.push\(`\$\{at \? clockLabel\(at\) \+ ' ' : ''\}\$\{who\}：\$\{text\}`\)/)
+  // 补读已提取到 identity.js：检查调用方传入时钟，并直接验证历史日期行为。
+  assert.match(hub, /flatLegacyHistory\(filterHistory\(chat.chatId, list\), selfId \|\| cfg.botQQ, \{ clockLabel \}\)/)
+  const now = Date.UTC(2026, 10, 9, 15, 34)
+  const rows = flatHistory([
+    { user_id: 10002, time: Date.UTC(2026, 10, 8, 15, 5) / 1000, message: '昨天的消息' },
+    { user_id: 10002, message: '缺少时间的消息' },
+  ], '10001', { clockLabel: at => clockLabel(at, now) })
+  assert.match(rows[0], /^昨天 23:05 群友·10002\(10002\)：昨天的消息$/)
+  assert.match(rows[1], /^群友·10002\(10002\)：缺少时间的消息$/)
   // 跨会话转达：原来只有 HH:MM，跨天会错
   assert.match(hub, /earlier\.map\(\(x\) => `\$\{clockLabel\(x\.at\)\} 你：\$\{x\.text\}`\)/)
   assert.doesNotMatch(hub, /toTimeString\(\)\.slice\(0, 5\)/)

@@ -11,7 +11,10 @@ export const REPLY_CLOSE = '⟦/REPLY⟧'
 
 // 解析时宽容一点：模型偶尔会写成 [[REPLY]] / 【REPLY】 或带空格。
 const OPEN_RE = /(?:⟦|\[\[|【)\s*REPLY\s*(?:⟧|\]\]|】)/gi
-const CLOSE_RE = /(?:⟦|\[\[|【)\s*\/\s*REPLY\s*(?:⟧|\]\]|】)/gi
+// 收尾标记：左边必须有个开括号，右边那个括号可以缺（模型常写成 ⟦/REPLY 就忘了 ⟧）。
+// 但不能两边都可有可无——那样正文里普通的 `/reply`（比如分支名 fix/reply-marker-system-skip）
+// 会被当成标记从中间整段吃掉，后面的话直接消失。
+const CLOSE_RE = /(?:⟦|\[\[|【)\s*\/\s*REPLY\s*(?:⟧|\]\]|】)?|\/\s*REPLY\s*(?:⟧|\]\]|】)/gi
 
 /** 注入给模型的格式要求（放在系统提示里，不动人格文件）。 */
 export function markerInstruction () {
@@ -47,4 +50,16 @@ export function extractMarkedReply (text) {
 /** 去掉标记本身（防止模型把标记留在正文里发出去）。 */
 export function stripMarkers (text) {
   return String(text || '').replace(OPEN_RE, '').replace(CLOSE_RE, '').trim()
+}
+
+/**
+ * 这条会话该不该按正文标记处理。
+ *
+ * 只有真人的聊天会话要：system: 开头的后台会话（目的引擎的代发决断、自动搭话裁决等）
+ * 输出的是「原样 / 改写 / [沉默]」这种决断，本来就不带标记；照标记去校验会把决断
+ * 反复打回重写，重写完还是干净的，最后判成「不发」，模块代发就永远发不出去。
+ */
+export function markerApplies (cfg, chatId) {
+  if (cfg?.chat?.replyMarker?.enabled !== true) return false
+  return !String(chatId || '').startsWith('system:')
 }

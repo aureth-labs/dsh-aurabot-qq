@@ -106,7 +106,7 @@ dsh plugin --profile <profile> add github:aureth-labs/dsh-aurabot-qq
 
 > ⚠️ 模块和插件在同一进程运行，能接触账号配置；安装时显示的能力只是声明，**不是沙箱**。只装信得过的模块。
 
-[Aurabot MAA Controller](https://github.com/nanmu-mu/aurabot-maa-controller)（社区维护，[预发布下载](https://github.com/nanmu-mu/aurabot-maa-controller/releases)，AGPL-3.0-only）通过主人 QQ 私聊控制本机 MAA 固定日常，支持启动、进度查询、温和停止和强制终止；日常结束后，也可按明确请求关闭绑定的 MuMu 实例 0，并保留原执行结果、完成时间和统计。模块使用 Aurabot API v1，默认停用，MAA 与模拟器需自行安装。支持环境、具体实测版本、安装步骤及验收边界见独立仓库。
+[Aurabot MAA Controller](https://github.com/nanmu-mu/aurabot-maa-controller)（社区维护，[预发布下载](https://github.com/nanmu-mu/aurabot-maa-controller/releases)，AGPL-3.0-only）通过主人 QQ 私聊控制本机 MAA 固定日常，支持启动、进度查询、温和停止和强制终止；日常结束后，可在主人私聊发送 `强制退出MAA和模拟器进程` 关闭绑定的 MuMu 实例 0，并保留原执行结果、完成时间和统计。模块默认停用，MAA 与模拟器需自行安装。支持环境、具体实测版本、安装步骤及验收边界见独立仓库。
 
 ## 🛡️ 安全与隐私
 
@@ -186,12 +186,10 @@ cd dsh-aurabot-qq
 npm test        # 单元测试 + 假 DSH 宿主/模拟 OneBot 的端到端测试
 ```
 
-多平台私聊使用真实 DSH 验证分叉、归档、恢复和轮次校验。使用已安装测试依赖的目标 DSH 源码目录运行。发布支持共享私聊的版本前，运行 `test:release`，它要求真实宿主、类型检查、QR 独立解码校验和全量测试全部通过。
+发布前运行 `test:release`，依次执行全量测试、类型检查和 QR 独立解码校验。
 
 ```bash
-npm run test:host-compat -- "/path/to/deepseek-harness"
-npm run test:release -- "/path/to/deepseek-harness"
-npm run test:qr-decode
+npm run test:release
 ```
 
 ```

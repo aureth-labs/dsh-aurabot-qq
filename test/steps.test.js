@@ -2,7 +2,7 @@
 // 两个开关都默认关，所以这里只测「打开以后按什么规则工作」。
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { takeInterim, reasoningOf, rescueFromThinking } from '../src/chat/steps.js'
+import { takeInterim, reasoningOf, rescueFromThinking, everyStepMode, mergeStepText, similarText } from '../src/chat/steps.js'
 
 const blank = () => ({ interimTurn: -1, interimText: '', interimStep: -1 })
 
@@ -110,4 +110,47 @@ test('捞回定稿：定稿后面又跟了自检，要截掉', () => {
 test('捞回定稿：多个定稿标记时取最后一个', () => {
   const thinking = '3 lines:\n旧的一版\n\n后来改成：\n2 lines:\n新的一版上\n新的一版下'
   assert.equal(rescueFromThinking(thinking), '新的一版上\n新的一版下')
+})
+
+test("每段都发='auto'：纯对话轮照常分条（本轮没有工具调用）", () => {
+  assert.equal(everyStepMode('auto', { sawToolCall: false }), true)
+})
+
+test("每段都发='auto'：这一轮调过工具就不分条（过程话并进最终回复）", () => {
+  const st = { sawToolCall: true }
+  assert.equal(everyStepMode('auto', st), false)
+  // 老事件里没有这个字段时按「没调过工具」处理
+  assert.equal(everyStepMode('auto', {}), true)
+})
+
+test("每段都发：true/false 语义不变，'auto' 之外的字符串按关闭处理", () => {
+  assert.equal(everyStepMode(true, {}), true)
+  assert.equal(everyStepMode(false, {}), false)
+  assert.equal(everyStepMode(undefined, {}), false)
+  assert.equal(everyStepMode('on', {}), true, "非空字符串仍是旧行为（Boolean('on')=true）")
+})
+
+test('不分条时的攒段：两段都留下，用空行分开（工具轮丢中间段那次现场）', () => {
+  const a = '是我发的，不是子代理。那是我自己整理后发出去的。'
+  const b = '证据站得住，不过有一条推理我还没完全接受。'
+  const merged = mergeStepText(mergeStepText('', a), b)
+  assert.ok(merged.includes('是我发的'), '前一段不能丢')
+  assert.ok(merged.includes('证据站得住'), '后一段也要在')
+  assert.equal(merged, `${a}\n\n${b}`)
+})
+
+test('不分条时的攒段：重复段不重复拼', () => {
+  assert.equal(mergeStepText('A 段', 'A 段'), 'A 段')
+  assert.equal(mergeStepText('前一句。后一句。', '后一句。'), '前一句。后一句。')
+  assert.equal(mergeStepText('短的旧稿', '长的旧稿短的旧稿'), '长的旧稿短的旧稿', '后一段已包含前一段时取后一段')
+})
+
+test('近似判定：同一份结果复述两遍 → 高相似，真补充 → 低相似', () => {
+  const a = '核完了：四篇里一共 117 条能核对的事实，对上 103 条，部分对 8 条，对不上 4 条，本机查不到 2 条。'
+  const b = '核对完了，报告在报告.md。一共核了 117 条，对上 103 条，部分对 8 条，对不上 4 条，本机查不到 2 条。'
+  const c = '另外还有一条我拿不准：8.18 那天日记里写的天气和你说的对不上。'
+  assert.ok(similarText(a, b) >= 0.45, `复述应高相似，实际 ${similarText(a, b).toFixed(2)}`)
+  assert.ok(similarText(a, c) < 0.45, `补充应低相似，实际 ${similarText(a, c).toFixed(2)}`)
+  assert.equal(similarText(a, a), 1)
+  assert.equal(similarText('', a), 0)
 })

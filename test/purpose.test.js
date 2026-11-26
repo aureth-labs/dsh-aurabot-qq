@@ -72,10 +72,12 @@ function makePurpose(hub, overrides = {}) {
     routeOwner: () => ownerIdentity.routeOwner(),
     log: { info() {}, warn() {}, debug() {} },
     isMuted: () => false,
-    mood: () => ({ nudge: (d, r) => nudges.push({ d, r }) }),
+    mood: () => ({ nudge: (d, r, chatId) => nudges.push({ d, r, chatId }) }),
     memory: () => ({ list: () => (overrides.memories ?? DEFAULT_MEMORIES).map((m) => ({ id: m.id || 'm1', text: m.text, importance: m.importance ?? 0.8, at: Date.now() })) }),
     personaText: () => overrides.persona || '',
     use,
+    // 载体（#446）：没给就当没装桌宠模块（petOf() 为 null → 一律按离线回落处理）
+    pet: () => overrides.pet || null,
   })
   return { p, cfg, nudges }
 }
@@ -145,6 +147,19 @@ test('闸门：安静时段（醒着窗口外）不发，推到安静结束', as
   assert.equal(c.quietEnd, '09:00')
   assert.ok(engine.inQuietHours(new Date('2026-01-01T23:00:00').getTime(), c), '23 点属于安静时段')
   assert.ok(!engine.inQuietHours(new Date('2026-01-01T12:00:00').getTime(), c), '中午不属于安静时段')
+})
+
+test('闸门：醒着窗口跨天（9 点到次日 3 点）时，安静时段是 3 点–9 点', () => {
+  const hub = makeHub()
+  const { cfg } = makePurpose(hub)
+  cfg.speakUp.awakeFrom = 9
+  cfg.speakUp.awakeTo = 3
+  const c = purposeConfig(cfg)
+  assert.equal(c.quietStart, '03:00')
+  assert.equal(c.quietEnd, '09:00')
+  assert.ok(engine.inQuietHours(new Date('2026-01-01T04:00:00').getTime(), c), '凌晨 4 点属于安静时段')
+  assert.ok(!engine.inQuietHours(new Date('2026-01-01T23:00:00').getTime(), c), '晚上 23 点不在安静时段')
+  assert.ok(!engine.inQuietHours(new Date('2026-01-01T02:00:00').getTime(), c), '凌晨 2 点还在醒着窗口')
 })
 
 test('闸门：总开关关掉后 tick 完全静默', async () => {
@@ -361,6 +376,7 @@ test('心情：sent 后按情绪 nudge mood；silent 不 nudge', async () => {
   const s = JSON.parse(readFileSync(stateFile(), 'utf8'))
   if (s.lastOutcome === 'sent') {
     assert.ok(nudges.length === 1 || (s.history.at(-1)?.emotion ?? '') === '', 'sent 时推了心情')
+    if (nudges.length) assert.equal(nudges[0].chatId, `private:${OWNER}`, '心情原因要记到主人私聊，不能变成全局原因')
   }
 })
 
@@ -990,6 +1006,7 @@ test('代发决断：提示词注入人格、心情、相关记忆、人物档�
     { id: 'm3', text: '主人说别再半夜发消息吵他', importance: 0.7, about: OWNER },
   ]
   const nudges = []
+  const moodChats = []
   const p = createPurpose({
     getConfig: () => ({
       enabled: true, ownerQQ: OWNER, ownerName: '主人',
@@ -1002,7 +1019,7 @@ test('代发决断：提示词注入人格、心情、相关记忆、人物档�
     log: { info() {}, warn() {}, debug() {} },
     isMuted: () => false,
     // 心情：contextLine 有就用它（真实 mood 模块的形态）
-    mood: () => ({ contextLine: () => '（你现在有点低落，因为主人刚说要去睡。这会自然地影响你说话：话少一点、别太闹。）', nudge: (d, r) => nudges.push({ d, r }) }),
+    mood: () => ({ contextLine: chat => { moodChats.push(chat); return '（你现在有点低落，因为主人刚说要去睡。这会自然地影响你说话：话少一点、别太闹。）'; }, nudge: (d, r) => nudges.push({ d, r }) }),
     memory: () => ({
       list: (q) => memories,
       recall: () => memories.map((m) => ({ it: m, score: 0.8 })),
@@ -1015,9 +1032,10 @@ test('代发决断：提示词注入人格、心情、相关记忆、人物档�
   // 人格
   assert.match(prompt, /大肥鱼/, '要带人格（她是谁）')
   assert.match(prompt, /软糯|撒娇/, '人格描述要进提示词')
-  // 心情
+  // 心情：代发决断只给主人私聊过目，contextLine 也必须按这个 chatId 取，不能把群里的原因带进来
   assert.match(prompt, /有点低落/, '心情 contextLine 要进提示词')
   assert.match(prompt, /别太闹|话少/, '心情对说话风格的影响要进提示词')
+  assert.deepEqual(moodChats, [{ chatId: `private:${OWNER}` }])
   // 记忆（按内容检索）
   assert.match(prompt, /面试|爸爸|半夜/, '相关记忆要进提示词')
   // 人物档案
@@ -1077,4 +1095,389 @@ test('代发决断：决断为沉默 → 不发；改写 → 用改写文本；�
   const r4 = await err.p.brokerReview({ to: `private:${OWNER}`, text: '原文直发', moduleId: 'm' })
   assert.equal(r4.send, true)
   assert.equal(r4.text, '原文直发')
+})
+
+test('代发决断：最近 20 条私聊流水都喂进去（8 条看不全上下文）', async () => {
+  const hub = makeHub({ reply: '原样' })
+  const rows = Array.from({ length: 25 }, (_, i) => ({
+    chatId: `private:${OWNER}`,
+    who: i % 2 ? 'bot' : 'owner',
+    text: `第${i + 1}条消息`,
+    t: Date.now() - (25 - i) * 1000,
+  }))
+  hub.chatLogDays = () => ['d1']
+  hub.chatLogOf = (day) => (day === 'd1' ? rows : [])
+  const { p } = makePurpose(hub)
+  await p.brokerReview({ to: `private:${OWNER}`, text: '模块推来的消息', moduleId: 'bili' })
+  const prompt = hub.turns[0].prompt
+  assert.match(prompt, /第25条消息/, '最新一条要在')
+  assert.match(prompt, /第6条消息/, '倒数第 20 条要在（20 条窗口）')
+  assert.doesNotMatch(prompt, /第5条消息/, '更早的不要，控制 token')
+})
+
+test('代发决断：跨天也要凑够 20 条（零点刚过时只看当天会不够）', async () => {
+  const hub = makeHub({ reply: '原样' })
+  const yesterday = Array.from({ length: 15 }, (_, i) => ({
+    chatId: `private:${OWNER}`, who: 'owner', text: `昨天的第${i + 1}条`, t: Date.now() - (30 - i) * 1000,
+  }))
+  const today = Array.from({ length: 10 }, (_, i) => ({
+    chatId: `private:${OWNER}`, who: 'bot', text: `今天的第${i + 1}条`, t: Date.now() - (10 - i) * 1000,
+  }))
+  hub.chatLogDays = () => ['d1', 'd2']
+  hub.chatLogOf = (day) => (day === 'd1' ? yesterday : day === 'd2' ? today : [])
+  const { p } = makePurpose(hub)
+  await p.brokerReview({ to: `private:${OWNER}`, text: '模块推来的消息', moduleId: 'bili' })
+  const prompt = hub.turns[0].prompt
+  assert.match(prompt, /今天的第10条/, '今天最新的要有')
+  assert.match(prompt, /昨天的第11条/, '往前凑满 20 条时，昨天的也要读进来')
+})
+
+test('代发决断：人格卡整份喂进去（5000 字窗口，后半段说话规则也要能看到）', async () => {
+  // 前半段：身份设定；后半段：说话规则——截 1500 字会把后半段切掉
+  const head = '她是一条活泼爱玩又黏人的鱼。'.repeat(120)   // 约 1680 字，确保超过旧的 1500 截断线
+  const tail = '【说话规则】说人话，不用校准闭环这类词；不说应酬话。'
+  const persona = head + tail
+  const hub = makeHub({ reply: '原样' })
+  const { p } = makePurpose(hub, { persona })
+  await p.brokerReview({ to: `private:${OWNER}`, text: '模块推来的消息', moduleId: 'bili' })
+  const prompt = hub.turns[0].prompt
+  assert.match(prompt, /说人话/, '人格后半段的说话规则要在提示词里')
+  assert.ok(persona.length > 1500, '人格本身超过 1500 字，用来证明窗口放大了')
+})
+
+test('代发决断：人格超过 5000 字才截断（防止极端长卡把 prompt 撑爆）', async () => {
+  const long = '甲'.repeat(6000) + '结尾标记'
+  const hub = makeHub({ reply: '原样' })
+  const { p } = makePurpose(hub, { persona: long })
+  await p.brokerReview({ to: `private:${OWNER}`, text: '模块推来的消息', moduleId: 'bili' })
+  const prompt = hub.turns[0].prompt
+  assert.doesNotMatch(prompt, /结尾标记/, '超 5000 字的部分被截掉')
+})
+
+// ---------- 追问（#298） ----------
+// 追问是一条真实的主动开口：她要判断的对象是「你刚问完一句、主人没回」这件事。
+// 这一组用例统一把时钟固定住，只改网关/流水/开关，逐个盯 #298 的六条缺陷。
+
+const NUDGE_FILE = () => join(process.env.AURABOT_DATA_DIR, 'purpose', 'nudge.json')
+
+// 一个已经「问到一半」的现场：她最后一句是提问，主人 20 分钟没回。
+function nudgeScene({
+  lastBot = { at: Date.now() - 20 * MIN, text: '你今天几点下班呀？' },
+  lastOwnerChatAt = 0,
+  reply = '人呢？',
+  speakUp = {},
+  chatRows = null,
+  randomSeq = null,
+} = {}) {
+  const hub = makeHub({ reply, lastBot, lastOwnerChatAt })
+  if (chatRows) {
+    hub.chatLogDays = () => ['d1']
+    hub.chatLogOf = () => chatRows
+  }
+  // runTurnInChat：在目标私聊里生成（#446）。默认成功；用例可以覆盖成 busy。
+  hub.chatTurns = []
+  hub.runTurnInChat = async (chatId, prompt, opts = {}) => {
+    hub.chatTurns.push({ chatId, prompt, opts })
+    if (hub.turnInChatResult) return hub.turnInChatResult
+    const sent = typeof reply === 'function' ? reply(prompt, opts) : reply
+    // 真实 hub 在这个私聊里真发出话之后，会把 lastBotToOwner 换成「她刚说的这句」
+    // （src/chat/hub.js，且发生在 onTurnEnd 之前）。fake 必须照这个时序更新，
+    // 否则上一轮写下的 nudgedFor 一直等于这一轮还没变的 lb.at，后面的循环用例会被误挡。
+    if (sent) hub.lastBotToOwner = { at: Date.now(), text: String(sent) }
+    return { ok: true, sent }
+  }
+  const { p, cfg } = makePurpose(hub, {
+    speakUp: { enabled: true, awakeFrom: 0, awakeTo: 24, idleMinutes: 30, minIntervalMinutes: 5, maxIntervalMinutes: 5, maxPerDay: 10, nudge: true, ...speakUp },
+  })
+  return { hub, p, cfg }
+}
+
+// Math.random 让「一半机会」可控：0.9 = 抽空不发，0.1 = 决定发。
+// 引擎内部用 Math.random（含排程），所以按调用序号脚本化更稳。
+function stubRandom(seq) {
+  const original = Math.random
+  let i = 0
+  Math.random = () => (i < seq.length ? seq[i++] : seq[seq.length - 1])
+  return () => { Math.random = original }
+}
+
+test('追问：speakUp.enabled=false 时一步都不做（用户关掉主动搭话仍被追问的那个 bug）', async () => {
+  const { hub, cfg } = nudgeScene()
+  cfg.speakUp.enabled = false
+  const { p } = makePurpose(hub, { speakUp: cfg.speakUp })
+  // 直接跑 tick：到点也不该冒出追问回合
+  await p.tick()
+  assert.equal(hub.chatTurns.length, 0, '总开关关掉时不能在私聊里生成追问')
+  assert.equal(hub.delivered.length, 0, '也不能退回系统会话另发一条')
+  assert.equal(existsSync(NUDGE_FILE()), false, '连追问标记文件都不该写')
+})
+
+test('追问：陈述句带「嘛」不触发，句尾「嘛？」才触发（正则要锚句尾）', async () => {
+  const restore = stubRandom([0, 0.1])
+  try {
+    // 陈述句：末尾是「你先忙」，中间的「嘛」是语气词，不是提问
+    const a = nudgeScene({ lastBot: { at: Date.now() - 20 * MIN, text: '这算什么嘛 反正我也不着急 你先忙' } })
+    await a.p.tick()
+    assert.equal(a.hub.chatTurns.length, 0, '陈述句里的「嘛」不算提问，不该追问')
+
+    // 句尾「嘛？」：是提问
+    const b = nudgeScene({ lastBot: { at: Date.now() - 20 * MIN, text: '你真的不想去嘛？' } })
+    await b.p.tick()
+    assert.equal(b.hub.chatTurns.length, 1, '句尾「嘛？」是提问，要追问')
+  } finally { restore() }
+})
+
+test('追问：句尾「吗」「呢」「没」都算提问，句中的不算', async () => {
+  const restore = stubRandom([0, 0.1])
+  try {
+    for (const [text, want] of [
+      ['你吃了吗', 1], ['在干嘛呢', 1], ['你睡了没', 1], ['你说呢 我先去忙', 0], ['去哪了吗我说', 0],
+    ]) {
+      const s = nudgeScene({ lastBot: { at: Date.now() - 20 * MIN, text } })
+      await s.p.tick()
+      assert.equal(s.hub.chatTurns.length, want, `「${text}」应当 ${want ? '追问' : '不追问'}`)
+    }
+  } finally { restore() }
+})
+
+test('追问：抽空不发时不消耗 nudgedFor（下一分钟还能再追）', async () => {
+  // 0 = 引擎排程用不到；这里只要保证「抛硬币」落在抽空那半边
+  const restore = stubRandom([0.9, 0.9, 0.9])
+  try {
+    const { hub, p } = nudgeScene()
+    await p.tick()
+    assert.equal(hub.chatTurns.length, 0, '抽空决定不发，这一分钟不该生成')
+    const flag = existsSync(NUDGE_FILE()) ? JSON.parse(readFileSync(NUDGE_FILE(), 'utf8')) : {}
+    assert.notEqual(flag.nudgedFor, hub.lastBotToOwner.at, '没真发就不能写 nudgedFor，否则永久吃掉这条消息的追问机会')
+  } finally { restore() }
+})
+
+test('追问：真发了才写 nudgedFor，且同一条消息只追一次', async () => {
+  const restore = stubRandom([0, 0.1, 0.1])
+  try {
+    const s = nudgeScene()
+    await s.p.tick()
+    assert.equal(s.hub.chatTurns.length, 1, '决定要发就生成一轮')
+    const flag = JSON.parse(readFileSync(NUDGE_FILE(), 'utf8'))
+    assert.equal(flag.nudgedFor, s.hub.lastBotToOwner.at, '真决定发了才落标记')
+    // 再 tick 一次：同一条消息已经追过，不能重复打扰
+    await s.p.tick()
+    assert.equal(s.hub.chatTurns.length, 1, '同一条消息只追一次')
+  } finally { restore() }
+})
+
+test('追问：安静时段闸门（把安静时段设成覆盖当前时刻，断言不追问）', async () => {
+  const restore = stubRandom([0, 0.1])
+  try {
+    // 把「醒着窗口」收成一个不含当前小时的点：24 小时窗口除了当前小时都是醒着，
+    // 于是当前时刻必然落进安静时段（这是构造出来的确定性场景，不依赖跑测试的钟点）。
+    const h = new Date().getHours()
+    const s = nudgeScene({ speakUp: { awakeFrom: (h + 1) % 24, awakeTo: h } })
+    const cfg = purposeConfig(s.cfg)
+    assert.ok(engine.inQuietHours(Date.now(), cfg), '构造前提：当前时刻在安静时段内')
+    await s.p.tick()
+    assert.equal(s.hub.chatTurns.length, 0, '安静时段内不能追问（以前走 normalize 前的老路径，这条闸门没吃到）')
+  } finally { restore() }
+})
+
+test('追问：达到每日上限时不发（追问也要吃 dailyMax）', async () => {
+  const restore = stubRandom([0.1])
+  try {
+    const s = nudgeScene({ speakUp: { maxPerDay: 3 } })
+    // 直接把「今天已经说满 3 次」写进状态：追问以前根本不吃这本账，现在必须吃。
+    const d = new Date()
+    const day = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+    mkdirSync(join(process.env.AURABOT_DATA_DIR, 'purpose'), { recursive: true })
+    writeFileSync(stateFile(), JSON.stringify({ day, countToday: 3, nextFireAt: Date.now() + 60 * MIN }))
+    await s.p.tick()
+    assert.equal(s.hub.chatTurns.length, 0, '到每日上限后不能再追问')
+  } finally { restore() }
+})
+
+test('追问：走目标私聊会话，不走 system:purpose-nudge（#446 / #298 第 5 点）', async () => {
+  const restore = stubRandom([0, 0.1])
+  try {
+    const s = nudgeScene()
+    await s.p.tick()
+    assert.equal(s.hub.chatTurns.length, 1, '要在私聊里生成一轮')
+    assert.equal(s.hub.chatTurns[0].chatId, `private:${OWNER}`, '必须是目标私聊的真实会话')
+    assert.equal(s.hub.chatTurns[0].opts.noTools, true, '主动回合不能借机拿工具')
+    // 不能再落进后台会话：runSystemTurn 一次都不该被叫
+    assert.equal(s.hub.turns.filter((t) => t.name === 'purpose-nudge').length, 0, '不许再用 system:purpose-nudge')
+    // 也不能自己再 deliver 一次：回复由 hub 的 turn/end 落地，否则双发
+    assert.equal(s.hub.delivered.length, 0, '私聊内生成时不要再 deliver，避免双发')
+  } finally { restore() }
+})
+
+test('追问：busy 让位时不消耗追问机会，也不吃掉这一分钟 tick', async () => {
+  const restore = stubRandom([0, 0.1, 0.1])
+  try {
+    const s = nudgeScene()
+    s.hub.turnInChatResult = { ok: false, reason: 'busy' } // 主人正在说话
+    await s.p.tick()
+    assert.equal(s.hub.chatTurns.length, 1, '尝试过一次')
+    const flag = existsSync(NUDGE_FILE()) ? JSON.parse(readFileSync(NUDGE_FILE(), 'utf8')) : {}
+    assert.notEqual(flag.nudgedFor, s.hub.lastBotToOwner.at, '让位不算追过，标记必须回滚')
+    // 让位后同一条消息下一分钟还能再追
+    s.hub.turnInChatResult = null
+    await s.p.tick()
+    assert.equal(s.hub.chatTurns.length, 2, '让位之后还能再追')
+  } finally { restore() }
+})
+
+test('追问：prompt 带上主人最近 1-2 条真实消息 + 真实静默分钟数', async () => {
+  const restore = stubRandom([0, 0.1])
+  try {
+    const rows = [
+      { chatId: `private:${OWNER}`, who: 'owner', text: '今天加班到九点', t: Date.now() - 60 * MIN },
+      { chatId: `private:${OWNER}`, who: 'owner', text: '回头再聊', t: Date.now() - 55 * MIN },
+      { chatId: `private:${OWNER}`, who: 'bot', text: '你今天几点下班呀？', t: Date.now() - 20 * MIN },
+    ]
+    const s = nudgeScene({ chatRows: rows })
+    await s.p.tick()
+    const prompt = s.hub.chatTurns[0].prompt
+    assert.match(prompt, /回头再聊/, '主人最近说的话要进提示词')
+    assert.match(prompt, /今天加班到九点/, '要带 1-2 条，不是只带最后一条')
+    assert.match(prompt, /20 分钟|20分钟/, '真实静默分钟数要进提示词')
+    assert.match(prompt, /真实/, '要明确告诉她这个静默时长才是真的（防 time-context 串台）')
+    assert.doesNotMatch(prompt, /你今天几点下班呀？\s*\n.*你今天几点下班呀？/, '她自己那句不要重复列')
+  } finally { restore() }
+})
+
+test('追问：追出来的新话不会变成下一条追问的由头（不连环催）', async () => {
+  const restore = stubRandom([0, 0.1, 0.1, 0.1])
+  try {
+    // 真实时序：hub 在 deliverTurn 里把 lastBotToOwner 换成她刚追出去的那句，
+    // 且发生在 onTurnEnd 之前——所以这里模拟「发送成功后 lastBotToOwner 已更新」的 hub。
+    const s = nudgeScene({ reply: '人呢？' })
+    const realTurn = s.hub.runTurnInChat
+    s.hub.runTurnInChat = async (chatId, prompt, opts) => {
+      const r = await realTurn(chatId, prompt, opts)
+      if (r && r.ok) s.hub.lastBotToOwner = { at: Date.now(), text: '人呢？' } // 她刚追出去的话
+      return r
+    }
+    await s.p.tick()
+    assert.equal(s.hub.chatTurns.length, 1, '第一轮追问发出去了')
+
+    // 关键不变量：标记必须推进到她刚追出去的这条新话上。
+    // 之后不管过多久，只要主人没再说话，lastBotToOwner 一直是这条，nudgedFor 也一直是它，
+    // 「同一条只追一次」的既有判定就会挡住——不会拿她自己的追问再追一次。
+    const flag = JSON.parse(readFileSync(NUDGE_FILE(), 'utf8'))
+    assert.equal(flag.nudgedFor, s.hub.lastBotToOwner.at,
+      'nudgedFor 要推进到她这次追问本身，否则「人呢？」几十分钟后会被当成新由头再追一次（连环催）')
+
+    // 不是永久封死：真正的新话（时间戳不同）照常能追。
+    s.hub.lastOwnerChatAt = 0
+    s.hub.lastBotToOwner = { at: Date.now() - 20 * MIN, text: '那你今晚还来不来呢？' }
+    await s.p.tick()
+    assert.equal(s.hub.chatTurns.length, 2, '之后的新话要能正常触发追问（不能永久封死）')
+  } finally { restore() }
+})
+
+// ---------- 正向主动搭话迁进私聊会话（#446 作者报的实际症状） ----------
+// FuLuTang 的复现：01:05「目的回合」主动发了大米布丁，03:19 主人回「你咋做」进了 private 会话，接不住。
+// 所以真正要迁的是这里——追问只是第三条会话。
+
+// 给正向回合用的现场：目的引擎开着、到点、有素材。
+function forwardScene({
+  // 真实形态：正文在前，内部备忘在回合最后另起一段（引擎提示词就是这么要求的）
+  reply = '今天的大米布丁我做好了，你要不要尝尝？\n\n【目的】说说布丁\n【状态】完成',
+  carrier = 'qq', petOnline = false, petFallbackToQQ = true,
+  inChatResult = null,
+} = {}) {
+  const hub = makeHub({ reply })
+  hub.chatTurns = []
+  hub.runTurnInChat = async (chatId, prompt, opts = {}) => {
+    hub.chatTurns.push({ chatId, prompt, opts })
+    if (inChatResult) return inChatResult
+    return { ok: true, silent: false, raw: typeof reply === 'function' ? reply(prompt, opts) : reply }
+  }
+  const pet = { dispatch: async () => ({ ok: true, via: 'pet' }), online: () => ({ online: petOnline }) }
+  const { p, cfg } = makePurpose(hub, {
+    ext: { purpose: { enabled: true, initialDelayMinutes: 1, minMaterials: 0, carrier, petFallbackToQQ } },
+    pet,
+  })
+  return { hub, p, cfg }
+}
+
+test('正向搭话：carrier=qq 时走目标私聊会话，不再用 system:purpose（#446 实际症状）', async () => {
+  const s = forwardScene()
+  await s.p.tick()
+  dueNow()
+  await s.p.tick()
+  assert.equal(s.hub.chatTurns.length, 1, '要在目标私聊里生成')
+  assert.equal(s.hub.chatTurns[0].chatId, `private:${OWNER}`, '必须是主人私聊的真实会话')
+  assert.equal(s.hub.chatTurns[0].opts.noTools, true, '主动回合不能拿工具')
+  assert.equal(s.hub.chatTurns[0].opts.suppressDelivery, true, '原文要先清洗掉内部备忘，不能让 hub 直接投递')
+  assert.equal(s.hub.turns.filter((t) => t.name === 'purpose').length, 0, '不许再用 system:purpose')
+})
+
+test('正向搭话：内部备忘不外泄（cleanReply 剥掉【目的】/【状态】再发）', async () => {
+  const s = forwardScene()
+  await s.p.tick()
+  dueNow()
+  await s.p.tick()
+  assert.equal(s.hub.delivered.length, 1, '清洗后仍要经 deliver 投递一次')
+  const sentText = s.hub.delivered[0].text
+  assert.match(sentText, /大米布丁/, '正文要发出去')
+  assert.doesNotMatch(sentText, /【目的】|【状态】|【待续】/, '内部备忘绝不能泄到 QQ')
+})
+
+test('正向搭话：载具仍是 QQ 时照旧走 deliver + enginePolicy 记账（结算链路不丢）', async () => {
+  const s = forwardScene()
+  const cred = { reserve: () => ({ ok: true, reserveId: 'r1' }), commit: () => {} }
+  s.p.setEnginePolicySource(cred)
+  await s.p.tick()
+  dueNow()
+  await s.p.tick()
+  const d = s.hub.delivered[0]
+  assert.equal(d.chatId, `private:${OWNER}`)
+  assert.equal(d.opts.userText, '【系统提醒，不是主人说的话】（她主动找你）', '心情链路前缀不能丢')
+  assert.equal(d.opts.enginePolicy, cred, '引擎策略源记账不能丢')
+  assert.equal(d.opts.enginePolicyName, 'purpose')
+  assert.ok(!d.opts.own, '不能带 own:true（那是 #211 已修好的桥接语义）')
+  // 结算照旧
+  const st = JSON.parse(readFileSync(stateFile(), 'utf8'))
+  assert.equal(st.lastOutcome, 'sent', '发送成功要照旧结算')
+  assert.equal(st.countToday, 1, '次数照旧记一次')
+})
+
+test('正向搭话：carrier=pet 且桌宠在线时保持原 system 会话路径（不往 QQ 多发一条）', async () => {
+  const s = forwardScene({ carrier: 'pet', petOnline: true })
+  await s.p.tick()
+  dueNow()
+  await s.p.tick()
+  assert.equal(s.hub.chatTurns.length, 0, '走气泡时不该进私聊会话生成')
+  assert.equal(s.hub.turns.filter((t) => t.name === 'purpose').length, 1, '保持原来的 system:purpose 路径')
+  assert.equal(s.hub.delivered.length, 0, '走气泡时不能再往 QQ 发一条')
+})
+
+test('正向搭话：carrier=pet 但桌宠离线且开回落 → 会走 QQ，所以进私聊会话', async () => {
+  const s = forwardScene({ carrier: 'pet', petOnline: false, petFallbackToQQ: true })
+  await s.p.tick()
+  dueNow()
+  await s.p.tick()
+  assert.equal(s.hub.chatTurns.length, 1, '既然最终会以 QQ 消息出现，就要在私聊里生成')
+  assert.equal(s.hub.delivered.length, 1, '回落路径照旧投递')
+})
+
+test('正向搭话：carrier=qq 时即使 petFallbackToQQ=false 也照常走私聊会话', async () => {
+  // petFallbackToQQ 只跟桌宠载体有关；carrier=qq 时它不该把这一轮挤回 system 会话。
+  const s = forwardScene({ carrier: 'qq', petFallbackToQQ: false })
+  await s.p.tick()
+  dueNow()
+  await s.p.tick()
+  assert.equal(s.hub.chatTurns.length, 1, 'carrier=qq 一定要在私聊里生成（petFallbackToQQ 与它无关）')
+  assert.equal(s.hub.delivered.length, 1, '照常投递')
+})
+
+test('正向搭话：主人在说话（busy）时让位，不占今日次数', async () => {
+  const s = forwardScene({ inChatResult: { ok: false, reason: 'busy' } })
+  await s.p.tick()
+  const before = JSON.parse(readFileSync(stateFile(), 'utf8')).countToday
+  dueNow()
+  const r = await s.p.tick()
+  assert.equal(s.hub.delivered.length, 0, '让位时不发')
+  const st = JSON.parse(readFileSync(stateFile(), 'utf8'))
+  assert.equal(st.countToday, before, '让位不该占掉今天的次数')
 })

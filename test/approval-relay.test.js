@@ -1,4 +1,4 @@
-import { test } from 'node:test'
+﻿import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createApprovalRelay } from '../src/security/approval.js'
 import { makeTestIdentity } from './helpers/identity.js'
@@ -142,3 +142,26 @@ test('QQ 不问的 QQ 会话：网页一直没人点，到时间按没批准处�
   assert.ok(waited, 'DSH 自己的会话不加时限')
 })
 
+
+test('等待时长可配：30 秒按「秒」显示，不会出现「0 分钟」', async () => {
+  const { relay, sent, req, unavailable } = setup({ timeoutMs: 30_000 })
+  relay.onRequest(req(), unavailable)
+  await tick()
+  assert.match(sent[0].text, /30 秒没回就不批/)
+  assert.doesNotMatch(sent[0].text, /0 分钟/)
+})
+
+test('等待时长可配：2 分钟按「分钟」显示', async () => {
+  const { relay, sent, req, unavailable } = setup({ timeoutMs: 120_000 })
+  relay.onRequest(req(), unavailable)
+  await tick()
+  assert.match(sent[0].text, /2 分钟没回就不批/)
+})
+
+test('超时后按没批准处理，并告知主人', async () => {
+  const { relay, sent, req } = setup({ timeoutMs: 30 })
+  const r = await relay.onRequest(req(), () => new Promise(() => {}))
+  assert.equal(r, 'unavailable')
+  await tick()
+  assert.ok(sent.some((m) => /授权超时了/.test(m.text)))
+})

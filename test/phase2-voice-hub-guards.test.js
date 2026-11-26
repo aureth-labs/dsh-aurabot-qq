@@ -7,7 +7,7 @@ import { createFakeDsh } from './helpers/fake-dsh.js'
 import { makeTestIdentity } from './helpers/identity.js'
 import { normalize } from '../src/core/config.js'
 import { createTitleFilter } from '../src/chat/title-filter.js'
-import { buildActPrompt } from '../src/autotelic/exec.js'
+import { createExecV5 } from '../src/autotelic/exec.js'
 import voiceModule from '../src/modules/voice/index.js'
 
 function makeWavBuffer(durationMs = 50, sampleRate = 16000) {
@@ -35,9 +35,16 @@ const until = async (predicate, ms = 3000) => {
   while (!predicate() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10))
 }
 
-test('PR-2F: buildActPrompt 不含 onebot 或 QQ 平台专有字样', () => {
-  const prompt = buildActPrompt({ goal: '整理今天的心情', plan: '先看日记再写一句反思' }, ['diary', 'memory'])
+test('PR-2F: 自驱 v5 工作间默认回合不启用工具，也不绑定某个平台', async () => {
+  const calls = []
+  const exec = createExecV5({
+    hub: { async runSystemTurn(...args) { calls.push(args); return '{"done":true,"observation":"看完日记"}' } },
+  })
+  await exec.run({ id: 'diary', tag: '生活', steps: [{ desc: '看看日记里有什么', level: 'read-only' }] })
+  assert.equal(calls.length, 1)
+  const [, , prompt, options] = calls[0]
   assert.doesNotMatch(prompt, /onebot|QQ/i)
+  assert.equal(options.noTools, true)
 })
 
 test('PR-2F: 飞书入站语音走 gateway.fetch -> DSH 本地识别，不调 QQ fetch_ptt_text / get_record', async (t) => {

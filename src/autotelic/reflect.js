@@ -119,14 +119,15 @@ export function distillDream({ tasks = [], auditToday = 0, modelText = '' } = {}
   return fallback.slice(0, 5)
 }
 
-/** 简易日刊存取（dir/daily、dir/dreams，一文件一天）。 */
-export function createJournal(dir) {
-  const write = (sub, day, text) => { try { mkdirSync(join(dir, sub), { recursive: true }); writeFileSync(join(dir, sub, `${day}.md`), text, 'utf8'); return true } catch { return false } }
-  const read = (sub, day) => { try { return readFileSync(join(dir, sub, `${day}.md`), 'utf8') } catch { return '' } }
-  const exists = (sub, day) => existsSync(join(dir, sub, `${day}.md`))
+/** 简易日刊存取（dir/daily、dir/dreams，一文件一天）。dir 给函数时每次按当时的目录取（换人格就换一份）。 */
+export function createJournal(base) {
+  const dir = () => (typeof base === 'function' ? base() : base)
+  const write = (sub, day, text) => { try { mkdirSync(join(dir(), sub), { recursive: true }); writeFileSync(join(dir(), sub, `${day}.md`), text, 'utf8'); return true } catch { return false } }
+  const read = (sub, day) => { try { return readFileSync(join(dir(), sub, `${day}.md`), 'utf8') } catch { return '' } }
+  const exists = (sub, day) => existsSync(join(dir(), sub, `${day}.md`))
   const list = (sub, n = 7) => {
     try {
-      return readdirSync(join(dir, sub)).filter((f) => f.endsWith('.md')).sort().slice(-n).reverse()
+      return readdirSync(join(dir(), sub)).filter((f) => f.endsWith('.md')).sort().slice(-n).reverse()
         .map((f) => ({ day: f.replace(/\.md$/, ''), text: read(sub, f.replace(/\.md$/, '')) }))
     } catch { return [] }
   }

@@ -65,7 +65,7 @@ before(async () => {
     stickers: { autoChance: 0 },
     group: { interjectChance: 0, burstMax: 50 },
     merge: { waitSec: 0.2, maxSec: 1, groupWaitSec: 0.2, groupMaxSec: 1 },
-    memory: { enabled: true, recallCount: 20 },
+    memory: { enabled: true, recallCount: 20, recallMinRelevance: 0 },
     model: { provider: 'fake', model: 'fake-1' },
   }))
   fake = createFakeDsh({ brain })

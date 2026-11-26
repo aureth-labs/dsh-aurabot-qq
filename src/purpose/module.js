@@ -5,28 +5,32 @@
 // 本文件负责副作用：状态文件、素材采集（记忆 + 聊天流水适配）、生成（hub.runSystemTurn）、
 // 投递（hub.deliver）、心情 nudge、追问、路由。
 //
-// 使用方式：独立的 purpose 内置模块（src/modules/purpose/index.js），默认关闭；
-// 现有的「主动搭话」模块（speakup，src/features/companion.js）保持默认实现不变，
-// 想换引擎的主人自己开关，迁移说明见 docs/PURPOSE_MODULE_API.md。
+// 使用方式：独立的 purpose 内置模块（src/modules/purpose/index.js）。P1/Q1 拍板起默认开启
+// （ext.purpose.enabled 缺省时兼容旧 speakUp.enabled，显式设置优先）。迁移说明见 docs/PURPOSE_MODULE_API.md。
 
 import { existsSync, unlinkSync } from 'node:fs'
 import { dataDir, readJson, writeJson } from '../core/store.js'
+import { randomUUID } from 'node:crypto'
+import { quietWindowOf } from '../core/time-window.js'
 import { cleanOutboundText } from '../chat/reply.js'
 import { isOwner, isOwnerChatMuted, isOwnerPrivateChat, resolveFriendTarget } from '../chat/access.js'
 import { normalizeChatId, parseChatId, sameChat } from '../gateway/address.js'
 import { isSessionBackoff } from '../chat/session-backoff.js'
 import { followUpHint } from '../features/memory.js'
-import { selfName, selfNames } from '../persona/personas.js'
+import { selfName, selfNames, personaDataDir, personaNow } from '../persona/personas.js'
 import { normalizeSelection } from '../chat/chat-model.js'
 import {
-  DEFAULT_PURPOSE_CONFIG, PURPOSE_NEEDS, NEED_LABELS, EMOTION_LABELS, EMOTION_PROFILES,
+  DEFAULT_PURPOSE_CONFIG, PURPOSE_NEEDS, NEED_LABELS,
   normalizePurposeConfig, createPurposeState, normalizePurposeState,
   ensurePurposeDay, ensurePurposeSchedule, planNextFire, evaluatePurposeTick,
   markPurposeDelivered, markPurposeSkip, applyPurposeOutcome,
   collectMaterials, analyzePersona, deriveDrives, formGoalHypotheses, applyPersonaOverrides,
+  inQuietHours,
   minePurposeSeeds, selectPurpose, buildPurposePrompt, parsePurposeMemo, emotionProfile,
   summarizePurposeState, recordOwnerReplyHours, formatMaterialLine,
 } from './engine.js'
+// 心情项的唯一真相在心情模块：这里只读配置、不自己存一份情绪表。
+import { normalizeEmotions, resolveEmotion } from '../features/mood-emotions.js'
 
 const MINUTE = 60_000
 // mood 模块靠 userText 的「【系统提醒」前缀把主动回合判成 origin='speak-up'（mood/index.js 的判定），
@@ -34,7 +38,6 @@ const MINUTE = 60_000
 const MOOD_PREFIX = '【系统提醒，不是主人说的话】（她主动找你）'
 const SILENCE = '[沉默]'
 
-const pad2 = (n) => String(n).padStart(2, '0')
 // 文本截断：模块内随手用（引擎侧有同名工具，这里不跨文件依赖）。
 const clip = (text, max = 120) => {
   const s = String(text ?? '').replace(/\s+/g, ' ').trim()
@@ -48,23 +51,22 @@ const clampInt = (v, d, lo, hi) => {
 /**
  * 把 Aurabot 配置映射成引擎配置。
  * 醒着窗口（speakUp.awakeFrom/awakeTo）是唯一真相，引擎的安静时段由它派生；
- * 调参走本模块自己的设置面 cfg.ext.purpose.*（模块默认关：ext.purpose.enabled）。
+ * 调参走本模块自己的设置面 cfg.ext.purpose.*（P1/Q1 拍板：默认开，见下）。
  */
 export function purposeConfig(cfg = {}) {
   const su = cfg.speakUp || {}
   const ext = (cfg.ext && cfg.ext.purpose) || {}
   const awakeFrom = clampInt(ext.awakeFrom ?? su.awakeFrom, 8, 0, 24)
   const awakeTo = clampInt(ext.awakeTo ?? su.awakeTo, 23, 0, 24)
-  // awake 窗口为全天（awakeTo>=24 或区间非法）时，安静时段关闭（start===end 视为不启用）
-  const quiet = awakeTo >= 24 || awakeFrom >= awakeTo
-    ? { quietStart: '00:00', quietEnd: '00:00' }
-    : { quietStart: `${pad2(awakeTo % 24)}:00`, quietEnd: `${pad2(awakeFrom)}:00` }
+  // 醒着窗口的补集 = 安静时段；from > to 是跨天窗口（如 9 点到次日 3 点），安静时段为 3 点–9 点。
+  // awakeTo=24 是「醒到午夜」不是全天：7~24 ⇒ 安静 00:00~07:00；只有 0~24（真全天醒）才关闭安静时段。
+  const quiet = quietWindowOf(awakeFrom, awakeTo)
   // normalizePurposeConfig 只认引擎字段，打分模型在归一化后补挂（面板下拉同款结构校验）
   return {
     ...normalizePurposeConfig({
-      // 总开关只看本模块自己的设置（ext.purpose.enabled，默认 false）；
-      // 与旧的「主动搭话」互不影响——两套同时开会重复打扰，迁移说明里提醒主人别同时开。
-      enabled: cfg.enabled !== false && ext.enabled === true,
+      // 总开关只看本模块自己的设置（ext.purpose.enabled）。P1/Q1 拍板默认开：
+      // 键缺省（undefined）= 开；显式 false = 主人关过，尊重不洗回（模块 defaults 填充也只补缺失键）。
+      enabled: cfg.enabled !== false && (ext.enabled ?? su.enabled ?? true) !== false,
       ownerUin: '',
       gapMinMs: clampInt(ext.minIntervalMinutes ?? su.minIntervalMinutes, 90, 5, 2880) * MINUTE,
       gapMaxMs: clampInt(ext.maxIntervalMinutes ?? su.maxIntervalMinutes, 240, 5, 2880) * MINUTE,
@@ -79,6 +81,11 @@ export function purposeConfig(cfg = {}) {
     }),
     // 素材打分模型（面板「目的引擎」卡下拉选；不配 = 用关键词法，零额外成本）。
     scoringModel: normalizeSelection(ext.scoringModel),
+    // 追问开关（P1 翻键，方案 §2.1）：读保持双层兼容——ext.purpose.nudge 覆写位优先，
+    // 老用户的 speakUp.nudge 仍生效；两边都没设时默认开（与 speakUp.nudge 默认一致）。
+    // 注意不能把 nudge 放进模块 defaults：defaults 填充会把 ext.purpose.nudge 落成 true，
+    // 老用户「speakUp.nudge=false」的关断就会被覆写位洗掉。
+    nudge: ext.nudge ?? su.nudge ?? true,
   }
 }
 
@@ -100,6 +107,8 @@ export function cleanReply(raw, options, cfg) {
 
 export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, memory, personaText, pet: petOf, use, identity, routeOwner, resolveOwnerRoute }) {
   const moodOf = () => { try { return mood?.() || null } catch { return null } }
+  // 心情项：用户配的情绪表（心情页可增删改名）。引擎只读，不自己存一份。
+  const emotionItems = () => normalizeEmotions(getConfig().mood?.emotions)
   const memoryOf = () => { try { return memory?.() || null } catch { return null } }
   const warnedBad = new Set()
   const warnBad = (ctx, val) => {
@@ -109,10 +118,24 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     log?.warn?.(`目的：存在无效地址/状态（${ctx}），已跳过：${String(val)}`)
   }
   const ownerId = () => identity?.owner?.() || null
-  const ownerRoute = () => {
+  const sharedOwnerRoute = () => hub.resolveSharedProactiveRoute?.() || null
+  const ordinaryOwnerRoute = () => {
     if (typeof resolveOwnerRoute === 'function') return resolveOwnerRoute({ purpose: 'proactive' })
-    const cid = typeof routeOwner === 'function' ? routeOwner() : hub?.ownerChat?.()
+    const cid = typeof routeOwner === 'function' ? routeOwner() : hub.ownerChat?.()
     return cid ? { chatId: String(cid), blocked: false, reason: 'ok' } : { chatId: '', blocked: false, reason: 'no-route' }
+  }
+  const ownerRoute = () => sharedOwnerRoute() || ordinaryOwnerRoute()
+  const unavailableOwner = (route) => route?.deferred
+    ? { outcome: 'deferred', reason: route.reason, retryable: route.retryable === true, error: route.error }
+    : { outcome: route?.blocked ? 'blocked' : 'no-route', reason: route?.reason || 'no-route' }
+  const ownerChat = (route, cfg) => {
+    const parsed = parseChatId(route?.chatId)
+    if (route?.blocked || parsed?.kind !== 'private') return null
+    return { chatId: route.chatId, kind: 'private', platform: parsed.platform, instance: parsed.instance, userId: parsed.id, nickname: cfg.ownerName || '主人' }
+  }
+  const pushOwner = (chat, content, route, opts) => {
+    if (typeof hub.pushProactiveToSession === 'function') return hub.pushProactiveToSession(chat, content, '', { ...opts, route })
+    return chat ? hub.pushToSession?.(chat, content, '', opts) : route
   }
   const resolveOwnerChat = () => {
     const r = ownerRoute()
@@ -132,16 +155,17 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
       Number(hub?.lastPrivateAt?.(target.id) || 0),
     )
   }
+  const purposeDir = (...parts) => personaDataDir(getConfig(), personaNow(getConfig()), 'purpose', ...parts)
   const friendStatePaths = (friend) => {
     if (!friend) {
-      const main = dataDir('purpose', 'purpose-state.json')
+      const main = purposeDir('purpose-state.json')
       return { canonical: main, legacy: '', preferCanonical: true }
     }
     const target = resolveFriendTarget(friend)
     if (!target) return null
     return {
-      canonical: dataDir('purpose', 'friends', `${target.safeFileKey}.json`),
-      legacy: target.legacyKey ? dataDir('purpose', 'friends', `${target.legacyKey}.json`) : '',
+      canonical: purposeDir('friends', `${target.safeFileKey}.json`),
+      legacy: target.legacyKey ? purposeDir('friends', `${target.legacyKey}.json`) : '',
       preferCanonical: !target.legacy,
     }
   }
@@ -149,9 +173,206 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     const p = friendStatePaths(friend)
     return p ? (p.preferCanonical || !p.legacy ? p.canonical : p.legacy) : ''
   }
-  const nudgeFile = () => dataDir('purpose', 'nudge.json')
+  const nudgeFile = () => purposeDir('nudge.json')
+  // ---------- 她的小闹钟（P2b 自 speakup 迁入，Q2 拍板 §2.2-A） ----------
+  // 每条提醒都是她自己在对话里设的一次性闹钟；到点只负责把她叫醒（pushToSession 进主人私聊
+  // 的真实会话），不直接替她发消息。数据：新写 purpose/reminders.json；新文件还没建过时
+  // 兼容读旧 speakup-reminders.json（只读不写回，首次保存后旧文件冻结、不删，便于审计）。
+  // 配置键冻结在 speakUp.reminder*（Q3/Q4 同口径：键留在 speakUp 命名空间，由 purpose 维护）。
+  const REMINDER_GRACE_MS = 15 * 60_000
+  const REMINDER_RETRY_MS = 5 * 60_000
+  const REMINDER_WAIT_MS = 4 * 60_000
+  let reminderBusy = false
+  const remindersFile = () => purposeDir('reminders.json')
+  const two = (n) => String(n).padStart(2, '0')
+  const reminderText = (at) => {
+    const d = new Date(at)
+    return `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}`
+  }
+  function parseReminderTime(value) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})$/.exec(String(value || '').trim())
+    if (!m) return 0
+    const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), 0, 0)
+    if (d.getFullYear() !== Number(m[1]) || d.getMonth() !== Number(m[2]) - 1 || d.getDate() !== Number(m[3])
+      || d.getHours() !== Number(m[4]) || d.getMinutes() !== Number(m[5])) return 0
+    return d.getTime()
+  }
+  function normalizeReminder(raw) {
+    if (!raw || typeof raw !== 'object') return null
+    const id = String(raw.id || '').trim()
+    const at = Number(raw.at)
+    const note = String(raw.note || '').trim().slice(0, 500)
+    if (!id || !Number.isFinite(at) || !note) return null
+    return {
+      id,
+      at,
+      atText: String(raw.atText || '').trim() || reminderText(at),
+      note,
+      createdAt: Number(raw.createdAt) || at,
+      attempts: Math.max(0, Math.round(Number(raw.attempts) || 0)),
+      nextAt: Number(raw.nextAt) || at,
+      expiresAt: Number(raw.expiresAt) || at + REMINDER_GRACE_MS,
+      lastError: String(raw.lastError || '').slice(0, 180),
+    }
+  }
+  function loadReminders() {
+    // 新文件存在（哪怕存的是空数组）就只认新文件：首写后旧文件冻结
+    const fresh = readJson(remindersFile(), null)
+    const raw = Array.isArray(fresh) ? fresh : (() => {
+      const legacy = readJson(dataDir('speakup-reminders.json'), null)
+      return Array.isArray(legacy) ? legacy : []
+    })()
+    return raw.map(normalizeReminder).filter(Boolean)
+  }
+  function saveReminders(list) { writeJson(remindersFile(), list) }
+  function pruneReminders(now = Date.now()) {
+    const raw = loadReminders()
+    const live = raw.filter((r) => r.expiresAt > now)
+    if (live.length !== raw.length) saveReminders(live)
+    return live
+  }
+  const reminderList = (now = Date.now()) => pruneReminders(now).sort((a, b) => a.at - b.at)
+  /** 小闹钟的总闸：插件总开关 + 目的引擎未显式关 + 主人在面板开了「小闹钟」开关。 */
+  function remindersOn(cfg = getConfig()) {
+    return Boolean(cfg.enabled) && !cfg.debug && purposeConfig(cfg).enabled && cfg.speakUp?.reminderEnabled === true
+  }
+  function addReminder(value, noteText) {
+    const cfg = getConfig()
+    if (!cfg.enabled) return { ok: false, message: '插件总开关没开启' }
+    if (!purposeConfig(cfg).enabled) return { ok: false, message: '目的引擎没开启' }
+    if (!cfg.speakUp?.reminderEnabled) return { ok: false, message: '小闹钟没开启' }
+    const at = parseReminderTime(value)
+    if (!at) return { ok: false, message: '时间格式不对，要用 yyyy-mm-dd HH:MM，例如 2026-11-12 17:30' }
+    const now = Date.now()
+    if (at <= now) return { ok: false, message: '这个时间已经过去了，请设一个将来的时间' }
+    const note = String(noteText || '').trim().slice(0, 500)
+    if (!note) return { ok: false, message: '要提醒自己什么？把想说的话写进 note' }
+    const live = pruneReminders(now)
+    if (live.length >= (cfg.speakUp.reminderLimit ?? 5)) return { ok: false, message: '你设定的提醒太多了' }
+    const reminder = {
+      id: randomUUID(),
+      at,
+      atText: reminderText(at),
+      note,
+      createdAt: now,
+      attempts: 0,
+      nextAt: at,
+      expiresAt: at + REMINDER_GRACE_MS,
+      lastError: '',
+    }
+    saveReminders([...live, reminder])
+    log.info(`小闹钟：${reminder.atText} ${note}`)
+    return { ok: true, id: reminder.id, at: reminder.atText, message: `已记下，${reminder.atText} 叫醒你` }
+  }
+  function closeReminder(id) {
+    const key = String(id || '').trim()
+    const live = pruneReminders()
+    if (!key || !live.some((r) => r.id === key)) return { ok: false, message: '没找到这个提醒，可能已经过期或关闭了' }
+    saveReminders(live.filter((r) => r.id !== key))
+    return { ok: true, message: '这个小闹钟已关闭' }
+  }
+  function reminderPrompt(reminder, owner) {
+    return `【系统提醒，不是${owner}说的话】你之前给自己定的小闹钟到时间了：${reminder.atText}「${reminder.note}」。现在可以主动找${owner}说这件事；如果你觉得现在不适合打扰，就只回 [沉默]。`
+  }
+  async function attemptReminder(reminder) {
+    const cfg = getConfig()
+    if (!ownerId() || !remindersOn(cfg)) return
+    const route = ownerRoute()
+    const chat = ownerChat(route, cfg)
+    if (!chat && !route?.deferred) return
+    const outcome = await new Promise((resolve) => {
+      let settled = false
+      const timer = setTimeout(() => finish({ ok: false, error: '等回复超时' }), REMINDER_WAIT_MS)
+      timer.unref?.()
+      const finish = (result) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        resolve(result || { ok: false, error: '没有结果' })
+      }
+      try {
+        const waiting = pushOwner(
+          chat,
+          [{ type: 'text', text: reminderPrompt(reminder, cfg.ownerName || '主人') }],
+          route,
+          { onTurnEnd: finish, proactiveCause: 'reminder' },
+        )
+        Promise.resolve(waiting).then(
+          (result) => { if (typeof result?.ok === 'boolean') finish(result) },
+          (error) => finish({ ok: false, error: error?.message || String(error) }),
+        )
+      } catch (error) {
+        finish({ ok: false, error: error?.message || String(error) })
+      }
+    })
+    const live = loadReminders()
+    const current = live.find((r) => r.id === reminder.id)
+    if (!current) return
+    if (!outcome.deferred && (outcome.ok || outcome.delivered === true)) {
+      saveReminders(live.filter((r) => r.id !== reminder.id))
+      log.info(`小闹钟触发：${reminder.atText} ${reminder.note}`)
+      return
+    }
+    const retry = cfg.speakUp?.reminderRetry !== false
+    const at = Date.now()
+    if (!retry) {
+      saveReminders(live.filter((r) => r.id !== reminder.id))
+      log.warn(`小闹钟放弃：${reminder.atText} ${outcome.error || '触发失败'}`)
+      return
+    }
+    // 第一次失败后从现在起保留 15 分钟；之后每 5 分钟再试。
+    if (current.attempts === 0) current.expiresAt = at + REMINDER_GRACE_MS
+    if (at + REMINDER_RETRY_MS >= current.expiresAt) {
+      saveReminders(live.filter((r) => r.id !== reminder.id))
+      log.warn(`小闹钟放弃：${reminder.atText} ${outcome.error || '触发失败'}`)
+      return
+    }
+    current.attempts += 1
+    current.nextAt = at + REMINDER_RETRY_MS
+    current.lastError = String(outcome.error || '触发失败').slice(0, 180)
+    saveReminders(live)
+    log.warn(`小闹钟触发失败，5 分钟后重试：${reminder.atText}（${current.lastError}）`)
+  }
+  async function tickReminders(now = Date.now()) {
+    if (reminderBusy) return false
+    const cfg = getConfig()
+    if (!remindersOn(cfg)) return false
+    const due = reminderList(now).find((r) => r.nextAt <= now)
+    if (!due) return false
+    reminderBusy = true
+    try { await attemptReminder(due) } finally { reminderBusy = false }
+    return true
+  }
 
   // ---------- 状态 ----------
+  // 【一次性迁移】2026-11-17 之前心情向量存在目的引擎的状态文件里（moods/moodsAt）；
+  // 之后归心情模块所有（persona-data/<人格>/mood.json 的 emotions/emotionsAt）。
+  // 这里在第一次读到带旧向量、且目的状态还没打迁移标记的存档时，把它并进心情模块，
+  // 然后清空自己这份并打标记——不清空的话下次启动会再并一次，把刚衰减下来的向量又抬回去。
+  // 只在主状态（friend===''）做：朋友的引擎状态不承载心情。
+  function migrateLegacyMoods(state, friend = '') {
+    if (friend) return false
+    if (state.moodsMigratedAt) return false
+    const legacy = state.moods && typeof state.moods === 'object' ? state.moods : null
+    const hasLegacy = legacy && Object.values(legacy).some((v) => Number(v) > 0)
+    if (hasLegacy) {
+      const m = moodOf()
+      if (typeof m?.importEmotions === 'function') {
+        try {
+          m.importEmotions(legacy, { at: Number(state.moodsAt) || 0 })
+          log.info?.('目的：旧的心情向量已迁移到心情模块')
+        } catch (error) {
+          log.warn?.('目的：心情向量迁移失败（不影响运行）：', error?.message)
+          return false // 迁移没成功就不打标记，下次再试
+        }
+      }
+    }
+    state.moods = {}
+    state.moodsAt = 0
+    state.moodsMigratedAt = Date.now()
+    return true
+  }
+
   function loadState(config, now = Date.now(), friend = '') {
     const paths = friendStatePaths(friend)
     let raw = null
@@ -166,11 +387,26 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
       }
     }
     const state = normalizePurposeState(raw, now)
-    if (!raw && !friend) {
-      // 旧 speakup.json 只读迁移当日次数，之后弃用
+    if (!raw) {
+      // 旧 speakup.json 只读。主人和朋友各自在新的 purpose 状态里承接旧排程。
       const legacy = readJson(dataDir('speakup.json'), null)
-      const legacyCount = Number(legacy?.count) || 0
-      if (legacy?.day === new Date(now).toDateString() && legacyCount > 0) state.countToday = legacyCount
+      const target = friend && resolveFriendTarget(friend)
+      let previous = friend ? null : legacy
+      if (target && legacy?.friends && typeof legacy.friends === 'object') {
+        for (const [key, entry] of Object.entries(legacy.friends)) {
+          const oldTarget = resolveFriendTarget(key)
+          if (!oldTarget || !entry || typeof entry !== 'object' || Array.isArray(entry)) {
+            warnBad('speakup.json/friends', key)
+            continue
+          }
+          if (oldTarget.canon === target.canon && (!previous || key === target.canon)) previous = entry
+        }
+      }
+      if (previous?.day === new Date(now).toDateString()) {
+        state.countToday = Math.max(0, Math.floor(Number(previous.count) || 0))
+      }
+      if (Number.isFinite(previous?.nextAt) && previous.nextAt > 0) state.nextFireAt = previous.nextAt
+      if (Number.isFinite(previous?.last) && previous.last > 0) state.lastRunAt = previous.last
     }
     if (state.lastOutcome === 'pending') { // 重启不补发：上次在途改判 interrupted，归零重排
       state.lastOutcome = 'interrupted'
@@ -178,6 +414,9 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     }
     ensurePurposeDay(state, now)
     ensurePurposeSchedule(state, { now, config })
+    // 迁移必须在 normalize 之后：normalize 只把旧向量原样读回来，不解释它的语义。
+    const migrated = migrateLegacyMoods(state, friend)
+    if (migrated) writeJson(stateFile(friend), state) // 立刻落盘，避免每次 load 都重跑迁移
     return state
   }
   const saveState = (state, friend = '') => {
@@ -268,10 +507,12 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     if (!sel || !Array.isArray(materials) || !materials.length) return materials
     const list = materials.slice(0, 28)
     const lines = list.map((m, i) => `${i + 1}. ${formatMaterialLine(m, now)}`)
+    // 情绪候选按「用户配的心情项」给——删掉的项不该再让模型产出（也给不出标签）。
+    const emotionItemsList = emotionItems()
     const prompt = [
-      '下面是 AI 伙伴「大肥鱼」最近看到/经历的事情列表（已脱敏）。给每一条判断：',
+      `下面是 AI 伙伴「${selfName(getConfig())}」最近看到/经历的事情列表（已脱敏）。给每一条判断：`,
       `① 它最指向哪种内心需要（只能是：${PURPOSE_NEEDS.join('/')}）；`,
-      `② 它让大肥鱼产生什么情绪（只能是：${Object.keys(EMOTION_LABELS).join('/')}）。`,
+      `② 它让${selfName(getConfig())}产生什么情绪（只能是：${emotionItemsList.map((e) => e.key).join('/')}）。`,
       '只输出一个 JSON 数组，不要解释：[{"i":1,"need":"play","emotion":"curious"}, …]，i 对应条目序号。',
       '',
       ...lines,
@@ -287,11 +528,12 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
         if (!m || !PURPOSE_NEEDS.includes(item?.need)) continue
         hit += 1
         m.needAffinity = Object.fromEntries(PURPOSE_NEEDS.map((n) => [n, n === item.need ? 1 : 0]))
-        const emotion = EMOTION_LABELS[item?.emotion] ? item.emotion : ''
+        // 模型可能仍吐出已删除的键（旧提示词缓存/自由发挥）：按画像映射到最接近的一项
+        const emotion = emotionItemsList.some((e) => e.key === item?.emotion) ? item.emotion : resolveEmotion(emotionItemsList, item?.emotion)
         if (emotion) {
           m.scoredEmotion = emotion
           // 情绪画像回写 cues：后续 appraiseMaterial 直接吃模型判的情绪强弱。
-          const p = EMOTION_PROFILES[emotion]
+          const p = emotionProfile(emotion, emotionItemsList)
           m.cues = { positive: p.valence > 0.1, negative: p.valence < -0.1, arousal: p.arousal }
         }
       }
@@ -403,6 +645,7 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
       history: state.history,
       stats: ctx.materials.stats,
       drives: ctx.drives,
+      emotions: emotionItems(),
     }) + `\n6) 这一轮不能用任何工具：直接输出你要发的那句话即可（会自动转发给${name}）。不想说就整段只输出 ${SILENCE}。`
     const body = friend ? prompt.replaceAll('主人', name) : prompt // 朋友不是她的主人
     return [`你是「${selfName(cfg)}」。`, body, selected?.kind === 'memory-follow-up' ? followUpHint(ctx.followUp) : ''].filter(Boolean).join('\n')
@@ -461,17 +704,30 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     return su.petFallbackToQQ ? 'qq' : 'silent'
   }
 
-  // ---------- 生成 + 投递 + 回执（hub.deliver 内部吞错，成功判定看返回值） ----------
-  async function runOnce({ reason = '定时', config, state, force = false, friend = '' } = {}) {
+  // ---------- 生成 + 投递 + 回执 ----------
+  let running = false
+  async function runOnce(options) {
+    if (running) return { outcome: 'skipped-busy' }
+    running = true
+    try { return await performTurn(options) } finally { running = false }
+  }
+
+  async function performTurn({ reason = '定时', config, state, friend = '' } = {}) {
+    const sharedRoute = friend ? null : sharedOwnerRoute()
     if (!friend) {
-      const r0 = ownerRoute()
+      const r0 = sharedRoute || ordinaryOwnerRoute()
       if (!r0 || r0.blocked || !r0.chatId) {
-        return { outcome: r0?.blocked ? 'blocked' : 'no-route', reason: r0?.reason || 'no-route' }
+        return unavailableOwner(r0)
       }
     }
     const cooldown = hub.systemSessionCooldown?.('purpose', { key: friend })
     if (cooldown) return { outcome: 'skipped-cooldown', retryAt: cooldown.retryAt }
+    // 迁进私聊会话之后（#446），会话故障的退避是记在 `private:<QQ>` 上的，不是 `system:purpose`。
+    // 这里必须先查它：否则第一次挂载失败之后每个 tick 都会重新 prepare、重算驱动力/目标并落盘，
+    // 把状态文件改得面目全非（实测会把 drives 一路推高），而实际一条消息都发不出去。
     const cfg = getConfig()
+    const roomCooldown = friend ? null : hub.chatCooldown?.(chatIdOf(cfg))
+    if (roomCooldown) return { outcome: 'skipped-cooldown', retryAt: roomCooldown.retryAt }
     const now = Date.now()
     ensurePurposeDay(state, now)
     const ctx = await prepare(cfg, config, state, now, friend)
@@ -496,7 +752,7 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
 
     const picked = selectPurpose({
       seeds: ctx.seeds, goals: ctx.goals, pending: state.pending, history: state.history,
-      config, drives: ctx.drives, now, lastMasterAt: ctx.lastMasterAt,
+      config, drives: ctx.drives, now, lastMasterAt: ctx.lastMasterAt, emotions: emotionItems(),
     })
     state.lastMaterialCount = ctx.materials.items.length
     state.lastCandidateCount = picked.candidates.length
@@ -508,16 +764,83 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     }
 
     const prompt = promptFor(cfg, config, picked.purpose, { ...ctx, candidates: picked.candidates }, state, now, friend)
-    // 投递即占今日次数（模型回合已经花钱了）；引擎随后按真结局结算
+    // 载体预判（#446）：真正的对外发言要归入目标私聊的统一时间线——但**只在它最终会以 QQ 消息出现时**。
+    // carrier=pet 且桌宠在线时这一轮走气泡，既不该往 QQ 发消息，也不能让私聊会话替它自动投递，
+    // 所以那种情况保持原来的 system 会话路径。
+    const su = carrierSettings()
+    const petOnline = su.carrier === 'pet' && Boolean(petOf()?.online?.()?.online)
+    // 这一轮会不会以 QQ 私聊消息落地：
+    //   · 朋友（friend）永远走 QQ → 会；
+    //   · carrier=qq（默认）→ 会（petFallbackToQQ 只跟 pet 载体有关，这里不该掺进来）；
+    //   · carrier=pet 且桌宠在线 → 不会（走气泡）；
+    //   · carrier=pet 且桌宠离线 → 只有开了回落才会，否则静默。
+    const willUseQQ = friend
+      ? true
+      : (su.carrier !== 'pet' || (!petOnline && su.petFallbackToQQ))
+    if (sharedRoute && willUseQQ) {
+      const chat = ownerChat(sharedRoute, cfg)
+      if (!chat || typeof hub.pushProactiveToSession !== 'function') return { outcome: 'blocked', reason: 'shared-unavailable' }
+      let raw = ''
+      let text = ''
+      let result
+      try {
+        result = await pushOwner(chat, [{ type: 'text', text: prompt }], sharedRoute, {
+          proactiveCause: 'purpose',
+          noTools: true,
+          transformReply: (reply) => {
+            raw = reply
+            text = cleanReply(reply, { warn: (message) => log.warn?.(`目的：${message}`) }, getConfig())
+            return text
+          },
+        })
+      } catch (error) {
+        log.warn?.('目的：共享回合失败：', error?.message)
+        return { outcome: 'failed' }
+      }
+      if (result?.deferred) return unavailableOwner(result)
+      // 共享会话仅凭真实送达回执扣次数。沉默、暂缓和未投递不能变成成功记录。
+      const outcome = result?.delivered ? 'sent' : result?.ok ? 'silent' : 'delivery-failed'
+      const following = picked.purpose.kind === 'memory-follow-up'
+      const memo = parsePurposeMemo(raw)
+      if (outcome === 'sent') {
+        markPurposeDelivered(state, { now, planned: picked.purpose })
+        if (following) memoryOf()?.markFollowUpAsked?.(ctx.followUp.id)
+        reportMood(picked.purpose, outcome, memo, chat.chatId)
+      }
+      applyPurposeOutcome(state, { now: Date.now(), config, outcome, text: outcome === 'sent' ? text : '', memo: following ? null : memo, planned: picked.purpose })
+      saveState(state)
+      return { outcome, text, memo }
+    }
+    // 普通路径保留 beta 的模型回合记账。
     const beforeAttempt = { ...state }
     markPurposeDelivered(state, { now, planned: picked.purpose })
     saveState(state, friend)
-
     let raw = ''
     let genError = null
+    const inChat = willUseQQ && typeof hub.runTurnInChat === 'function'
     try {
       log.info?.(`目的（${reason}）：${picked.purpose.text}`)
-      raw = await hub.runSystemTurn('purpose', '主动搭话（目的回合）', prompt, { timeoutMs: 180000, noTools: true, key: friend })
+      if (inChat) {
+        // 在这一轮真正的私聊会话里生成：她看到的上下文就是这段聊天本身，
+        // DSH 注入的 elapsed 也就天然是这段私聊的真实静默时长（#446 的核心）。
+        // suppressDelivery：原文末尾带「内部备忘」（【目的】/【状态】/【待续】），
+        // 直接让 hub 投递会把备忘泄到 QQ 里；所以拿回原文，照旧过 cleanReply 再由下面选载体投递。
+        const r = await hub.runTurnInChat(chatIdOf(cfg, friend), prompt, {
+          // userText 只喂检索/存档，别把这一大段提示词当成用户消息记进她的对话档案。
+          noTools: true, timeoutMs: 180000, kind: 'purpose', suppressDelivery: true, userText: MOOD_PREFIX,
+        })
+        if (r && r.ok === false && r.reason === 'busy') {
+          // 主人正在说话：不插队，也不占次数（与追问让位同一口径）
+          Object.assign(state, beforeAttempt)
+          saveState(state, friend)
+          log.info?.(`目的（${reason}）：主人在说话，这一轮让位`)
+          return { outcome: 'skipped-busy' }
+        }
+        if (r && r.ok === false) throw Object.assign(new Error(r.error || '在私聊里生成失败'), { code: 'IN_CHAT_FAILED' })
+        raw = String(r?.raw || '')
+      } else {
+        raw = await hub.runSystemTurn('purpose', '主动搭话（目的回合）', prompt, { timeoutMs: 180000, noTools: true, key: friend })
+      }
     } catch (error) {
       if (isSessionBackoff(error)) {
         // 查询与真正调用之间也可能进入冷却；这一轮没启动，不占次数或失败账。
@@ -541,6 +864,10 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
         outcome = 'silent' // carrier=pet 且关闭回落（或专注模式）：静默，不硬补
       } else if (where === 'failed') {
         outcome = 'delivery-failed' // dispatch 结果不确定：不补发，避免重复
+      } else if (!friend && (sharedRoute || sharedOwnerRoute())) {
+        Object.assign(state, beforeAttempt)
+        saveState(state)
+        return { outcome: 'deferred', reason: 'shared-route-changed', retryable: true }
       } else {
         try {
           // 引擎自发发言走 §5.3 私有凭据（enginePolicy）：tickOne 已经用 evaluatePurposeTick
@@ -571,7 +898,7 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     if (following && outcome === 'sent') memoryOf()?.markFollowUpAsked?.(ctx.followUp.id)
     // 模型的「待续」不能把事实跟进再复制进 purpose.pending。
     applyPurposeOutcome(state, { now: Date.now(), config, outcome, text, memo: following ? null : memo, planned: picked.purpose })
-    if (!friend) nudgeMood(picked.purpose, outcome, memo)
+    if (!friend) reportMood(picked.purpose, outcome, memo, chatIdOf(cfg, friend))
     saveState(state, friend)
     log.info?.(`目的：回合结束 ${outcome}（今天第 ${state.countToday} 次）`)
     return { outcome, text, memo }
@@ -620,7 +947,8 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     const persona = (() => {
       try {
         const t = typeof personaText === 'function' ? String(personaText() || '').trim() : ''
-        return t.slice(0, 1500)
+        // 5000 字：人格卡后半段常是「怎么说话/怎么接话」的具体规则，截 1500 字会把最关键的判断依据切掉
+        return t.slice(0, 5000)
       } catch { return '' }
     })()
     const moodLine = (() => {
@@ -629,12 +957,12 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
         if (!m) return ''
         // contextLine 自带「你现在 X，因为 Y。这会影响你说话：Z」，比裸数字有用得多
         if (typeof m.contextLine === 'function') {
-          const line = String(m.contextLine() || '').trim()
+          const line = String(m.contextLine({ chatId: target }) || '').trim()
           if (line) return line
         }
         if (typeof m.state === 'function') {
           const st = m.state()
-          if (st) return `（你现在心情 ${Number(st.value ?? 60)}/100（${st.label || ''}）${st.reason ? `，因为${st.reason}` : ''}。）`
+          if (st) return `（你现在心情 ${Number(st.value ?? 60)}/100（${st.label || ''}）。）`
         }
       } catch {}
       return ''
@@ -712,14 +1040,16 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
       try {
         const days = hub.chatLogDays?.() || []
         const rows = []
-        for (const day of days.slice(-1)) {
+        // 读两天：只看当天的话，凌晨刚过零点时最近 20 条会凑不满
+        for (const day of days.slice(-2)) {
           for (const e of hub.chatLogOf?.(day) || []) {
             if (!e || e.forgottenAt) continue
             if (!sameChat(e.chatId, target) && (!ownerKey || !sameChat(e.chatId, ownerKey))) continue
             rows.push(e)
           }
         }
-        const tail = rows.slice(-8)
+        // 20 条：决断要看得出「你们现在聊到哪、什么气氛」，8 条常常只够看到半截对话
+        const tail = rows.slice(-20)
         if (!tail.length) return ''
         // 顺便判断：主人私聊流水里，她最近有没有真的发过几乎一样的内容（这才是「说过了」的硬证据）
         const norm = (s) => String(s || '').replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, '').slice(0, 120)
@@ -796,52 +1126,157 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     }
   }
 
-  // 9 维驱动 → mood 单标量。mood 关闭时 nudge 自静默。
-  // memo 里的【感受】喜/−喜（feelings.moodDelta ±10）会叠加在情绪表之上。
-  function nudgeMood(purpose, outcome, memo = null) {
+  // 一轮结束后的心情上报（2026-11-17 改口径）：
+  //   ① 情绪向量：把这一轮的情绪交给心情模块（mood.feel），它是唯一真相；
+  //   ② 心情标量：按情绪表折算成 ±N 交给 mood.nudge（沿用旧口径，只是现在和向量同源）；
+  //   ③ memo 里的【感受】喜/−喜（feelings.moodDelta ±10）叠加在标量之上。
+  // 心情模块关着时 feel/nudge 自己静默（旧行为：mood 关闭 nudge 自静默）。
+  function reportMood(purpose, outcome, memo = null, chatId = '') {
     if (outcome !== 'sent') return
     const m = moodOf()
-    if (!m?.nudge) return
+    if (!m) return
+    const emotion = resolveEmotion(emotionItems(), purpose?.emotion)
+    // 向量：这一轮的情绪抬一手（它自己会按心情的半衰期衰减）
+    if (emotion && typeof m.feel === 'function') {
+      try { m.feel(emotion, { weight: 0.45 }) } catch {}
+    }
+    if (typeof m.nudge !== 'function') return
     const table = { affectionate: 5, excited: 5, proud: 4, amused: 4, lonely: -3, bored: -2, worried: -2, envious: -2, content: 0 }
-    const delta = table[purpose?.emotion] || 0
+    const delta = table[emotion] || 0
     const feel = Math.max(-10, Math.min(10, Number(memo?.feelings?.moodDelta) || 0))
     const total = delta + feel
     if (!total) return
-    try { m.nudge(total, `主动搭话：${String(purpose?.text || '').slice(0, 20)}`) } catch {}
+    try { m.nudge(total, `主动搭话：${String(purpose?.text || '').slice(0, 20)}`, chatId) } catch {}
+  }
+
+  /** 主人（或朋友）最近真的发过来的几句话，越靠后越新。追问的提示词要拿它当真实上下文。 */
+  function recentInbound(cfg, friend = '', limit = 2) {
+    const ownerKey = chatIdOf(cfg, friend)
+    try {
+      const rows = []
+      for (const day of (hub.chatLogDays?.() || []).slice(-2)) {
+        for (const e of hub.chatLogOf?.(day) || []) {
+          if (!e || e.forgottenAt) continue
+          if (String(e.chatId) !== ownerKey) continue
+          if (e.who === 'bot') continue // 只看对方说的话，她自己说的上面已经有了
+          const text = String(e.text || '').replace(/\s+/g, ' ').trim()
+          if (text) rows.push({ text, at: Number(e.t) || 0 })
+        }
+      }
+      return rows.slice(-limit)
+    } catch { return [] }
   }
 
   // ---------- 追问（沿用旧 speakup 的「轻轻追一句」，不占今日次数） ----------
-  async function maybeNudge(cfg, state, now = Date.now()) {
+  //
+  // #298 的六条缺陷在这里逐条收口：
+  //   · 只判 su.nudge 不够，还要判 speakUp.enabled（对齐旧引擎 companion.js 的 `if (!cfg.enabled || !c.enabled) return`）；
+  //   · nudgedFor 必须「真决定发」之后才写——先抛硬币再写标记会把这条消息的追问机会永久吃掉；
+  //   · 吗/呢/嘛 要锚句尾，否则陈述句里的「嘛」会被当成提问；
+  //   · 追问也是主动开口，安静时段与每日上限跟正常目的回合同一套口径；
+  //   · 生成改在目标私聊的真实会话里（见 runNudgeTurn），DSH 注入的 elapsed 天然就是这段静默的真实时长。
+  async function maybeNudge(cfg, config, state, now = Date.now()) {
     const su = cfg.speakUp || {}
-    if (!su.nudge) return false
+    // 总开关关掉就一步都不做：主人关掉「主动搭话」后追问还会发，是用户实际踩到的那个 bug。
+    // 追问键（P1 翻键）：config.nudge 由 purposeConfig 按 ext.purpose.nudge ?? speakUp.nudge ?? true 算好；
+    // speakUp.enabled 总闸 P1 保留（方案 §4.3 兼容期口径，speakup 模块退场批次再收）。
+    if (!cfg.enabled || !su.enabled || !config.nudge) return false
     const lb = hub.lastBotToOwner || { at: 0, text: '' }
     const quietMs = now - (lb.at || 0)
-    const flag = readJson(nudgeFile(), {})
     if (!lb.at || lb.at <= (hub.lastOwnerChatAt || 0)) return false
+    const flag = readJson(nudgeFile(), {})
     if (flag.nudgedFor === lb.at) return false
-    if (!/[？?]|吗|呢|嘛|没$/.test(String(lb.text || '').trim())) return false
+    // 问号在哪儿都算提问；吗/呢/嘛/没 必须落在句尾（「这算什么嘛 反正我也不着急 你先忙」不是提问）。
+    if (!/[？?]|(?:吗|呢|嘛|没)$/.test(String(lb.text || '').trim())) return false
     if (!(quietMs > 15 * MINUTE && quietMs < 40 * MINUTE)) return false
+    // 安静时段与每日上限：追问以前走的是 normalize 之前的老路径，两条闸门都没吃到。
+    if (inQuietHours(now, config)) return false
+    if (config.dailyMax > 0 && state.countToday >= config.dailyMax) return false
     if (hub.systemSessionCooldown?.('purpose-nudge')) return false
     const nudgeRoute = ownerRoute()
     if (!nudgeRoute || nudgeRoute.blocked || !nudgeRoute.chatId) return false
-    writeJson(nudgeFile(), { nudgedFor: lb.at }) // 引擎状态文件会被 normalize 洗字段，追问标记单独存
+    // 抽空不发：这里必须直接返回，绝不能先写 nudgedFor——写了就等于永久消耗这条消息的追问机会。
     if (Math.random() >= 0.5) return true
-    const idle = Math.round(quietMs / MINUTE)
     const owner = cfg.ownerName || '主人'
-    const prompt = `【系统提醒，不是${owner}说的话】你刚才跟${owner}说「${String(lb.text || '').slice(-60)}」，${owner}已经 ${idle} 分钟没回了。可以轻轻追一句（比如「人呢」「睡着啦？」，或者换个话题），别催、别抱怨；觉得${owner}在忙就只回 ${SILENCE}。这一轮不能用工具，直接输出那句话。`
+    const idle = Math.round(quietMs / MINUTE)
+    const recent = recentInbound(cfg, '', 2)
+    const recentBlock = recent.length
+      ? `\n【${owner}最近真的对你说过的话（真实聊天记录，越靠后越新）】\n${
+        recent.map((e) => `${owner}：${e.text.slice(0, 80)}`).join('\n')}\n`
+      : ''
+    const prompt = [
+      `【系统提醒，不是${owner}说的话】你刚才跟${owner}说「${String(lb.text || '').slice(-60)}」，到现在 ${idle} 分钟没有回你。`,
+      recentBlock,
+      `这一轮不能用工具，直接输出你要发的那句话。可以轻轻追一句（比如「人呢」「睡着啦？」，或者换个话题），别催、别抱怨；觉得${owner}在忙就只回 ${SILENCE}。`,
+      // time-context 串台的正本清源：静默时长只有下面这一个数字是真的，
+      // 不许拿别的「距上次对话过了多久」来推算，否则又会说出「22 小时没回了」这种与事实不符的话。
+      `注意：${idle} 分钟就是${owner}没回你的真实时长。不要用任何其它来源的「过了多久」来替代或叠加它，也不要把它说成更大的数。`,
+    ].filter(Boolean).join('\n')
+    // 决定要发了才落标记：这一轮没发生（让位/提交失败）时恢复成原值，这条消息还能再追一次。
+    writeJson(nudgeFile(), { ...flag, nudgedFor: lb.at }) // 引擎状态文件会被 normalize 洗字段，追问标记单独存
     try {
-      const raw = await hub.runSystemTurn('purpose-nudge', '主动搭话（追问）', prompt, { timeoutMs: 120000, noTools: true })
-      const text = cleanReply(raw, { warn: (message) => log.warn?.(`目的：${message}`) }, getConfig())
-      const to = resolveOwnerChat()
-      if (text && to) await hub.deliver(to, text, { userText: MOOD_PREFIX }) // 不带 own:true，同上：hub 桥接进下次对话
-    } catch (error) {
-      if (isSessionBackoff(error)) {
-        writeJson(nudgeFile(), flag)
+      const outcome = await runNudgeTurn(cfg, prompt)
+      if (outcome === 'busy') {
+        writeJson(nudgeFile(), flag) // 让位给主人的正常对话：不消耗这次追问机会
         return false
       }
+      // 追问本身也是在这个私聊里说的一句话：hub 在 deliverTurn 里会把 lastBotToOwner
+      // 换成这条新话（主人私聊的历史记录分支），
+      // 而它发生在 onTurnEnd 之前，所以这里读到的已经是「她刚追出去的那句」。
+      // 把 nudgedFor 推进到它上面：一句追问不会再成为下一条追问的由头（否则「人呢？」几十分钟后
+      // 又满足条件，一路连环催）。真正的新消息（主人的回复、她之后别的话）时间戳不同，照常能追。
+      if (outcome === 'sent') {
+        const after = Number(hub.lastBotToOwner?.at) || 0
+        if (after && after !== lb.at) writeJson(nudgeFile(), { ...flag, nudgedFor: after })
+      }
+      return true // sent / silent / unknown 都算追过（unknown 保守不回滚，避免双发）
+    } catch (error) {
+      writeJson(nudgeFile(), flag) // 抛错 = 这一轮没发生，不算追过
+      if (isSessionBackoff(error)) return false
       log.warn?.('目的：追问出错：', error?.message)
+      return false
     }
-    return true
+  }
+
+  /**
+   * 在目标私聊的真实会话里跑一轮追问（#446 的核心：对外发言要在目标聊天的统一时间线里生成）。
+   *
+   * 返回语义（决定调用方要不要回滚 nudgedFor）：
+   *   · 'sent'     她真发出了话
+   *   · 'silent'   她这轮决定沉默 —— 也算追过，不再重复打扰
+   *   · 'busy'     让位/没提交起来：这一轮根本没发生，调用方回滚标记，下一分钟还能再追
+   *   · 'unknown'  超时等结果不确定：**不回滚**，宁可少追一次也不能冒双发的险
+   */
+  async function runNudgeTurn(cfg, prompt) {
+    const sharedRoute = sharedOwnerRoute()
+    if (sharedRoute) {
+      const chat = ownerChat(sharedRoute, cfg)
+      if (!chat || typeof hub.pushProactiveToSession !== 'function') return 'busy'
+      const result = await pushOwner(chat, [{ type: 'text', text: prompt }], sharedRoute, {
+        proactiveCause: 'purpose-nudge',
+        noTools: true,
+        transformReply: (reply) => cleanReply(reply, { warn: (message) => log.warn?.(`目的：${message}`) }, getConfig()),
+      })
+      if (result?.deferred) return 'busy'
+      if (result?.delivered) return 'sent'
+      return result?.ok ? 'silent' : 'unknown'
+    }
+    const chatId = chatIdOf(cfg)
+    if (typeof hub.runTurnInChat !== 'function') {
+      // 旧宿主没有这个入口：退回系统会话，但提示词里已经给了真实静默分钟数（见 maybeNudge 的说明）。
+      const raw = await hub.runSystemTurn('purpose-nudge', '主动搭话（追问）', prompt, { timeoutMs: 120000, noTools: true })
+      const text = cleanReply(raw, { warn: (message) => log.warn?.(`目的：${message}`) }, getConfig())
+      if (text) await hub.deliver(chatId, text, { userText: MOOD_PREFIX }) // 不带 own:true，hub 桥接进下次对话
+      return text ? 'sent' : 'silent'
+    }
+    // 在真私聊里生成：回复由 hub 的 turn/end 正常落地（logChat + saidElsewhere + 心情链路全复用），
+    // 这里不要再 deliver 一次，否则会双发。
+    const r = await hub.runTurnInChat(chatId, prompt, { noTools: true, timeoutMs: 120000, userText: MOOD_PREFIX, kind: 'purpose-nudge' })
+    if (r && r.ok === true) return r.sent ? 'sent' : 'silent'
+    // 只有「这一轮根本没发生」才允许回滚：busy 让位 / 提交失败。
+    // 超时属于结果未知，回滚会导致下一分钟重追、可能双发，所以按已追过处理。
+    if (r && (r.reason === 'busy' || r.reason === 'submit-failed' || r.reason === 'unsupported-chat')) return 'busy'
+    return 'unknown'
   }
 
   // ---------- 对外 ----------
@@ -859,7 +1294,7 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
   async function tickOne(cfg, config, friend = '') {
     const now = Date.now()
     const state = loadState(config, now, friend)
-    if (!friend && await maybeNudge(cfg, state, now)) return true
+    if (!friend && await maybeNudge(cfg, config, state, now)) return true
     if (hub.systemSessionCooldown?.('purpose', { key: friend })) return false
     const env = {
       enabled: true, modeOk: true, dshReady: true, paused: false, ownerAllowed: true,
@@ -878,7 +1313,15 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
 
   /** 主人和白名单的朋友各算各的，一次最多找一个人，不一口气群发。
    *  人格卡的性格覆写（胆量/话多/黏人地板）只作用于主人这条线；朋友的排程沿用基础配置。 */
-  async function tick() {
+  let ticking = false
+  async function tick({ ownerOnly = false } = {}) {
+    if (ticking || running) return
+    ticking = true
+    try { return await tickScheduled(ownerOnly) } finally { ticking = false }
+  }
+
+  async function tickScheduled(ownerOnly) {
+    if (await tickReminders()) return true
     const cfg = getConfig()
     const config = purposeConfig(cfg)
     const ownId = ownerId()
@@ -886,6 +1329,7 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     const ownerConfig = applyPersonaOverrides(config, personaOf(cfg))
     const ownerCheck = ownerRoute()
     if (ownerCheck && !ownerCheck.blocked && ownerCheck.chatId && !ownerMuted() && !memoryOf()?.dislikes?.(ownId) && await tickOne(cfg, ownerConfig)) return
+    if (ownerOnly) return
     for (const raw of cfg.speakUp?.allow || []) {
       const target = resolveFriendTarget(raw)
       if (!target) { warnBad('speakUp.allow', raw); continue }
@@ -906,18 +1350,19 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     if (!ownId) return { outcome: 'no-owner' }
     const route = ownerRoute()
     if (!route || route.blocked || !route.chatId) {
-      return { outcome: route?.blocked ? 'blocked' : 'no-route', reason: route?.reason || 'no-route' }
+      return unavailableOwner(route)
     }
     if (ownerMuted()) return { outcome: 'muted' }
     if (memoryOf()?.dislikes?.(ownId)) return { outcome: 'disliked' }
     const state = loadState(config)
-    return runOnce({ reason, config, state, force: true })
+    return runOnce({ reason, config, state })
   }
 
   /** 同步返回（host.js:401 / 概览页依赖），至少含 count。 */
   function state() {
-    const s = readJson(stateFile(), null)
-    const normalized = normalizePurposeState(s)
+    // 走 loadState 而不是裸 readJson：心情向量的一次性迁移挂在 loadState 上，
+    // 面板/命令先调 state() 的路径也必须触发它（否则只有主动搭话才会迁移）。
+    const normalized = loadState(purposeConfig(getConfig()))
     return {
       count: normalized.countToday,
       countToday: normalized.countToday,
@@ -925,13 +1370,15 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
       nextFireAt: normalized.nextFireAt,
       lastOutcome: normalized.lastOutcome,
       lastPurpose: normalized.lastPurpose,
+      // 小闹钟（P2b 迁入）：面板/调试要看「她现在挂着哪些闹钟」
+      reminders: reminderList(),
     }
   }
 
   /** 面板摘要（不含提示词全文）。 */
   function status() {
     const config = purposeConfig(getConfig())
-    return summarizePurposeState(loadState(config), { config })
+    return summarizePurposeState(loadState(config), { config, emotions: emotionItems() })
   }
 
   /** 零副作用预览：真收素材、真拼提示词，但不写状态、不生成、不投递。 */
@@ -944,7 +1391,7 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     const lastMasterAt = ctx.lastMasterAt
     const picked = selectPurpose({
       seeds: ctx.seeds, goals: ctx.goals, pending: state.pending, history: state.history,
-      config, drives: ctx.drives, now, lastMasterAt,
+      config, drives: ctx.drives, now, lastMasterAt, emotions: emotionItems(),
     })
     const prompt = picked.purpose ? promptFor(cfg, config, picked.purpose, { ...ctx, candidates: picked.candidates }, state, now) : ''
     return {
@@ -959,11 +1406,10 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
   }
   const pAction = (p) => p.action || ''
 
-  /** 每轮系统提示词里的驱动提示（零风险的提示层对接：只影响语气倾向，不改变工具与权限）。 */
+  /** 每轮附在消息末尾的驱动提示（零风险的提示层对接：只影响语气倾向，不改变工具与权限）。 */
   function drivesRule() {
     const cfg = getConfig()
-    if (cfg.enabled === false) return ''
-    if (!((cfg.ext && cfg.ext.purpose) || {}).enabled) return '' // 引擎没开就不往提示词里掺驱动
+    if (!purposeConfig(cfg).enabled) return ''
     const s = readJson(stateFile(), null)
     if (!s) return ''
     const drives = s.drives || {}
@@ -976,5 +1422,15 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
     return `（你最近心里比较想要：${top.map((t) => t.label).join('、')}。它会自然影响你想聊什么，不用说出来。）`
   }
 
-  return { tick, fire, state, status, preview, run: fire, drivesRule, brokerReview, setEnginePolicySource }
+  // ---------- 安静时段派生观察哨（模块装配时打一次） ----------
+  // purposeConfig 派生出安静时段后在这里 log 出来，防「配置语义≠代码语义」再犯：
+  // 2026-11-16 用户设醒着 7~24 被旧派生当成全天、整夜唤醒的报障回归观察哨。
+  // 刻意只在 createPurpose（模块 setup）时打一次、不在每分钟 tick 里打——
+  // 冷却路径有「不记自己的日志」契约（system-session-backoff.test.js 锁的行为）。
+  {
+    const bootConfig = purposeConfig(getConfig())
+    log.info?.(`目的：醒着窗口派生安静时段 ${bootConfig.quietStart} ~ ${bootConfig.quietEnd}（起止相同 = 不启用安静时段）`)
+  }
+
+  return { tick, fire, state, status, preview, run: fire, drivesRule, brokerReview, setEnginePolicySource, addReminder, closeReminder, reminders: reminderList }
 }

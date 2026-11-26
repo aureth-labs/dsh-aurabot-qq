@@ -141,7 +141,7 @@ test('端到端：gate 档 + 策略源拒绝预算 → 模块发不出去', asyn
     hooks: { fsSync: false },
   })
   svc.registerPolicySource({
-    name: 'speakup',
+    name: 'purpose',
     state: () => 'ready',
     ready: () => true,
     reserve: () => ({ ok: false, reason: 'budget' }),
@@ -163,7 +163,7 @@ test('端到端：gate 档 + 策略源放行 → 正常发出', async (t) => {
     hooks: { fsSync: false },
   })
   svc.registerPolicySource({
-    name: 'speakup',
+    name: 'purpose',
     state: () => 'ready',
     ready: () => true,
     reserve: () => ({ ok: true, reserveId: 'r1' }),
@@ -472,6 +472,67 @@ test('broker 档：模块发主人纯文本改走宿主代发（scopedHub 路径
   assert.ok(r, '代发成功要返回真值，旧调用方语义不变')
   assert.deepEqual(submitted, [{ to: 'private:10001', text: '抖音日报来了' }], '内容交给宿主代发器（引擎决断入口）')
   assert.equal(sent.length, 0, 'broker 代发路径不应再直接调 hub')
+})
+
+// ---------- broker 档：显式声明 turnNotice 的回合内提示才直发（2026-11-18 生图画前提示重复回归） ----------
+
+const makeBroker = (t) => {
+  const svc = createOutboundPolicy({
+    getConfig: () => ({ ownerQQ: '10001', ext: { outboundPolicy: { tier: 'broker' } } }),
+    dataDir: null,
+    hooks: { fsSync: false },
+  })
+  const counters = { reserves: 0 }
+  svc.registerPolicySource({
+    name: 'purpose', state: () => 'ready', ready: () => true,
+    reserve: () => { counters.reserves++; return { ok: true, reserveId: 'r1' } }, commit: () => ({ ok: true }), release: () => ({ ok: true }),
+  })
+  const submitted = []
+  svc.setDeliverer(async (to, text) => { submitted.push({ to, text }); return true })
+  const { hub, sent } = makeHub(t)
+  // 模拟「她的回合正在进行」（工具执行阶段）：生图的画前提示正是在这个窗口里发出的。
+  // 用闭包变量切换状态——scopedHub 在创建时捕获函数引用，事后重赋值不生效。
+  const state = { inTurn: true }
+  hub.turnRunning = (chatId) => state.inTurn && chatId === 'private:10001'
+  const scopedFor = (id) => scopeCoreForModule({ hub: { ...hub, subagentFor: () => () => 'ok' }, outbound: svc }, id)
+  return { svc, counters, submitted, sent, state, scopedFor }
+}
+
+test('broker 档：白名单模块显式声明 turnNotice 时直发不经代发决断', async (t) => {
+  const { counters, submitted, sent, state, scopedFor } = makeBroker(t)
+  const scoped = scopedFor('imagegen')
+  const r = await scoped.hub.sendText('private:10001', '哟 憋半天是想要这款 行 给你画 别太兴奋', undefined, undefined, undefined, { turnNotice: true })
+  assert.deepEqual(r, { message_id: 'm1' }, '回合内直发返回真实发送回执（sendText 立刻完成）')
+  assert.equal(sent.length, 1, '这条真的发到 QQ 了')
+  assert.equal(submitted.length, 0, '不进代发决断——慢工具兜底与代发不会再重复同一句话')
+  assert.equal(counters.reserves, 0, '回合内直发不占策略源额度')
+  // 回合结束后：即使带着 turnNotice 标记，也回到原来的 broker 代发路径（防回合后借标记绕过）
+  state.inTurn = false
+  const r2 = await scoped.hub.sendText('private:10001', '抖音日报来了', undefined, undefined, undefined, { turnNotice: true })
+  assert.ok(r2, '回合结束后的发送照旧走代发')
+  assert.deepEqual(submitted, [{ to: 'private:10001', text: '抖音日报来了' }])
+  assert.equal(sent.length, 1, '代发路径不直接调 hub')
+})
+
+test('broker 档：非白名单模块在她回合内仍受代发治理（闸门不被回合窗口整体旁路）', async (t) => {
+  const { counters, submitted, sent, state, scopedFor } = makeBroker(t)
+  // 抖音日报这类「模块主动找主人」的发送：即便撞上她的回合、即便自己塞了 turnNotice，
+  // 也必须照旧走代发决断（TURN_NOTICE_MODULES 是宿主侧白名单，模块自己声明不算）。
+  const douyin = scopedFor('douyin')
+  const r = await douyin.hub.sendText('private:10001', '抖音日报来了', undefined, undefined, undefined, { turnNotice: true })
+  assert.ok(r, '照旧走代发并返回真值')
+  assert.deepEqual(submitted, [{ to: 'private:10001', text: '抖音日报来了' }], '仍进代发决断')
+  assert.equal(sent.length, 0, '非白名单模块不得在回合内直发')
+  assert.equal(state.inTurn, true, '前提：此刻她的回合确实在跑（否则这条用例测不到旁路风险）')
+})
+
+test('broker 档：白名单模块不声明 turnNotice 时，回合内也照旧走代发', async (t) => {
+  const { submitted, sent, scopedFor } = makeBroker(t)
+  const scoped = scopedFor('imagegen')
+  const r = await scoped.hub.sendText('private:10001', '抖音日报来了')
+  assert.ok(r, '没声明就按普通主动发言处理')
+  assert.deepEqual(submitted, [{ to: 'private:10001', text: '抖音日报来了' }], '未声明标记 → 走代发')
+  assert.equal(sent.length, 0)
 })
 
 test('broker 档：决断不发 + 日志口各种坏形态都不炸链路（2026-11-06 生产 TypeError 回归）', async (t) => {

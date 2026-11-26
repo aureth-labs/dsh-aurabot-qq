@@ -272,7 +272,7 @@ test('桌宠行为回执只留 3 天，别的记忆不受影响（#138）', asyn
 })
 
 test('心情基线可配，衰减往基线靠（#139）', async () => {
-  const { decayed } = await import('../src/features/companion.js')
+  const { decayed } = await import('../src/features/mood.js')
   assert.equal(Math.round(decayed(100, 0, 1, 100 * 3600_000, 40)), 40)
   assert.equal(Math.round(decayed(100, 0, 1, 100 * 3600_000)), 60)
 })

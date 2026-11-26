@@ -8,14 +8,16 @@
 //
 // 接口说明给写模块的人看：src/modules/API.md（每次启动复制到数据目录 modules/ 里）。
 
-import { existsSync, readdirSync, statSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
+import { existsSync, readdirSync, statSync, lstatSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { join, dirname, relative, resolve, sep, isAbsolute } from 'node:path'
 import { pathToFileURL, fileURLToPath } from 'node:url'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { dataDir } from './store.js'
 import { registerSecretField } from './config.js'
 import { defineTool } from '../tools/tools.js'
-import { selfName } from '../persona/personas.js'
+import { selfName, personaScope, personaNow } from '../persona/personas.js'
+import { PERSONA_MEMORY_MODULE } from './persona-memory-bridge.js'
 import { normalizeChatId, parseChatId } from '../gateway/address.js'
 import { ALL_FEATURES, emptyFeatures, mergeCapsWithFeatures } from '../gateway/features.js'
 import { partsToSegmentsFallback, segmentsToPartsFallback } from '../chat/part-fallback.js'
@@ -386,9 +388,39 @@ function settleModuleCall(core, verdict, outcome, log) {
  * 未注入服务（旧环境 / 纯测试）时**不设** outboundDone：让 hub 的第二道保险（若宿主挂了）
  * 仍然生效；两道都没有时就是原样直发，与改造前逐字节等价。
  */
+// 模块显式声明「这条是我说的话」（调用时带 `{ proactive: true }`）时，把留痕标记透给 hub：
+// hub.sendText / hub.sendSegments 只有看到 opts.proactive 才走 noteProactive() → chatlog 记一条 bot 发言，
+// 而模块捷径以前只转 (chatId, text)，标记根本传不进去 —— 于是模块发的消息在 chatlog 里零命中
+// （qq-peek 的 qq_say_in_group 就这么丢档，2026-11-22 修）。不声明就不加键：
+// 日报、画前提示这类本来不该进记忆的发送保持改造前的行为。
+function logAsModuleSpeech(extra, opts, id) {
+  if (!opts || opts.proactive !== true) return extra
+  return { ...extra, proactive: true, proactiveCause: String(opts.proactiveCause || `module:${id}`) }
+}
+
 function governedSend(core, id, ask, run, log) {
   const svc = outboundOf(core)
   if (!svc) return run({ sourceModule: id })
+  // 「回合内提示」直发（2026-11-18 生图画前提示重复回归）。
+  //
+  // 只在**调用方显式声明**这条发送是回合内提示时才放行：她回合里的画前/进度提示是对话的一部分，
+  // 走代发决断要等一轮模型，慢工具兜底（1.5s）会先把同一句发出去 → 同一句话发两遍。
+  //
+  // 为什么必须显式声明、不能按 `hub.turnRunning(chatId)` 一刀切：那等于在**任意模块**的回合窗口内
+  // 把外发闸门整体旁路——抖音日报这类「模块主动找主人」的发送只要撞上回合就会绕过代发决断。
+  // 闸门的语义是「谁在说」，不是「什么时候说」，所以判定依据只能是发送侧的意图声明。
+  //
+  // 声明方式（三重条件，缺一不可）：
+  //   1. 调用方带 `turnNotice`（scoped hub 发送方法的第 6 个参数，或模块快捷 API 的 opts）；
+  //   2. 该模块在 TURN_NOTICE_MODULES 白名单里（宿主侧把关，模块自己写不算）；
+  //   3. 此刻这个聊天确实有回合在跑（防止回合结束后有人借标记绕过）。
+  const declaresNotice = Boolean(ask?.turnNotice) && TURN_NOTICE_MODULES.has(id)
+  const inTurn = declaresNotice && typeof core.hub?.turnRunning === 'function'
+    && ask?.chatId && core.hub.turnRunning(ask.chatId)
+  if (inTurn) {
+    safeLog('info', log, `模块「${id}」这条发送声明为回合内提示（画前/进度），直发不经代发决断`)
+    return run({ sourceModule: id, outboundDone: true })
+  }
   // broker 档无可审文本（图片/文件/语音/消息段）发主人私聊：识别不了就直发，不进门闸
   if (unreviewableBrokerSend(core, ask)) {
     safeLog('info', log, `模块「${id}」这条主动发送没有可审文本（图片/文件等），按「识别不了就直发」口径直接发出`)
@@ -511,6 +543,15 @@ async function delegateToHost(core, id, ask, verdict, svc, log) {
 const GOVERNED_HUB_METHODS = new Set(['sendText', 'sendSegments', 'sendParts', 'sendImage', 'sendFile', 'sendVoiceFile', 'deliver'])
 
 /**
+ * 允许声明「回合内提示」的模块（宿主侧白名单，模块自己声明不到）。
+ *
+ * 只有这类模块的发送才**可能**在回合内直发：它们发的是「我这就去做」的进度提示，
+ * 与正在进行的回合是同一件事，走代发决断反而会被慢工具兜底抢先、导致同一句发两遍。
+ * 其余模块（抖音日报、RSS、主动私聊等）无论何时都照旧走代发决断——闸门管的是「谁在说」。
+ */
+const TURN_NOTICE_MODULES = new Set(['imagegen'])
+
+/**
  * 按方法名把一次 scopedHub 调用翻译成「治理问题 + 真正执行」。
  * 返回 null 表示这个方法不走治理（按原样转发）。
  *
@@ -519,10 +560,15 @@ const GOVERNED_HUB_METHODS = new Set(['sendText', 'sendSegments', 'sendParts', '
  */
 function governScopedCall(core, id, name, args, log, compat = null) {
   const [chatId, a, b, c] = args
+  // 回合内提示的声明：模块只能在 opts 里写 `turnNotice: true`（第 6 个参数对 sendText、第 4 个对
+  // sendSegments、第 5 个对 sendImage……统一从「最后一个对象参数」里取）。是否真的放行由
+  // governedSend 结合 TURN_NOTICE_MODULES 与 turnRunning 三重判定，模块单方面声明无效。
+  const optsOf = (...idxs) => { for (const i of idxs) { const v = args[i]; if (v && typeof v === 'object') return v } return null }
+  const turnNotice = (opts) => Boolean(opts && opts.turnNotice === true)
   switch (name) {
     case 'sendText':
       // sendText(chatId, text, replyId, missed, userId, opts)
-      return governedSend(core, id, { chatId, text: a }, (extra) => {
+      return governedSend(core, id, { chatId, text: a, turnNotice: turnNotice(optsOf(5)) }, (extra) => {
         const last = args[5]
         const opts = last && typeof last === 'object' ? { ...last, ...extra } : extra
         return core.hub.sendText(chatId, a, args[2], args[3], args[4], opts)
@@ -530,7 +576,7 @@ function governScopedCall(core, id, name, args, log, compat = null) {
     case 'sendSegments':
       // sendSegments(chatId, segments, note, opts)
       compat?.requireQqSend?.(chatId)
-      return governedSend(core, id, { chatId, text: '' }, (extra) => {
+      return governedSend(core, id, { chatId, text: '', turnNotice: turnNotice(optsOf(3)) }, (extra) => {
         const last = args[3]
         const opts = last && typeof last === 'object' ? { ...last, ...extra } : extra
         return core.hub.sendSegments(chatId, a, b, opts)
@@ -543,7 +589,7 @@ function governScopedCall(core, id, name, args, log, compat = null) {
       }, log)
     case 'sendImage':
       // sendImage(chatId, src, replyId, userId, opts)
-      return governedSend(core, id, { chatId }, (extra) => {
+      return governedSend(core, id, { chatId, turnNotice: turnNotice(optsOf(4)) }, (extra) => {
         const last = args[4]
         const opts = last && typeof last === 'object' ? { ...last, ...extra } : extra
         return core.hub.sendImage(chatId, a, args[2], args[3], opts)
@@ -555,10 +601,10 @@ function governScopedCall(core, id, name, args, log, compat = null) {
       // sendVoiceFile(chatId, file, note)
       return governedSend(core, id, { chatId }, () => core.hub.sendVoiceFile(chatId, a, b), log)
     case 'deliver': {
-      // deliver(chatId, text, opts)：引擎路径（opts.enginePolicy）由 hub 自己 reserve，跳过主动门闸
-      const opts = c && typeof c === 'object' ? c : {}
+      // deliver(chatId, text, opts)：第三个参数是 b，不能丢掉 voice / enginePolicy 等发送选项
+      const opts = b && typeof b === 'object' ? b : {}
       if (opts.enginePolicy) return core.hub.deliver(chatId, a, opts)
-      return governedSend(core, id, { chatId, text: a }, (extra) => core.hub.deliver(chatId, a, { ...opts, ...extra }), log)
+      return governedSend(core, id, { chatId, text: a, turnNotice: turnNotice(opts) }, (extra) => core.hub.deliver(chatId, a, { ...opts, ...extra }), log)
     }
     default:
       return null
@@ -582,7 +628,7 @@ export function scopeCoreForModule(core, id, compat = null) {
     const hasSubagent = typeof core.hub.subagentFor === 'function'
     scopedHub = {}
     for (const name of Object.getOwnPropertyNames(core.hub)) {
-      if (name === 'pushProactiveToSession' && id !== 'speakup') continue
+      if ((name === 'pushProactiveToSession' || name === 'runTurnInChat') && id !== 'purpose') continue
       if ((name === 'canSendToSharedPlatform' || name === 'sendToSharedPlatform') && id !== 'chat-tools') continue
       if (name === 'recoverSharedFromCheckpoint' || name === 'preflightSharedRecovery') continue
       if (hasSubagent && (name === 'runSubagentTurn' || name === 'subagentFor')) continue
@@ -613,7 +659,7 @@ export function scopeCoreForModule(core, id, compat = null) {
       })
     }
   }
-  const scopedOnebot = compat
+  const scopedOnebot = compat?.qqState
     ? new Proxy({}, {
       get(_target, key) {
         if (key === 'state') return compat.qqState()
@@ -637,7 +683,7 @@ export function scopeCoreForModule(core, id, compat = null) {
       },
     })
     : null
-  const scopedSnowluma = compat
+  const scopedSnowluma = compat?.requireQqNative
     ? new Proxy(core.snowluma || {}, {
       get(t, key, r) {
         const v = Reflect.get(t, key, r)
@@ -663,6 +709,8 @@ export function scopeCoreForModule(core, id, compat = null) {
       if (key === 'hub') return scopedHub
       if (key === 'onebot' && scopedOnebot) return scopedOnebot
       if (key === 'snowluma' && scopedSnowluma) return scopedSnowluma
+      if (key === 'setConfig' && compat?.setCoreConfig) return compat.setCoreConfig
+      if (key === 'personaMemoryBridge') return id === PERSONA_MEMORY_MODULE ? compat?.personaMemoryBridge : undefined
       // 出站治理服务不下发给模块：模块能拿到原始 svc 就能自己填 moduleId 冒充别人，
       // 也会绕过 api.proactive 的身份绑定。模块只能走 api.proactive（见 makeApi）。
       if (key === 'outbound') return undefined
@@ -670,8 +718,15 @@ export function scopeCoreForModule(core, id, compat = null) {
     },
     getOwnPropertyDescriptor(target, key) {
       const descriptor = Reflect.getOwnPropertyDescriptor(target, key)
-      if (descriptor?.configurable && (key === 'hub' || (key === 'onebot' && scopedOnebot))) {
-        return { configurable: true, enumerable: descriptor.enumerable, writable: false, value: key === 'hub' ? scopedHub : scopedOnebot }
+      if (descriptor?.configurable) {
+        const safe = key === 'hub' ? scopedHub
+          : key === 'onebot' ? scopedOnebot
+            : key === 'snowluma' ? scopedSnowluma
+              : key === 'setConfig' ? compat?.setCoreConfig
+                : undefined
+        if (safe !== undefined || key === 'outbound') {
+          return { configurable: true, enumerable: descriptor.enumerable, writable: false, value: safe }
+        }
       }
       return descriptor
     },
@@ -679,7 +734,7 @@ export function scopeCoreForModule(core, id, compat = null) {
   })
 }
 
-export function createModules({ ctx, core, getConfig, setConfig, logger, version, builtins }) {
+export function createModules({ ctx, core, getConfig, setConfig, logger, version, builtins, personaMemoryRuntime }) {
   const log = logger.child('modules')
   const builtinDefs = new Map(builtins.map((d) => [d.id, d]))
   const live = new Map() // id → 运行中的模块（见 start）
@@ -690,6 +745,10 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
   const revisions = new Map() // id → 停止次数，取消在途 import
   // 模块每次（重）启动都递增一次「代际」：hub 用它判断会话里挂的工具是不是旧模块实例的闭包。
   let generation = 0
+  // 导航版本：模块安装/启停/失败/重载（含可用平台随定义变化）时递增；
+  // 面板首屏轮询 /panel/pulse 拿它判断要不要重新拉导航摘要（方案 §二/§2.1）。
+  let navigationRevisionCounter = 0
+  const bumpNavigation = () => { navigationRevisionCounter++ }
   let userSeen = new Map() // id → { dir, file, stamp }
   const userMeta = new Map() // id → { name, description, version, platforms }
   const skipped = new Map() // id → 跳过原因（例如 '未启用对应平台'）
@@ -978,8 +1037,8 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       const chatId = typeof core.routeOwner === 'function' ? String(core.routeOwner() || '') : ''
       return { chatId, blocked: false, reason: chatId ? 'legacy' : 'no-route', target: null, fallbackUsed: false }
     }
-    const writable = (label, fn) => (...args) => {
-      if (!active()) {
+    const writable = (label, fn, allowed = active) => (...args) => {
+      if (!allowed()) {
         const error = new Error(`模块「${id}」已停止，不能调用 ${label}`)
         mlog.warn(error.message)
         throw error
@@ -1007,10 +1066,24 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     // 内置模块和替换它的版本用原来的路径（内置的面板页照常能用）；新模块放在 /ext/模块id/ 下
     const prefix = routesAtRoot(id) ? '' : `/ext/${id}`
     const def = rec.def
+    const setModuleConfig = writable('setConfig', (patch) => setConfig(typeof patch === 'function' ? patch(getConfig()) : deepMerge(getConfig(), patch)))
+    // 兼容在同步收尾里恢复设置的模块；迟到的回调和旧实例不能再写。
+    const setCoreConfig = writable('core.setConfig', (patch) => {
+      if (!isObj(patch)) throw new TypeError('core.setConfig 需要配置对象')
+      return setConfig(deepMerge(getConfig(), patch))
+    }, () => active() || (rec.cleaning && !live.has(id)))
     // 模块拿到的 core：hub 换成「宿主按模块身份封装」的白名单副本（三审 #177：原型链斩断，
     // 模块摸不到原始 runSubagentTurn / subagentFor）；core 本体用 Proxy 转发，
     // getPrototypeOf 也掐断，防 getPrototypeOf(api.core).hub 绕回原始入口。
+    const bridgeActive = () => active() && isUserOn() && isEnabled(id)
+    const personaMemoryBridge = id === PERSONA_MEMORY_MODULE && bridgeActive()
+      ? personaMemoryRuntime?.forModule(bridgeActive, track)
+      : undefined
     const scopedCore = scopeCoreForModule(core, id, {
+      setCoreConfig,
+      get personaMemoryBridge() {
+        return bridgeActive() ? personaMemoryBridge : undefined
+      },
       qqState: () => core.defaultQqTransportPaused ? 'stopped' : getQqState(),
       assertDefaultQqAvailable,
       requireQqNative: (label) => requireQqCompatFor(rec, id, label),
@@ -1029,7 +1102,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       log: mlog,
       // ---- 配置 ----
       config: () => getConfig(),
-      setConfig: writable('setConfig', (patch) => setConfig(typeof patch === 'function' ? patch(getConfig()) : deepMerge(getConfig(), patch))),
+      setConfig: setModuleConfig,
       settings: () => ({ ...(def.defaults || {}), ...(getConfig().ext?.[id] || {}) }),
       saveSettings: writable('saveSettings', (patch) => {
         const cfg = getConfig()
@@ -1088,17 +1161,18 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
         return off
       },
       emit: writable('emit', (event, ...args) => emit(event, ...args)),
+      // 每次触发都按当时的当前人格固定（不沿用 setup 时的上下文）：这一趟写的记忆、流水、会话都归这个人格
       every: (ms, fn, label = '定时任务') => {
         const t = setInterval(() => {
           // 调试模式不跑定时任务：刷 B 站、逛空间、主动搭话、整理记忆这些都别在调试里自己动
           if (!active() || getConfig().debug) return
-          Promise.resolve().then(() => { if (active()) return fn() }).catch((error) => note(id, label, error))
+          personaScope.run(personaNow(getConfig()), () => Promise.resolve().then(() => { if (active()) return fn() }).catch((error) => note(id, label, error)))
         }, Math.max(1000, Number(ms) || 60_000))
         t.unref?.()
         return track(() => clearInterval(t))
       },
       later: (ms, fn) => {
-        const t = setTimeout(() => { Promise.resolve().then(() => { if (active()) return fn() }).catch((error) => note(id, '延时任务', error)) }, Math.max(0, Number(ms) || 0))
+        const t = setTimeout(() => { personaScope.run(personaNow(getConfig()), () => Promise.resolve().then(() => { if (active()) return fn() }).catch((error) => note(id, '延时任务', error))) }, Math.max(0, Number(ms) || 0))
         t.unref?.()
         return track(() => clearTimeout(t))
       },
@@ -1120,7 +1194,9 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       // 注意 reply 不参与：那是「回某一条消息」的回合内响应，由 hub 自己的回复链路负责，
       // 不是模块自发的主对话（治理对象只有主动私聊主人）。
       send: writable('send', (chatId, text) => governedSend(core, id, { chatId: String(chatId), text: String(text ?? '') }, (extra) => core.hub.deliver(String(chatId), String(text ?? ''), extra), obLog)),
-      sendText: writable('sendText', (chatId, text) => governedSend(core, id, { chatId: String(chatId), text: String(text ?? '') }, (extra) => core.hub.sendText(String(chatId), String(text ?? ''), undefined, undefined, undefined, extra), obLog)),
+      // 第三个参数可选：`{ proactive: true, proactiveCause: 'qq_say_in_group' }` —— 声明「这条是我说的话」，
+      // hub 会在目标聊天 chatlog 里补一条 bot 记录（否则模块发的消息不落档）。
+      sendText: writable('sendText', (chatId, text, opts) => governedSend(core, id, { chatId: String(chatId), text: String(text ?? '') }, (extra) => core.hub.sendText(String(chatId), String(text ?? ''), undefined, undefined, undefined, logAsModuleSpeech(extra, opts, id)), obLog)),
       // 回某一条消息：群里以「引用回复」发出，私聊直接发
       reply: writable('reply', (msg, text) => core.hub.sendText(String(msg.chatId), String(text ?? ''), msg.kind === 'group' ? msg.messageId : undefined)),
       isOwner: (userId, platform) => {
@@ -1155,7 +1231,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
           throw new Error('中枢不支持 sendParts（未注入 hub.sendParts 或非默认平台缺少网关）')
         }, obLog)
       }),
-      sendSegments: writable('sendSegments', (chatId, segs, note) => {
+      sendSegments: writable('sendSegments', (chatId, segs, note, opts) => {
         requireQqCompatFor(rec, id, 'api.sendSegments', chatId)
         return governedSend(core, id, { chatId: String(chatId) }, (extra) => {
           if (typeof core.hub?.sendParts === 'function') {
@@ -1167,9 +1243,9 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
               if (!/没有实现 toParts/.test(err?.message || '')) throw err
               parts = segmentsToPartsFallback(segs)
             }
-            return core.hub.sendParts(norm, parts, { note: note || `[${id}]`, ...extra })
+            return core.hub.sendParts(norm, parts, { note: note || `[${id}]`, ...logAsModuleSpeech(extra, opts, id) })
           }
-          return core.hub.sendSegments(String(chatId), segs, note || `[${id}]`, extra)
+          return core.hub.sendSegments(String(chatId), segs, note || `[${id}]`, logAsModuleSpeech(extra, opts, id))
         }, obLog)
       }),
       // 发任意文件（文档 / 压缩包 / 音频 / 视频……）：本机绝对路径，或网关能取到的网址 / base64://
@@ -1288,11 +1364,13 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       registerToolAliases(rec)
       rec.exports = exports
       log.info(`模块「${def.name || id}」${source !== 'user' ? '' : existsSync(join(rec.dir, '.aurabot-source.json')) ? '（模块市场）' : '（自己写的）'}已启动`)
+      bumpNavigation() // 新实例进了注册表：导航摘要可能变（新增/替换）
       emit('module/start', id)
     } catch (error) {
       if (disposed || rec.stopped || live.get(id) !== rec) return null
       stop(id, { quiet: true })
       errors.set(id, { message: String(error && error.message ? error.message : error).slice(0, 800), at: Date.now(), source })
+      bumpNavigation() // 启动失败也进导航（availability=error）
       log.warn(`模块「${def.name || id}」启动失败：`, error.message)
     }
     return live.get(id)
@@ -1309,15 +1387,20 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     generation++ // 内置模块（重）启动也换代际：会话里的工具要在下一轮重挂
     if (errors.get(id)?.source !== 'user') errors.delete(id) // 替换版的报错留着给面板看
     try {
-      const r = def.setup(makeApi(id, 'builtin', rec))
+      const api = makeApi(id, 'builtin', rec)
+      const r = id === 'memory' && personaMemoryRuntime
+        ? def.setup(api, { registerNativePreview: read => api.onDispose(personaMemoryRuntime.registerNativePreview(read)) })
+        : def.setup(api)
       if (r && typeof r.then === 'function') throw new Error('内置模块的 setup 要同步返回')
       registerToolAliases(rec)
       rec.exports = r ?? {}
       everStarted.add(id)
       if (restored) log.info(`模块「${def.name || id}」已恢复`)
+      bumpNavigation() // 内置模块（重）启动：导航摘要可能变
     } catch (error) {
       stop(id, { quiet: true })
       errors.set(id, { message: String(error.message || error).slice(0, 800), at: Date.now(), source: 'builtin' })
+      bumpNavigation() // 启动失败也进导航（availability=error）
       log.error(`内置模块「${def.name || id}」启动失败：`, error.message)
     }
   }
@@ -1328,9 +1411,15 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     if (!rec) return false
     live.delete(id)
     generation++ // 停止或替换也使会话工具缓存失效
+    bumpNavigation() // 模块停了/被替换：导航摘要可能变
     rec.stopped = true
-    for (const off of rec.offs.splice(0).reverse()) cleanup(off)
-    cleanup(() => rec.exports?.dispose?.())
+    rec.cleaning = true
+    try {
+      for (const off of rec.offs.splice(0).reverse()) cleanup(off)
+      cleanup(() => rec.exports?.dispose?.())
+    } finally {
+      rec.cleaning = false
+    }
     rec.exports = null
     // 路由和监听器由各自的 off 按实例撤销，清理期间可能已经启动了同名新实例。
     if (rec.dshTools.length) core.bridge?.refresh()
@@ -1387,6 +1476,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       if (!stillWanted()) { resyncRequested = true; return null }
       skipped.delete(u.id)
       errors.set(u.id, { message: String(error.message || error).slice(0, 800), at: Date.now(), source: 'user', fallback: builtinDefs.has(u.id) })
+      bumpNavigation() // 加载失败也进导航（availability=error）
       log.warn(`模块「${u.id}」加载失败：`, error.message)
       userSeen.set(u.id, { ...u, stamp: stampOf(u.dir) })
       return null
@@ -1505,7 +1595,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
         if (back) { back.fallback = true; log.warn(`模块「${id}」：你的版本没加载成功，先用内置的`) }
       }
     }
-    for (const id of [...userSeen.keys()]) if (!users.some((u) => u.id === id)) { userSeen.delete(id); userMeta.delete(id); skipped.delete(id); if (errors.get(id)?.source === 'user') errors.delete(id) }
+    for (const id of [...userSeen.keys()]) if (!users.some((u) => u.id === id)) { userSeen.delete(id); userMeta.delete(id); skipped.delete(id); if (errors.get(id)?.source === 'user') errors.delete(id); bumpNavigation() }
   }
 
   function sync() {
@@ -1554,7 +1644,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     return !platform || recMatchesPlatform(rec, platform)
   }
   function emit(event, ...args) {
-    if (disposed) return
+    if (disposed || event === 'chat/delivery') return
     if ((event === 'onebot' || event === 'onebot/state') && !qqEnabled()) return
     const p = eventPlatform(event, args)
     runWithPlatform(p, () => {
@@ -1932,6 +2022,45 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     return names
   }
 
+  // ---------- 面板首屏：导航摘要（方案 §二/§2.1） ----------
+  /**
+   * 从内存注册表生成导航摘要：内置定义（builtinDefs）+ 用户模块扫描缓存（userSeen）+
+   * 运行记录（live）+ 错误表（errors）+ 配置（modCfg）。**绝不调 scanUser() 重扫模块目录，
+   * 也不执行工具构造器**（toolNames 那套不走）——首屏读取只准碰内存。
+   * 每项：id/name/tab/navGroup/hasSettings/hasPanel/enabled/running/platforms/availability。
+   */
+  function summarizeModules() {
+    const ids = new Set([...builtinDefs.keys(), ...userSeen.keys(), ...live.keys()])
+    const modules = [...ids].sort().map((id) => {
+      const b = builtinDefs.get(id)
+      const seen = userSeen.get(id)
+      const rec = live.get(id)
+      const def = rec?.def || b || {}
+      const m = modCfg(id)
+      const err = errors.get(id)
+      const enabled = m.enabled !== false
+      const availability = rec ? 'ready'
+        : err ? 'error'
+        : !enabled ? 'disabled'
+        : (b || seen) ? 'stopped' // 有定义/有安装记录但没在跑（被关、被替换、等待加载）
+        : 'unloaded' // 只有扫描缓存残影，定义还没拿到
+      return {
+        id,
+        name: def.name || id,
+        tab: def.tab || '',
+        navGroup: typeof def.navGroup === 'string' ? def.navGroup : '',
+        hasSettings: Array.isArray(def.settings) && def.settings.length > 0,
+        hasPanel: Boolean(rec && def.panel),
+        enabled,
+        running: rec ? rec.source : null, // 'builtin' | 'user' | null
+        platforms: Array.isArray(def.platforms) ? def.platforms.map(String) : [],
+        availability, // ready | error | disabled | stopped | unloaded
+        error: err && !rec ? err.message : '',
+      }
+    })
+    return { navigationRevision: navigationRevisionCounter, modules }
+  }
+
   /** file 是不是在 root 目录里面（root 自己不算；越过 root 的 ../ 一律不算）。 */
   function inside(root, file) {
     const rel = relative(resolve(root), resolve(file))
@@ -1995,6 +2124,38 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     return { ok: true, dir, message: `复制好了：${dir}。改完保存，几秒内就会换成你的版本` }
   }
 
+  /** 删除用户模块：先停掉，再把源码和本地改动归档到 modules/.trash；默认保留数据和设置，purge 才清掉。 */
+  async function removeModule(id, { purge = false } = {}) {
+    if (typeof id !== 'string' || !ID_RE.test(id)) return { ok: false, message: 'id 不对' }
+    const dir = join(userDir(), id)
+    if (!inside(userDir(), dir)) return { ok: false, message: 'id 不对' }
+    if (!existsSync(dir)) return { ok: false, message: `modules/${id} 不存在` }
+    if (!lstatSync(dir).isDirectory()) return { ok: false, message: `modules/${id} 不是文件夹` }
+    const trash = join(userDir(), '.trash')
+    mkdirSync(trash, { recursive: true })
+    if (!lstatSync(trash).isDirectory()) return { ok: false, message: 'modules/.trash 不是文件夹，没法归档' }
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const folder = `${id}-${stamp}-${randomUUID().slice(0, 8)}`
+    const archive = `modules/.trash/${folder}`
+    stop(id)
+    try {
+      renameSync(dir, join(trash, folder))
+      log.info(`面板删除模块「${id}」，源码归档到 ${archive}`)
+      if (purge) {
+        rmSync(dataDir('modules-data', id), { recursive: true, force: true })
+        const cfg = getConfig()
+        const { [id]: _ext, ...ext } = cfg.ext || {}
+        const { [id]: _mod, ...modules } = cfg.modules || {}
+        setConfig({ ...cfg, ext, modules })
+      }
+    } finally {
+      await sync()
+    }
+    const dataStatus = purge ? '数据和设置已清除' : '数据和设置已保留'
+    const fallback = builtinDefs.has(id) ? '内置版本会继续运行。' : ''
+    return { ok: true, archive, message: `删掉了，源码和本地改动已移到 ${archive}。${dataStatus}。${fallback}` }
+  }
+
   /** 接口说明和类型提示放进 modules/（插件的东西，每次启动都覆盖成当前版本）。 */
   function installDocs() {
     try {
@@ -2020,9 +2181,11 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
   const publicHandle = { use: exportsOf, has: (id) => live.has(id), list: () => status().map(({ id, name, running }) => ({ id, name, running })), emit }
 
   return {
-    boot, sync, reload, stop, dispose, status, create, fork, promptFor, panelSource,
+    boot, sync, reload, stop, dispose, status, create, fork, remove: removeModule, promptFor, panelSource,
     use: exportsOf, has: (id) => live.has(id), running: (id) => live.get(id)?.source || null, generation: () => generation,
     capabilitiesOf,
+    // 面板首屏提速：导航摘要（纯内存）与导航版本号（安装/启停/失败/重载时递增）
+    summarizeModules, navigationRevision: () => navigationRevisionCounter,
     emit, claim, filter, filterSync, buildTools, resolveTool, toolAliases,
     // 插件核心自己听事件（不属于任何模块，不会被撤掉）
     listen: (event, fn) => { const item = { id: '@core', fn }; listeners.set(event, [...(listeners.get(event) || []), item]); return () => listeners.set(event, (listeners.get(event) || []).filter((x) => x !== item)) }, contextFor, rules, commands, dshTools, builtinOff, activePlatforms: () => [...activePlatforms()], handle,

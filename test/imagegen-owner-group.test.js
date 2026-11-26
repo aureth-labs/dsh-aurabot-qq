@@ -121,3 +121,17 @@ test('排队给下一轮的主人请求不能授权正在执行的群友轮次',
   assert.equal(s.snapshots[1].directOwner, true)
   assert.equal(s.draws(), 1, '只放行下一轮主人的请求')
 })
+
+test('群友拒绝后，主人下一轮仅用昵称提出请求仍按当前轮授权', async t => {
+  const s = setup(t)
+  const denied = await s.batch(event(OTHER, '请给他改图', { at: true }))
+  assert.equal(s.draws(), 0)
+  assert.match(denied.message, /本轮未获绘图授权/)
+  assert.match(denied.message, /群聊也能画/)
+  assert.match(denied.message, /转私聊不会自动放行/)
+  await s.batch(event(OWNER, '心软给他画'))
+  assert.equal(s.draws(), 1, '旧的拒绝不阻止主人新一轮请求')
+  assert.deepEqual(s.snapshots[1], { allOwner: true, directOwner: false })
+  await s.batch(event(OTHER, '继续给我画', { at: true }))
+  assert.equal(s.draws(), 1, '不把主人的权限延续给群友')
+})

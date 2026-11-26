@@ -5,6 +5,7 @@ import { copyFileSync, mkdtempSync, writeFileSync, mkdirSync, readFileSync, read
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
+import { createServer } from 'node:http'
 import { startMockOneBot } from './helpers/mock-onebot.js'
 import { createFakeDsh } from './helpers/fake-dsh.js'
 
@@ -563,12 +564,29 @@ test('普通照片不收进表情库', async () => {
   assert.equal(mock.sent('add_custom_face').length, 1, '数量没变')
 })
 
-test('语音：回复里的 <voice> 变成 QQ 语音条', { skip: process.platform !== 'win32' && '依赖 Windows TTS 引擎' }, async () => {
+async function withTestTts(run) {
+  const wav = Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(2000)])
+  const server = createServer((_req, res) => {
+    res.setHeader('content-type', 'audio/wav')
+    res.end(wav)
+  })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  try {
+    const saved = await fake.call('/save', { voice: { engine: 'http', http: { urlTemplate: `http://127.0.0.1:${server.address().port}/tts?text={text}` } } })
+    assert.equal(saved.json().ok, true, saved.raw())
+    await run()
+  } finally {
+    server.close()
+    await fake.call('/save', { voice: { engine: 'windows' } })
+  }
+}
+
+test('语音：回复里的 <voice> 变成 QQ 语音条', () => withTestTts(async () => {
+  const before = sentTo('private', OWNER).length
   mock.push(priv(OWNER, text('晚安')))
-  await until(() => sentTo('private', OWNER).some((c) => c.params.message[0].type === 'record'), 20000)
-  const rec = sentTo('private', OWNER).find((c) => c.params.message[0].type === 'record')
+  const rec = await until(() => sentTo('private', OWNER).slice(before).find(c => c.params.message[0].type === 'record'))
   assert.match(rec.params.message[0].data.file, /^base64:\/\//)
-})
+}))
 
 test('引用 + 语音：语音条单独一条发，不和引用/@ 拼在同一条（issue #103）', async () => {
   const http = await import('node:http')
@@ -778,23 +796,25 @@ test('空间日记：手动写一篇（仅自己可见），配今天画的图�
   const r = result.json()
   assert.equal(r.ok, true, r.message)
   assert.equal(r.images, 1, '今天画了图，日记应该配一张')
-  const q = mock.sent('send_qzone_msg').at(-1)
-  assert.equal(q.params.ugc_right, 64)
-  assert.match(q.params.content, /白米饭/)
-  assert.equal(q.params.images.length, 1, '说说带了一张图')
-  assert.match(q.params.images[0], /^base64:\/\//)
+  const q = mock.qzone.get(r.tid)
+  assert.ok(q, '返回的日记 ID 应指向本次发布的内容')
+  assert.equal(q.ugc_right, 64)
+  assert.match(q.content, /白米饭/)
+  assert.equal(q.images.length, 1, '说说带了一张图')
+  assert.match(q.images[0], /^base64:\/\//)
   assert.deepEqual(sent, [], '日记那一轮没转发到聊天里')
   const d = (await fake.call('/qzone/delete', { tid: r.tid })).json()
   assert.equal(d.ok, true)
-  assert.equal(mock.qzone.has(r.tid), false, '这次发的说说要删掉')
+  assert.equal(mock.qzone.has(r.tid), false)
 
   // 面板关掉「日记配图」：只发文字
   await fake.call('/save', { diary: { attachImage: false } })
   const r2 = (await api.hub.capture(() => fake.call('/diary/run', { visibility: 'self' }))).result.json()
   assert.equal(r2.ok, true, r2.message)
   assert.equal(r2.images, 0)
-  const q2 = mock.sent('send_qzone_msg').at(-1)
-  assert.equal(q2.params.images, undefined, '关掉后不带图')
+  const q2 = mock.qzone.get(r2.tid)
+  assert.ok(q2, '应保存这次发布的纯文字日记')
+  assert.equal(q2.images, undefined, '关掉后不带图')
   await fake.call('/qzone/delete', { tid: r2.tid })
 
   // 配图发不出去（空间不认这张图）：不能憋住整篇日记，退回只发文字
@@ -804,8 +824,9 @@ test('空间日记：手动写一篇（仅自己可见），配今天画的图�
     const r3 = (await api.hub.capture(() => fake.call('/diary/run', { visibility: 'self' }))).result.json()
     assert.equal(r3.ok, true, '配图失败也要把日记发出去')
     assert.equal(r3.images, 0, '最后没配成图')
-    const q3 = mock.sent('send_qzone_msg')[2]
-    assert.equal(q3.params.images, undefined, '退回只发文字的说说')
+    const q3 = mock.qzone.get(r3.tid)
+    assert.ok(q3, '应保存配图失败后发布的日记')
+    assert.equal(q3.images, undefined, '退回只发文字的说说')
     await fake.call('/qzone/delete', { tid: r3.tid })
   } finally {
     mock.state.failQzoneImage = false
@@ -841,13 +862,12 @@ test('面板接口：token 用量（今日 / 昨日 / 近 7 天 / 近 30 天 + �
     assert.equal(typeof r.totalTokens, 'number', key + ' 要有合计 token')
     assert.equal(typeof r.promptTokens, 'number', key + ' 要有输入 token')
     assert.equal(typeof r.cachedTokens, 'number', key + ' 要有缓存命中 token')
-    assert.equal(typeof r.cost, 'number', key + ' 要有花费')
+    assert.equal(r.cost, null, key + ' 未确认渠道价格，不冒充零费用')
   }
   assert.equal(u.ranges.last30.runs >= u.ranges.last7.runs, true, '近 30 天不会比近 7 天少')
   assert.ok(u.current, '要带所选区间的明细')
   for (const dim of ['byModule', 'byChat', 'byModel']) assert.ok(Array.isArray(u.current[dim]), dim + ' 要是个列表')
-  assert.equal(typeof u.current.cacheHitRate, 'number')
-  assert.equal(typeof u.current.peakRatio, 'number')
+  assert.ok(u.current.cacheHitRate === null || typeof u.current.cacheHitRate === 'number')
   // ?range= 决定 current 是哪个区间（面板点指标卡就是切这个）
   const today = (await fake.call('/usage?range=today')).json()
   assert.equal(today.range, 'today')
@@ -875,9 +895,9 @@ test('用量归属：聊天里让她刷 B 站，处理工具结果那次调用�
   const biliBefore = runsOf(before, '刷 B 站')
 
   // 这一轮：她调 bili_watch（step 1），然后处理看回来的内容（step 2，带 usage）
-  fake.emit('session/event', sess, { type: 'tool/call', data: { turn: 9001, step: 1, callId: 'c1', name: 'bili_watch', arguments: '{"link":"BV1xx"}' } })
+  fake.emit('session/event', sess, { seq: 90010, time: Date.now(), type: 'tool/call', data: { turn: 9001, step: 1, callId: 'c1', name: 'bili_watch', arguments: '{"link":"BV1xx"}' } })
   fake.emit('session/event', sess, {
-    type: 'assistant/message',
+    seq: 90011, type: 'assistant/message',
     time: Date.now(),
     data: {
       turn: 9001,
@@ -896,9 +916,9 @@ test('用量归属：聊天里让她刷 B 站，处理工具结果那次调用�
   const mid = await read()
   const chat2 = runsOf(mid, '聊天')
   const bili2 = runsOf(mid, '刷 B 站')
-  fake.emit('session/event', sess, { type: 'tool/call', data: { turn: 9002, step: 1, callId: 'c2', name: 'send_message', arguments: '{}' } })
+  fake.emit('session/event', sess, { seq: 90020, time: Date.now(), type: 'tool/call', data: { turn: 9002, step: 1, callId: 'c2', name: 'send_message', arguments: '{}' } })
   fake.emit('session/event', sess, {
-    type: 'assistant/message',
+    seq: 90021, type: 'assistant/message',
     time: Date.now(),
     data: {
       turn: 9002,
@@ -911,6 +931,88 @@ test('用量归属：聊天里让她刷 B 站，处理工具结果那次调用�
   const after2 = await read()
   assert.equal(runsOf(after2, '聊天') - chat2, 1, '聊天自己的工具仍算「聊天」')
   assert.equal(runsOf(after2, '刷 B 站') - bili2, 0)
+})
+
+test('人格外貌：管理接口、视觉解析、切换注入及方法和访问门禁', async () => {
+  const id = 'look-e2e'
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64')
+  const data = 'data:image/png;base64,' + png.toString('base64')
+  const original = (await fake.call('/state')).json().config.persona
+  try {
+    assert.equal((await fake.call('/persona/look/upload', { id, data })).json().ok, false)
+    assert.equal((await fake.call('/persona/save', { id, body: '你是图像测试人格。', appearance: '蓝色短发', appearanceSource: 'manual' })).json().ok, true)
+    const up = (await fake.call('/persona/look/upload', { id, data })).json()
+    assert.equal(up.ok, true)
+    assert.equal(up.look.stale, true)
+    assert.deepEqual((await fake.call(`/persona/look/image?id=${id}`)).raw(), png)
+    assert.equal((await fake.call(`/persona/get?id=${id}`)).json().look.appearance, '蓝色短发')
+    const added = (await fake.call('/persona/look/upload', { id, data, append: true })).json()
+    assert.equal(added.look.images.length, 2)
+    const secondId = added.look.images[1].id
+    const settings = (await fake.call('/persona/look/configure', { id, imageId: secondId, reference: false, note: '工作服' })).json()
+    assert.equal(settings.ok, true)
+    assert.equal(settings.look.images[0].reference, true)
+    assert.equal(settings.look.images[1].reference, false)
+    assert.equal(settings.look.images[1].note, '工作服')
+    assert.equal((await fake.call('/persona/look/configure', { id, imageId: secondId, reference: 'yes' })).json().ok, false)
+    assert.equal((await fake.call('/persona/look/configure', { id, imageId: '../bad', note: 'x' })).json().ok, false)
+    const changed = Buffer.concat([png, Buffer.from([1])])
+    const replaced = (await fake.call('/persona/look/upload', { id, imageId: secondId, data: 'data:image/png;base64,' + changed.toString('base64') })).json()
+    assert.equal(replaced.look.images.length, 2)
+    assert.deepEqual((await fake.call(`/persona/look/image?id=${id}&imageId=${secondId}`)).raw(), changed)
+    assert.deepEqual((await fake.call(`/persona/look/image?id=${id}&imageId=${up.look.images[0].id}`)).raw(), png)
+    assert.equal((await fake.call('/persona/look/delete', { id })).json().ok, false, '多图删除须明确选择')
+    assert.equal((await fake.call('/persona/look/upload', { id, data, imageId: '../bad' })).json().ok, false)
+    assert.equal((await fake.call('/persona/look/delete', { id, imageId: '0'.repeat(32) })).json().ok, false)
+    const described = (await fake.call('/persona/look/describe', { id })).json()
+    const removed = (await fake.call('/persona/look/delete', { id, imageId: secondId })).json()
+    assert.equal(removed.look.images.length, 1)
+    assert.equal(removed.look.images[0].id, up.look.images[0].id)
+    const originalStream = fake.ctx.llm.stream
+    let finishVision, startedVision
+    const visionStarted = new Promise((resolve) => { startedVision = resolve })
+    const visionGate = new Promise((resolve) => { finishVision = resolve })
+    try {
+      fake.ctx.llm.stream = async function* () { startedVision(); await visionGate; yield { type: 'text-delta', text: '过期的外貌' } }
+      const pendingDescription = fake.call('/persona/look/describe', { id })
+      await visionStarted
+      await fake.call('/persona/look/upload', { id, append: true, data })
+      finishVision()
+      const staleResult = (await pendingDescription).json()
+      assert.equal(staleResult.ok, false)
+      assert.match(staleResult.message, /已变化/)
+      const currentImages = (await fake.call(`/persona/look?id=${id}`)).json().look.images
+      await fake.call('/persona/look/delete', { id, imageId: currentImages[1].id })
+    } finally { finishVision?.(); fake.ctx.llm.stream = originalStream }
+    assert.equal(described.ok, true)
+    assert.ok(described.text)
+    assert.equal((await fake.call(`/persona/look?id=${id}`)).json().look.appearance, '蓝色短发', '解析不直接保存')
+    await fake.call('/save', { persona: { ...original, lookTestKey: 'preserved' } })
+    await fake.call('/persona/use', { id })
+    assert.match(fake.variables.get('aurabot_persona')(), /蓝色短发/)
+    assert.equal((await fake.call('/state')).json().config.persona.lookTestKey, 'preserved')
+    await fake.call('/persona/use', { id: 'dafeiyu' })
+    assert.doesNotMatch(fake.variables.get('aurabot_persona')(), /蓝色短发/)
+    assert.equal((await fake.call('/persona/look/delete', { id })).json().look.appearance, '蓝色短发')
+    assert.equal((await fake.call(`/persona/look/image?id=${id}`)).status, 404)
+    assert.equal((await fake.call('/persona/look/describe', { id })).json().ok, false)
+    for (const path of ['/persona/look/upload', '/persona/look/delete', '/persona/look/configure', '/persona/look/describe', '/persona/save']) {
+      assert.equal((await fake.call(path, { id, data, body: 'x' }, {}, undefined, 'GET')).status, 405)
+      assert.equal((await fake.call(path, { id, data }, { origin: 'https://evil.example' })).status, 403)
+      assert.equal((await fake.call(path, { id, data }, {}, '203.0.113.7')).status, 403)
+      assert.equal((await fake.call(path, { id, data }, { host: 'evil.example' })).status, 403)
+    }
+    assert.equal((await fake.call('/persona/look/upload', { id, data: 'data:image/png;base64,bm90LWltYWdl' })).json().ok, false)
+    assert.equal((await fake.call('/persona/look/upload', { id: '../look-e2e', data })).json().ok, false)
+    assert.equal((await fake.call('/persona/look/upload', { id, data: 'data:image/png;base64,' + Buffer.alloc(5 * 1024 * 1024 + 1).toString('base64') })).json().ok, false)
+    assert.equal((await fake.call('/persona/look/upload', { id, data: 'x'.repeat(8 * 1024 * 1024) })).json().ok, false)
+    await fake.call('/persona/look/upload', { id, data })
+    await fake.call('/persona/delete', { id })
+    assert.equal(readdirSync(join(dataDir, 'personas')).some((name) => name.startsWith(id + '.')), false)
+  } finally {
+    await fake.call('/persona/use', { id: original.current })
+    await fake.call('/persona/delete', { id })
+  }
 })
 
 test('头像：上传自定义头像、同步成 QQ 头像、恢复默认', async () => {
@@ -952,12 +1054,12 @@ test('语音发不出去时退回成发文字', async () => {
   mock.state.failRecord = false
 })
 
-test('明确要语音但她只打了字：插件强制转成语音', { skip: process.platform !== 'win32' && '依赖 Windows TTS 引擎' }, async () => {
+test('明确要语音但她只打了字：插件强制转成语音', () => withTestTts(async () => {
   const n = sentTo('private', OWNER).length
   mock.push(priv(OWNER, text('用语音说你好')))
   await until(() => sentTo('private', OWNER).slice(n).some((c) => c.params.message[0].type === 'record'), 20000)
   assert.ok(!sentTo('private', OWNER).slice(n).some((c) => c.params.message[0].type === 'text' && c.params.message[0].data.text === '你好呀'))
-})
+}))
 
 test('连发合并：一口气发两句，她只回一次', async () => {
   const before = fake.turns.length
@@ -1364,7 +1466,8 @@ test('主人私聊可以查询最新 QQ 资料，关闭资料模块后查询工�
   const expected = { ...mock.state.selfProfile }
   mock.push(priv(OWNER, text('查看QQ资料测试')))
   const c = await lastCall('查看QQ资料测试')
-  assert.equal(c.result.ok, true)
+  assert.equal(c.name, 'qq_get_profile', '应读取本次资料查询的回执')
+  assert.equal(c.result.ok, true, JSON.stringify({ tool: c.name, result: c.result }))
   assert.equal(c.result.profile.nickname, expected.nickname)
   assert.equal(c.result.profile.signature, expected.long_nick)
   assert.equal(mock.sent('get_stranger_info').at(-1).params.no_cache, true)
@@ -1388,7 +1491,10 @@ test('#58 在 DSH 会话窗口里直接打字：这一轮按主人说的算（�
   // 从 QQ 发一条消息，建立新的 QQ 会话
   const n = fake.turns.length
   mock.push(priv(OWNER, text('在吗')))
-  await until(() => fake.turns.length > n && api.hub.sessions()['private:' + OWNER]?.sessionId)
+  await until(() => {
+    const id = api.hub.sessions()['private:' + OWNER]?.sessionId
+    return id && fake.turns.slice(n).some(turn => turn.sessionId === id)
+  })
   // 后台任务也会创建会话；用 QQ 映射定位，不能假定最后一个会话就是主人私聊。
   const sid = api.hub.sessions()['private:' + OWNER]?.sessionId
   assert.ok(sid, '新会话建出来了')

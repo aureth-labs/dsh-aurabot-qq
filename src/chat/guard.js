@@ -93,6 +93,65 @@ function isBlank (text) {
   return t.replace(/[\s\p{P}\p{S}]/gu, '') === ''
 }
 
+// ---------- 协议残渣兜底（第二道保险，只判不剥） ----------
+//
+// 正常剥除在 reply.js 的 cleanOutboundText（所有出口的公共必经点）里做完了。
+// 这里只回答一个问题：**整条剥完是不是只剩协议残渣**——是的话宁可沉默也不发。
+// 存在的意义是兜住「将来出现新的标记形态、cleanOutboundText 还不认识」的情况：
+// 那种时候正文里往往只剩标签/属性串，没有真正要说的话，发出去就是纯脏内容。
+//
+// 判据：把已知协议标签、属性串、编号都挖空之后，若既没有中文、也没有成词的字母数字，就算残渣。
+// 刻意保守——正常句子（哪怕很短，如「在吗」「ok」）一定留得下成词的字母/中文，不会误判。
+
+/** 已知协议标签：acp / state / poke 闭合 / DSML 系列 / tool 调用类。 */
+const PROTO_TAG_ALL = /<\s*\/?\s*(?:acp|state|x?invoke|x?parameter|x?function_calls?|x?tool_calls?|x?tool_use|antml:[a-z_]+)(?=[\s/>])[^<>]*>/gi
+/**
+ * 任意标签（含开/闭/自闭合、带或不带属性）。
+ * 挖掉它不会误伤合法标记——`<poke>` / `<voice>` / `<sticker:…>` 这类在上面已经按 LEGIT_MARKUP
+ * 提前放行了，走不到这里。这样「将来出现不认识的新协议帧」（开标签带属性、闭标签不带）也能兜住。
+ */
+const ANY_TAG = /<\s*\/?\s*[A-Za-z][\w:-]*(?:\s[^<>]*)?>/g
+/** 属性串形状：`tokens="86" type="text" time="…"`（可能带前导 `=`）。 */
+const PROTO_ATTR_RUN = /(?:=\s*)?"[^"]*"\s*(?:(?:[a-z][\w:-]*)\s*=\s*"[^"]*"\s*)+>>?/gi
+/** 消息编号：`m01990`。 */
+const PROTO_MSG_ID = /\bm\d{4,8}\b/g
+/**
+ * 属性尾巴里的日期时间残片（实况 `6-11-22 17:26:55">`：`2026-…` 被截掉了头）。
+ * 只有「时间 + 收尾引号尖括号」这种**残片形状**才挖掉；正文里正常写的时间不会带上 `">`，
+ * 所以「我们约 2026-11-22 17:26:55 见」不受影响（已实测）。
+ */
+const PROTO_TIME_TAIL = /(?:\d{1,4}-)?\d{1,2}-\d{1,2}\s+\d{1,2}:\d{2}:\d{2}\s*">/g
+
+/**
+ * 插件自己的合法出站标记：`<poke>` `<voice>` `<sticker:…>` `<face:…>` `<reply:…>` `<at:…>`。
+ * 它们本身就是「要说的内容」（发个戳一戳、发个表情），绝不能因为挖空后没剩字就判残渣。
+ * 有它们在场时直接按「有人话」放行，交给后面的 parseReply 正常解析。
+ */
+const LEGIT_MARKUP = /<\s*\/?\s*(?:poke|voice|sticker|face|reply|at|state)\b[^<>]*>/i
+
+/**
+ * 整条是不是只剩协议残渣。
+ * @returns {boolean} true = 没有真正要说的话，应当按沉默处理
+ */
+function isProtocolResidue (text) {
+  const t = String(text || '')
+  if (!t.trim()) return true
+  // 只有插件自己的合法标记（发个戳一戳 / 发个语音 / 发个表情）：那是内容，不是残渣。
+  if (LEGIT_MARKUP.test(t)) return false
+  // 先把已知标记挖空；挖完什么都不剩 → 残渣。
+  const hollow = t
+    .replace(/```[\s\S]*?```/g, '') // 围栏内是正当内容，不参与判定
+    .replace(PROTO_TAG_ALL, '')
+    .replace(ANY_TAG, '') // 兜住将来出现的不认识的新协议帧（含不带属性的闭标签）
+    .replace(PROTO_ATTR_RUN, '')
+    .replace(PROTO_TIME_TAIL, '')
+    .replace(PROTO_MSG_ID, '')
+  // 剩下的必须还有「成词」的东西才算有人话：中文 ≥1 字，或 ≥2 个连续字母数字。
+  // 都挖空之后什么都不剩 → 整条只有协议标记，按沉默处理。
+  if (/[\u4e00-\u9fff]/.test(hollow)) return false
+  return !/[A-Za-z0-9]{2,}/.test(hollow.replace(/[=<>/\\"'`\-_.:;,|]+/g, ' '))
+}
+
 /**
  * 注入给模型的格式提醒（由代码放进系统提示，不动人格文件）。
  * 目的是让「干活时贴的代码」能过闸：guard 对 ``` 围栏整段豁免，
@@ -136,6 +195,9 @@ export function guardOutgoing (text, opts = {}) { // eslint-disable-line no-unus
   if (!work) return { ok: false, text: '', reason: 'thinking-only' }
 
   if (isBlank(work)) return { ok: false, text: '', reason: 'blank' }
+  // 整条只剩协议标记/属性串（cleanOutboundText 还不认识的新形态）：宁可沉默，也不发脏内容。
+  // 放在退化检测之前：残渣常常带一长串属性，LONG_TOKEN 会把它从退化检测里豁免掉。
+  if (isProtocolResidue(work)) return { ok: false, text: '', reason: 'protocol-residue' }
   // base64 / 哈希 / 长 ID 这类长串不按「复读」处理，否则贴一串数据就被当成退化了。
   if (!LONG_TOKEN.test(work) && isDegenerate(work)) return { ok: false, text: '', reason: 'degenerate' }
   if (DRAFT_MARK.test(work)) return { ok: false, text: '', reason: 'draft' }

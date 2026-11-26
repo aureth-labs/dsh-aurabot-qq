@@ -335,8 +335,9 @@ test('旧梗概压成感受与结论，印象到期后清除；失败时保留�
   assert.deepEqual(s.state().gists.map((g) => g.text), ['主人爱我'])
   assert.equal(s.state().gists[0].level, 2)
   const prompt = s.calls.find((x) => isGist(x.system)).system
-  assert.match(prompt, /主人爱我/)
-  assert.match(prompt, /这群人性压抑/)
+  assert.match(prompt, /对方做事细心/)
+  assert.match(prompt, /这个群关注游戏技术/)
+  assert.doesNotMatch(prompt, /大米饭|性压抑/)
   assert.match(prompt, /不写事情经过/)
   assert.match(mem.recallHint(privateChat(OWNER), '主人爱我'), /主人爱我/)
 })

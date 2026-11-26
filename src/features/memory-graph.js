@@ -189,7 +189,7 @@ const parentTagOf = (groupId) => {
 
 /** 星团里的小模块：跳过父标签和「经历」，取第一个剩下的标签。 */
 const moduleTagOf = (item, parentTag) => tagsOf(item).slice(0, 3)
-  .find((tag) => tag !== EVENT_ROOT_TAG && tag !== parentTag) || '未标注';
+  .find((tag) => tag !== EVENT_ROOT_TAG && tag !== parentTag) || '其他';
 
 // 批量导入的 B站 记忆时间几乎全落在同一天，按时间分段没有意义；
 // 这里按标题/正文里的高频主题分成几个内容星区，让大模块在空间上真的能分开。
@@ -312,7 +312,7 @@ const childModulesOf = (group, itemsById) => {
   const modules = [...counts.entries()]
     .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
     .map(([label, count]) => ({ label, count }));
-  // 全团只有一类（或全是未标注）时不算有子结构，避免点开只看到一个多余的标签。
+  // 全团只有一类（或全是「其他」）时不算有子结构，避免点开只看到一个多余的标签。
   return modules.length > 1 ? modules : [];
 };
 

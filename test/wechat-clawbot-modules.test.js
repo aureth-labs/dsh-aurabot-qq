@@ -227,7 +227,7 @@ test('纯 wechat-clawbot 运行时：19 模块矩阵、tool/context 无 QQ 泄�
     const row = statuses.find((m) => m.id === id)
     assert.ok(!row || row.running === null, `${id} 在纯 wechat-clawbot 下不应运行`)
   }
-  for (const id of ['stickers', 'voice', 'mood', 'memory', 'chat-tools', 'imagegen', 'speakup', 'purpose', 'autotelic', 'bili', 'song', 'video']) {
+  for (const id of ['stickers', 'voice', 'mood', 'memory', 'chat-tools', 'imagegen', 'purpose', 'autotelic', 'bili', 'song', 'video']) {
     const row = statuses.find((m) => m.id === id)
     assert.equal(row?.running, 'builtin', `${id} 应在纯 wechat-clawbot 下正常运行`)
   }

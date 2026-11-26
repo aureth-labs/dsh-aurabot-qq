@@ -119,7 +119,7 @@ export type Part =
   /** 分享卡片，平台端已经读出标题和链接；读不出就只有 text */
   | { type: 'card'; text: string; title?: string; url?: string; from?: string }
   /** 合并转发，id 之后用 adapter.fetch({ kind: 'forward' }) 展开 */
-  | { type: 'forward'; id: string }
+  | { type: 'forward'; id: string; outerId?: string; messages?: FetchedMessage[] }
   | { type: 'poke' }
   /** 平台端认不出的东西。text 是给她看的占位，如「[闪传文件]」 */
   | { type: 'other'; text: string; native?: unknown }

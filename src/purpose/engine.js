@@ -21,6 +21,11 @@
  * THIRD-PARTY-NOTICES.md；已按 Aurabot 的模块与配置语境改写。
  */
 
+// 心情项（情绪字典）的唯一真相在心情模块那边：这里只借用出厂的默认十项做快照与兜底。
+import {
+  DEFAULT_EMOTIONS, emotionLabels, emotionProfiles, profileOf, resolveEmotion,
+} from '../features/mood-emotions.js';
+
 export const PURPOSE_STATE_VERSION = 1;
 // 到期事实优先关心；只由记忆库提供到期的一件，不在目的状态里复制排程。
 export const FOLLOW_UP_WEIGHT = 4;
@@ -206,10 +211,12 @@ export function createPurposeState(now = Date.now()) {
     needFeedback: {},
     lastEmotion: '',
     lastEmotionText: '',
-    // 心情向量：与驱力同款的跨轮状态（每种情绪一个 0~1 强度，随时间衰减）。
-    // 面板按它画「心情进度条」；与 lastEmotion（只是「上次那一刻」）互补。
+    // 【已废弃·仅为迁移保留】心情向量 2026-11-17 起归心情模块（mood.json 的 emotions/emotionsAt）。
+    // 这里只负责把老存档里的这两个字段读出来交给接线层迁移（purpose/module.js 的 loadState），
+    // 引擎自己不再写、面板不再读；等老用户都迁过一轮后连同 normalize 分支一起删。
     moods: {},
-    moodsAt: now,
+    moodsAt: 0,
+    moodsMigratedAt: 0,
     lastGoalId: '',
     // 给设置页画「这一轮链路」用的计数（不参与决策）。
     lastMaterialCount: 0,
@@ -285,6 +292,8 @@ export function normalizePurposeState(raw, now = Date.now()) {
   base.lastEmotionText = clip(raw.lastEmotionText, 30);
   base.moods = normalizeMoods(raw.moods);
   base.moodsAt = Number(raw.moodsAt) || 0;
+  // 迁移标记：旧向量搬去心情模块后打在状态文件上，normalize 必须保留它，否则每次启动都会重新搬。
+  base.moodsMigratedAt = Number(raw.moodsMigratedAt) || 0;
   base.lastGoalId = String(raw.lastGoalId ?? '').slice(0, 24);
   base.lastMaterialCount = clampInt(raw.lastMaterialCount, 0, 0, 999);
   base.lastCandidateCount = clampInt(raw.lastCandidateCount, 0, 0, 99);
@@ -533,12 +542,10 @@ export function applyPurposeOutcome(state, {
   const need = PURPOSE_NEEDS.includes(memo?.need) ? memo.need : (PURPOSE_NEEDS.includes(planned?.need) ? planned.need : '');
   const action = memo?.action || planned?.action || '';
   const emotion = memo?.emotionText ? '' : (planned?.emotion || '');
-  state.lastEmotion = String(emotion || planned?.emotion || state.lastEmotion || '').slice(0, 20);
+  state.lastEmotion = String(emotion || planned?.emotion || state.lastEmotion || '').slice(0, 24);
   state.lastEmotionText = clip(memo?.emotionText || state.lastEmotionText || '', 30);
-  // 心情向量结算：先衰减旧心情，再给这次的情绪抬一手（面板的心情进度条就吃这里）。
-  const derivedMoods = deriveMoods({ moods: state.moods, moodsAt: state.moodsAt, lastEmotion: state.lastEmotion, now });
-  state.moods = derivedMoods.moods;
-  state.moodsAt = derivedMoods.moodsAt;
+  // 心情向量不在这里结算了（2026-11-17 下沉到心情模块）：接线层拿到这一轮的 emotion 后
+  // 调 mood.feel()，那边统一做衰减 + 抬升，并且与聊天里判出来的心情共用同一套心情项。
   // 目标假设记账：这次主动说了/没说，都会影响下一次的置信度；主人回复在 formGoalHypotheses 里结算。
   const goalId = String(planned?.goalId || '').slice(0, 24);
   const goal = goalId ? (Array.isArray(state.goals) ? state.goals : []).find((g) => g?.id === goalId) : null;
@@ -972,31 +979,24 @@ export const ACTION_LABELS = Object.freeze({
   share: '分享', ask: '索取', invite: '邀请', confide: '倾诉', follow: '追问', curiosity: '好奇',
 });
 
-export const EMOTION_LABELS = Object.freeze({
-  curious: '好奇', excited: '兴奋', lonely: '寂寞', envious: '羡慕',
-  worried: '担心', proud: '得意', affectionate: '亲近', bored: '无聊',
-  amused: '好笑', content: '平静',
-});
+export const EMOTION_LABELS = emotionLabels(DEFAULT_EMOTIONS);
 
 // 情绪的二维画像：valence（正负 -1~1）与 arousal（强弱 0~1）。
 // 离散标签好让模型读懂，数值好让桌宠表情/语气跟着强度走。
-export const EMOTION_PROFILES = Object.freeze({
-  curious: { valence: 0.3, arousal: 0.6 },
-  excited: { valence: 0.8, arousal: 0.9 },
-  lonely: { valence: -0.6, arousal: 0.3 },
-  envious: { valence: -0.4, arousal: 0.5 },
-  worried: { valence: -0.5, arousal: 0.6 },
-  proud: { valence: 0.6, arousal: 0.5 },
-  affectionate: { valence: 0.7, arousal: 0.4 },
-  bored: { valence: -0.2, arousal: 0.2 },
-  amused: { valence: 0.6, arousal: 0.7 },
-  content: { valence: 0.2, arousal: 0.3 },
-});
+// 2026-11-17 起这张表由「心情项」配置生成（features/mood-emotions.js），
+// 这里保留默认十项的快照只为兼容旧调用；真正取值一律走 emotionProfile(emotion, emotions)。
+export const EMOTION_PROFILES = emotionProfiles(DEFAULT_EMOTIONS);
 
-/** 情绪 → { valence, arousal }；未知情绪回中性偏弱。 */
-export function emotionProfile(emotion) {
-  const p = EMOTION_PROFILES[emotion];
-  return p ? { ...p } : { valence: 0, arousal: 0.4 };
+/** 情绪 → { valence, arousal }；未知情绪回中性偏弱。emotions 不传时按出厂十项。 */
+export function emotionProfile(emotion, emotions = DEFAULT_EMOTIONS) {
+  return profileOf(emotions, emotion);
+}
+
+/** 情绪键 → 用户配的标签（删掉的项返回空串，调用方按「没有标签」处理）。 */
+export function emotionLabelFor(emotions, emotion) {
+  if (!emotion) return '';
+  const labels = emotionLabels(emotions);
+  return labels[emotion] || '';
 }
 
 export const DEFAULT_DRIVES = Object.freeze({
@@ -1331,9 +1331,13 @@ export function normalizeMoods(raw = {}) {
 }
 
 /**
- * 心情向量的跨轮推导（与 deriveDrives 同款模式）：
- * 先按半衰期整体向 0 衰减（心情会淡忘），再把「最近一次行动的情绪」明显抬一手——
- * 刚发生的事在心情里站 C 位。没有基线（不像驱力有 DEFAULT_DRIVES），淡了就是真的淡了。
+ * 【已废弃】心情向量的跨轮推导。
+ *
+ * 2026-11-17 起心情向量的衰减/抬升统一由心情模块做（features/mood-emotions.js 的
+ * deriveEmotionVector + features/mood.js 的 feel()）。这里保留一个薄壳只为两件事：
+ *   1. 老测试/老调用还能跑（行为等价于旧实现，十项固定）；
+ *   2. 迁移时不需要改历史数据的语义。
+ * 新代码不要再用它——它不认用户配的心情项，也不跟心情的标量共用半衰期。
  */
 export function deriveMoods({ moods = {}, moodsAt = 0, lastEmotion = '', now = Date.now(), halfLifeHours = 6 } = {}) {
   const next = normalizeMoods(moods);
@@ -2171,6 +2175,9 @@ export function selectPurpose({
   now = Date.now(),
   lastMasterAt = 0,
   random = Math.random,
+  // 心情项：用户在心情页配了哪些情绪，这里就只认哪些（删掉的项映射到最接近的一项，
+  // 而不是产出提示词里没有标签的空情绪）。
+  emotions = DEFAULT_EMOTIONS,
 } = {}) {
   const recent = (Array.isArray(history) ? history : []).slice(-10);
   const query = normalizeDrives(drives);
@@ -2188,12 +2195,15 @@ export function selectPurpose({
     if (candidates.some((c) => textSimilarity(c.text, text) >= 0.8)) return;
     const needAff = item.needAffinity || needAffinity(text);
     const need = PURPOSE_NEEDS.includes(item.need) ? item.need : topNeedOf(needAff, query);
-    const emotion = item.emotion || appraiseMaterial({
+    const rawEmotion = item.emotion || appraiseMaterial({
       material: { text, title: '', selfRef: Boolean(item.selfRef), cues: emotionCues(text), needAffinity: needAff },
       need,
       now,
       lastMasterAt,
     });
+    // 写死的情绪键可能已被用户在「心情项」里删掉：映射到最接近的一项（删了「无聊」→「平静」），
+    // 一项都没配上时才留空字符串（提示词会跳过强弱措辞，不至于崩）。
+    const emotion = resolveEmotion(emotions, rawEmotion) || '';
     let action = item.action || actionForNeed(need, item.topic || '', { emotion, hoursSinceMaster });
     // 高风险目标只能「问」或「说」，不能默认替她做（装/买/联系别人）。
     if ((Number(item.risk) || 0) >= 0.5 && !['ask', 'share'].includes(action)) action = 'ask';
@@ -2205,8 +2215,8 @@ export function selectPurpose({
       action: ACTION_LABELS[action] ? action : 'share',
       actionLabel: ACTION_LABELS[action] || ACTION_LABELS.share,
       emotion,
-      emotionLabel: EMOTION_LABELS[emotion] || '',
-      emotionProfile: emotionProfile(emotion),
+      emotionLabel: emotionLabelFor(emotions, emotion),
+      emotionProfile: emotionProfile(emotion, emotions),
       topic: String(item.topic || '').slice(0, 40),
       text,
       source: String(item.source || '').slice(0, 20),
@@ -2379,6 +2389,8 @@ export function buildPurposePrompt({
   history = [],
   stats = {},
   drives = DEFAULT_DRIVES,
+  // 心情项：提示词里的情绪名字与强弱措辞都按用户配的项走
+  emotions = DEFAULT_EMOTIONS,
 } = {}) {
   const lines = [];
   const owner = String(ownerName || '').trim() || '主人';
@@ -2396,13 +2408,16 @@ export function buildPurposePrompt({
     .slice(0, 2)
     .filter((item) => item.score >= 0.25)
     .map((item) => NEED_LABELS[item.need] || item.need);
-  const emotionText = selected?.emotion ? (EMOTION_LABELS[selected.emotion] || '') : '';
+  const emotionText = selected?.emotion ? emotionLabelFor(emotions, selected.emotion) : '';
   // 强弱措辞跟情绪画像走：arousal 高就「强烈」，中「明显」，低「隐约」。
   const intensityWord = (emotion) => {
-    const a = emotionProfile(emotion).arousal;
+    const a = emotionProfile(emotion, emotions).arousal;
     return a >= 0.7 ? '强烈地' : a >= 0.45 ? '明显' : '隐约';
   };
-  const emotionPhrase = selected?.emotion === 'content'
+  // 「平静」这一档说的是「心里挺平静的」而不是「有点平静」——但用户可能把 content 删了/改名了，
+  // 所以只在它确实存在且 arousal 低（平静型）时才走这个特例，其余一律走通用措辞。
+  const calm = selected?.emotion && selected.emotion === 'content' && emotionText && emotionProfile(selected.emotion, emotions).arousal < 0.45;
+  const emotionPhrase = calm
     ? '心里挺平静的'
     : (emotionText ? `心里${intensityWord(selected.emotion)}有点${emotionText}` : '');
   if (topNeeds.length || emotionPhrase) {
@@ -2723,7 +2738,7 @@ export function resolvePendingPurpose(state, text = '') {
 }
 
 /** API / 设置页用的摘要（不返回提示词全文，避免把记忆内容带进页面日志）。 */
-export function summarizePurposeState(state, { config = DEFAULT_PURPOSE_CONFIG, now = Date.now() } = {}) {
+export function summarizePurposeState(state, { config = DEFAULT_PURPOSE_CONFIG, now = Date.now(), emotions = DEFAULT_EMOTIONS } = {}) {
   const drives = normalizeDrives(state.drives);
   const topNeeds = PURPOSE_NEEDS
     .map((need) => ({ need, label: NEED_LABELS[need] || need, value: Math.round((drives[need] || 0) * 100) }))
@@ -2740,9 +2755,9 @@ export function summarizePurposeState(state, { config = DEFAULT_PURPOSE_CONFIG, 
     lastPurpose: state.lastPurpose || '',
     lastText: state.lastText || '',
     lastEmotion: state.lastEmotion || '',
-    lastEmotionLabel: EMOTION_LABELS[state.lastEmotion] || '',
+    lastEmotionLabel: emotionLabelFor(emotions, state.lastEmotion),
     lastEmotionText: state.lastEmotionText || '',
-    lastEmotionProfile: state.lastEmotion ? emotionProfile(state.lastEmotion) : null,
+    lastEmotionProfile: state.lastEmotion ? emotionProfile(state.lastEmotion, emotions) : null,
     lastGoalId: state.lastGoalId || '',
     goals: (Array.isArray(state.goals) ? state.goals : []).slice(0, 5).map((g) => ({
       id: g.id, owner: g.owner, ownerLabel: GOAL_OWNER_LABELS[g.owner] || g.owner,
@@ -2759,7 +2774,8 @@ export function summarizePurposeState(state, { config = DEFAULT_PURPOSE_CONFIG, 
     attempts: Number(state.attempts) || 0,
     drives,
     topNeeds,
-    // 心情向量：面板照驱力的样子画每种情绪的进度条
+    // 【迁移用】旧存档的心情向量：面板 2026-11-17 起改读心情模块（/state.mood.emotionsItems），
+    // 这里保留原字段只为让老版本面板/老测试不炸，以及接线层判断「还有没有没搬走的」。
     moods: normalizeMoods(state.moods),
     moodsAt: Number(state.moodsAt) || 0,
     pending: (Array.isArray(state.pending) ? state.pending : []).slice(-8).map((p) => ({

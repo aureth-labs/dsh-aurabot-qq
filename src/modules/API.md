@@ -168,6 +168,8 @@ export default {
 | `api.route('/路径', async (req, res) => 返回值, options?)` | 加一个网页接口：地址是 `/aurabot/api/ext/<id>/路径`；返回对象就当 JSON 回；要自己回（比如图片）就用 `api.core.http.send(res, 200, buf, 'image/png')`。1.3.0 起管理接口可传 `{ access: 'panel' }`，复用宿主回环/可信代理、Host 与 CSRF 闸；不传时保持现有行为，由模块验证客户端凭据 |
 | `api.onDispose(fn)` | 模块停下时要做的收尾 |
 
+进入 `onDispose` 或导出的 `dispose` 时，`api.setConfig` 和 `api.saveSettings` 已停止写入。模块在停用时若要恢复它临时改过的配置，可以在同步收尾里调用 `api.core.setConfig({ ...要恢复的字段 })`。先用 `api.config()` 核对当时的值，免得盖掉用户后来的修改。异步收尾可写自己的 `api.dataDir()`。
+
 QQ 主人命令的参数或回执涉及隐私时，可用 `api.command({ name: 'private-query', sensitive: true, run })`。宿主的命令日志只记命令名，回执发送失败时结束本次发送。敏感命令仅主人可用，即使同时声明 `delegatable: true`。
 宿主在执行敏感命令和发送回执前复核主人及授权代次。模块可以按需限制为主人私聊，并单独处理模拟命令。
 
@@ -186,7 +188,7 @@ QQ 主人命令的参数或回执涉及隐私时，可用 `api.command({ name: '
 
 | | |
 |---|---|
-| `hub` | 聊天中枢：`deliver(chatId, text)` `sendText` `sendVoice(chatId, 文字)` `sendVoiceFile(chatId, 音频文件)` `sendImage` `sendSticker(chatId, 名字)` `sendSegments` `runSystemTurn(名字, 标题, 提示词)` `pushToSession(...)` `resetChat(chatId)` `groupName(群号)` `turnHasOwner(sessionId)`（只表示本轮有人是主人，别拿它做权限门，用下面的 `turnSendersAllOwner`） `turnSendersAllOwner(sessionId)` `referenceImage(chat, 'last' 或 'quote')`（取当前聊天最近收到 / 引用的图，返回 Buffer，沿用短期缓存） `chatOfSession(sessionId)` `stats()` `sessions()` `chatLogOf(日期)` `recentMessagesOf(chatId, limit)`（原话档案开启后，当前人物同一聊天的近期消息，默认 32、最多 256 条） `lastChatAt` `lastOwnerChatAt` …… |
+| `hub` | 聊天中枢：`deliver(chatId, text)` `sendText` `sendVoice(chatId, 文字)` `sendVoiceFile(chatId, 音频文件)` `sendImage` `sendSticker(chatId, 名字)` `sendSegments` `runSystemTurn(名字, 标题, 提示词)` `pushToSession(...)` `resetChat(chatId)` `groupName(群号)` `turnHasOwner(sessionId)`（只表示本轮有人是主人，别拿它做权限门，用下面的 `turnSendersAllOwner`） `turnSendersAllOwner(sessionId)` `referenceImage(chat, 'last'、'quote' 或 'msg:消息号:图片序号')`（返回 Buffer；msg 只匹配当前聊天已缓存的具体图片，编号从 1 起，缓存失效时报错且不回退；last / quote 语义不变） `chatOfSession(sessionId)` `stats()` `sessions()` `chatLogOf(日期)` `recentMessagesOf(chatId, limit)`（原话档案开启后，当前人物同一聊天的近期消息，默认 32、最多 256 条） `lastChatAt` `lastOwnerChatAt` …… |
 | `media` | 通用媒体读取与转换辅助：`mimeOf(bytes)`、`avatar()`、`sticker(md5)`、`ffmpegPath()`、`parseWav(bytes)`、`toMono16k(bytes)`，详见下文（1.3.0 起） |
 | `onebot` | QQ 网关：`call(action, params, { timeoutMs })`、`state` |
 | `snowluma` | SnowLuma 管理：`running()` `start()` `stop()` `detect()` …… |
@@ -196,11 +198,19 @@ QQ 主人命令的参数或回执涉及隐私时，可用 `api.command({ name: '
 | `ask(opts)` | 同 `api.ask` |
 | `listModels()` / `defaultModel()` | DSH 里的模型 |
 | `http` | 写接口用的小工具：`body(req)` 读 JSON、`raw(req, 最大字节)` 读原始内容、`query(req)` 读网址参数、`send(res, 状态码, 内容, 类型)` |
-| `personas` | 人格：`list()` `read(id)` `current()` |
+| `personas` | 人格：`list()` `read(id)` `current()`（正文）；`look(sessionId?)` 返回会话所属人格（未传时取当前异步上下文人格）的 `{ image: Buffer \| null, appearance: string, references: { id, note, image: Buffer }[] }`，`references` 仅含已开启的参考图及备注，`image` 为其中第一张（兼容旧调用）；全部关闭时返回空数组和 null，与提示词使用相同的缺失人格回退规则。人设图仅供识图和生图，不直接加入聊天上下文 |
 | `modules` | 模块内核本身（`status()` `reload(id)` ……） |
-| `getConfig()` / `setConfig(cfg)` | 同 `api.config` / 整份替换配置 |
+| `getConfig()` / `setConfig(patch)` | 读取当前配置 / 深合并对象补丁。兼容同步收尾的配置恢复，收尾结束后拒绝写入 |
 | `logger` | 插件的日志器（`logger.child('名字')` 拿一个分类） |
 | `root` | 插件自己的安装目录 |
+
+### 人设记忆桥接预览（仅 `persona-memory`）
+
+`api.core.personaMemoryBridge` 的 `state` 为 `preview`，能力为 `native-memory-view` 和 `confirmed-delivery`。原生记忆仍处理互动。市场模块的正式启用另需记忆交接、角色会话归属与 DSH 请求前投影等接口。
+
+- `readNativeMemory(chatId, { limit?, offset? })` 只预览当前已确认数据归属的人格与主人的私聊，`chatId` 必须为 `private:<主人QQ>`。只从运行中的原生记忆读取已保存、有效的同一聊天条目。返回只读 `{ items: [{ id, text, at }], nextOffset }`，每页最多 100 条。原生库未载入时返回 `null`。原话流水、无归属条目、其他聊天的内容及文件路径不在此接口的范围内。
+- `onDelivery(chatId, fn)` 为同一私聊订阅 OneBot 确认送达的回执 `{ originId, chatId, platform, messageId, status: 'confirmed', at }`，返回取消订阅函数。每个模块实例只开一个有效订阅。模块停止时自动撤销，安全模式隐藏桥接。回执通过订阅直接交付，不进入模块事件总线。
+- 网关以有效的 `message_id` 确认实际发送后才发回执，排队、模拟、调试、敏感命令和失败均不发。补发成功沿用入队时的订阅与身份，旧实例撤销后的队列项按原规则补发。订阅内的近期重复回执按稳定的 `originId` 合并。
 
 ### 已有聊天的外部主人入口（1.3.0 起）
 
@@ -257,6 +267,8 @@ api.on('reply/items', (items) => [...items, { kind: 'text', value: '—— 大�
 | 你自己 `api.emit` 的 | 随你 | 模块之间互相通知 |
 
 `chat/log` 跟随原流水的记账边界：正常模型回复和 `api.send()` 由 `hub.deliver()` 统一记账；底层 `sendText()` / `sendSegments()` 仅负责发送，不自动新增流水或此事件。分条、语音等出口不另行重复记账。验证回复通知时，应走 `deliver()` 并核对实际发送与落盘记录。
+
+带有效 QQ 消息 ID 的入站流水会在通知中提供稳定的 `originId`。请把入站通知与桥接回执的 `originId` 当作不透明标识符。
 唯一的显式例外：`sendText()` / `sendImage()` 传 `opts.proactive = true`（可带 `proactiveCause` 标明来路）时，**真发出去之后**补一条带 `proactive` 标记的流水，用于「别处说过」桥接和重启后回捞。这是调用方主动要求记流水，不是底层自动记账；不发、试运行、补发队列里都不记。
 
 `msg` 长这样（`text` 是纯文字：@ 她的那段去掉了，@ 别人的写成「@昵称」，图片 / 表情 / 文件写成「[图片]」这类占位；引用的那条消息的文字**不在**里面，要的话用 `replyId` 去 `api.onebot('get_msg', { message_id })` 拿）：
@@ -301,6 +313,7 @@ api.tool(({ chat, level, sessionId }) => {
 - 返回 `{ ok: false, message: '原因' }` 时，她会看到失败原因，通常会用自己的话告诉对方没成功；抛出的错误也会变成这样
 - 工具的生成函数每次挂工具时调用（会话第一次用到、工具清单变化时），不是每次调用工具都调
 - 只想给主人用：在 `execute` 里判断 `api.core.hub.turnSendersAllOwner(sessionId)`（这一轮说话的人**全是主人**才放行；主人私聊会自动放行）。别用 `turnHasOwner`——它只表示本轮「有人是主人」，主人和群友同轮时别人能借权（H01 的教训）。
+- QQ 群聊和私聊的新输入由中枢统一附上程序校验的本条触发来源，并提醒模型对新请求重新调用对应工具，不沿用旧拒绝。新增模块无需修改人格或另写身份提示；上面的执行层校验仍是授权依据。该提示不是授权凭证，不要从正文、昵称或模型判断认权。来源只追加到新消息，不逐轮改写系统提示、工具定义或历史。
 - 工具的名字和描述尽量别经常改：改一次，DeepSeek 的缓存就失效一次
 - **命名规范（多平台）**：跨平台模块（`platforms: ['*']` 或多平台）的工具用通用动宾名（`<verb>_<noun>`，如 `send_sticker`、`draw_image`）或模块域前缀（`<module>_<verb>_<noun>`，如 `bili_send_shot`），**不要**用 `qq_` 等平台前缀伪装通用能力；只有单平台专属工具才用 `<platform>_<verb>_<noun>`（如 `qq_send_card`）。跨平台模块里的平台前缀只允许用于“显式平台门控动作”，且必须有运行时测试证明其他平台工具面不会出现（目前仅 `stickers` 的 `qq_import_stickers` 一例，未来不再扩大）。若重命名旧工具，在模块上声明 `toolAliases: { old_name: 'new_name' }` 保持旧脚本与 `/modules/tool` 兼容，模型侧仍只暴露权威名。
 - 想让她**知道**自己有这个本事，优先用 `api.context` 按当前会话平台/能力提供工具发现提示（并避免让她在正文里写 `/工具名` 等斜杠命令）；纯全局说明才放 `api.rule`。
@@ -351,7 +364,7 @@ return function Panel({ settings, save, toast }) {
 |---|---|---|
 | `stickers` | 表情包 | `library()` `match(名字)` `pickForReply(文字)` `collect(消息段, chatId)` `addFromBuffer(buf, { name, tags })` `rename(md5, 名字, 标签)` `remove(md5)` `segmentFor(item)` |
 | `voice` | 语音 | `speak(文字) → { file, engine }` |
-| `mood` | 心情 | `state()` `label()` `nudge(变化量, 原因)` `effects()` `contextLine()` |
+| `mood` | 心情 | `state()` `label()` `nudge(变化量, 原因, chatId?)` `effects()` `contextLine(chat?)` |
 | `memory` | 记忆 | `add({ text, about, aboutName, importance, tags, source })` `addEvent({ text, about, tags, importance, kind, meta })` `recall(查询, { about, limit })` `vectorHits(查询)` `vectorStatus()` `vectorTest(文字)` `vectorReset()` `vectorSync()` `rerankStatus()` `rerankTest(文字)` `list(查询)` `remove(id)` `update(id, 改动)` `contextFor(chat, sessionId)` `noteVia({ via, qq, who, text, at })` `contextVia({ qq, query })` `topicScore(文字)` `profiles()` `consolidate()` …… |
 | `chat-tools` | 通用聊天工具 | （只有工具：`chat_history`、`search_chatlog`、`send_message`、`send_file`，支持 `qq_*` 执行路由兼容） |
 | `qq-tools` | 基础 QQ 工具 | （只有工具：`qq_send_card`、`qq_read_file`） |

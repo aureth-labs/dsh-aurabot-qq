@@ -73,17 +73,18 @@ for (const stop of ['dispose', 'turn/end']) test(`慢工具在 ${stop} 后不再
   assert.equal(sent.some((x) => x.includes('进度探针')), false)
 })
 
-test('慢工具 slow=true 时优先发她自己写的话', async (t) => {
+for (const [limitTagged, autoChance, sendsSticker, keywordExemption = false, notice = '等我一下，我去画张图 <sticker:开心>'] of [[false, 0, true], [true, 0, false], [true, 1, true], [true, 0, true, true], [true, 0, true, true, '<sticker:开心>'], [true, 0, false, false, '<sticker:开心>']]) test(`慢工具优先发她自己写的话，标签概率限制 ${limitTagged}/${autoChance}/关键词${keywordExemption}/纯表情${notice === '<sticker:开心>'}`, async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] })
   const work = deferred()
   t.after(() => work.resolve({ ok: true }))
   let fake
   const sent = []
   const s = setup(t, {
+    cfg: config({ stickers: { enabled: true, limitTagged, autoChance, keywordExemption } }),
     brain: async ({ callTool }) => {
       const agent = [...fake.agents.values()][0]
       fake.emit('session/event', agent.session, { type: 'assistant/message', data: { turn: 1, message: { content: [
-        { type: 'text', text: '等我一下，我去画 <sticker:开心>' },
+        { type: 'text', text: notice },
         { type: 'tool-call', id: 'slow-auto-1', name: 'slow-auto', arguments: '{}' },
       ] } } })
       await callTool('slow-auto', {})
@@ -98,8 +99,8 @@ test('慢工具 slow=true 时优先发她自己写的话', async (t) => {
   await settle()
   t.mock.timers.tick(1501)
   await settle()
-  assert.equal(sent.some((x) => x.includes('等我一下，我去画')), true)
-  assert.equal(sent.some((x) => x.includes('[表情] 开心')), true)
+  assert.equal(sent.some((x) => x.includes('等我一下，我去画')), notice.includes('我去画'))
+  assert.equal(sent.some((x) => x.includes('[表情] 开心')), sendsSticker)
   assert.equal(sent.some((x) => x.includes('sticker:开心')), false)
 })
 
@@ -127,6 +128,38 @@ test('慢工具提示等待发送挂钩时轮次结束，不再投递到 QQ', as
   sending.resolve()
   await settle()
   assert.equal(s.calls.some((x) => x.action === 'send_private_msg'), false)
+})
+
+// 生图 notice 已经自己发过「正在做」提示（qq_draw_image 里 markSlowNotice）：hub 的 1.5s 兜底
+// 要跳过，不能把她的当轮正文再发一遍——同样的话会重复两条（2026-11-18 主人私聊实测）。
+test('工具调 markSlowNotice 后，慢工具兜底不再发她当轮正文', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const work = deferred()
+  t.after(() => work.resolve({ ok: true }))
+  let fake
+  const s = setup(t, {
+    cfg: config({ dryRun: false }),
+    brain: async ({ callTool }) => {
+      const agent = [...fake.agents.values()][0]
+      // 她当轮正文写了「我去画」，同时工具先自己把 notice 发出去并登记 markSlowNotice
+      fake.emit('session/event', agent.session, { type: 'assistant/message', data: { turn: 1, message: { content: [
+        { type: 'text', text: '哟 憋半天是想要这款 行 给你画 别太兴奋' },
+        { type: 'tool-call', id: 'slow-mark-1', name: 'slow-mark', arguments: '{}' },
+      ] } } })
+      const [sid] = [...s.hub.sessions().values()].map((x) => x.sessionId)
+      s.hub.markSlowNotice(sid)
+      await callTool('slow-mark', {})
+      return ''
+    },
+    buildTools: () => [{ name: 'slow-mark', slow: true, execute: () => work.promise }],
+  })
+  fake = s.fake
+  await s.hub.onMessage(event())
+  await settle()
+  t.mock.timers.tick(1501)
+  await settle()
+  assert.equal(s.calls.some((x) => x.action === 'send_private_msg' && JSON.stringify(x.params.message).includes('憋半天')), false,
+    'notice 已发过时兜底不能把当轮正文再发一遍')
 })
 
 function config(patch = {}) {
@@ -695,3 +728,26 @@ test('敏感命令执行前发现授权代次已变化', async (t) => {
   assert.equal(executed, false)
 })
 
+
+test('用量接入：真实会话事件记一次，失败重试分别记，非 Aurabot 会话不记', async (t) => {
+  const s = setup(t)
+  const usage = await import('../src/core/usage.js')
+  usage.initUsage()
+  t.after(() => usage.closeUsage())
+  await s.hub.onMessage(event('建立用量测试会话'))
+  await settle()
+  const sid = s.hub.sessions()[CHAT]?.sessionId
+  assert.ok(sid)
+  const at = Date.now()
+  const e = { seq: 10000, time: at, type: 'assistant/attempt', data: { turn: 70, step: 0, usage: { inputTokens: 100, outputTokens: 10, cacheReadTokens: 800, cacheWriteTokens: 100 } } }
+  s.hub.onSessionEvent({ id: sid }, e)
+  s.hub.onSessionEvent({ id: sid }, e)
+  s.hub.onSessionEvent({ id: 'session-unrelated' }, e)
+  const read = () => usage.usageReport({ range: 'all' }).current
+  assert.equal(read().totalTokens, 1010)
+  assert.equal(read().byChat[0].key, CHAT)
+  s.hub.onSessionEvent({ id: sid }, { seq: 10001, time: at, type: 'llm/retry-started', data: { turn: 70, step: 0 } })
+  s.hub.onSessionEvent({ id: sid }, { ...e, seq: 10002 })
+  assert.equal(read().runs, 2)
+  assert.equal(read().totalTokens, 2020)
+})

@@ -2,11 +2,13 @@
 // 定时看别人回她的评论并接着回；你在 QQ 里发链接，她也能点进去看完再聊。看过的、评过的都记成她的经历。
 
 import { dataDir, readJson, writeJson } from '../core/store.js'
+import { isPeak } from '../core/offpeak.js'
 import { createBiliApi, findVideoId, parseCookie } from './api.js'
 import { loginSessionKey, recoverLoginPause } from './login-pause.js'
 import { isSessionBackoff } from '../chat/session-backoff.js'
 import { lookWithVision, visionState } from './vision.js'
 import { createShotStore, shotPath, clockOf } from './shots.js'
+import { inHourWindow } from '../core/time-window.js'
 
 // 这些错误说明今天别再发了：没登录 / Cookie 过期、csrf 不对、风控、要验证码、太频繁
 const PAUSE_CODES = { '-101': 'B 站没登录或 Cookie 过期了', '-111': 'Cookie 里的 bili_jct 不对', '-352': '被 B 站风控了', '-509': '发得太频繁', '12015': 'B 站要求验证码' }
@@ -16,7 +18,22 @@ import { normalizeChatId, parseChatId } from '../gateway/address.js'
 
 const FACE_MAX = 2 * 1024 * 1024 // B 站头像上限（api.js 里也有一份，这里给缩图判断用）
 const dayKey = (d = new Date()) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-const link = (bvid) => `https://www.bilibili.com/video/${bvid}`
+export const link = (bvid) => `https://www.bilibili.com/video/${bvid}`
+// QQ 里点得开的是网页播放器：点开直接播；video/ 普通链接常被拦去外部浏览器或要重新登录（#334）。
+// 记忆/流水里仍存 link() 的正式地址，便于回溯与去重。
+export const playerLink = (bvid, p = 1) =>
+  `https://www.bilibili.com/blackboard/webplayer/mbplayer.html?bvid=${bvid}&p=${p}&autoplay=true`
+
+/**
+ * 「只在谷时刷」的跳过原因（纯函数，测试友好）。
+ * 开关关着 → ''（照常跑）；开着且现在是 DeepSeek 峰时 → 返回中文原因。
+ * 峰谷口径同 src/core/offpeak.js：北京时间工作日 09:00–12:00、14:00–18:00 为峰时，周末和法定节假日全天谷价。
+ */
+export function offpeakSkipReason(cfg, now = new Date()) {
+  if (cfg?.bili?.offpeak !== true) return ''
+  const holidays = Array.isArray(cfg?.cost?.offPeakHolidays) ? cfg.cost.offPeakHolidays : []
+  return isPeak(now, { holidays }) ? '峰时（北京时间工作日 09:00–12:00、14:00–18:00），等谷时再刷' : ''
+}
 
 /** 从模型输出里取 JSON（对象或数组），取不到返回 fallback。 */
 export function pickJson(out, fallback) {
@@ -49,9 +66,9 @@ export function createBili({ getConfig, hub, memory, log, dsh, api: injected, vi
   const api = injected || createBiliApi({ getCookie: () => cfg().cookie, log })
   const shots = createShotStore({ max: () => getConfig().bili.shotLibrary })
   const file = () => dataDir('bili.json')
-  const load = () => readJson(file(), () => ({ day: '', runs: 0, comments: 0, replies: 0, lastRun: 0, lastReplyCheck: 0, seen: [], repliedFeed: [], history: [] }))
+  const load = () => readJson(file(), () => ({ day: '', runs: 0, comments: 0, replies: 0, lastRun: 0, lastReplyCheck: 0, lastSkipReason: '', lastSkipAt: 0, seen: [], repliedFeed: [], history: [] }))
   const save = (s) => writeJson(file(), s)
-  const today = (s) => { if (s.day !== dayKey()) Object.assign(s, { day: dayKey(), runs: 0, comments: 0, replies: 0 }) ; return s }
+  const today = (s) => { if (s.day !== dayKey()) Object.assign(s, { day: dayKey(), runs: 0, comments: 0, replies: 0, lastSkipReason: '', lastSkipAt: 0 }) ; return s }
   let busy = false
   let stopped = false
   let login = { at: 0, key: '', value: { isLogin: false, uname: '' } }
@@ -250,6 +267,8 @@ export function createBili({ getConfig, hub, memory, log, dsh, api: injected, vi
     if (cooldown) return { ok: false, skipped: true, retryAt: cooldown.retryAt, message: '后台会话冷却中' }
     busy = true
     const s = today(load())
+    s.lastSkipReason = ''
+    s.lastSkipAt = 0
     try {
       const seen = new Set(s.seen)
       const kws = await chooseKeywords()
@@ -277,7 +296,7 @@ export function createBili({ getConfig, hub, memory, log, dsh, api: injected, vi
       // 群分享开着才让她想群里的话（关着就不往提示词里塞，省 token）
       const groupShareOn = Boolean(groupShare && c.groupShare && c.groupShare.enabled && c.groupShare.groupId && !getConfig().dryRun)
       const out = await think(`你在 B 站刷到了这几个视频：\n\n${looked.map((x, i) => `【${i + 1}】${x.digest}`).join('\n\n')}\n\n` +
-        `看完说说你的想法。对每个视频给一个对象：{"i":序号, "feeling":"一句你的真实感受", "comment":"想在视频下发的评论（像普通观众，一两句、别打广告，不想评就空字符串）", "share":"想私聊分享给${owner()}的话（觉得${owner()}会喜欢才写，不然空字符串）"` +
+        `看完说说你的想法。对每个视频给一个对象：{"i":序号, "feeling":"一句你的真实感受", "comment":"想在视频下发的评论（像普通观众，一两句、别打广告，不想评就空字符串）", "share":"想私聊分享给${owner()}的话（觉得${owner()}会喜欢才写，不然空字符串；不要自己贴 bilibili.com/video 链接，系统会自动附上能在 QQ 里直接播放的播放器链接）"` +
         (groupShareOn ? `, "shareGroup":"想发到群里跟群友一起看的话（群里说话的口吻，一两句；没什么值得说就空字符串）"` : '') +
         `, "remember":"值得记住的一件事（没有就空字符串）"}。` +
         `这次最多评论 ${commentLeft} 个。只输出 JSON 数组。`)
@@ -319,7 +338,7 @@ export function createBili({ getConfig, hub, memory, log, dsh, api: injected, vi
             if (shareRoute.blocked && !ownerBlocked) ownerBlocked = shareRoute
           } else {
             // proactive：真发出去才记账（聊天流水 + 她下次在私聊里认得出自己发过什么）；试运行/排队补发不算
-            const r = await hub.sendText(shareRoute.chatId, `${share}\n${link(v.bvid)}`, undefined, undefined, undefined, { proactive: true, proactiveCause: 'bili' })
+            const r = await hub.sendText(shareRoute.chatId, `${share}\n${playerLink(v.bvid)}`, undefined, undefined, undefined, { proactive: true, proactiveCause: 'bili' })
             if (reallySent(r)) {
               shared++
               record(s, { kind: 'share', title: v.title, bvid: v.bvid, text: share })
@@ -522,9 +541,20 @@ export function createBili({ getConfig, hub, memory, log, dsh, api: injected, vi
     const g = getConfig()
     const c = g.bili
     if (!g.enabled || !c.enabled || hub.systemSessionCooldown?.('bili')) return
-    const h = new Date().getHours()
-    if (h < g.speakUp.awakeFrom || h >= g.speakUp.awakeTo) return
+    if (!inHourWindow(Date.now(), g.speakUp.awakeFrom, g.speakUp.awakeTo)) return
     const s = today(load())
+    // 只在谷时刷：峰时跳过整个定时流程（刷视频 + 看回复），把原因记进状态给面板看，不占额度
+    const skipReason = offpeakSkipReason(g)
+    if (skipReason) {
+      if (s.lastSkipReason !== skipReason) {
+        s.lastSkipReason = skipReason
+        s.lastSkipAt = Date.now()
+        save(s)
+        log.info(`B 站定时刷跳过：${skipReason}`)
+      }
+      return
+    }
+    if (s.lastSkipReason) { s.lastSkipReason = ''; s.lastSkipAt = 0; save(s) }
     if (c.reply && Date.now() - (s.lastReplyCheck || 0) > 20 * 60_000 && (await account()).isLogin) await checkReplies()
     if (!hub.systemSessionCooldown?.('bili') && c.autoBrowse && s.runs < c.maxRunsPerDay && Date.now() - (s.lastRun || 0) > c.intervalHours * 3600_000) await run()
   }
@@ -535,7 +565,7 @@ export function createBili({ getConfig, hub, memory, log, dsh, api: injected, vi
     dispose() { stopped = true },
     state: () => {
       const s = today(load())
-      return { runs: s.runs, comments: s.comments, replies: s.replies, lastRun: s.lastRun, history: s.history.slice(0, 20), canPost: canPost(s), pauseReason: s.pauseDay === dayKey() ? s.pauseReason : '', vision: visionState(cfg()), shots: { count: shots.count() } }
+      return { runs: s.runs, comments: s.comments, replies: s.replies, lastRun: s.lastRun, lastSkipReason: s.lastSkipReason || '', lastSkipAt: s.lastSkipAt || 0, history: s.history.slice(0, 20), canPost: canPost(s), pauseReason: s.pauseDay === dayKey() ? s.pauseReason : '', vision: visionState(cfg()), shots: { count: shots.count() } }
     },
   }
 }

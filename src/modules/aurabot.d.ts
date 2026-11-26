@@ -474,11 +474,17 @@ export interface Api {
     listModels(): Promise<{ provider: string; model: string; name: string }[]>
     defaultModel(): ModelSelection | null
     http: { body(req: any): Promise<any>; raw(req: any, max: number): Promise<Buffer>; query(req: any): Record<string, string>; send(res: any, code: number, body: any, type?: string): void }
-    personas: any
+    personas: {
+      list(): { id: string; name: string; tags: string[]; chars: number }[]
+      read(id: string): { id: string; name: string; tags: string[]; body: string; raw: string } | null
+      current(): string
+      /** references 仅含已开启图片；image 为其中首张，保留单图兼容。 */
+      look(sessionId?: string): { image: Buffer | null; appearance: string; references: { id: string; note: string; image: Buffer }[] }
+    }
     modules: any
     root: string
     getConfig(): any
-    setConfig(cfg: any): any
+    setConfig(patch: Record<string, unknown>): any
   }
   /** DSH 给插件的 ctx：dsh.get('服务名') 拿 DSH 的任何服务 */
   dsh: any

@@ -1,3 +1,4 @@
+import { validMemberFilter } from './chat/member-filter.js'
 // Aurabot · 宿主半边（DSH 插件入口）
 //
 // 让 DSH 里的 AI 以独立 QQ 号「大肥鱼」住在 QQ 里：
@@ -17,7 +18,8 @@ import { spawn } from 'node:child_process'
 import { setTimeout as delay } from 'node:timers/promises'
 import { isDeepStrictEqual } from 'node:util'
 import net from 'node:net'
-import { loadConfig, saveConfig, normalize, publicConfig, mergeFromPanel, authOwnerKey, ownerAuthorizationRevision, normalizeFallbackOrderList, PLATFORM_SECRET_KEYS, readRawConfig, writeRawConfigAtomic, qqOwnershipConfigSnapshot } from './core/config.js'
+import { loadConfig, saveConfig, commitConfig, configRevision, normalize, publicConfig, mergeFromPanel, authOwnerKey, ownerAuthorizationRevision, normalizeFallbackOrderList, PLATFORM_SECRET_KEYS, readRawConfig, writeRawConfigAtomic, qqOwnershipConfigSnapshot } from './core/config.js'
+import { quietWindowOf } from './core/time-window.js'
 import { createLogger } from './core/logger.js'
 import { encodeResponse } from './core/http-compress.js'
 import { registerSecret, redact } from './core/redact.js'
@@ -25,6 +27,7 @@ import { createOneBotClient } from './onebot/client.js'
 import { createOutbox } from './onebot/outbox.js'
 import { createSnowLumaManager, DOWNLOAD_PAGE } from './snowluma/manager.js'
 import { createHub, workspaceDirOf } from './chat/hub.js'
+import { createPersonaMemoryRuntime } from './core/persona-memory-bridge.js'
 import { normalizeSelection } from './chat/chat-model.js'
 import { grantOwner, moveWorkspace, realWorkspace } from './core/workspace-move.js'
 import { createLocal, fileOf, toImageBuffer } from './local/local.js'
@@ -36,13 +39,15 @@ import { createMediaAccess } from './core/media.js'
 import { buildFaceIndex } from './chat/faces.js'
 import { FACE_TABLE } from './chat/face-table.js'
 import { dataDir, ensureDir } from './core/store.js'
-import { initUsage, usageReport } from './core/usage.js'
+import { createUsageFx } from './core/usage-fx.js'
+import { initUsage, usageReport, closeUsage } from './core/usage.js'
 import { createUpdateChecker, changelogSection, hostEnv, updatePlan, repoOf } from './core/update.js'
 import { parseCommand, runCommand, createMutes, commandList } from './chat/commands.js'
-import { ownerPrivateChatIds } from './chat/access.js'
+import { ownerPrivateChatIds, groupResponseMode } from './chat/access.js'
 import { changePermissions, changePrivateWhitelist, privatePermissionCatalog } from './chat/permission-policy.js'
 import { canUseDelegatedCommand, delegatedCommandKey, runPersonalModelCommand } from './chat/delegated-commands.js'
-import { listPersonas, readPersona, savePersona, deletePersona, currentPersonaText, rulesText, qqSessionRulesText, QQ_POKE_RULE, seedPersonas } from './persona/personas.js'
+import { listPersonas, readPersona, savePersona, deletePersona, currentPersonaText, resolvePersonaId, rulesText, qqSessionRulesText, QQ_POKE_RULE, seedPersonas, safeId, dataOwner, claimPending, hasRootData, personaDataDir, personaNow } from './persona/personas.js'
+import { readLook, lookImage, lookImages, lookReferences, configureLookImage, lookMime, saveLookImage, deleteLookImage, saveAppearance, appearanceBlock, describeLook } from './persona/persona-look.js'
 import { createModules, API_VERSION } from './core/modules.js'
 import { createCommunity, REGISTRY_URL, GITEE_MIRROR } from './core/community.js'
 import { createApprovalRelay } from './security/approval.js'
@@ -85,7 +90,7 @@ import { createAuditor } from './autotelic/audit.js'
 import { setSsrpMode, assertPublicUrl, fetchGuarded } from './core/net.js'
 import { BUILTINS } from './modules/index.js'
 import { createOutboundPolicy } from './chat/outbound-policy.js'
-import { createPurposePolicy, createSpeakupPolicy, createSharedBudget } from './features/proactive-policy.js'
+import { createPurposePolicy, createSharedBudget } from './features/proactive-policy.js'
 import { parseChatId, normalizeChatId, formatChatId } from './gateway/address.js'
 import { fixedSharedPrimary } from './gateway/shared-private-route.js'
 import { createIdentity } from './gateway/identity.js'
@@ -191,6 +196,13 @@ export function isChatSession(hub, session) {
 export function apply(ctx, opts = {}) {
   const logger = createLogger({ dsh: ctx })
   const log = logger.child('core')
+  // ---------- 面板首屏提速（方案 §二） ----------
+  // bootId：本次宿主装配的唯一标识，面板用它判定「同一进程」的读写与保存回执；重启即换新。
+  const bootId = randomUUID()
+  // 核心配置与面板路由就绪前，三条轻量 GET（/panel/bootstrap|pulse|config）回 503 BOOTSTRAPPING。
+  let panelCoreReady = false
+  // 模块目录尚未就绪时 bootstrap 里 modulesReady=false（面板先画已知入口，占位等确认）。
+  let modsReady = false
   const dataRoot = dataDir()
 
   const enterMinimalBackupMovingRecovery = (journal) => {
@@ -793,6 +805,11 @@ export function apply(ctx, opts = {}) {
       }
     }
   }
+  // 全新安装（根目录还没有记忆、会话和流水）：当前人格直接认领根目录。老用户升级要主人在面板里认领。
+  if (!dataOwner(cfg) && !hasRootData()) {
+    try { cfg = commitConfig({ ...cfg, persona: { ...cfg.persona, dataOwner: safeId(cfg.persona.current) || 'dafeiyu' } }, cfg) }
+    catch { log.warn('记录数据归属人格失败，本次启动所有人格共用根目录') }
+  }
   let mods = null
   let bridge = null
   // 备份与云备份推送的任务状态声明在顶部：setConfig 里改云备份设置时要提前排定时器
@@ -804,6 +821,7 @@ export function apply(ctx, opts = {}) {
   // 已注册的策略源实例（name → policy），给 deliver 的 enginePolicy 解析用
   const enginePolicies = new Map()
   const getConfig = () => cfg
+  const personaMemoryRuntime = createPersonaMemoryRuntime({ getConfig, identity })
   let qqOwnershipRevision = 0
   const legacyQqOwnsConnection = () => cfg.legacyQqEnabled !== false
   const legacyQqAvailable = () => legacyQqOwnsConnection() && !qqOwnershipTransfer && !isQqRecoveryPaused()
@@ -815,7 +833,13 @@ export function apply(ctx, opts = {}) {
   setSsrpMode(() => (getConfig().security && getConfig().security.ssrfMode === 'loose' ? 'loose' : 'strict'))
   const secrets = () => {
     for (const k of ['webuiPassword', 'httpToken', 'wsToken']) registerSecret(cfg.snowluma[k])
+    registerSecret(cfg.voice?.fishApiKey)
+    for (const pool of Object.values(cfg.voice?.keyPools || {})) {
+      for (const account of pool.accounts || []) registerSecret(account.apiKey)
+    }
     registerSecret(cfg.imageGen.apiKey)
+    registerSecret(cfg.imageGen.minimax?.apiKey)
+    registerSecret(cfg.video?.minimax?.apiKey)
     for (const e of cfg.imageGen.fallbacks || []) registerSecret(e.apiKey)
     registerSecret(cfg.bridge.token)
     registerSecret(cfg.backup?.remote?.token)
@@ -827,7 +851,7 @@ export function apply(ctx, opts = {}) {
   } // 含平台与云备份凭据，日志统一打码
   const writeConfig = (next, source = '配置写入') => {
     const before = cfg
-    cfg = saveConfig(next, before)
+    cfg = commitConfig(next, before)
     logFallbackOrderChange(source, before.ownerPrimary.fallbackOrder, cfg.ownerPrimary.fallbackOrder)
     if (!isDeepStrictEqual(qqConfigFields(before), qqConfigFields(cfg))) qqOwnershipRevision++
     return before
@@ -914,7 +938,7 @@ export function apply(ctx, opts = {}) {
   secrets()
   seedPersonas()
   // token 用量与花费（面板「概览」）：价格表可以在 config.usage.pricing 里覆盖
-  initUsage(cfg.usage?.pricing, cfg.cost?.offPeakHolidays)
+  initUsage(cfg.usage?.pricing)
 
   // ---------- 人格与规则：通过提示词变量注入到 Aurabot 的两个 preset ----------
   const variable = (n, fn) => ctx.effect(() => ctx.systemPrompt.variable(n, (...args) => captureSystemPrompt(n, cleanText(fn(...args)))), `aurabot: 变量 ${n}`)
@@ -948,7 +972,10 @@ export function apply(ctx, opts = {}) {
   })
   // 扩展模块能整段改写人格和规则（同步：提示词变量不能等）
   const rewrite = (event, text, ...args) => { const r = mods ? mods.filterSync(event, text, ...args) : text; return typeof r === 'string' ? r : r === null ? '' : text }
-  variable('aurabot_persona', () => rewrite('persona', currentPersonaText(cfg.persona.current)))
+  variable('aurabot_persona', () => {
+    const id = resolvePersonaId(personaNow(cfg))
+    return rewrite('persona', currentPersonaText(id) + appearanceBlock(id))
+  })
   variable('aurabot_rules_private', () => {
     const base = rewrite('rules', rulesText('private', cfg, rulesOpts('private')), 'private')
     // 危险命令确认开着时补一句：被拦下要如实告诉主人，别绕着写
@@ -989,6 +1016,9 @@ export function apply(ctx, opts = {}) {
   // 连上后先核对登录的是不是机器人号，核对通过前不处理任何消息；不是就断开，不再自动重连
   let loginOk = false
   let wrongAccount = ''
+  // 已核验登录快照（方案 §二「连接摘要」）：checkLogin 核对时顺手缓存，面板轻量接口只读它，
+  // 绝不为了首屏现打 get_login_info（5 秒超时那个就是首屏卡顿的元凶）。断线即作废。
+  let loginSnapshot = { uin: '', nickname: '', at: 0 }
   // 核对期间收到的事件先攒着：核对通过就补处理，核对失败就丢掉。
   // 直接丢弃的话，刚连上那几百毫秒里主人发的消息就没了（登录核对要等一次 get_login_info 往返）。
   let verifying = false
@@ -1006,9 +1036,12 @@ export function apply(ctx, opts = {}) {
     pendingEvents = []
     try {
       let uin = ''
+      let info = null
       try {
-        const info = await onebot.call('get_login_info', {}, { timeoutMs: 10000 })
+        info = await onebot.call('get_login_info', {}, { timeoutMs: 10000 })
         uin = String(info?.user_id ?? '')
+        // 核对往返顺带更新登录快照（昵称一起缓存；核对本身不增加任何额外网络调用）
+        loginSnapshot = { uin, nickname: info?.nickname || '', at: Date.now() }
       } catch (error) {
         logger.child('onebot').warn('核对登录的 QQ 号失败：', error.message)
       }
@@ -1839,7 +1872,7 @@ export function apply(ctx, opts = {}) {
       onebotState = s
       if (s === 'connected' || s === 'stopped' || s === 'unconfigured') { gatewayWarmSince = 0; warmupPhase = { phase: '', label: '' } }
       else if (!gatewayWarmSince && legacyQqActive()) gatewayWarmSince = Date.now()
-      if (s !== 'connected') { loginOk = false; verifying = false; pendingEvents = [] }
+      if (s !== 'connected') { loginOk = false; verifying = false; pendingEvents = []; loginSnapshot = { uin: '', nickname: '', at: loginSnapshot.at } }
       else if (legacyQqActive()) checkLogin().then(() => { if (loginOk) flushOutbox() }).catch((error) => log.warn('核对登录号出错：', error.message))
       // 预热阶段 connecting/disconnected 会每 3 秒来回刷：首次和每 20 秒记一条 info，其余进 debug
       const line = `QQ 网关：${s}${d ? '（' + d + '）' : ''}`
@@ -2815,13 +2848,27 @@ export function apply(ctx, opts = {}) {
       return txObj
     },
   }
+  let flushingOutbox = false
   async function flushOutbox () {
-    if (!legacyQqActive() || onebotState !== 'connected' || !loginOk) return
+    if (flushingOutbox || !legacyQqActive() || onebotState !== 'connected' || !loginOk) return
+    flushingOutbox = true
     try {
-      const r = await outbox.flush((action, params, opts) => onebot.call(action, params, { ...opts, retries: 0 }))
+      const r = await outbox.flush((action, params, opts) => onebot.call(action, params, { ...opts, retries: 0 }),
+        item => !item.incomingReply || item.action !== 'send_group_msg' || groupResponseMode(cfg, item.params?.group_id) === 'chat',
+        (item, result) => {
+          // #327：主动发言入队时带了来路，补发成功后要补回聊天流水与「别处说过」，否则断线恢复后她不记得发过什么。
+          if (item.proactive) {
+            try { hub.noteProactive(item.chatId, item.params?.message || [], { proactiveCause: item.proactive }) } catch (error) { logger.child('outbox').warn('补发后补记主动发言失败：', error.message) }
+          }
+          if (item.action !== 'send_private_msg' || item.chatId !== `private:${item.params?.user_id}` ||
+              item.deliveryScope?.botQQ !== loginSnapshot.uin || result?.queued) return
+          personaMemoryRuntime.confirmDelivery(item.chatId, result?.message_id, item.deliveryScope)
+        })
       if (r.sent || r.dropped || r.left) log.info(`补发队列：成功 ${r.sent}，丢弃 ${r.dropped}，剩余 ${r.left}`)
     } catch (error) {
       logger.child('onebot').warn('补发队列出错：', error.message)
+    } finally {
+      flushingOutbox = false
     }
   }
   // 连接后漏掉的、或补发中途又断网的，定时再试；没连接时直接返回。
@@ -2944,6 +2991,9 @@ export function apply(ctx, opts = {}) {
     },
     stickers,
     tts,
+    // ACP 标记的模型兜底（chat.acpSanitize.modelFallback，默认关）要用它问一次宿主模型。
+    // 走的是「不进会话」的既有封装 askModel，不占聊天会话、不计入她的上下文。
+    askModel: (opts) => askModel(ctx, { cfg: getConfig(), ...opts }),
     buildTools: (where) => mods.buildTools(where),
     // 模块声明的能力（module.json capabilities）：子智能体委派这类要本机权限的能力靠它把关（一审 #177）
     capabilitiesOf: (id) => (typeof mods.capabilitiesOf === 'function' ? mods.capabilitiesOf(id) : []),
@@ -2977,7 +3027,7 @@ export function apply(ctx, opts = {}) {
       if (!cmd) return null
       if (!ownerStillCurrent()) {
         const key = delegatedCommandKey(cmd)
-        if (!canUseDelegatedCommand(getConfig(), msg, key)) return '你没有使用这个命令的权限，请联系主人设置。'
+        if (!canUseDelegatedCommand(getConfig(), msg, key)) return '这条命令没有执行，你当前没有使用权限。'
         if (key === 'help') {
           const list = commandList(commands, { hidden }).filter((item) => canUseDelegatedCommand(getConfig(), msg, delegatedCommandKey(parseCommand('/' + item.name, commands, { hidden }))))
           return '你可以使用的命令：\n' + list.map((item) => {
@@ -2991,8 +3041,8 @@ export function apply(ctx, opts = {}) {
         if (cmd.ext.sensitive === true && !markSensitive(cmd.name)) return ''
         return String((await cmd.ext.run(cmd.arg, msg)) ?? '')
       }
-      if (cmd.name === 'permissions' && !markSensitive(cmd.name)) return ''
-      return runCommand(cmd, msg, { getConfig, setConfig, mutes, hub, identity, mood: use('mood'), memory: use('memory'), qzone: use('diary'), song: use('song'), listModels, reasoningFor: (provider, model) => modelReasoning(ctx, provider, model, { refresh: true }), defaultModel: () => defaultModel(ctx, { model: {} }), extraCommands: commands, hidden })
+      if (['permissions', 'groupsettings'].includes(cmd.name) && !markSensitive(cmd.name)) return ''
+      return runCommand(cmd, msg, { getConfig, setConfig, mutes, hub, identity, onebot, listJoinedGroups: () => onebot.call('get_group_list', {}, { timeoutMs: 10000, retries: 0 }), ownerStillCurrent, log: logger, mood: use('mood'), memory: use('memory'), qzone: use('diary'), song: use('song'), listModels, reasoningFor: (provider, model) => modelReasoning(ctx, provider, model, { refresh: true }), defaultModel: () => defaultModel(ctx, { model: {} }), extraCommands: commands, hidden })
     },
     isMuted: (chatId) => mutes.muted(chatId),
     moodEffects: () => use('mood')?.effects?.() ?? null,
@@ -3012,6 +3062,10 @@ export function apply(ctx, opts = {}) {
       model: (sel, chat) => mods.filterSync('model', sel, chat),
       poke: (ev) => mods.claim('poke', ev),
       journal: (row) => mods?.emit('chat/log', row),
+      deliveryScope: (chatId, personaId, botQQ) => loginOk && loginSnapshot.uin === botQQ
+        ? personaMemoryRuntime.captureDelivery(chatId, personaId, botQQ)
+        : null,
+      delivery: personaMemoryRuntime.confirmDelivery,
     },
   })
   if (isQqRecoveryPaused()) hub.setDefaultQqTransportPaused(true)
@@ -3390,13 +3444,109 @@ export function apply(ctx, opts = {}) {
     defaultModel: () => defaultModel(ctx, { model: {} }),
     http: { body: readBody, raw: readRaw, query, send },
     media: createMediaAccess({ root: ROOT, use, config: getConfig }),
-    personas: { list: listPersonas, read: readPersona, current: () => currentPersonaText(cfg.persona.current) },
-    getConfig, setConfig,
+    personas: {
+      list: listPersonas, read: readPersona, current: () => currentPersonaText(cfg.persona.current),
+      look: (sessionId) => {
+        const id = resolvePersonaId((sessionId && hub.personaOf(sessionId)) || personaNow(cfg))
+        const references = id ? lookReferences(id, { lazy: true }) : []
+        return { get image() { return references[0]?.image || null }, references, appearance: id ? readLook(id).appearance : '' }
+      },
+    },
+    getConfig,
   }
-  mods = createModules({ ctx, core, getConfig, setConfig, logger, version: VERSION, builtins: BUILTINS })
+  mods = createModules({ ctx, core, getConfig, setConfig, logger, version: VERSION, builtins: BUILTINS, personaMemoryRuntime })
   bridge = createBridge({ ctx, getConfig, setConfig, hub, mods, identity, resolveOwnerRoute, routeOwner, log: logger.child('bridge'), version: VERSION, apiVersion: API_VERSION, overview: () => overview() })
   core.bridge = bridge
   core.modules = mods
+
+  // ---------- 面板首屏：三条轻量只读接口（GET /panel/bootstrap|pulse|config，方案 §二/§2.1） ----------
+  // 铁规矩：只读宿主内存——绝不触发 SnowLuma/OneBot 网络探测、不启动网关、不重扫模块目录。
+  // 鉴权/Host/CSRF 与其它管理面一致（route() 内统一过闸）；no-store 由 send() 统一带上。
+  // 常用开关的界面显示值（试运行口径与 publicConfig 相同：调试开着时试运行显示为关）。
+  const controlsView = () => ({
+    enabled: Boolean(cfg.enabled),
+    dryRun: Boolean(cfg.dryRun && !cfg.debug),
+    debug: Boolean(cfg.debug),
+    safeMode: Boolean(cfg.safeMode),
+  })
+  // 连接快照：QQ 直连只用事件状态（onebotState）+ 已核验登录快照（checkLogin 顺带缓存），
+  // 原因码只给可公开的机器值（reason），不给内部细节。
+  const connectionsView = () => {
+    const managed = (platformGateway?.instances() || [])
+      .filter((instance) => instance.instance !== 'qq' || !legacyQqOwnsConnection())
+      .map((instance) => ({
+        platform: instance.platform,
+        instanceId: instance.instance,
+        enabled: instance.enabled !== false,
+        stage: instance.enabled === false ? 'disabled' : instance.state,
+        verified: instance.state === 'connected' && Boolean(instance.self?.account),
+      }))
+    if (!legacyQqOwnsConnection()) return managed
+    const connected = onebotState === 'connected'
+    const verified = connected && loginOk
+    let stage = 'connecting'
+    let reason = 'gateway_connecting'
+    if (!cfg.enabled) { stage = 'disabled'; reason = 'disabled_in_config' }
+    else if (connected && verified) { stage = 'connected'; reason = 'ok' }
+    else if (connected) { stage = 'verifying'; reason = wrongAccount ? 'wrong_account' : 'verifying_login' }
+    else if (onebotState === 'unconfigured') { stage = 'unconfigured'; reason = 'gateway_unconfigured' }
+    else if (onebotState === 'stopped') { stage = 'disconnected'; reason = 'gateway_disconnected' }
+    else if (gatewayWarmSince) { reason = 'gateway_warming' }
+    return [{
+      platform: 'qq',
+      instanceId: 'onebot',
+      enabled: Boolean(cfg.enabled),
+      stage, // connected | verifying | connecting | disconnected | unconfigured | disabled
+      verified,
+      reason, // ok | wrong_account | verifying_login | gateway_warming | gateway_connecting | gateway_disconnected | gateway_unconfigured | disabled_in_config
+      login: verified ? { uin: loginSnapshot.uin, nickname: loginSnapshot.nickname } : null,
+      warmupSeconds: gatewayWarmSince ? Math.max(0, Math.round((Date.now() - gatewayWarmSince) / 1000)) : 0,
+    }, ...managed]
+  }
+  // 导航摘要：mods 尚未装配时给空表（bootstrap 用 modulesReady=false 提示面板先占位）。
+  const navSummary = () => (mods ? mods.summarizeModules() : { navigationRevision: 0, modules: [] })
+  const navRevision = () => (mods ? mods.navigationRevision() : 0)
+  // 核心配置/路由未就绪：三条轻量 GET 统一回 503 BOOTSTRAPPING（方案 §2.1「启动与失败」）。
+  const bootstrapping = (res) => {
+    if (panelCoreReady) return false
+    send(res, 503, { ok: false, code: 'BOOTSTRAPPING', bootId })
+    return true
+  }
+  route('/panel/bootstrap', async (req, res) => {
+    if (bootstrapping(res)) return
+    const nav = navSummary()
+    return {
+      ok: true,
+      bootId,
+      configRevision: configRevision(),
+      version: VERSION,
+      setupDone: Boolean(cfg.setupDone),
+      controls: controlsView(),
+      connections: connectionsView(),
+      modulesReady: modsReady,
+      navigationRevision: nav.navigationRevision,
+      modules: nav.modules,
+    }
+  })
+  route('/panel/pulse', async (req, res) => {
+    if (bootstrapping(res)) return
+    return {
+      ok: true,
+      bootId,
+      configRevision: configRevision(),
+      navigationRevision: navRevision(),
+      setupDone: Boolean(cfg.setupDone),
+      controls: controlsView(),
+      connections: connectionsView(),
+    }
+  })
+  route('/panel/config', async (req, res) => {
+    if (bootstrapping(res)) return
+    // 面板草稿唯一的初始化/刷新来源：现有 publicConfig 的脱敏结果（密码/token 不回传原文）。
+    return { ok: true, bootId, configRevision: configRevision(), config: publicConfig(cfg) }
+  })
+  // 配置已加载、上述路由已注册：之后轻量读接口直接回 200（503 只覆盖装配早期）。
+  panelCoreReady = true
 
   // 出站门闸接进 hub（第二道保险：模块直调 api.core.hub.sendText / scopedHub 也都被覆盖）。
   // 判定的来源因果由调用方带 sourceModule / enginePolicy 时生效；没带标记的内部发送完全不受影响。
@@ -3442,10 +3592,10 @@ export function apply(ctx, opts = {}) {
     const ownerChats = () => ownerPrivateChatIds(identity)
     const budget = createSharedBudget({ owner: ownerPerson, dataDir: dir, log: say })
     try {
-      // 目的引擎（默认关）：模块在跑且配置开着才注册。引擎未启用 / 未 ready 时不注册，
-      // 服务自己会处理 managed=false 与 deny 语义（设计稿故障语义：不得静默 pass）。
+      // 目的引擎（P1/Q1 拍板默认开）：模块在跑且配置未显式关才注册。键缺省=开、显式 false 不注册；
+      // 引擎未 ready 时不注册，服务自己会处理 managed=false 与 deny 语义（设计稿故障语义：不得静默 pass）。
       const pu = use('purpose')
-      if (cfg.ext?.purpose?.enabled === true && pu) {
+      if (cfg.ext?.purpose?.enabled !== false && pu) {
         const policy = createPurposePolicy({
           getConfig, engine: pu, state: () => pu.state?.() || null,
           dataDir: dir, log: say, identity, owner: ownerPerson, ownerChat: ownerChats, defaultPlatform, budget,
@@ -3460,29 +3610,17 @@ export function apply(ctx, opts = {}) {
         enginePolicies.delete('purpose')
         use('purpose')?.setEnginePolicySource?.(null) // 策略源撤了，凭据一并撤
       }
-      // 主动搭话（现行默认）：speakup 模块在跑就注册
-      const sp = use('speakup')
-      if (cfg.speakUp?.enabled !== false && sp) {
-        const policy = createSpeakupPolicy({
-          getConfig, speakup: sp,
-          // 与 companion.js 同口径：私聊「最近一次来往」= max(主人最后说话, 她最后发给主人)。
-          // 注意不能把 hub.lastPrivateAt 直接传进来：那个函数按 QQ 号查，策略源调用时不带参数。
-          lastPrivateAt: () => Math.max(hub.lastOwnerChatAt || 0, hub.lastBotToOwner?.at || 0),
-          // 策略源传进来的是完整 chatId（如 'qq:private:...' / 'private:...'），直接问 mutes 即可
-          isMuted: (chatId) => { try { return Boolean(mutes?.muted?.(chatId)) } catch { return false } },
-          dataDir: dir, log: say, identity, owner: ownerPerson, ownerChat: ownerChats, defaultPlatform, budget,
-        })
-        outbound.registerPolicySource(policy)
-        enginePolicies.set('speakup', policy)
-      } else {
-        outbound.unregisterPolicySource('speakup')
-        enginePolicies.delete('speakup')
-      }
-      // 主人换人/换号：旧 pending 一律作废（设计稿「接收人固定」）
+      // 主动搭话策略源（P3 收拢）：不再注册 speakup 源——主动搭话已并入目的引擎（P1），
+      // 出站治理只注册 purpose。
+      // 存量账本 speakup-policy.json 保留原文不合并（两套口径不同，见方案 §6）。
+      outbound.unregisterPolicySource('speakup')
+      enginePolicies.delete('speakup')
+      // 主人换号：旧 pending 一律作废（设计稿「接收人固定」）
       outbound.syncOwner?.(ownerPerson)
-      // 面板存过的 activePolicy 要在重启后重新生效（否则配置写了却只有服务实例的默认值在跑）
-      const active = (cfg.ext?.outboundPolicy && cfg.ext.outboundPolicy.activePolicy) || 'auto'
-      outbound.setActivePolicy?.(active)
+      // 面板存过的 activePolicy 要在重启后重新生效（否则配置写了却只有服务实例的默认值在跑）；
+      // P3 存量归一化：老配置里存的 'speakup' 生效为 'purpose'（服务侧 setActivePolicy 也兜一层）
+      const rawActive = (cfg.ext?.outboundPolicy && cfg.ext.outboundPolicy.activePolicy) || 'auto'
+      outbound.setActivePolicy?.(rawActive === 'speakup' ? 'purpose' : rawActive)
     } catch (error) {
       // 装配失败不能拖垮宿主启动：服务会因「无 ready 策略源」拒绝并显示原因
       logger.child('出站策略').warn('策略源装配失败：', error && error.message)
@@ -3511,6 +3649,8 @@ export function apply(ctx, opts = {}) {
     chatOfSession: (id) => hub.chatOfSession(id),
     identity,
     resolveNoticeOwnerChat: () => resolveOwnerRoute({ purpose: 'notice' }),
+    // 等主人回复「确认」多久：可配置（config.approvalTimeoutSec，秒），默认 5 分钟
+    timeoutMs: (Number(getConfig().approvalTimeoutSec) || 300) * 1000,
     log,
   })
   ctx.effect(() => {
@@ -3633,6 +3773,7 @@ export function apply(ctx, opts = {}) {
       await resumeCommittedRecovery(pendingCommittedRecovery)
     }
   })
+  booted.then(() => { modsReady = true /* 模块目录就绪：bootstrap 的 modulesReady 转 true */ }).catch(() => {})
   booted.then(() => injectPetPort()).catch(() => {})
   booted.then(() => { if (getConfig().debug) hub.ensureDebugSession().catch((error) => log.warn('建调试会话失败：', error.message)) }).catch(() => {})
   // 模块起来之后再把策略源接上（此时 use('speakup') / use('purpose') 才拿得到实例）
@@ -3720,6 +3861,8 @@ export function apply(ctx, opts = {}) {
     hasOwner: () => Boolean(identity.owner()),
     workspaceOf: workspaceOfSession,
     compose: noticeText,
+    // 合并窗口可配置（config.notice.windowSec，秒）：审批/选项请求到齐后等多久再推 QQ
+    windowMs: (Number(getConfig().notice?.windowSec) || 8) * 1000,
     log,
   })
   async function notifyApproval(session, event) {
@@ -3751,9 +3894,10 @@ export function apply(ctx, opts = {}) {
     try {
       const d = event?.data || {}
       const sid = String(session?.id || '')
-      const callId = String(d.callId || '')
-      if (!sid || !callId) return
+      if (!sid) return
       if (event.type === 'tool/call' && d.name === 'ask_user_question') {
+        const callId = String(d.callId || '')
+        if (!callId) return
         let qs = []
         try { qs = JSON.parse(String(d.arguments || '{}')).questions || [] } catch (error) {}
         if (!Array.isArray(qs) || !qs.length) return
@@ -3764,9 +3908,13 @@ export function apply(ctx, opts = {}) {
         const id = `q:${sid}:${callId}`
         const queued = noticeRelay?.announce('question', { id, sessionId: sid, title, questions: qs })
         log.info(`提问上报：${qs.length} 个问题（${title}）→ ${queued ? '已入队' : (noticeRelay?.enabled('question', sid) ? '重复/已在队列' : '被开关挡掉')}`)
-      } else if (event.type === 'tool/result' && d.toolCallId) {
-        // 问题答完 / 超时跳过：把还没推出去的那条撤掉
-        noticeRelay?.cancel(`q:${sid}:${d.toolCallId}`)
+      } else if (event.type === 'tool/result') {
+        // 问题答完 / 超时跳过：把还没推出去的那条撤掉。
+        // 两处旧写法都取不到 id，导致这条取消路径从来没跑过（30 秒内答完照样推过期提醒）：
+        //   1. 函数开头要求 d.callId，但 tool/result 的 data 只有 turn/step/message/meta；
+        //   2. 这里读 d.toolCallId，实际字段在 d.message.toolCallId（本机 1369 条实测）。
+        const tcid = String(d.message?.toolCallId || d.toolCallId || '')
+        if (tcid) noticeRelay?.cancel(`q:${sid}:${tcid}`)
       }
     } catch (error) {
       log.debug?.('提问上报失败：', error.message)
@@ -3846,6 +3994,7 @@ export function apply(ctx, opts = {}) {
     dangerGuard?.dispose()
     approvalRelay?.dispose()
     hub.dispose()
+    closeUsage()
     bridge.dispose()
     mods.dispose()
     Promise.resolve(platformAuth?.dispose?.()).catch(() => {})
@@ -4164,7 +4313,8 @@ export function apply(ctx, opts = {}) {
       stickers: { count: stickers.library().items.length, canQqSync: core.stickerSync.ready() },
       diary: diary ? { next: diary.nextTime(), last: diary.history()[0] || null } : { next: 0, last: null },
       qzoneSocial: use('qzone-social')?.state?.() ?? null,
-      speakUp: use('speakup')?.state?.() ?? { count: 0 },
+      // P3：今日次数改读目的引擎（主动搭话已并入 purpose；speakup 策略源不再注册）
+      speakUp: use('purpose')?.state?.() ?? { count: 0 },
       purpose: purposeOverview(),
       pet: petStatus(),
       memory: { lastConsolidate: memory?.lastConsolidate?.() ?? 0 },
@@ -4176,6 +4326,7 @@ export function apply(ctx, opts = {}) {
       workspaceDir: workspaceDirOf(cfg),
       workspaceReal: realWorkspace(workspaceDirOf(cfg)),
       personas: listPersonas(),
+      persona: { current: cfg.persona.current, dataOwner: dataOwner(cfg), claimPending: claimPending(cfg) },
       modules: mods.status(),
       bridge: { dshTools: cfg.bridge.dshTools, http: cfg.bridge.http, hasToken: Boolean(cfg.bridge.token), tools: bridge.deniedTools(), toolsService: Boolean(ctx.get?.('tools')) },
     }
@@ -4197,13 +4348,14 @@ export function apply(ctx, opts = {}) {
     const pu = use('purpose')
     const ext = (cfg.ext && cfg.ext.purpose) || {}
     const sp = cfg.speakUp || {}
-    const pad2 = (n) => String(n % 24).padStart(2, '0')
-    const awakeFrom = Number.isFinite(sp.awakeFrom) ? sp.awakeFrom : 8
-    const awakeTo = Number.isFinite(sp.awakeTo) ? sp.awakeTo : 23
-    const quiet = awakeTo >= 24 || awakeFrom >= awakeTo ? { quietStart: '00:00', quietEnd: '00:00' } : { quietStart: pad2(awakeTo) + ':00', quietEnd: pad2(awakeFrom) + ':00' }
+    // P3：醒着窗口的读法与 purposeConfig 对齐（ext.purpose 覆写位优先、speakUp 兜底），
+    // 键仍冻结在 speakUp.awake*（Q3 拍板），只是概览展示别再绕过覆写位。
+    const awakeFrom = Number.isFinite(ext.awakeFrom) ? ext.awakeFrom : (Number.isFinite(sp.awakeFrom) ? sp.awakeFrom : 8)
+    const awakeTo = Number.isFinite(ext.awakeTo) ? ext.awakeTo : (Number.isFinite(sp.awakeTo) ? sp.awakeTo : 23)
+    const quiet = quietWindowOf(awakeFrom, awakeTo)
     return {
       available: typeof pu?.status === 'function',
-      enabled: ext.enabled === true,
+      enabled: ext.enabled !== false, // P1/Q1 默认开：键缺省=开，显式 false 才算关（与 purposeConfig 同口径）
       status: pu?.status?.() ?? null,
       count: pu?.state?.().count ?? 0,
       carrier: ext.carrier === 'pet' ? 'pet' : 'qq',
@@ -4214,7 +4366,7 @@ export function apply(ctx, opts = {}) {
         : null,
       quietStart: quiet.quietStart,
       quietEnd: quiet.quietEnd,
-      dailyMax: Number.isFinite(sp.maxPerDay) ? sp.maxPerDay : null,
+      dailyMax: Number.isFinite(ext.maxPerDay) ? ext.maxPerDay : (Number.isFinite(sp.maxPerDay) ? sp.maxPerDay : null),
       awakeFrom,
       awakeTo,
     }
@@ -4224,20 +4376,79 @@ export function apply(ctx, opts = {}) {
   route('/state', async () => overview())
   // token 用量与花费：今日 / 昨日 / 近 7 天 / 近 30 天，各带模块明细
   // ?range=today|yesterday|7|30|all —— 面板点哪张指标卡就按哪个区间出明细
-  route('/usage', async (req) => ({ ok: true, ...usageReport({ range: query(req).range || '7' }) }))
+  const getUsageFx = createUsageFx()
+  route('/usage', async (req) => ({ ok: true, fx: await getUsageFx(query(req).fx === 'refresh'), ...usageReport({ range: query(req).range || '7' }) }))
+
+  // JSON Pointer（RFC 6901）小工具：保存回执按 /voice/enabled 这类路径逐字段确认（方案 §2.2）。
+  const pointerGet = (obj, pointer) => String(pointer || '').split('/').slice(1)
+    .map((s) => s.replace(/~1/g, '/').replace(/~0/g, '~'))
+    .reduce((o, k) => (o && typeof o === 'object' ? o[k] : undefined), obj)
+  // 面板提交体 → 提交字段路径：对象逐层展开；数组按整字段确认（不拆下标）；空对象也算整字段。
+  const pointerPaths = (v, prefix = '') => {
+    if (prefix && (Array.isArray(v) || v === null || typeof v !== 'object')) return [prefix]
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return prefix ? [prefix] : []
+    const keys = Object.keys(v)
+    if (!keys.length) return prefix ? [prefix] : []
+    return keys.flatMap((k) => pointerPaths(v[k], prefix + '/' + k.replace(/~/g, '~0').replace(/\//g, '~1')))
+  }
+  // 校验失败的回执：没有发生任何提交，committed/unchanged 都是空、版本取当前值（原返回形状不变，只多字段）。
+  const saveEnvelope = (body) => ({ bootId, configRevision: configRevision(), committedPaths: [], unchangedPaths: [], ...body })
 
   route('/save', async (req) => {
     const body = await readBody(req)
+    // 面板草稿可能早于 QQ 的 /quiet /chatty；拒绝覆盖期间改过的群设置。
+    // 只检查新版面板显式附带的基线，旧版和模块的局部保存维持原约定。
+    if (body?.memory && Object.hasOwn(body.memory, 'passiveGroups')) {
+      const raw = body.memory.passiveGroups
+      const ids = Array.isArray(raw) ? raw : typeof raw === 'string' ? raw.split(/[\s,，;；]+/).filter(Boolean) : null
+      if (!ids || ids.some(id => !/^[1-9]\d{4,11}$/.test(String(id).trim()))) return saveEnvelope({
+        ok: false, code: 'invalid_passive_groups', message: '旁听名单请填 5～12 位数字群号，用换行或逗号分隔，不要混入文字。本次没有保存。',
+      })
+    }
+    for (const ids of [body?.group?.moduleOnlyGroups, ...(body?._groupSettingsBase?.groups ? [body?.allow?.groups] : [])]) {
+      if (ids !== undefined && (!Array.isArray(ids) || ids.some(id => !/^[1-9]\d{4,11}$/.test(String(id))))) return saveEnvelope({
+        ok: false, code: 'invalid_group_ids', message: '群号请填 5～12 位数字，不要混入文字。本次没有保存。',
+      })
+    }
+    if (body && Object.hasOwn(body, 'memberFilter') && !validMemberFilter(body.memberFilter)) return saveEnvelope({
+      ok: false, code: 'invalid_member_filter', message: '不回应名单未保存：请填有效的 QQ 号和群号（5～12 位数字），每人只添加一次，并明确选择所有群或指定群；最多 100 人、每人 100 个群。',
+    })
+    const expected = body?._groupSettingsBase
+    if (body) delete body._groupSettingsBase
+    if (expected && (
+      (Object.hasOwn(expected, 'groups') && !isDeepStrictEqual(expected.groups, cfg.allow.groups)) ||
+      (Object.hasOwn(expected, 'memberFilter') && !isDeepStrictEqual(expected.memberFilter, cfg.memberFilter)) ||
+      (Object.hasOwn(expected, 'group') && !isDeepStrictEqual(expected.group, cfg.group)) ||
+      (Object.hasOwn(expected, 'groupExtraction') && !isDeepStrictEqual(expected.groupExtraction, cfg.memory.groupExtraction || {})) ||
+      (Object.hasOwn(expected, 'passiveGroups') && !isDeepStrictEqual(expected.passiveGroups, cfg.memory.passiveGroups))
+    )) return saveEnvelope({ ok: false, code: 'group_settings_conflict', message: '群设置已在别处修改，本次没有保存。请记下要保留的改动，再点「读取最新设置」放弃草稿。' })
     const before = cfg
+    // ---- 保存回执（方案 §2.2）：按提交前后（归一化后）的实际结果逐字段确认。 ----
+    // body 此时已剥掉 _groupSettingsBase 与 snowluma.webuiPassword（密码走单独通道，不算普通配置字段）。
+    // 提交字段路径先收集，分类在下面 setConfig 之后做（提交前 cfg===before，分类会全落 unchanged）。
+    const submittedPaths = pointerPaths(body)
     // 控制台密码不能只改配置（SnowLuma 那边还是旧的）：拿出来单独去 SnowLuma 改
     const newPw = typeof body?.snowluma?.webuiPassword === 'string' ? body.snowluma.webuiPassword : ''
     if (body?.snowluma) delete body.snowluma.webuiPassword
 
     const order = validateOwnerFallbackOrder(identity.owner(), body?.ownerPrimary?.fallbackOrder)
-    if (!order.ok) return { ok: false, message: order.message }
+    if (!order.ok) return saveEnvelope({ ok: false, message: order.message })
     const mergedNext = mergeFromPanel(before, body)
     mergedNext.ownerPrimary = { ...mergedNext.ownerPrimary, fallbackOrder: order.list }
     setConfig(mergedNext, '/save')
+    // committed/unchanged 分类必须在提交之后：commitConfig 返回新的归一化对象（变化时），
+    // 逐字段对比 before（提交前）与 cfg（提交后）——真写了的进 committedPaths，
+    // 显式提交但值相同（含 mergeFromPanel 归一化后等值）的进 unchangedPaths（草稿别一直标脏）。
+    const committedPaths = []
+    const unchangedPaths = []
+    for (const p of submittedPaths) {
+      if (isDeepStrictEqual(pointerGet(cfg, p), pointerGet(before, p))) unchangedPaths.push(p)
+      else committedPaths.push(p)
+    }
+    // 本次请求的回执（定义在提交之后、使用之前，避免 pw 失败分支的 TDZ）：
+    // 版本 = 本次请求触发的全部同步提交后的最高版本（如 SnowLuma 密码自动保存会再提交一次）；
+    // 异步回执不得借用别的请求版本，所以在这里闭包当场取值。
+    const saveReceipt = () => ({ bootId, configRevision: configRevision(), committedPaths, unchangedPaths })
     let pw = null
     if (newPw && newPw !== before.snowluma.webuiPassword) pw = await snowluma.setPassword(newPw)
     const changedConn = before.gateway !== cfg.gateway || ['httpUrl', 'wsUrl', 'httpToken', 'wsToken', 'dir'].some((k) => before.snowluma[k] !== cfg.snowluma[k])
@@ -4252,7 +4463,7 @@ export function apply(ctx, opts = {}) {
     await mods.sync().catch(() => {})
     // 模块启停 / 生图开关变化后工具清单可能变了：已挂载的会话重新挂一遍
     try { hub.remountAll?.('设置已保存') } catch (error) { log.debug('重挂工具失败：', error.message) }
-    if (pw && !pw.ok) return { ...(await overview()), ok: false, message: '其他设置保存了，但控制台密码没改：' + pw.message }
+    if (pw && !pw.ok) return { ...(await overview()), ...saveReceipt(), ok: false, message: '其他设置保存了，但控制台密码没改：' + pw.message }
     let debugNote = ''
     if (cfg.debug) {
       try {
@@ -4262,7 +4473,7 @@ export function apply(ctx, opts = {}) {
         log.debug('建调试会话失败：', error.message)
       }
     }
-    return { ...(await overview()), message: '保存好了' + (pw ? '，' + pw.message : '') + debugNote }
+    return { ...(await overview()), ...saveReceipt(), message: '保存好了' + (pw ? '，' + pw.message : '') + debugNote }
   })
 
   route('/debug/session', async () => {
@@ -4336,6 +4547,7 @@ export function apply(ctx, opts = {}) {
     } else {
       notice[kind] = value
     }
+    // 带上整份配置：保存时只和默认值合并，只传 notice 会把其他设置全重置
     setConfig({ ...cfg, notice })
     return { ok: true, notice }
   })
@@ -4344,6 +4556,8 @@ export function apply(ctx, opts = {}) {
     const patch = {}
     const extPatch = {}
     if (typeof b.enabled === 'boolean') extPatch.enabled = b.enabled
+    // 追问开关（P1 翻键）：写入口从 speakUp.nudge 翻到 ext.purpose.nudge（读侧 purposeConfig 双层兼容）。
+    if (typeof b.nudge === 'boolean') extPatch.nudge = b.nudge
     if (b.carrier === 'qq' || b.carrier === 'pet') extPatch.carrier = b.carrier
     if (typeof b.petFallbackToQQ === 'boolean') extPatch.petFallbackToQQ = b.petFallbackToQQ
     if (['conservative', 'default', 'active'].includes(b.pacing)) extPatch.pacing = b.pacing
@@ -4375,8 +4589,10 @@ export function apply(ctx, opts = {}) {
     return readBody(req).then((b) => {
       const patch = {}
       if (['pass', 'gate', 'broker'].includes(b.tier)) patch.tier = b.tier
-      if (['auto', 'purpose', 'speakup'].includes(b.activePolicy)) patch.activePolicy = b.activePolicy
-      if (!Object.keys(patch).length) return { ok: false, message: '没有可保存的字段（tier 只认 pass/gate/broker，activePolicy 只认 auto/purpose/speakup）', outbound: outboundView().outbound }
+      // P3 存量归一化：老面板/老配置提交的 'speakup' 落盘为 'purpose'（不弹错、行为等价）
+      const wantActive = b.activePolicy === 'speakup' ? 'purpose' : b.activePolicy
+      if (['auto', 'purpose'].includes(wantActive)) patch.activePolicy = wantActive
+      if (!Object.keys(patch).length) return { ok: false, message: '没有可保存的字段（tier 只认 pass/gate/broker，activePolicy 只认 auto/purpose）', outbound: outboundView().outbound }
       const now = getConfig()
       const cur = (now.ext && now.ext.outboundPolicy) || {}
       setConfig({ ...now, ext: { ...now.ext, outboundPolicy: { ...cur, ...patch } } })
@@ -4405,8 +4621,10 @@ export function apply(ctx, opts = {}) {
     ready: { label: '就绪', tone: 'ok' },
     error: { label: '出错', tone: 'bad' },
   }
-  const ACTIVE_VIEW = { auto: '自动（挑就绪的那个）', purpose: '目的引擎', speakup: '主动搭话' }
-  const POLICY_NAME_VIEW = { purpose: '目的引擎', speakup: '主动搭话' }
+  // P3：活跃策略下拉收拢为 purpose/auto（speakup 档已从服务与面板两侧移除；
+  // 存量 'speakup' 由服务 setActivePolicy 与 /panel/outbound-policy 写入口归一化为 'purpose'）
+  const ACTIVE_VIEW = { auto: '自动（挑就绪的那个）', purpose: '目的引擎' }
+  const POLICY_NAME_VIEW = { purpose: '目的引擎' }
   const LEDGER_STATE_VIEW = {
     pending: '待投递', sending: '发送中', sent: '已送达', dropped: '已丢弃',
     failed: '失败', uncertain: '结果未明', expired: '已过期', 'transport-queued': '已交由网关',
@@ -4535,6 +4753,29 @@ export function apply(ctx, opts = {}) {
     // 历史上限与保留天数：与模块 settings 的 min/max 对齐（10~2000 条；0 天 = 永久保留）
     if (Number.isFinite(b.petChatMaxEntries)) patch.petChatMaxEntries = Math.min(2000, Math.max(10, Math.round(b.petChatMaxEntries)))
     if (Number.isFinite(b.petChatRetentionDays)) patch.petChatRetentionDays = Math.min(3650, Math.max(0, Math.round(b.petChatRetentionDays)))
+    // ---------- 语音对讲（pet 1.2.0 起在模块库）：独立设置键的唯一写入通道 ----------
+    // 同「三处必须同步」：模块 defaults/settings 已声明这些键，这里补白名单，
+    // client/client.js 桌宠页另起一张独立的「语音对讲」卡（不塞进对话框卡）。
+    // toggle 模式：按一下开始听、再按一下发送，不再需要 PTT 键与静音断句秒数，
+    // 因此 callPttKey / callVadSilence 不再写入（旧配置里残留的值也不再被面板改动）。
+    // 口径与现有键一致：类型/枚举/协议不对的坏值忽略（不写 patch，保持原值）；
+    // 数值用有限数并 clamp 到模块 settings 的 min/max；文本 trim 后按上限截断（空串合法 = 关掉/回落默认）。
+    if (b.callEngine === 'native' || b.callEngine === 'sovits' || b.callEngine === 'voice') patch.callEngine = b.callEngine
+    // 说话方式固定 toggle；旧值 free/ptt 也收，仅为兼容旧配置读写，面板不再暴露该控件
+    if (b.callTalkMode === 'free' || b.callTalkMode === 'ptt' || b.callTalkMode === 'toggle') patch.callTalkMode = b.callTalkMode
+    if (typeof b.callRvc === 'boolean') patch.callRvc = b.callRvc
+    for (const [k, max] of [['callRvcVoice', 60], ['voiceHotkey', 40], ['callMicDeviceId', 200], ['callSpeakerDeviceId', 200]]) {
+      if (typeof b[k] === 'string') patch[k] = b[k].trim().slice(0, max)
+    }
+    // 两个服务地址：只收 http/https，留空 = 回落模块内置默认（sovitsUrl 默认 9880 / callAsrUrl 默认 8000）
+    for (const k of ['sovitsUrl', 'callAsrUrl']) {
+      if (typeof b[k] === 'string') {
+        const u = b[k].trim().slice(0, 300)
+        if (!u || /^https?:\/\//i.test(u)) patch[k] = u
+      }
+    }
+    // 一次最多字数 20~300（与模块 settings 的 min/max 对齐）；toggle 模式不再有「说完判定秒数」
+    if (Number.isFinite(b.callMaxChars)) patch.callMaxChars = Math.min(300, Math.max(20, Math.round(b.callMaxChars)))
     if (typeof b.whisperLines === 'string') patch.whisperLines = b.whisperLines.slice(0, 4000)
     // 素材包下载地址：内建模块的 settings 字段不渲染成表单（同上），这里是它唯一的写入通道。
     // 只收 http/https（或空 = 回到内置默认），别把 file:// 之类塞进来当下载源
@@ -5172,30 +5413,105 @@ export function apply(ctx, opts = {}) {
     return { ok: true, message: n ? `归档了 ${n} 个会话，下一条消息起她会重新开始` : '本来就没有会话' }
   })
 
-  // 人格
-  route('/personas', async () => ({ ok: true, list: listPersonas(), current: cfg.persona.current }))
+  // 人格：新增写操作显式限制 POST，避免 GET 绕过 CSRF 方法检查。
+  const personaPost = (req, res) => {
+    if (req.method === 'POST') return true
+    send(res, 405, { ok: false, message: '请使用 POST' })
+    return false
+  }
+  const savedLookId = (id) => {
+    readLook(id) // 严格检查 id，不接受清洗后指向另一人格
+    if (!readPersona(id)) throw new Error('请先保存人格')
+    return id
+  }
+  route('/persona/look', async (req) => ({ ok: true, look: readLook(savedLookId(query(req).id)) }))
+  route('/persona/look/image', async (req, res) => {
+    const q = query(req)
+    const buf = lookImage(savedLookId(q.id), q.imageId)
+    if (!buf) { send(res, 404, { ok: false, message: '还没有人设图' }); return }
+    res.setHeader?.('x-content-type-options', 'nosniff')
+    send(res, 200, buf, lookMime(buf))
+  })
+  route('/persona/look/upload', async (req, res) => {
+    if (!personaPost(req, res)) return
+    const b = JSON.parse((await readRaw(req, 8 * 1024 * 1024)).toString('utf8'))
+    const id = savedLookId(b?.id)
+    const match = typeof b.data === 'string' && b.data.match(/^data:image\/(?:png|jpeg|jpg|gif|webp);base64,([A-Za-z0-9+/]+={0,2})$/)
+    if (!match || match[1].length % 4 !== 0) throw new Error('请选择有效的图片 data URL')
+    return { ok: true, look: saveLookImage(id, Buffer.from(match[1], 'base64'), { imageId: b.imageId, append: b.append === true }) }
+  })
+  route('/persona/look/delete', async (req, res) => {
+    if (!personaPost(req, res)) return
+    const b = await readBody(req)
+    return { ok: true, look: deleteLookImage(savedLookId(b.id), b.imageId) }
+  })
+  route('/persona/look/configure', async (req, res) => {
+    if (!personaPost(req, res)) return
+    const b = JSON.parse((await readRaw(req, 16 * 1024)).toString('utf8'))
+    return { ok: true, look: configureLookImage(savedLookId(b.id), b.imageId, { reference: b.reference, note: b.note }) }
+  })
+  route('/persona/look/describe', async (req, res) => {
+    if (!personaPost(req, res)) return
+    const b = await readBody(req)
+    const id = savedLookId(b.id)
+    const buffers = lookImages(id)
+    if (!buffers.length) throw new Error('请先上传人设图')
+    const imageHash = readLook(id).imageHash
+    const text = await describeLook({ dsh: ctx, cfg: getConfig(), buffers })
+    // 在途解析不覆盖换图后的状态；描述仍由面板确认保存。
+    if (!readPersona(id) || readLook(id).imageHash !== imageHash) throw new Error('人设图已变化，请重新解析')
+    return { ok: true, text, imageHash }
+  })
+  route('/personas', async () => ({ ok: true, list: listPersonas(), current: cfg.persona.current, dataOwner: dataOwner(cfg), claimPending: claimPending(cfg) }))
   route('/persona/get', async (req) => {
     const p = readPersona(query(req).id)
-    return p ? { ok: true, persona: p } : { ok: false, message: '没有这个人格' }
+    return p ? { ok: true, persona: p, look: readLook(p.id) } : { ok: false, message: '没有这个人格' }
   })
-  route('/persona/save', async (req) => {
+  route('/persona/save', async (req, res) => {
+    if (!personaPost(req, res)) return
     const b = await readBody(req)
+    readLook(b.id)
+    if (b.appearance !== undefined && typeof b.appearance !== 'string') throw new Error('外貌描述须为文字')
     const p = savePersona(b.id, b)
+    if (b.appearance !== undefined) saveAppearance(p.id, b.appearance, b.appearanceSource)
     bridge.refresh()
-    return { ok: true, persona: p, message: '人格已保存，下一轮起生效' }
+    return { ok: true, persona: p, look: readLook(p.id), message: '人格已保存，下一轮起生效' }
   })
   route('/persona/delete', async (req) => {
     const b = await readBody(req)
-    if (b.id === cfg.persona.current) return { ok: false, message: '正在用的人格不能删' }
-    deletePersona(b.id)
+    const id = safeId(b.id)
+    if (id === safeId(cfg.persona.current)) return { ok: false, message: '正在用的人格不能删' }
+    deletePersona(id)
+    // 连数据一起删：只删 persona-data/<id>/。根目录归数据归属人格（还没认领时大家共用），不能删。
+    const dir = personaDataDir(cfg, id)
+    if (b.withData && id && dir !== dataDir()) {
+      use('memory')?.closePersona?.(id)
+      try { rmSync(dir, { recursive: true, force: true }) } catch (error) {
+        return { ok: false, list: listPersonas(), message: '人格删掉了，但它的数据没删干净：' + error.message }
+      }
+    }
     return { ok: true, list: listPersonas() }
   })
   route('/persona/use', async (req) => {
     const b = await readBody(req)
-    if (!readPersona(b.id)) return { ok: false, message: '没有这个人格' }
-    setConfig({ ...cfg, persona: { current: b.id } })
-    log.info(`切换人格 → ${b.id}`)
-    return { ok: true, current: b.id, message: '切换好了，下一轮回复起生效' }
+    const id = safeId(b.id)
+    if (!readPersona(id)) return { ok: false, message: '没有这个人格' }
+    // 正在回复或在忙后台的事：切过去会把旧人格的回复当成新人格的发出去
+    if (id !== safeId(cfg.persona.current) && hub.busy()) return { ok: false, message: '她正在回复或在忙后台的事，等这一轮结束再切' }
+    setConfig({ ...cfg, persona: { ...cfg.persona, current: id } })
+    log.info(`切换人格 → ${id}`)
+    return { ok: true, current: id, message: '切换好了，下一轮回复起生效' }
+  })
+  // 老用户升级后认领根目录的数据：只能认领一次，之后其他人格用 persona-data/<id>/ 里自己的记忆和会话
+  route('/persona/data-owner', async (req) => {
+    const b = await readBody(req)
+    const id = safeId(b.id)
+    if (dataOwner(cfg)) return { ok: false, message: '根目录的数据已经认领过了' }
+    if (!readPersona(id)) return { ok: false, message: '没有这个人格' }
+    if (hub.busy()) return { ok: false, message: '她正在回复或在忙后台的事，等这一轮结束再认领' }
+    setConfig({ ...cfg, persona: { ...cfg.persona, dataOwner: id } })
+    log.info(`根目录的记忆和会话归给人格 ${id}`)
+    return { ok: true, dataOwner: id, message: '认领好了，其他人格从下一轮起用自己的记忆和会话' }
   })
   // 人格页「AI 润色」：只改面板上这一节的文字，不保存；用不用由主人在面板里选
   route('/persona/polish', async (req) => {
@@ -5457,6 +5773,15 @@ export function apply(ctx, opts = {}) {
   route('/modules/community/remove', async (req) => {
     const b = await readBody(req)
     return { ...(await community.remove(String(b.id || ''), { purge: b.purge === true })), modules: mods.status() }
+  })
+  route('/modules/remove', async (req) => {
+    const b = await readBody(req)
+    return { ...(await mods.remove(String(b.id || ''), { purge: b.purge === true })), list: mods.status() }
+  })
+  // 批量更新已安装且有可用新版的市场模块。
+  route('/modules/community/update-all', async (req, res) => {
+    if (req.method !== 'POST') return send(res, 405, { ok: false, message: '请使用 POST' })
+    return { ...(await community.updateAll()), modules: mods.status() }
   })
   // 模块市场地址：换索引源（自建索引 / 国内镜像 / 内网部署）用。留空 = 回到内置 GitHub 地址；
   // 只收 http/https，别把 file:// 之类塞进来当下载源。单一真相在 ext.market.registryUrl，

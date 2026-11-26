@@ -25,7 +25,7 @@ function setup () {
   const today = dayKey()
   const cfg = normalize({
     ownerQQ: '10000001',
-    memory: { dailyConsolidate: true, extractDailyBatches: 0, consolidateTimes: [hhmm()], keepChatlogDays: 0, keepChatlogSet: true },
+    memory: { groupExtraction: { '9': 'all' }, dailyConsolidate: true, extractDailyBatches: 0, consolidateTimes: [hhmm()], keepChatlogDays: 0, keepChatlogSet: true },
   })
   const logs = []
   const log = { info: (...a) => logs.push(a.join(' ')), warn: (...a) => logs.push('WARN ' + a.join(' ')), debug: () => {} }

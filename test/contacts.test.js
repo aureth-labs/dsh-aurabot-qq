@@ -52,14 +52,14 @@ const friendEv = (over = {}) => ({ post_type: 'request', request_type: 'friend',
 
 test('权限：默认仅主人私聊；所有人含群；关了谁都不挂', () => {
   const t = setup()
-  assert.deepEqual(Object.keys(t.tools(ownerPm)).sort(), ['qq_handle_friend_request', 'qq_handle_group_request', 'qq_list_group_requests', 'qq_whitelist'])
+  assert.deepEqual(Object.keys(t.tools(ownerPm)).sort(), ['qq_group_settings', 'qq_handle_friend_request', 'qq_handle_group_request', 'qq_list_friend_requests', 'qq_list_group_requests', 'qq_whitelist'])
   assert.deepEqual(Object.keys(t.tools(otherPm)), [])
   assert.deepEqual(Object.keys(t.tools(group)), [])
   assert.deepEqual(Object.keys(t.tools({ kind: 'system' })), [])
   t.set({ profilePerms: { qqFriendRequest: 'all', whitelist: 'off' } })
-  assert.deepEqual(Object.keys(t.tools(group)), ['qq_handle_friend_request'])
-  assert.deepEqual(Object.keys(t.tools(otherPm)), ['qq_handle_friend_request'])
-  assert.deepEqual(Object.keys(t.tools(ownerPm)), ['qq_handle_friend_request', 'qq_list_group_requests', 'qq_handle_group_request'])
+  assert.deepEqual(Object.keys(t.tools(group)), ['qq_list_friend_requests', 'qq_handle_friend_request'])
+  assert.deepEqual(Object.keys(t.tools(otherPm)), ['qq_list_friend_requests', 'qq_handle_friend_request'])
+  assert.deepEqual(Object.keys(t.tools(ownerPm)), ['qq_list_friend_requests', 'qq_handle_friend_request', 'qq_list_group_requests', 'qq_handle_group_request'])
   assert.equal(normalize({ profilePerms: { whitelist: 'boss', qqFriendRequest: 7 } }).profilePerms.whitelist, 'owner', '乱填回到默认')
   assert.equal(normalize({}).profilePerms.qqFriendRequest, 'owner')
 })
@@ -125,6 +125,79 @@ test('拒绝、只有一个申请时 QQ 号可不填、多个时要说清楚', a
   assert.match(r.message, /40004/)
   assert.match(r.message, /50005/)
   assert.equal(m.calls.length, 0)
+})
+
+test('user_id=0 的好友申请不丢：通知说明未知QQ（由QQ过滤），可按序号通过', async () => {
+  const t = setup()
+  t.event(friendEv({ user_id: 0, flag: 'u_unknown_1', comment: '我是小王' }))
+  assert.equal(t.sent.length, 1)
+  assert.match(t.sent[0].text, /未知QQ（由QQ过滤）/)
+  assert.match(t.sent[0].text, /第 1 个/)
+  const list = await t.tools(ownerPm).qq_list_friend_requests.execute({})
+  assert.match(list.message, /未知QQ（由QQ过滤）/)
+  assert.match(list.message, /u_unknown_1/)
+  const r = await t.tools(ownerPm).qq_handle_friend_request.execute({ index: 1, approve: true })
+  assert.equal(r.ok, true)
+  assert.match(r.message, /未知QQ（由QQ过滤）/)
+  assert.deepEqual(t.calls.filter((x) => x.action !== 'get_doubt_friends_add_request'), [{ action: 'set_friend_add_request', params: { flag: 'u_unknown_1', approve: true } }])
+})
+
+test('未知申请按 flag 处理；删一条不会把其他未知 QQ 的申请一起删掉', async () => {
+  const t = setup()
+  t.event(friendEv({ user_id: 0, flag: 'u_a' }))
+  t.event(friendEv({ user_id: 0, flag: 'u_b' }))
+  assert.equal(t.sent.length, 2)
+  assert.match(t.sent[1].text, /第 2 个/)
+  let r = await t.tools(ownerPm).qq_handle_friend_request.execute({ flag: 'u_a', approve: false })
+  assert.equal(r.ok, true)
+  assert.deepEqual(t.calls.at(-1), { action: 'set_friend_add_request', params: { flag: 'u_a', approve: false } })
+  const list = await t.tools(ownerPm).qq_list_friend_requests.execute({})
+  assert.doesNotMatch(list.message, /u_a/)
+  assert.match(list.message, /u_b/)
+  // 删掉 u_a 后 u_b 变成第 1 个
+  r = await t.tools(ownerPm).qq_handle_friend_request.execute({ index: 1, approve: true })
+  assert.equal(r.ok, true)
+  assert.deepEqual(t.calls.at(-1), { action: 'set_friend_add_request', params: { flag: 'u_b', approve: true } })
+})
+
+test('多个申请可按序号查找；qq/flag/序号冲突、坏序号都拒绝', async () => {
+  const t = setup()
+  t.event(friendEv())
+  t.event(friendEv({ user_id: 50005, flag: 'u_def' }))
+  const tool = t.tools(ownerPm).qq_handle_friend_request
+  assert.equal((await tool.execute({ index: 0, approve: true })).ok, false)
+  assert.equal((await tool.execute({ index: 1.5, approve: true })).ok, false)
+  assert.equal((await tool.execute({ index: 1, flag: 'u_abc', approve: true })).ok, false)
+  assert.equal((await tool.execute({ qq: '40004', index: 1, approve: true })).ok, false)
+  assert.equal(t.calls.length, 0)
+  const r = await tool.execute({ index: 2, approve: true })
+  assert.equal(r.ok, true)
+  assert.deepEqual(t.calls, [{ action: 'set_friend_add_request', params: { flag: 'u_def', approve: true } }])
+})
+
+test('好友申请列表合并事件和 QQ 过滤申请，同一 uid 不重复；可按 flag 处理过滤申请', async () => {
+  const t = setup({ callImpl: (a) => (a === 'get_doubt_friends_add_request' ? [
+    { uid: 'u_unknown_1', user_id: 0, msg: 'hi' },
+    { uid: 'u_doubt_2', user_id: 60006, nick: 'x', msg: 'hello' },
+  ] : null) })
+  t.event(friendEv({ user_id: 0, flag: 'u_unknown_1', comment: '' }))
+  const list = await t.tools(ownerPm).qq_list_friend_requests.execute({})
+  assert.equal((list.message.match(/u_unknown_1/g) || []).length, 1, '事件里已有的 uid 不要在过滤列表里再列一遍')
+  assert.match(list.message, /2\. QQ 60006/)
+  const r = await t.tools(ownerPm).qq_handle_friend_request.execute({ flag: 'u_doubt_2', approve: true })
+  assert.equal(r.ok, true)
+  assert.deepEqual(t.calls.at(-1), { action: 'set_doubt_friends_add_request', params: { flag: 'u_doubt_2', approve: true } })
+})
+
+test('试运行：未知 QQ 申请只回话，不调接口、申请还在', async () => {
+  const t = setup({ cfg: { dryRun: true } })
+  t.event(friendEv({ user_id: 0, flag: 'u_dry' }))
+  const r = await t.tools(ownerPm).qq_handle_friend_request.execute({ index: 1, approve: true })
+  assert.equal(r.ok, true)
+  assert.match(r.message, /试运行/)
+  assert.equal(t.calls.length, 0)
+  t.set({ dryRun: false })
+  assert.equal((await t.tools(ownerPm).qq_handle_friend_request.execute({ index: 1, approve: true })).ok, true)
 })
 
 test('试运行只回话：不调接口、申请还在', async () => {

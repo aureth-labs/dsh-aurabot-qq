@@ -5,8 +5,10 @@
 // 安全约定（首审 5 项 P1，2026-11-03）：
 //   ① 推送前用 Gitee API 校验目标仓库确实私有（private===true），公开仓库一律拒绝——
 //      这是「备份不上公网」的唯一硬闸，面板红字提醒只算引导不算兜底；
-//   ② 令牌不写进 .git/config：remote 只记不带凭证的 gitee.com URL，令牌经
-//      GIT_CONFIG_* 环境变量以 http.extraheader（Basic，base64）喂给 git，进程参数里也不出现；
+//   ② 令牌不写进 .git/config：remote 只记不带凭证的 gitee.com URL，令牌经环境变量
+//      AURABOT_GITEE_TOKEN 喂给内联凭据助手（#556：Gitee 的 git 服务只认 401 challenge
+//      后补发的 Basic 凭据，预发 http.extraheader 头会被直接拒掉，改走 credential.helper），
+//      助手脚本文本里不含令牌、进程参数里也不出现；
 //   ③ 所有报错（git 子进程与 Gitee API）统一过 redact 再给人看，backup 令牌同时在
 //      host.js 全局 secrets() 登记；
 //   ④ owner/repo/branch 白名单校验（字母数字._- 等），防 URL 注入与 git 参数注入；
@@ -48,15 +50,31 @@ export function redact(text, token) {
 const cleanUrl = (r) => `https://gitee.com/${r.owner}/${r.repo}.git`
 
 /**
- * 给 git 子进程的环境变量：令牌以 http.extraheader（Basic base64）注入，只进环境不进
- * 命令行、不进 .git/config；顺带关掉凭据管理器与终端交互提示，防止 token 被存到别处。
+ * 给 git 子进程的环境变量（#556）：令牌经环境变量 AURABOT_GITEE_TOKEN 喂给内联凭据助手
+ * （credential.helper，`!` 前缀表示 shell 一行式，由 git 自带的 sh 执行），git 收到远端
+ * 401 challenge 后才调用助手补发凭据——Gitee 拒收预发的 http.extraheader，这是它唯一认
+ * 的方式。令牌只进环境变量，不进助手脚本文本、命令行参数或 .git/config；顺带关掉凭据
+ * 管理器与终端交互提示，防止 token 被存到别处。
  */
-function gitEnv(token) {
-  const env = { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: devNull, GIT_CONFIG_COUNT: '2' }
+/** 用户名白名单：拼进助手脚本前先过一道（脚本里是 sh 字符串），非法字符回落 oauth2。 */
+const HELPER_USER_RE = /^[\w.-]{1,64}$/
+
+/** 导出仅供测试：直接验证助手环境变量的构造与用户名回落。 */
+export function gitEnv(token, username = '') {
+  const env = { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_COUNT: '1' }
+  // Windows 的 NUL 路径不能交给 git 的 GIT_CONFIG_GLOBAL；非 Windows 才屏蔽系统/全局配置。
+  if (process.platform !== 'win32') env.GIT_CONFIG_GLOBAL = devNull
+  // 新仓库没有本地身份；不依赖用户全局 git 配置，否则 Windows 上 commit 会报 Author identity unknown。
+  env.GIT_AUTHOR_NAME = 'Aurabot'
+  env.GIT_AUTHOR_EMAIL = 'aurabot@localhost'
+  env.GIT_COMMITTER_NAME = 'Aurabot'
+  env.GIT_COMMITTER_EMAIL = 'aurabot@localhost'
+  env.AURABOT_GITEE_TOKEN = token
+  // Gitee 的 HTTPS 认证需要「用户名:私人令牌」的 Basic；用户名不合法时用 oauth2 占位。
+  const user = HELPER_USER_RE.test(String(username)) ? String(username) : 'oauth2'
   env.GIT_CONFIG_KEY_0 = 'credential.helper'
-  env.GIT_CONFIG_VALUE_0 = '' // 清空凭据助手链，别让 git 把令牌写进系统凭据库
-  env.GIT_CONFIG_KEY_1 = 'http.extraheader'
-  env.GIT_CONFIG_VALUE_1 = 'AUTHORIZATION: basic ' + Buffer.from(`oauth2:${token}`).toString('base64')
+  // 助手脚本只 echo 用户名与从环境变量读的密码，令牌原文不出现在这段脚本里。
+  env.GIT_CONFIG_VALUE_0 = `!echo "username=${user}"; echo "password=$AURABOT_GITEE_TOKEN"`
   return env
 }
 
@@ -68,10 +86,10 @@ export function prunePlan(dirs, keep) {
 }
 
 /** 跑一条 git 命令：超时/非零退出都报人话，输出过 redact，令牌经环境变量喂给 git。 */
-function runGit(args, { cwd, token, onLog = () => {} }) {
+function runGit(args, { cwd, token, username = '', onLog = () => {} }) {
   const doSpawn = pushHooks.spawn || spawn
   return new Promise((resolve) => {
-    const child = doSpawn('git', args, { cwd, windowsHide: true, env: gitEnv(token) })
+    const child = doSpawn('git', args, { cwd, windowsHide: true, env: gitEnv(token, username) })
     let out = ''
     let err = ''
     let done = false
@@ -85,7 +103,8 @@ function runGit(args, { cwd, token, onLog = () => {} }) {
 
 const human = (r, what) => {
   if (/git.*不是内部或外部命令|ENOENT|command not found/i.test(r.err + r.out)) return `这台电脑没装 git（${what} 失败）。装一个 git 再试：https://git-scm.com/downloads`
-  if (/Authentication failed|403|401|could not read Username/i.test(r.err)) return 'Gitee 令牌不对或过期了：去 Gitee 设置→私人令牌重新生成一个，填进面板再试'
+  if (/could not read Username|terminal prompts disabled/i.test(r.err)) return 'Gitee 认证失败：检查仓库 owner/令牌权限；当前使用 HTTPS 用户名+私人令牌认证，不会把令牌写进 URL 或 .git/config'
+  if (/Authentication failed|403|401/i.test(r.err)) return 'Gitee 令牌不对或过期了：去 Gitee 设置→私人令牌重新生成一个，填进面板再试'
   if (/not found|does not appear to be a git repository|repository.*not.*exist/i.test(r.err)) return 'Gitee 上找不到这个仓库：确认仓库名没写错，或在 Gitee 上先建一个（私有的）'
   if (/pre-receive hook declined/i.test(r.err + r.out)) return 'Gitee 拒收了这次推送：多半是单文件超过 100MB（超过 95MB 会自动分卷，还报这个就是仓库容量满了，去 Gitee 清掉一些旧提交或调小「远端留几份」）'
   const detail = (r.err || r.out || '').trim().split('\n').filter(Boolean).slice(-3).join('；')
@@ -137,9 +156,9 @@ async function createRepo(r) {
 
 /** 中转目录的 .git 已存在时：把 remote URL 对齐当前配置（换仓库/换用户名后不会推错地方），令牌从不进 URL。 */
 async function ensureRemote(wd, r, token, onLog) {
-  let git = await runGit(['remote', 'set-url', 'origin', cleanUrl(r)], { cwd: wd, token, onLog })
+  let git = await runGit(['remote', 'set-url', 'origin', cleanUrl(r)], { cwd: wd, token, username: r.owner, onLog })
   if (git.code !== 0) {
-    git = await runGit(['remote', 'add', 'origin', cleanUrl(r)], { cwd: wd, token, onLog })
+    git = await runGit(['remote', 'add', 'origin', cleanUrl(r)], { cwd: wd, token, username: r.owner, onLog })
     if (git.code !== 0) throw new Error(human(git, 'git remote'))
   }
   // 兜底检查：无论哪条路，.git/config 里都不该有令牌（旧版可能写进去过）
@@ -154,12 +173,12 @@ async function ensureRemote(wd, r, token, onLog) {
 /** Gitee 拒收后的兜底：删掉中转目录的 .git 重新初始化，把现存备份文件夹合成一个干净提交。 */
 async function resetHistory(wd, r, name, version, token, onLog) {
   rmSync(join(wd, '.git'), { recursive: true, force: true })
-  let git = await runGit(['init', '-b', r.branch || 'master'], { cwd: wd, token, onLog })
+  let git = await runGit(['init', '-b', r.branch || 'master'], { cwd: wd, token, username: r.owner, onLog })
   if (git.code !== 0) throw new Error(human(git, 'git init'))
-  git = await runGit(['remote', 'add', 'origin', cleanUrl(r)], { cwd: wd, token, onLog })
+  git = await runGit(['remote', 'add', 'origin', cleanUrl(r)], { cwd: wd, token, username: r.owner, onLog })
   if (git.code !== 0) throw new Error(human(git, 'git remote'))
-  await runGit(['add', '-A'], { cwd: wd, token, onLog })
-  const commit = await runGit(['commit', '-m', `backup ${name}${version ? ' (aurabot v' + version + ')' : ''} (clean history)`], { cwd: wd, token, onLog })
+  await runGit(['add', '-A'], { cwd: wd, token, username: r.owner, onLog })
+  const commit = await runGit(['commit', '-m', `backup ${name}${version ? ' (aurabot v' + version + ')' : ''} (clean history)`], { cwd: wd, token, username: r.owner, onLog })
   if (commit.code !== 0 && !/nothing to commit/i.test(commit.err + commit.out)) throw new Error(human(commit, 'git commit'))
 }
 
@@ -350,9 +369,9 @@ async function pushBackupGitee(r, { version = '', onLog = () => {} } = {}) {
 
   // 第一次用：初始化中转目录（remote 只记干净 URL）；已有的话把 remote 对齐当前配置
   if (!existsSync(join(wd, '.git'))) {
-    let git = await runGit(['init', '-b', branch], { cwd: wd, token, onLog })
+    let git = await runGit(['init', '-b', branch], { cwd: wd, token, username: r.owner, onLog })
     if (git.code !== 0) throw new Error(human(git, 'git init'))
-    git = await runGit(['remote', 'add', 'origin', cleanUrl(r)], { cwd: wd, token, onLog })
+    git = await runGit(['remote', 'add', 'origin', cleanUrl(r)], { cwd: wd, token, username: r.owner, onLog })
     if (git.code !== 0) throw new Error(human(git, 'git remote'))
   } else {
     await ensureRemote(wd, r, token, onLog)
@@ -372,7 +391,7 @@ async function pushBackupGitee(r, { version = '', onLog = () => {} } = {}) {
     }
   }
 
-  let check = await runGit(['ls-remote', '--heads', 'origin'], { cwd: wd, token, onLog })
+  let check = await runGit(['ls-remote', '--heads', 'origin'], { cwd: wd, token, username: r.owner, onLog })
   if (check.code !== 0) throw new Error(human(check, '连接仓库'))
 
   // P1-5：备份仓标记。写进中转目录根（随 add -A 推到远端仓库根），
@@ -389,7 +408,7 @@ async function pushBackupGitee(r, { version = '', onLog = () => {} } = {}) {
   const plan = prunePlan([...dirs.filter((d) => d !== base), base], Math.max(1, Math.round(Number(r.keep) || 7)))
   for (const old of plan.drop) {
     rmSync(join(root, old), { recursive: true, force: true })
-    await runGit(['rm', '-r', '-f', '--ignore-unmatch', `backups/${old}`], { cwd: wd, token, onLog })
+    await runGit(['rm', '-r', '-f', '--ignore-unmatch', `backups/${old}`], { cwd: wd, token, username: r.owner, onLog })
   }
 
   // 把这次的备份写进自己的文件夹；超 Gitee 单文件限制就自动分卷（xxx.zip.part01/02/…），恢复时按顺序合并回一个 zip
@@ -412,14 +431,14 @@ async function pushBackupGitee(r, { version = '', onLog = () => {} } = {}) {
     // 文件夹里剩下的旧文件（上次是整包或分卷更多）：一并清掉
     for (const stale of readdirSync(outDir).filter((f) => !pushed.includes(f))) {
       rmSync(join(outDir, stale), { force: true })
-      await runGit(['rm', '-f', '--ignore-unmatch', `backups/${base}/${stale}`], { cwd: wd, token, onLog })
+      await runGit(['rm', '-f', '--ignore-unmatch', `backups/${base}/${stale}`], { cwd: wd, token, username: r.owner, onLog })
     }
   }
-  await runGit(['add', '-A'], { cwd: wd, token, onLog })
+  await runGit(['add', '-A'], { cwd: wd, token, username: r.owner, onLog })
 
-  let commit = await runGit(['commit', '-m', `backup ${name}${version ? ' (aurabot v' + version + ')' : ''}`], { cwd: wd, token, onLog })
+  let commit = await runGit(['commit', '-m', `backup ${name}${version ? ' (aurabot v' + version + ')' : ''}`], { cwd: wd, token, username: r.owner, onLog })
   if (commit.code !== 0 && !/nothing to commit/i.test(commit.err + commit.out)) throw new Error(human(commit, 'git commit'))
-  const doPush = (extra = []) => runGit(['push', '-u', 'origin', 'HEAD:' + branch, ...extra], { cwd: wd, token, onLog })
+  const doPush = (extra = []) => runGit(['push', '-u', 'origin', 'HEAD:' + branch, ...extra], { cwd: wd, token, username: r.owner, onLog })
   const declined = (p) => /pre-receive hook declined/i.test(p.err + p.out)
   const diverged = (p) => /fetch first|non-fast-forward/i.test(p.err + p.out)
   let push = await doPush()

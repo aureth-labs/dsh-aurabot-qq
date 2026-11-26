@@ -20,6 +20,12 @@
 /**
  * 块级标签名；行内标签（b/i/strong/em/a/span 等）不在内，一律不碰。
  * HTML5 语义标签也要覆盖：模型吐的收尾片段不只有 `</p>`。
+ *
+ * `acp` 不是 HTML 标签，是 DSH 上下文代理给每条消息注入的 ACP 包装标记
+ * （`<acp tokens="…" type="text" time="…">mNNNNN</acp>`）。模型会把它当正文模仿复述，
+ * 于是带属性串漏进 QQ（2026-11-22 实况：`<acp tokens="86" type="text" time="…"></acp>`）。
+ * 收进这张表就能复用下面「配对 / 落单 / 整行只剩标签则删行」的现成逻辑，不另写算法。
+ * 注意：只影响带尖括号的标签，正文里裸写 `acp` 这个词不受任何影响（TAG_RE 要求 `<` 开头）。
  */
 const BLOCK_NAMES = new Set([
   'p', 'div', 'br', 'li', 'ul', 'ol', 'dl', 'dt', 'dd',
@@ -28,7 +34,14 @@ const BLOCK_NAMES = new Set([
   'section', 'article', 'main', 'nav', 'header', 'footer', 'aside',
   'figure', 'figcaption', 'blockquote', 'pre', 'hr',
   'form', 'fieldset', 'legend', 'address', 'details', 'summary',
+  'acp',
 ])
+
+/**
+ * 成对出现也一律剥掉的标签名（不做配对保留）。
+ * 目前只有 `acp`：它是传输层包装，不是给人看的内容。
+ */
+const ALWAYS_DROP = new Set(['acp'])
 
 /**
  * 任意 `<名字 …>` / `</名字>` / `<名字 …/>`；名字首字母必须是 ASCII 字母。
@@ -95,6 +108,9 @@ export function stripLineTags (line) {
   const keep = new Set()
   const stack = []
   for (const t of tags) {
+    // ACP 标记是传输层包装，成对出现也没有任何「给人看」的语义：开了也不留、不压栈，
+    // 于是开闭两个标签统统落进下面的 drop 列表（模型真会聊 `<div>内容</div>`，但绝不会聊 `<acp>`）。
+    if (ALWAYS_DROP.has(t.name)) continue
     if (t.name === 'br') {
       if (!t.close) keep.add(t)
       continue

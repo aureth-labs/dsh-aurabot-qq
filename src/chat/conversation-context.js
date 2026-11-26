@@ -39,7 +39,8 @@ export function queriesFor(query, recent = []) {
 /** BM25 over independent query variants, reciprocal-rank fusion, and diversity. */
 export function retrieve(queries, documents, { limit = 6, textOf = d => d.text, eligible = () => true } = {}) {
   const docs = documents.filter(eligible).map(item => {
-    const words = terms(textOf(item)), tf = new Map()
+    // 片段的分词结果可以随片段对象缓存（群里每轮都要对几千个片段重新分词，占大半时间）
+    const words = item._terms || terms(textOf(item)), tf = new Map()
     for (const word of words) tf.set(word, (tf.get(word) || 0) + 1)
     return { item, tf, length: words.length || 1 }
   })
@@ -110,7 +111,7 @@ export function recentWithin(messages, maxCharacters = 6000) {
 const CHAT_ID_RE = /^(?:[a-z][a-z0-9-]*(?:#[a-zA-Z0-9_-]+)?:)?(private|group):[^\s:]+$/
 
 /** Durable, persona- and chat-isolated archive; append-only journal is the source. */
-export function createConversationArchive({ directory, namespace = 'default', now = Date.now, visible = () => true, aliasesFor = () => [] } = {}) {
+export function createConversationArchive({ directory, namespace = 'default', now = Date.now, visible = () => true, visibleKey = null, aliasesFor = () => [] } = {}) {
   if (!directory) throw new Error('Conversation archive directory required')
   const cache = new Map()
   const keyFor = chatId => createHash('sha256').update(namespace + '\0' + String(chatId)).digest('hex')
@@ -180,32 +181,81 @@ export function createConversationArchive({ directory, namespace = 'default', no
     const count = Math.max(0, Math.min(256, Math.trunc(Number(limit) || 0)))
     return count ? available(chatId).slice(-count).map(m => ({ ...m })) : []
   }
+  // 群聊每轮都会重算「相关较早片段」，语密的群历史能到几万条：整份重切要逐条 JSON.stringify，
+  // 卡在回合开头（#520 之后群里一开口就慢）。这里按聊天缓存切块结果，只补追加的尾部；
+  // 可见性规则或清理记忆截止时间一变就整份重建（visibleKey 由宿主给）。
+  // 窗口设上限：超过后只保留最近 EPISODE_SCAN_MAX 条参与召回，避免历史越长每轮越慢。
+  const episodeCache = new Map() // `${chatId}|${maxCharacters}` → { vis, start, consumed, list, block, serializedSize }
+  const EPISODE_CACHE_MAX = 16
+  const EPISODE_SCAN_MAX = 20_000
+  // 窗口起点按步长对齐：否则每来一条消息窗口就滑动一格，缓存全废、整份重切。
+  const EPISODE_WINDOW_STEP = 2_000
+  const viewStamp = (chatId) => {
+    if (!visibleKey) return ''
+    try { return String(visibleKey(chatId)) } catch (error) { return 'error:' + error.message }
+  }
+  function episodeOf (block) {
+    return { id: 'conversation-' + block[0].id, at: block[0].at, source: 'new_conversation',
+      visibility: 'same_conversation', evidence_ids: block.map(m => m.id), context: block.map(m => ({ ...m })),
+      text: block.map(m => `${m.role}: ${m.text}`).join('\n') }
+  }
   function episodes(chatId, { maxCharacters = 2000 } = {}) {
-    const result = []; let block = [], serializedSize = 0
+    const value = state(chatId)
     // Reserve the episode wrapper and evidence IDs. Split at source-message
     // boundaries, so a large paste cannot hide its small neighboring facts.
     const recordBudget = Math.max(1, maxCharacters - 256)
+    const vis = viewStamp(chatId)
+    const key = chatId + '|' + maxCharacters
+    const overflow = value.messages.length - EPISODE_SCAN_MAX
+    const start = overflow <= 0 ? 0 : Math.floor(overflow / EPISODE_WINDOW_STEP) * EPISODE_WINDOW_STEP
+    let entry = episodeCache.get(key)
+    episodeCache.delete(key) // 命中与否都重插到队尾，当 LRU 用
+    if (!entry || entry.vis !== vis || entry.start !== start || entry.consumed > value.messages.length) {
+      entry = { vis, start, consumed: start, list: [], block: [], serializedSize: 0 }
+    }
     const emit = () => {
-      if (!block.length) return
-      result.push({ id: 'conversation-' + block[0].id, at: block[0].at, source: 'new_conversation',
-        visibility: 'same_conversation', evidence_ids: block.map(m => m.id), context: block.map(m => ({ ...m })),
-        text: block.map(m => `${m.role}: ${m.text}`).join('\n') }); block = []; serializedSize = 0
+      if (!entry.block.length) return
+      entry.list.push(episodeOf(entry.block)); entry.block = []; entry.serializedSize = 0
     }
-    for (const m of available(chatId)) {
+    for (let i = entry.consumed; i < value.messages.length; i++) {
+      const m = value.messages[i]
+      entry.consumed = i + 1
+      if (!visible(chatId, m)) continue
       const size = JSON.stringify(m).length + JSON.stringify(m.id).length + 2
-      if (block.length && (m.at - block.at(-1).at > 30 * 60_000 || (m.role === 'user' && block.length >= 8) || serializedSize + size > recordBudget)) emit()
-      block.push(m); serializedSize += size
-      if (serializedSize >= recordBudget) emit()
+      const block = entry.block
+      if (block.length && (m.at - block.at(-1).at > 30 * 60_000 || (m.role === 'user' && block.length >= 8) || entry.serializedSize + size > recordBudget)) emit()
+      entry.block.push(m); entry.serializedSize += size
+      if (entry.serializedSize >= recordBudget) emit()
     }
-    emit(); return result
+    episodeCache.set(key, entry)
+    while (episodeCache.size > EPISODE_CACHE_MAX) episodeCache.delete(episodeCache.keys().next().value)
+    // 尾部那段还开着（下一条可能接着进同一段），返回时只临时包一层，不改缓存状态。
+    return entry.block.length ? [...entry.list, episodeOf(entry.block)] : entry.list.slice()
   }
+  // 每轮的预算过滤也要把每个片段重新 stringify 一遍，几千个片段就是几百毫秒。
+  // 片段内容不随查询变，只有「含近期窗口里那些消息」的片段才需要重算，其余记下长度复用。
+  const renderCache = new WeakMap() // episode → 全量渲染字数
   function recall(chatId, query, { maxCharacters = 4000, recentMessages = recent(chatId), excludeIds = [] } = {}) {
     const excluded = new Set([...excludeIds, ...recentMessages.map(m => m.id)])
     const render = e => JSON.stringify({ id: e.id, source: e.source, evidence_ids: e.evidence_ids, context: e.context })
-    const docs = episodes(chatId, { maxCharacters: Math.min(2000, maxCharacters) }).filter(e => e.context.some(m => !excluded.has(m.id)))
-      .map(e => ({ ...e, context: e.context.filter(m => !excluded.has(m.id)) }))
-      .map(e => ({ ...e, evidence_ids: e.context.map(m => m.id), text: e.context.map(m => `${m.role}: ${m.text}`).join('\n') }))
-      .filter(e => Array.from(render(e)).length <= maxCharacters)
+    const docs = []
+    for (const e of episodes(chatId, { maxCharacters: Math.min(2000, maxCharacters) })) {
+      if (e.context.some(m => excluded.has(m.id))) {
+        const context = e.context.filter(m => !excluded.has(m.id))
+        const doc = { ...e, context, evidence_ids: context.map(m => m.id), text: context.map(m => `${m.role}: ${m.text}`).join('\n') }
+        if (render(doc).length <= maxCharacters) docs.push(doc)
+        continue
+      }
+      let cached = renderCache.get(e)
+      if (!cached) {
+        cached = { chars: render(e).length }
+        renderCache.set(e, cached)
+      }
+      if (cached.chars <= maxCharacters) {
+        if (!e._terms) Object.defineProperty(e, '_terms', { value: terms(e.text), enumerable: false, configurable: true })
+        docs.push(e)
+      }
+    }
     const hits = retrieve(queriesFor(query, recentMessages), docs, { limit: 6 })
     return packEvidence(hits, render, maxCharacters)
   }

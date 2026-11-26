@@ -1,8 +1,11 @@
+import { createKeyRouter, rateMeta } from './key-pool.mjs'
+export const runCloud = createKeyRouter()
 // 文字 → 语音文件。
 //   首选：edge-tts（微软在线朗读，音色好），装在插件自己的 Python 虚拟环境 C:\Aurabot\pyenv 里，不污染系统。
-//   兜底：Windows 自带的中文语音（System.Speech / Huihui），什么都不装也能用（只有 Windows 有）。
+//   兜底：系统自带语音——Windows 用 System.Speech（Huihui 等中文音色）、macOS 用 say，什么都不装也能用。
 // 管线：文字 → TTS → 文件路径。任何一步失败由调用方退回发文字。（RVC 音色目前用在翻唱上，见 src/song/）
 
+import { fishSpeech } from './fish.js'
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, statSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs'
 import { buildWav } from './wav.js'
@@ -157,6 +160,32 @@ async function windowsSynth(text) {
   return file
 }
 
+/**
+ * 这个引擎该不该先试 edge-tts：#255 —— 明确要系统语音（windows / say）时必须直接走系统，
+ * 否则 macOS 上明明有 say 也会先被 edge 截走，自检拿到 mp3。
+ */
+export function edgeAllowed (engine) {
+  return !['windows', 'say'].includes(String(engine || ''))
+}
+
+/** 系统自带语音兜底用哪个：#255 —— Windows 用 System.Speech，macOS 用 say，其它平台没有。 */
+export function systemVoiceEngine (platform = process.platform) {
+  if (platform === 'win32') return 'windows'
+  if (platform === 'darwin') return 'say'
+  return ''
+}
+
+/** macOS 自带 `say`：直接输出 16k 单声道 WAV，识别链路不用再转码。 */
+async function saySynth (text) {
+  const file = join(outDir(), `say-${randomUUID()}.wav`)
+  const voice = String(process.env.AURABOT_SAY_VOICE || '').trim()
+  // `--` 之后一律当文本：否则正文以 `-v`/`--progress` 开头会被 say 当选项解析，甚至转去读 stdin 卡到超时。
+  const args = ['-o', file, '--data-format=LEI16@16000', ...(voice ? ['-v', voice] : []), '--', text]
+  const r = await run('say', args, { timeoutMs: 60000 })
+  if (!existsSync(file) || statSync(file).size < 1000) throw new Error('系统语音（say）失败：' + (r.err || '').slice(-200))
+  return file
+}
+
 // ---------- 本地 / 自建 TTS 服务（地址是主人自己填的，所以允许 127.0.0.1） ----------
 
 async function fetchAudio(url, init, timeoutMs = 120000) {
@@ -226,7 +255,7 @@ export async function breezeSynth(text, c = {}) {
   let r
   try {
     r = await fetch(url, {
-      method: 'POST',
+      method: 'POST', redirect: 'error',
       headers: { 'xi-api-key': key, accept: 'application/json, audio/*', 'content-type': 'application/json' },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(timeout),
@@ -235,9 +264,9 @@ export async function breezeSynth(text, c = {}) {
     throw new Error(`Breeze 连不上（${base}）：${error.message}`)
   }
   if (!r.ok) {
-    const detail = (await r.text().catch(() => '')).slice(0, 160)
+    await r.body?.cancel().catch(() => {})
     const hint = r.status === 401 ? '：Key 不对或已撤销' : r.status === 402 ? '：额度不够' : r.status === 429 ? '：撞频率限制了' : ''
-    throw new Error(`Breeze HTTP ${r.status}${hint}：${detail}`)
+    throw Object.assign(new Error(`Breeze HTTP ${r.status}${hint}`), rateMeta(r))
   }
   const type = r.headers.get('content-type') || ''
   if (!/^audio\//i.test(type)) {
@@ -339,7 +368,11 @@ export async function httpSynth(text, c) {
     if (!hasHeader('content-type')) headers['content-type'] = 'application/json'
   }
 
-  const r = await fetch(target, { method, headers, body, signal: AbortSignal.timeout(120000) })
+  const keyed = Object.values(headers).some(v => v.includes('{apiKey}'))
+  if (keyed && (!c.accountKey || new URL(target).protocol !== 'https:' || new URL(target).origin !== c.keyOrigin)) throw new Error('请在此 HTTPS 服务的「多账号设置」中添加密钥')
+  if (keyed) for (const h of Object.keys(headers)) headers[h] = headers[h].split('{apiKey}').join(c.accountKey)
+  const r = await fetch(target, { method, headers, body, ...(keyed && { redirect: 'error' }), signal: AbortSignal.timeout(120000) })
+  if (!r.ok && keyed) { await r.body?.cancel().catch(() => {}); throw Object.assign(new Error(`HTTP ${r.status}`), rateMeta(r)) }
   if (!r.ok) throw new Error(`HTTP ${r.status}：${(await r.text().catch(() => '')).slice(0, 160)}`)
 
   let buf = Buffer.from(await r.arrayBuffer())
@@ -425,7 +458,7 @@ export async function volcanoSynth(text, c) {
   if (Math.abs(speed - 1) > 0.001) audioParams.speech_rate = Math.round((speed - 1) * 100)
 
   const r = await fetch(VOLCANO_URL, {
-    method: 'POST',
+    method: 'POST', redirect: 'error',
     headers: {
       'content-type': 'application/json',
       'X-Api-Key': apiKey,
@@ -445,7 +478,7 @@ export async function volcanoSynth(text, c) {
     try { j = JSON.parse(raw) } catch (e) {}
     const code = (j && j.header && j.header.code) || (j && j.code)
     const msg = (j && j.header && j.header.message) || (j && j.message) || raw
-    throw new Error(volcanoHint(code, msg) || `豆包语音 HTTP ${r.status}：${String(msg).slice(0, 160)}`)
+    throw Object.assign(new Error(volcanoHint(code, msg) || `豆包语音 HTTP ${r.status}`), rateMeta(r, r.status >= 500 ? r.status : Number(code) === 45000010 ? 401 : r.status))
   }
 
   const parts = []
@@ -464,7 +497,7 @@ export async function volcanoSynth(text, c) {
     const sp = firstError.indexOf(' ')
     const code = sp > 0 ? firstError.slice(0, sp) : '0'
     const msg = sp > 0 ? firstError.slice(sp + 1) : firstError
-    throw new Error(volcanoHint(code, msg) || `豆包语音没返回音频：${raw.slice(0, 160)}`)
+    throw Object.assign(new Error(volcanoHint(code, msg) || '豆包语音没返回音频'), rateMeta(r, Number(code) === 45000010 ? 401 : r.status))
   }
 
   const buf = Buffer.concat(parts)
@@ -503,7 +536,7 @@ export async function minimaxSynth(text, c = {}) {
   if (emotion && emotion !== 'auto') voiceSetting.emotion = emotion
 
   const r = await fetch(`${base}/v1/t2a_v2`, {
-    method: 'POST',
+    method: 'POST', redirect: 'error',
     headers: {
       'content-type': 'application/json',
       authorization: 'Bearer ' + apiKey,
@@ -525,8 +558,8 @@ export async function minimaxSynth(text, c = {}) {
   let j = null
   try { j = JSON.parse(raw) } catch (e) {}
   const code = j && j.base_resp ? j.base_resp.status_code : undefined
-  if (code === undefined) throw new Error(`MiniMax HTTP ${r.status}：${raw.slice(0, 160)}`)
-  if (Number(code) !== 0) throw new Error(minimaxHint(code, j.base_resp.status_msg) || `MiniMax ${code}：${j.base_resp.status_msg || '未知错误'}`)
+  if (!r.ok || code === undefined) throw Object.assign(new Error(minimaxHint(code, j?.base_resp?.status_msg) || `MiniMax HTTP ${r.status}`), rateMeta(r))
+  if (Number(code) !== 0) throw Object.assign(new Error(minimaxHint(code, j.base_resp.status_msg) || `MiniMax ${code}`), rateMeta(r, ({ 1002: 429, 1039: 429, 1004: 401, 1008: 402 })[Number(code)] || r.status))
 
   const hex = String((j.data && j.data.audio) || '')
   // 正常是 hex；万一哪天回 base64，这里能拦住，别写出坏文件
@@ -548,25 +581,55 @@ export async function textToSpeech(text, opt = {}, log) {
   let file = ''
   let engine = ''
   const local = { cosyvoice: cosyvoiceSynth, gptsovits: gptsovitsSynth, http: httpSynth, volcano: volcanoSynth, breeze: breezeSynth, minimax: minimaxSynth }[opt.engine]
-  if (local) {
+  if (opt.engine === 'fish-free') {
+    file = saveAudio(await runCloud('fish-free', opt.fishApiKey, opt.keyPools?.['fish-free'], key => fishSpeech(clean, key, undefined, opt.fishReferenceId)))
+    engine = 'fish-free'
+  } else if (local) {
     try {
-      file = await local(clean, opt[opt.engine] || {})
+      const c = opt[opt.engine] || {}
+      if (opt.engine === 'http' && Object.values(parseHeaderText(c.headers)).some(v => v.includes('{apiKey}'))) {
+        const origin = new URL(c.urlTemplate).origin
+        const pool = opt.keyPools?.http
+        const scoped = { ...pool, accounts: (pool?.accounts || []).filter(a => a.origin === origin) }
+        file = await runCloud('http:' + origin, '', scoped, key => httpSynth(clean, { ...c, accountKey: key, keyOrigin: origin }))
+      } else if (['breeze', 'volcano', 'minimax'].includes(opt.engine) && !(opt.engine === 'breeze' && c.mode === 'local')) {
+        const field = opt.engine === 'breeze' ? 'key' : 'apiKey'
+        file = await runCloud(opt.engine, c[field], opt.keyPools?.[opt.engine], key => local(clean, { ...c, [field]: key }))
+      } else file = await local(clean, c)
       engine = opt.engine
     } catch (error) {
-      log?.warn(`${opt.engine} 失败：${error.message} → 改用 Windows 语音`)
+      // 云端音色的调用方可显式选择 Edge 或文字回退，不能再悄悄降成系统机械声。
+      if (opt.engine === 'http' && opt.http?.fallback === 'edge') {
+        log?.warn(`http 失败：${error.message} → 改用 Edge 语音`)
+        if (!edgeInstalled()) throw new Error('HTTP 语音失败，Edge 语音组件未安装；不使用 Windows 语音', { cause: error })
+        file = await edgeSynth(clean, opt.voice || 'zh-CN-XiaoyiNeural', opt.rate, opt.pitch)
+        engine = 'edge'
+      } else if (opt.engine === 'http' && opt.http?.fallback === 'text') {
+        throw error
+      } else {
+        log?.warn(`${opt.engine} 失败：${error.message} → 改用系统语音`)
+      }
     }
-  } else if (opt.engine !== 'windows' && edgeInstalled()) {
+  } else if (edgeAllowed(opt.engine) && edgeInstalled()) {
     try {
       file = await edgeSynth(clean, opt.voice || 'zh-CN-XiaoyiNeural', opt.rate, opt.pitch)
       engine = 'edge'
     } catch (error) {
-      log?.warn(error.message, '→ 改用 Windows 语音')
+      log?.warn(error.message, '→ 改用系统语音')
     }
   }
   if (!file) {
-    if (!WIN) throw new Error('语音没合成出来：Linux / macOS 上没有 Windows 自带语音可以兜底，先在「语音」页装好 edge-tts，或者用本地 TTS 服务')
-    file = await windowsSynth(clean)
-    engine = 'windows'
+    // 系统自带语音兜底按平台选（#255）：Windows 用 System.Speech，macOS 用 say，其它平台没有可用系统语音。
+    const system = systemVoiceEngine()
+    if (system === 'windows') {
+      file = await windowsSynth(clean)
+      engine = 'windows'
+    } else if (system === 'say') {
+      file = await saySynth(clean)
+      engine = 'say'
+    } else {
+      throw new Error('语音没合成出来：这台机器没有系统自带语音可以兜底（Windows 用系统语音、macOS 用 say），先在「语音」页装好 edge-tts，或者用本地 TTS 服务')
+    }
   }
   for (const conv of voiceConverters) {
     try {

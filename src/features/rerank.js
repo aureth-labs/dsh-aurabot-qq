@@ -2,6 +2,8 @@
 // 统一走 OpenAI 兼容的 POST {baseUrl}/rerank（硅基 BAAI/bge-reranker-v2-m3 免费）。
 // 失败 / 超时一律由调用方回退原顺序，绝不阻塞回复。
 
+import { recordRetrievalUsage } from '../core/usage.js'
+
 const DEFAULT_BASE = 'https://api.siliconflow.cn/v1'
 const DEFAULT_MODEL = 'BAAI/bge-reranker-v2-m3'
 
@@ -37,9 +39,29 @@ export function createReranker({ getConfig, log, fetchImpl = globalThis.fetch })
     return Boolean(settings())
   }
 
+  // 失败退避：接口超时或报错后暂停一阵（1 分钟起，连续失败翻倍，最多 30 分钟），期间直接用原顺序，
+  // 不然每条消息都要等满超时（反馈里召回阶段每轮多等十几秒的来源之一）
+  let failures = 0
+  let skipUntil = 0
+  const now = () => Date.now()
+
   async function rank(query, hits) {
     const c = settings()
     if (!c || !Array.isArray(hits) || hits.length < 2) return hits
+    if (now() < skipUntil) return hits
+    try {
+      const out = await rankOnce(c, query, hits)
+      failures = 0
+      skipUntil = 0
+      return out
+    } catch (error) {
+      failures++
+      skipUntil = now() + Math.min(30 * 60_000, 60_000 * 2 ** (failures - 1))
+      throw error
+    }
+  }
+
+  async function rankOnce(c, query, hits) {
     const candidates = hits.slice(0, c.topN)
     const documents = candidates.map((h) => String(h?.it?.text || '').slice(0, 1200))
     const usable = documents.map((d, i) => ({ d, i })).filter((x) => x.d)
@@ -63,6 +85,7 @@ export function createReranker({ getConfig, log, fetchImpl = globalThis.fetch })
     if (!r.ok) throw new Error(`HTTP ${r.status}`)
     let json
     try { json = JSON.parse(raw) } catch (error) { throw new Error('重排服务返回的不是 JSON') }
+    recordRetrievalUsage('记忆检索排序', c.model, json?.usage)
     const rows = Array.isArray(json?.results) ? json.results : []
     if (!rows.length) return hits
     const scored = []
@@ -97,10 +120,11 @@ export function createReranker({ getConfig, log, fetchImpl = globalThis.fetch })
     if (!r.ok) throw new Error(`HTTP ${r.status}：${raw.slice(0, 120)}`)
     let json
     try { json = JSON.parse(raw) } catch (error) { throw new Error('重排服务返回的不是 JSON') }
+    recordRetrievalUsage('记忆检索排序', c.model, json?.usage)
     const rows = Array.isArray(json?.results) ? json.results : []
     if (!rows.length) throw new Error('没返回排序结果')
     return { model: c.model, top: rows[0]?.index ?? -1, score: Number(rows[0]?.relevance_score) || 0 }
   }
 
-  return { settings, configured, rank, test }
+  return { settings, configured, rank, test, backoff: () => ({ failures, skipUntil }) }
 }

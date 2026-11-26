@@ -102,7 +102,9 @@ test('早展开开着：消息一进来就拉一次（哪怕这条不回她）',
   createHubRef = createHub
   const { hub, calls } = setup(t, { forward: { expandEarly: true } })
   await hub.onMessage(groupEvent())
-  assert.deepEqual(calls, ['fw1'], '没叫她也要展开，否则之后问她看不见')
+  // #526 之后回退顺序是 outerId → 段内 id：这里 mock 对外层 message_id=11 也返回内容，
+  // 命中即停，所以只调一次、且用的是外层 id（顺序细节由 forward-fallback.test.js 覆盖）。
+  assert.deepEqual(calls, ['11'], '没叫她也要展开；外层 id 能拿到就不再试段内 id')
 })
 
 test('早展开关着：不叫她的时候一次都不拉', async (t) => {
@@ -131,7 +133,11 @@ test('契约：引用里套的合并转发也展开，字数上限单独放宽',
 })
 
 test('契约：面板上有这两个开关', () => {
-  assert.ok(clientSrc.includes("title: '合并转发'"), '面板缺「合并转发」卡')
+  // 「合并转发」的两种合法形态都接受：
+  //   - 卡片形态 `h(Card, { title: '合并转发', ... })`（上游现状）
+  //   - 组行形态 `h(Row, { label: '合并转发', ... })`（本机面板组行重排后的形态）
+  // 只要求面板上确实存在这一项，不锁死布局细节。
+  assert.ok(clientSrc.includes("'合并转发'"), '面板缺「合并转发」开关')
   assert.ok(clientSrc.includes("f.sw('forward.expandEarly')"), '缺早展开开关')
   assert.ok(clientSrc.includes("f.sw('forward.expandHistory')"), '缺补展开开关')
 })

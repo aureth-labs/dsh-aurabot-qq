@@ -19,13 +19,12 @@ let createIdentity
 let resolveConfirmChat
 let createApprovalRelay
 let createDangerGuard
-let createSpeakUp
 let createPurpose
 let createBili
 let createGroupShare
 let createModules
 let createOutboundPolicy
-let createSpeakupPolicy
+let createPurposePolicy
 let contactsMod
 let songMod
 let createFakeDsh
@@ -40,13 +39,12 @@ before(async () => {
   ;({ resolveConfirmChat } = await import('../src/chat/access.js'))
   ;({ createApprovalRelay } = await import('../src/security/approval.js'))
   ;({ createDangerGuard } = await import('../src/security/danger.js'))
-  ;({ createSpeakUp } = await import('../src/features/companion.js'))
   ;({ createPurpose } = await import('../src/purpose/module.js'))
   ;({ createBili } = await import('../src/bili/duty.js'))
   ;({ createGroupShare } = await import('../src/bili/group-share.js'))
   ;({ createModules } = await import('../src/core/modules.js'))
   ;({ createOutboundPolicy } = await import('../src/chat/outbound-policy.js'))
-  ;({ createSpeakupPolicy } = await import('../src/features/proactive-policy.js'))
+  ;({ createPurposePolicy } = await import('../src/features/proactive-policy.js'))
   ;({ default: contactsMod } = await import('../src/modules/contacts/index.js'))
   ;({ default: songMod } = await import('../src/modules/song/index.js'))
   ;({ createFakeDsh } = await import('./helpers/fake-dsh.js'))
@@ -203,9 +201,13 @@ test('P2-1: Class A 不绕过主账号路由且多实例 primary 经由 outbound
 
   // 同平台不同实例（bridge#1 vs bridge#2）的 channel / 幂等键相互独立，且均通过 isGovernedTarget 与 proactive-policy 范围判定
   policyIdentity.setOwner('b_one', 'bridge', 'owner-1')
-  const spPolicy = createSpeakupPolicy({
-    getConfig: () => ({ enabled: true, speakUp: { enabled: true, awakeFrom: 0, awakeTo: 24, idleMinutes: 0, minIntervalMinutes: 5, maxIntervalMinutes: 5, maxPerDay: 5 } }),
-    speakup: { state: () => ({ lastAt: 0, count: 0, day: '2026-11-16' }), reset: () => {} },
+  const spPolicy = createPurposePolicy({
+    getConfig: () => ({
+      enabled: true,
+      speakUp: { enabled: true, awakeFrom: 0, awakeTo: 24, idleMinutes: 0, minIntervalMinutes: 5, maxIntervalMinutes: 5, maxPerDay: 5 },
+      ext: { purpose: { enabled: true } },
+    }),
+    state: () => ({ countToday: 0, nextFireAt: 0, lastAttemptAt: 0 }),
     now: () => new Date(2026, 10, 16, 12, 0, 0).getTime(),
     dataDir: freshDataDir('aurabot-p2-proact-'),
     log: { warn() {}, info() {} },
@@ -214,7 +216,7 @@ test('P2-1: Class A 不绕过主账号路由且多实例 primary 经由 outbound
     defaultPlatform: 'qq',
   })
   const b1Res = spPolicy.reserve({ to: 'bridge#1:private:b_one', sourceModule: 'test' })
-  assert.equal(b1Res.ok, true, '多实例 bridge#1:private:b_one 应通过 proactive-policy 范围校验并预占')
+  assert.equal(b1Res.ok, true, `多实例 bridge#1:private:b_one 应通过 proactive-policy 范围校验并预占 ${JSON.stringify(b1Res)}`)
   const subB1 = await policy.submit({ moduleId: 'p2-multi', itemId: 'same-item', to: 'bridge#1:private:b_one', text: '实例1' })
   const subB2 = await policy.submit({ moduleId: 'p2-multi', itemId: 'same-item', to: 'bridge#2:private:b_two', text: '实例2' })
   assert.equal(subB1.state, 'sent')
@@ -308,68 +310,7 @@ test('P2-1: Class A 不绕过主账号路由且多实例 primary 经由 outbound
   assert.deepEqual(contactSent.map((x) => x.chatId), ['feishu:private:ou_c'])
 })
 
-test('P2-2: speakup 与 purpose 在 owner blocked 时不消耗额度，朋友线不受阻，回合标题去 QQ 前缀', async (t) => {
-  // ---- speakup ----
-  const speakDir = freshDataDir('aurabot-p2-speak-')
-  const speakPushed = []
-  let speakOwnerBlocked = true
-  const speakCfg = normalize({
-    enabled: true,
-    dryRun: false,
-    ownerQQ: '10001',
-    allow: { private: ['22222'], groups: [] },
-    speakUp: {
-      enabled: true,
-      awakeFrom: 0,
-      awakeTo: 24,
-      minIntervalMinutes: 1,
-      maxIntervalMinutes: 1,
-      idleMinutes: 1,
-      maxPerDay: 5,
-      allow: ['22222'],
-    },
-  })
-  const speakIdentity = makeTestIdentity('10001', 'qq', { personId: 'owner-sp' })
-  speakIdentity.setOwner('ou_sp', 'feishu', 'owner-sp')
-  const speakHub = {
-    lastOwnerChatAt: Date.now() - 120 * 60_000,
-    lastChatAt: Date.now(),
-    lastBotToOwner: { at: Date.now() - 120 * 60_000, text: '晚安' },
-    lastPrivateAt: () => 0,
-    ownerChat: () => 'private:10001',
-    pushToSession: async (chat, content) => speakPushed.push({ chatId: chat.chatId, text: content[0].text }),
-  }
-  const realNow = Date.now
-  try {
-    const speakup = createSpeakUp({
-      getConfig: () => speakCfg,
-      hub: speakHub,
-      log: { info() {}, debug() {}, warn() {} },
-      identity: speakIdentity,
-      resolveOwnerRoute: () => (speakOwnerBlocked
-        ? { ok: false, blocked: true, reason: 'primary-offline', chatId: '' }
-        : { ok: true, blocked: false, reason: 'primary', chatId: 'feishu:private:ou_sp' }),
-      routeOwner: () => 'private:10001',
-    })
-    await speakup.tick() // 首次排时间
-    assert.equal(speakPushed.length, 0)
-    Date.now = () => realNow() + 5 * 60_000
-    await speakup.tick()
-    assert.equal(speakup.state().count, 0, 'owner blocked 时 tick 不能消费 speakup 每日次数')
-    assert.equal(speakPushed.filter((x) => x.chatId === 'private:10001' || x.chatId.includes('ou_sp')).length, 0)
-    assert.deepEqual(speakPushed.map((x) => x.chatId), ['private:22222'], '白名单朋友线在 owner blocked 时仍正常触发')
-
-    const fireBlocked = await speakup.fire()
-    assert.equal(fireBlocked.ok, false)
-    assert.equal(fireBlocked.blocked, true)
-    assert.equal(fireBlocked.reason, 'primary-offline')
-    assert.equal(speakup.state().count, 0, 'blocked fire 不得消费次数')
-  } finally {
-    Date.now = realNow
-  }
-  assert.ok(speakDir)
-
-  // ---- purpose ----
+test('P2-2: purpose 在 owner blocked 时不消耗额度，回合标题与平台无关', async (t) => {
   const purposeDir = freshDataDir('aurabot-p2-purpose-')
   const purposeIdentity = makeTestIdentity('10001', 'qq', { personId: 'owner-pp' })
   purposeIdentity.setOwner('ou_pp', 'feishu', 'owner-pp')
@@ -451,14 +392,9 @@ test('P2-2: speakup 与 purpose 在 owner blocked 时不消耗额度，朋友线
     assert.ok(!String(turn.title || '').startsWith('QQ · '), `回合标题不应含硬编码 QQ 前缀: ${turn.title}`)
   }
 
-  // 宿主 HTTP /speakup/fire 与 /purpose/fire 在 primary-offline 时返回结构化 blocked
+  // 宿主 HTTP /purpose/fire 在 primary-offline 时返回结构化 blocked
   const { fake, bridgeAdapters } = await setupHostWithBridge2(t)
   bridgeAdapters.get('bridge#2').disconnect()
-  const httpSpeak = (await fake.call('/speakup/fire', {})).json()
-  assert.equal(httpSpeak.ok, false)
-  assert.equal(httpSpeak.blocked, true)
-  assert.equal(httpSpeak.reason, 'primary-offline')
-
   const httpPurpose = (await fake.call('/purpose/fire', {})).json()
   assert.equal(httpPurpose.ok, false)
   assert.equal(httpPurpose.blocked, true)

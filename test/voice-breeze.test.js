@@ -26,6 +26,7 @@ const base = `http://127.0.0.1:${server.address().port}`
 const { breezeSynth, textToSpeech } = await import('../src/voice/tts.js')
 const { breezeBalance, breezeLogin, breezeClaim, breezeSession, shouldAutoClaim, clearBreezeSession, breezeVoices } = await import('../src/voice/breeze.js')
 const { DEFAULTS, normalize, publicConfig, mergeFromPanel } = await import('../src/core/config.js')
+const { splitSpeakable } = await import('../src/chat/faces.js')
 
 after(() => {
   server.close()
@@ -269,4 +270,13 @@ test('Breeze 音色列表：把 /v1/voices 映射成面板能用的 id/名字', 
   assert.match((await breezeVoices({ url: base, key: '' })).message, /没填 API Key/)
   respond = (res) => { res.writeHead(401, { 'content-type': 'application/json' }); res.end('{}') }
   assert.match((await breezeVoices({ url: base, key: 'brz_k', timeoutMs: 5000 })).message, /Key 不对/)
+})
+test('Breeze：音频标签原样进请求体，连续标签不能被合并', async () => {
+  hits.length = 0
+  respond = (res) => { res.writeHead(200, { 'content-type': 'audio/mpeg' }); res.end(mp3) }
+  const spoken = splitSpeakable('[咯咯笑][叹气]你好呀').spoken
+  assert.equal(spoken, '[咯咯笑][叹气]你好呀', '清洗层不能改写 Breeze 标签')
+  await breezeSynth(spoken, cfg())
+  const body = JSON.parse(hits[0].body)
+  assert.equal(body.text, '[咯咯笑][叹气]你好呀', '请求体里的标签保持原样，引擎才能识别成笑声/叹气而不是念字')
 })

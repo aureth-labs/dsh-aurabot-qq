@@ -1,6 +1,6 @@
 // 面板集成：目的引擎 / 桌宠的 /panel/* 代理与 /state 聚合。
 // fake-dsh 模式；AURABOT_DATA_DIR 隔离；不引入新依赖。
-// purpose 是默认关的独立模块：这里验证「没开时面板不炸、打开后接口可用」的降级语义。
+// P1/Q1 拍板起 purpose 默认开：这里验证「默认开时的面板聚合」与「显式关掉后的降级语义」。
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, unlinkSync } from 'node:fs'
@@ -64,7 +64,7 @@ test('/state 聚合 purpose 字段（独立模块，默认关也不炸）', asyn
   assert.equal(typeof st.speakUp.count, 'number')
   assert.ok(st.purpose, 'purpose 聚合字段存在')
   assert.equal(st.purpose.available, true, 'purpose 模块已提供 status()')
-  assert.equal(st.purpose.enabled, false, '目的引擎默认关')
+  assert.equal(st.purpose.enabled, true, 'P1 默认开：ext.purpose.enabled 缺省即开')
   assert.equal(st.purpose.pacing, 'default')
   assert.equal(st.purpose.dailyMax, 20, 'dailyMax 取自 speakUp.maxPerDay 默认值')
   assert.equal(st.purpose.quietStart, '23:00', '安静时段由醒着窗口 8~23 推算')
@@ -78,7 +78,7 @@ test('面板代理 /panel/purpose/status：聚合 purpose + pet，token 已脱�
   const r = await call('/panel/purpose/status')
   assert.equal(r.ok, true)
   assert.equal(r.purpose.available, true)
-  assert.equal(r.purpose.enabled, false)
+  assert.equal(r.purpose.enabled, true, 'P1 默认开')
   assert.equal(r.pet, null, '桌宠没装：不影响目的引擎')
   assert.ok(!JSON.stringify(r).includes('a'.repeat(32)))
 })
@@ -129,17 +129,38 @@ test('预览零副作用：/panel/purpose/preview 收素材拼提示词，但不
   assert.equal(sentToOwner().length, before, '预览不得向 QQ 发送任何消息')
 })
 
+test('追问开关写 ext.purpose.nudge（P1 翻键），读侧双层兼容', async () => {
+  const r = await call('/panel/purpose/config', { nudge: false })
+  assert.equal(r.ok, true)
+  // 落盘位置：追问写入口已翻到 ext.purpose.nudge；speakUp.nudge 键保留不动（与 awake/allow 同口径）
+  const saved = JSON.parse(readFileSync(join(dataDir, 'config.json'), 'utf8'))
+  assert.equal(saved.ext.purpose.nudge, false, '追问写入口在 ext.purpose.nudge')
+  assert.equal(saved.speakUp.nudge, true, 'speakUp.nudge 键不被动')
+  // 读侧 fallback：ext 覆写位优先，老用户 speakUp.nudge 仍生效，缺省默认开
+  const { purposeConfig } = await import('../src/purpose/module.js')
+  assert.equal(purposeConfig({ speakUp: { nudge: true }, ext: { purpose: { nudge: false } } }).nudge, false, '覆写位优先')
+  assert.equal(purposeConfig({ speakUp: { nudge: false } }).nudge, false, '老用户 speakUp.nudge=false 仍生效')
+  assert.equal(purposeConfig({ speakUp: { nudge: false }, ext: { purpose: { nudge: true } } }).nudge, true, '显式 ext 覆写可重新打开')
+  assert.equal(purposeConfig({}).nudge, true, '两边都没设默认开')
+  // 写回 true，不污染后面的用例
+  const back = await call('/panel/purpose/config', { nudge: true })
+  assert.equal(back.ok, true)
+})
+
 test('手动试跑：引擎关着时明确拒绝；打开后能真跑一轮并投递私聊', async () => {
   const r0 = await call('/panel/purpose/run')
   assert.equal(r0.ok, false, '默认关：run 明确报「开关是关的」')
   assert.match(String(r0.message || ''), /开关/)
-  const on = await call('/panel/purpose/config', { enabled: true })
+  // 打开时顺手把醒着窗口设成全日（0~24）：真跑一轮断言不能依赖测试运行的墙钟时间，
+  // 否则深夜（默认 8~23 窗口外）跑这套用例会被安静时段拦下（凌晨实测踩过）。
+  const on = await call('/panel/purpose/config', { enabled: true, awakeFrom: 0, awakeTo: 24 })
   assert.equal(on.ok, true)
   const before = sentToOwner().length
   const r = await call('/panel/purpose/run')
   assert.equal(r.ok, true, JSON.stringify(r))
   assert.equal(sentToOwner().length, before + 1, '真跑一轮：私聊里多发了一条')
-  await call('/panel/purpose/config', { enabled: false })
+  // 写回默认作息，不污染后面的用例
+  await call('/panel/purpose/config', { enabled: false, awakeFrom: 8, awakeTo: 23 })
 })
 
 // ---------- 桌宠（pet 模块与面板代理） ----------

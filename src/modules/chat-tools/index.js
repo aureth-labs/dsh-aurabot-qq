@@ -7,6 +7,7 @@ import { normalizeChatId, parseChatId, sameChat } from '../../gateway/address.js
 import { allowMatches, isOwner } from '../../chat/access.js'
 import { renderParts } from '../../gateway/render.js'
 import { parseMessageEvent } from '../../chat/inbound.js'
+import { hasInvalidVoiceMarkup } from '../../chat/reply.js'
 
 export const LEGACY_TOOL_ALIASES = Object.freeze({
   qq_chat_history: 'chat_history',
@@ -491,10 +492,11 @@ export default {
           description: '主动给另一个聊天（好友私聊或群）发一条消息，不是回复当前聊天时用。target 填 private:账号、group:群号 或 平台:kind:id；只能发给主人或白名单里的人和群。',
           properties: {
             target: str('private:账号 / group:群号 / 平台:kind:id'),
-            text: str('要发的话，可以用 ||| 分多条、<voice>…</voice> 发语音、<sticker:名字> 发表情'),
+            text: str('要发的话。普通消息支持 |||、<voice>…</voice>、<sticker:名字>。voice=true 时只填正文。'),
+            voice: bool('这次按语音发送时填 true；以回执确认实际消息类型。'),
           },
           required: ['target', 'text'],
-          execute: async ({ target, text }) => {
+          execute: async ({ target, text, voice }) => {
             if (chat.kind === 'group' && !hub.turnSendersAllOwner(sessionId)) return { ok: false, message: '只有主人开口时才能往别的聊天发，这一轮不是。' }
             const curCfg = api.config() || {}
             const res = resolveAuthorizedTarget({ target, cfg: curCfg, identity })
@@ -504,12 +506,31 @@ export default {
             if (tgtCaps?.proactive === 'none') {
               return { ok: false, message: '目标平台当前仅支持被动回复，不能主动跨聊天发消息' }
             }
-            const r = await hub.deliver(res.chatId, String(text || ''))
-            if (!r) return { ok: false, message: '没发出去：这条被拦下了，或者内容是空的' }
-            if (r.failed) return { ok: false, message: `没发出去（${r.failed} 条失败）：${r.errors[0]}。别说发过了，照实告诉对方` }
-            return r?.missedAt?.length
-              ? { ok: true, message: `发出去了，但 ${r.missedAt.map((n) => '@' + n).join('、')} 没对上群里的人（群名片和昵称里没有），只是文字、对方收不到提醒。请核对准确的群名片或用户账号` }
-              : { ok: true, message: '发出去了' }
+            if (voice !== undefined && typeof voice !== 'boolean') return { ok: false, message: 'voice 要填 true 或 false；还没有发送。' }
+            const body = String(text || '')
+            if (voice === true && (/<\/?(?:voice|sticker|reply|at|poke|face)\b/i.test(body) || body.includes('|||'))) {
+              return { ok: false, message: 'voice=true 时 text 只填要念的正文；请修改后再试，还没有发送。' }
+            }
+            if (hasInvalidVoiceMarkup(body)) return { ok: false, message: '语音标签没有正确配对，还没有发送。请修正 <voice>正文</voice> 或改用 voice=true。' }
+            let result
+            try { result = await hub.deliver(res.chatId, body, voice === true ? { voice: true } : {}) }
+            catch (error) {
+              api.log?.warn?.('跨聊天发送未确认：', error?.message || error)
+              return { ok: false, message: '发送结果未确认，请先查看目标聊天。不要自动重发整条消息。' }
+            }
+            if (!result) return { ok: false, message: '没发出去：这条被拦下了，或者内容是空的' }
+            const sentTypes = result.sentTypes || [], queuedTypes = result.queuedTypes || []
+            const labels = { record: '语音', text: '文字', image: '图片', face: '表情', poke: '戳一戳' }
+            const sent = sentTypes.length ? '已发送：' + [...new Set(sentTypes.map((t) => labels[t] || '其他消息'))].join('、') + '。' : ''
+            if (result.failed) return { ok: false, sentTypes, queuedTypes, message: sent + (queuedTypes.length ? '还有消息在等待补发。' : '') + '部分发送失败或结果未确认，请勿自动重发整条消息。' }
+            if (queuedTypes.length) return { ok: true, sentTypes, queuedTypes, message: sent + '还有消息已排队等待补发，尚未确认送达，请勿重复发送。' }
+            if (!sentTypes.length) return { ok: false, message: '没有确认发出的消息，不能说已发送。' }
+            const expectedVoice = voice === true || /<voice>/.test(body)
+            const fallback = expectedVoice && !sentTypes.includes('record') ? '本次没有发出语音。' : ''
+            const mentions = result.missedAt?.length
+              ? '但 ' + result.missedAt.map(n => '@' + n).join('、') + ' 没对上群里的人，只是文字、对方收不到提醒。'
+              : ''
+            return { ok: true, sentTypes, queuedTypes, message: sent + fallback + mentions }
           },
         }))
       }

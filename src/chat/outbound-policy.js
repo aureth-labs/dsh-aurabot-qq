@@ -19,7 +19,10 @@ const MAX_TEXT_BYTES = 8 * 1024 // 单条文本 8KB
 
 const DEFAULT_TIER = 'pass' // 契约 L74：pass 是兼容旧行为的默认档
 const TIERS = ['pass', 'gate', 'broker']
-const ACTIVE_MODES = ['purpose', 'speakup', 'auto']
+// P3（speakup → purpose 迁移）：speakup 策略源不再注册，活跃档收拢为 purpose/auto。
+// 存量 activePolicy:'speakup' 在 setActivePolicy 入口归一化为 'purpose'（不弹错）。
+const ACTIVE_MODES = ['purpose', 'auto']
+const LEGACY_ACTIVE_MODES = { speakup: 'purpose' } // 存量值 → 归一化值
 const POLICY_READY_STATE = 'ready'
 const CAUSES = ['reply', 'delegation', 'background', 'unknown']
 const KNOWN_STATES = ['pending', 'sending', 'sent', 'dropped', 'failed', 'uncertain', 'expired']
@@ -181,7 +184,7 @@ export function createOutboundPolicy(opts = {}) {
 
   /** 策略源登记表：name -> policy（幂等，同 name 覆盖） */
   const sources = new Map()
-  /** 活跃策略源选择：'purpose' | 'speakup' | 'auto'（auto=取 ready 的那个） */
+  /** 活跃策略源选择：'purpose' | 'auto'（auto=取 ready 的那个）；存量 'speakup' 归一化为 'purpose' */
   let activeMode = 'auto'
   /** 内存账本：deliveryId -> item */
   let items = new Map()
@@ -370,13 +373,13 @@ export function createOutboundPolicy(opts = {}) {
    */
   function pickSource() {
     if (activeMode === 'auto') {
-      // auto：优先 purpose，其次 speakup；都不可用则降级（交给上层按故障语义处理）
-      for (const name of ['purpose', 'speakup']) {
+      // auto：只有 purpose（P3 收拢，speakup 源已停止注册）；不可用则降级（交给上层按故障语义处理）
+      for (const name of ['purpose']) {
         const p = sources.get(name)
         if (p && isReady(p)) return { name, policy: p, state: 'ready', ready: true }
       }
       // 没有 ready 的：如果有已配置策略源，就报它（非 ready → deny）
-      for (const name of ['purpose', 'speakup']) {
+      for (const name of ['purpose']) {
         const p = sources.get(name)
         if (p) return { name, policy: p, state: stateOf(p), ready: false }
       }
@@ -421,7 +424,9 @@ export function createOutboundPolicy(opts = {}) {
 
   function setActivePolicy(mode) {
     try {
-      const m = String(mode ?? '').trim().toLowerCase()
+      let m = String(mode ?? '').trim().toLowerCase()
+      // P3 存量归一化：老配置里存的 'speakup' 读取为 'purpose'，不弹错、行为等价
+      if (LEGACY_ACTIVE_MODES[m]) m = LEGACY_ACTIVE_MODES[m]
       if (!ACTIVE_MODES.includes(m)) return { ok: false, reason: 'invalid-active' }
       activeMode = m
       return { ok: true, activePolicy: activeMode }

@@ -193,24 +193,33 @@ test('autotelic_run_python：能力关了就拒；探测不到 Python 也优雅�
 
 test('autotelic_propose_say（场景 11）：安静时段先攒着不 submit；平时交治理；unsupported/dropped 都优雅', async (t) => {
   // 安静时段：攒着，submit 不被调
+  // 坑：早先这里写死 awakeFrom:2/awakeTo:3 假定「此刻在安静时段」，CI 跑在 UTC 时
+  // 当地小时可能正好落在 2~3 点，用例就翻脸。改成按当前小时相对取值：
+  // 醒着窗口 = now+2 ~ now+3（跨天自动绕圈），那么安静窗口必然包含「现在」。
+  const h = new Date().getHours()
+  const awakeFrom = (h + 2) % 24
+  const awakeTo = (h + 3) % 24
   let submits = 0
-  const quiet = mkApi(t, { settings: { quietFrom: '00:00', quietTo: '23:59' }, submit: async () => { submits++; return { state: 'pending' } } })
+  const quiet = mkApi(t, { settings: { awakeFrom, awakeTo }, submit: async () => { submits++; return { state: 'pending' } } })
   const rq = await quiet.call('autotelic_propose_say', { text: '今天学会了裁切' })
   assert.equal(rq.ok, true)
   assert.match(rq.message, /攒着/)
   assert.equal(submits, 0, '安静时段绝不直发')
   assert.ok(existsSync(join(quiet.root, 'modules-data', 'autotelic', 'say-pending.json')), '攒的话落了盘（留痕）')
   // 平时：交治理
-  const normal = mkApi(t, { submit: async () => { submits++; return { deliveryId: 'd1', state: 'pending' } } })
+  // 同样的坑：默认醒着窗口 8~23 点，CI 在 UTC 下可能正好跑在安静时段 →
+  // 这三例显式设全天窗口（start===end 视为不启用安静时段），与运行时刻解耦。
+  const allDay = { awakeFrom: 0, awakeTo: 24 }
+  const normal = mkApi(t, { settings: allDay, submit: async () => { submits++; return { deliveryId: 'd1', state: 'pending' } } })
   const rn = await normal.call('autotelic_propose_say', { text: '想跟你说件事' })
   assert.equal(rn.ok, true)
   assert.match(rn.message, /出站治理/)
   // unsupported：主人还没开 broker 档 → 优雅提示，不炸
-  const unsup = mkApi(t, { submit: async () => ({ deliveryId: null, state: 'unsupported' }) })
+  const unsup = mkApi(t, { settings: allDay, submit: async () => ({ deliveryId: null, state: 'unsupported' }) })
   const ru = await unsup.call('autotelic_propose_say', { text: 'hi' })
   assert.match(ru.message, /broker/)
   // dropped：治理没放行 → 说清楚，不假装发了
-  const dropped = mkApi(t, { submit: async () => ({ deliveryId: null, state: 'dropped', reason: 'quiet' }) })
+  const dropped = mkApi(t, { settings: allDay, submit: async () => ({ deliveryId: null, state: 'dropped', reason: 'quiet' }) })
   const rd = await dropped.call('autotelic_propose_say', { text: 'hi' })
   assert.match(rd.message, /没放行/)
 })

@@ -1,12 +1,13 @@
-# purpose 模块对外接口（目的引擎 · 实验性，默认关）
+# purpose 模块对外接口（目的引擎 · 主动搭话已并入本模块，P1 起默认开）
 
-> 给面板/联调 agent 的接口说明。purpose 是**独立内置模块**（id **'purpose'**，默认关闭），
+> 给面板/联调 agent 的接口说明。purpose 是**独立内置模块**（id **'purpose'**），
 > 是从 surfcore 移植的「目的机制」主动搭话引擎：素材 → 目标假设（归属/置信度/风险）→ 选目的 →
 > 生成一句话 → 投递主人私聊。
 >
-> 与「主动搭话」（speakup）的关系：speakup 的默认实现**保持不变**；purpose 是可选的新引擎。
-> 想换引擎的主人：打开目的引擎开关，并关掉主动搭话的总开关（两套同时开会重复打扰）。
-> 安静时段沿用主动搭话的醒着窗口（awakeFrom/awakeTo），所以两套的作息是同一份。
+> 迁移状态（P1~P5 全部完成，方案 docs/SPEAKUP-INTO-PURPOSE-PLAN.md）：旧「主动搭话」模块
+> （speakup）已退场，主动搭话能力（时机/频率/追问/白名单朋友线/小闹钟）全部由本模块承担。
+> 老用户升级时由播种逻辑无感切换（醒着窗口/频率/白名单沿用原值）；显式关过的不覆盖。
+> 安静时段沿用醒着窗口（awakeFrom/awakeTo），作息真相仍是同一份。
 >
 > 文件布局：引擎（纯函数）`src/purpose/engine.js`（移植自 Mieksido/surfcore 的
 > `src/purpose-engine.js`，MIT，署名见 THIRD-PARTY-NOTICES.md）；接线 `src/purpose/module.js`
@@ -21,10 +22,10 @@
 | `tick()` | `async () => void` | 60s 心跳（`api.every(60_000)` 已在 setup 注册），闸门判定 + 到点跑一轮 |
 | `fire(reason)` | `async (reason?) => { outcome }` | 手动触发：跳过排程类闸门，不跳过总开关/禁言/ownerQQ。`outcome`: `sent / silent / failed / delivery-failed / skipped-materials / skipped-no-candidate / disabled / muted / no-owner` |
 | `run({force})` | 同 `fire` | 别名 |
-| `state()` | `() => { count, countToday, day, nextFireAt, lastOutcome, lastPurpose }` | **同步**，至少含 `count`（今日已投递次数） |
+| `state()` | `() => { count, countToday, day, nextFireAt, lastOutcome, lastPurpose, reminders }` | **同步**，至少含 `count`（今日已投递次数）；`reminders` 为当前挂着的小闹钟列表 |
 | `status()` | `() => summary` | `summarizePurposeState` 包装：今日次数/上次结果/下次时间/驱动向量/topNeeds/前 5 条目标假设/pending/history 摘要 |
 | `preview()` | `() => preview` | **零副作用**预览：真收素材、真拼提示词，不写状态、不生成、不投递。`{ stats, materials, drives, goals, candidates, selected, prompt }` |
-| `drivesRule()` | `() => string` | 驱动提示层（已 `api.rule` 注册进每轮系统提示词），面板不用调；引擎关着时返回空串 |
+| `drivesRule()` | `() => string` | 驱动提示层（经 `prompt` 钩子附在每轮消息末尾，不进系统提示词），面板不用调；引擎关着时返回空串 |
 
 ## 2. HTTP 路由（内置模块 prefix=''，即 `/aurabot/api/...`）
 
@@ -33,6 +34,7 @@
 | POST | `/aurabot/api/purpose/fire` | 无 | `{ ok, message }` |
 | GET/POST | `/aurabot/api/purpose/status` | 无 | `{ ok, status, state }` |
 | GET/POST | `/aurabot/api/purpose/preview` | 无 | `{ ok, preview }`（零副作用；`prompt` 含记忆素材，别打进公开日志） |
+| POST | `/aurabot/api/purpose/reminder/close` | `{ id }` | `{ ok, message }`（P2b：小闹钟迁入本模块） |
 
 面板另有 `/panel/purpose/*` 聚合代理（host.js）：`status / preview / run / config`，
 模块没跑时降级返回 `available:false`，不炸。
@@ -41,6 +43,11 @@
 
 - 路径：`api.dataDir('purpose', 'purpose-state.json')` → `~/.dsh/plugins-data/aurabot/purpose/purpose-state.json`
 - 结构照 surfcore 引擎（`createPurposeState`）：`version, day, countToday, lastRunAt, lastAttemptAt, lastSentAt, lastOutcome('sent'|'silent'|'failed'|'delivery-failed'|'interrupted'|'pending'), lastPurpose, lastText, nextFireAt, attempts, drives{9维0~1}, drivesAt, lastEmotion(+Text), lastGoalId, lastMaterialCount, lastCandidateCount, goals[], observations[], pending[], history[], lastSkip`
+- **心情向量已迁出（2026-11-17）**：`moods/moodsAt` 不再是引擎字段，跨轮心情归心情模块
+  （`persona-data/<人格>/mood.json` 的 `emotions/emotionsAt`）。遗留字段只为迁移：
+  第一次 `loadState` 读到非零旧向量时交给 `mood.importEmotions()`，随后清空并写 `moodsMigratedAt`，
+  之后不再读也不再写。`lastEmotion/lastEmotionText` 留在引擎里，语义是「上一轮主动搭话时的情绪」
+  （提示词强弱措辞、桌宠气泡辉光用它），不是跨轮心情。
 - 行为学习字段：`replyHours[24]`（主人私聊时刻直方图）与 `replyWeekday[7]`（星期分桶，
   两者共用 `replyHoursSeen` 记已计素材 id 防重复）——排程在间隔基础上向主人更常回话的小时轻推
   （最多 3h，样本 <5 不偏置）、向更常回话的日子轻推（≤7 天，样本 <7 不偏置）；
@@ -60,14 +67,20 @@
   中文需要词/英文 need 键直接叠加进九维驱动（每项 ±0.5 封顶，叠加在满足衰减之后）；
   「喜」折算成 moodDelta（±10）由接线层 `mood.nudge` 执行，叠加在情绪表之上；
   「欲/意」按本次目的的【需求】维度结算，写不出维度就丢弃，不瞎猜。
-- **mood 对接**：`sent` 后按情绪 nudge `api.use('mood').nudge(delta, '主动搭话：<目的前20字>')`——
+- **mood 对接（2026-11-17 改口径：只上报，不持有）**：`sent` 后接线层 `reportMood()` 做两件事——
+  ① 情绪向量：`api.use('mood').feel(<emotion>)`，把这一轮的情绪交给心情模块记账（衰减/抬升都在那边）；
+  ② 心情标量：`api.use('mood').nudge(delta, '主动搭话：<目的前20字>')`——
   `affectionate/excited +5、proud/amused +4、lonely -3、bored/worried/envious -2、content 0`；silent 不推。
+  心情模块关着时 `feel/nudge` 自己静默（与旧行为一致）。情绪键一律先经 `resolveEmotion()`
+  映射到用户配的心情项：用户在面板删掉的项不会产出，而是落到 valence/arousal 最接近的那一项。
 - **心情判定兼容**：投递走 `hub.runSystemTurn` + `hub.deliver(text, { own:true, userText:'【系统提醒，…】' })`，
   userText 带前缀所以 mood.judge 的 `origin='speak-up'` 判定照常生效。
-- top2 驱动（≥0.35）经 `api.rule` 写进每轮上下文：「你最近心里比较想要：玩、陪」。
+- top2 驱动（≥0.35）附在每轮消息末尾（和心情一样，不进系统提示词，免得驱动一变整段前缀缓存失效）：「你最近心里比较想要：玩、陪」。
 - **情绪画像**：每个情绪标签带 `valence`（-1~1）与 `arousal`（0~1）二维数值
-  （`emotionProfile()`），候选与面板摘要都会带；提示词的强弱措辞（强烈地/明显/隐约）跟 arousal 走，
-  桌宠端表情/语气强度可以直接吃这两个数。
+  （`emotionProfile(emotion, emotions)`），候选与面板摘要都会带；提示词的强弱措辞（强烈地/明显/隐约）跟 arousal 走，
+  桌宠端表情/语气强度可以直接吃这两个数。情绪字典不再写死在引擎里，而是读 `config.mood.emotions`
+  （心情页「心情项」可配，见 `src/features/mood-emotions.js`）；引擎里的 `EMOTION_LABELS/EMOTION_PROFILES`
+  只是出厂十项的快照，新代码一律传 emotions 参数。
 - **人格覆写**（`analyzePersona` 的 `overrides` + `applyPersonaOverrides`）：人格卡里写了
   「胆小/谨慎」→ riskScale ×1.25，「大胆/爱折腾」→ ×0.8；「话痨/话多」→ dailyMax +1
   （「高冷/少打扰」→ -1；dailyMax=0 不限时不动）；「黏人/怕孤独」→ connect 驱动地板 +0.1。
@@ -75,7 +88,8 @@
 
 ## 5. 配置
 
-**开关**：`config.ext.purpose.enabled`（模块 defaults 播种，**默认 false**）。
+**开关**：`config.ext.purpose.enabled`（**P1/Q1 拍板默认开**：键缺省=开、显式 false 尊重不被洗回；
+老用户由首启播种写入显式 true + `seededFromSpeakup` 标记）。
 **调参**：`config.ext.purpose.*`：`minMaterials / initialDelayMinutes / maxCandidates / promptMaxChars`，
 另有覆写位 `awakeFrom/awakeTo/minIntervalMinutes/maxIntervalMinutes/maxPerDay/idleMinutes`。
 选择层与驱动调参（本轮新增，均有安全钳制）：`pendingShareProbability`（惦记优先概率，默认 0.5）、
@@ -91,9 +105,13 @@
 回写 `needAffinity` 与 `cues`（情绪画像）；不配/出错/解析不出 = 关键词法，零额外成本。
 preview 变为 async（打分是 I/O）；`/panel/purpose/status` 附 `models` 下拉选项，
 `/panel/purpose/config` 收 `scoringModel`。
-**沿用主动搭话的设置**（保持作息单一真相）：`config.speakUp.awakeFrom/awakeTo`（派生引擎安静时段；全天=关闭安静）、
-`idleMinutes`（→ idleThreshold）、`minIntervalMinutes/maxIntervalMinutes`（→ gap）、`maxPerDay`（→ dailyMax）——
-ext.purpose 同名键可覆写。
+**沿用主动搭话的设置（Q3/Q4 拍板：键冻结在 `speakUp.*` 命名空间，语义归属 purpose 维护）**：
+`config.speakUp.awakeFrom/awakeTo`（派生引擎安静时段；全天=关闭安静；**此键由目的引擎维护，
+全插件自动任务共用作息真相，speakup 模块退场后键名保留**）、
+`idleMinutes`（→ idleThreshold）、`minIntervalMinutes/maxIntervalMinutes`（→ gap）、`maxPerDay`（→ dailyMax）、
+`allow`（白名单朋友线，memory.js 相识判定与 QQ 内 `/speak` 命令同读此键）——
+ext.purpose 同名键可覆写。追问键已翻到 `ext.purpose.nudge`（读保持 `ext.purpose.nudge ?? speakUp.nudge ?? true` 双层兼容）；
+小闹钟键 `speakUp.reminderEnabled/reminderLimit/reminderRetry` 由 purpose 维护（P2b 迁入）。
 
 ## 6. 其它接线事实
 
@@ -107,4 +125,5 @@ ext.purpose 同名键可覆写。
 - 归属/回执/pending 语义与 surfcore 一致（群友目标重复≥3 或被点名才升 self；主人回复正/负/中性 → confirmed/rejected/微调；备忘【状态】待续/完成驱动 pending）。
 - 投递载体：`ext.purpose.carrier`（默认 `qq`）。`carrier=pet` 时经桌宠模块（pet）推桌面气泡，
   桌宠离线按 `petFallbackToQQ` 回落 QQ 或静默；互斥铁律一轮只发一处，详见 docs/PET_MODULE_API.md（在社区库 modules/pet/ 里） §4。
-- 旧 `createSpeakUp` 仍在 `src/features/companion.js`，是「主动搭话」的现行实现（mood 模块 files 与旧测试依赖，勿删）。
+- 旧 `createSpeakUp` 与 companion.js 已随 speakup 模块退场删除（P5）；mood 实现在
+  `src/features/mood.js`（自 companion.js 拆出）。

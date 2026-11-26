@@ -2,6 +2,7 @@
 // 评论在专用的后台会话里按她的人格写；试运行时只记日志不发。
 
 import { dataDir, readJson, writeJson } from '../core/store.js'
+import { inHourWindow } from '../core/time-window.js'
 import { isSilence, stripMarkdown, cleanOutboundText } from '../chat/reply.js'
 
 const dayKey = (d = new Date()) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
@@ -200,8 +201,7 @@ export function createQzoneSocial({ getConfig, onebot, hub, log, memory, identit
     const cfg = getConfig()
     const c = cfg.qzoneSocial
     if (!cfg.enabled || !c.enabled) return
-    const h = new Date().getHours()
-    if (h < cfg.speakUp.awakeFrom || h >= cfg.speakUp.awakeTo) return
+    if (!inHourWindow(Date.now(), cfg.speakUp.awakeFrom, cfg.speakUp.awakeTo)) return
     if (Date.now() - load().lastRun < c.intervalMin * 60_000) return
     await run()
   }

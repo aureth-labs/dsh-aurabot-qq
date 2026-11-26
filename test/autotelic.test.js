@@ -258,7 +258,8 @@ test('模块壳：默认全关、状态路由返回审计链校验，enabled=fal
   }
   const exported = module.setup(api)
   assert.equal(typeof exported.auditDir, 'function')
-  assert.equal(typeof exported.runtime.tick, 'function', 'P1：模块导出运行时')
+  assert.equal(typeof exported.schedule.tick, 'function', 'v5：模块导出排程器（双轨触发）')
+  assert.equal(typeof exported.runRound, 'function', 'v5：模块导出一轮回味（决策环入口）')
   assert.equal(api.dataDir('audit').includes(join('modules-data', 'autotelic', 'audit')), true, '审计目录在 modules-data/autotelic/audit，不多一层')
   const status = await routes['/autotelic/status']()
   assert.equal(status.ok, true)
@@ -266,10 +267,9 @@ test('模块壳：默认全关、状态路由返回审计链校验，enabled=fal
   assert.equal(status.audit.wired, false, 'host 没接线时如实报告「未开启」')
   assert.equal(status.audit.today, 0)
   assert.equal(status.audit.chain.ok, true, '空目录 = 完好的空链')
-  assert.deepEqual(status.heartbeats, [])
-  assert.equal(status.summary.total, 0)
   assert.deepEqual(status.tasks, [], '默认关时账本是空的')
-  assert.deepEqual(Object.keys(routes).sort(), ['/autotelic/day', '/autotelic/env', '/autotelic/journal', '/autotelic/preview', '/autotelic/proposals', '/autotelic/run', '/autotelic/skills', '/autotelic/status', '/autotelic/step', '/autotelic/takeover', '/autotelic/takeover-status', '/autotelic/tune'].sort(), 'P0~P4 + 接管：状态/预览/手动跑/推进一步/调参/复盘/技能/提案/环境/某天记录/接管与还原/接管状态')
+  assert.equal(status.takenOver !== undefined, true, 'v5：接管原值备份在状态里透明')
+  assert.deepEqual(Object.keys(routes).sort(), ['/autotelic/confirm', '/autotelic/day', '/autotelic/decisions', '/autotelic/env', '/autotelic/feedback', '/autotelic/journal', '/autotelic/plan', '/autotelic/preview', '/autotelic/proposals', '/autotelic/run', '/autotelic/skills', '/autotelic/status', '/autotelic/step', '/autotelic/takeover', '/autotelic/takeover-status', '/autotelic/tune'].sort(), 'v5：状态/手动回味(plan、run 别名)/单步退役提示/确认闸/反馈回路/决策审计/复盘刊物/技能/提案/环境/某天记录/接管与还原/接管状态/调参')
 })
 
 test('模块壳：host 接线后状态路由显示「审计已开启」与当日条数', async (t) => {
@@ -298,15 +298,20 @@ test('模块壳：host 接线后状态路由显示「审计已开启」与当日
 
 test('声明式配置：settings 覆盖所有用户可见键，内部键不进面板', () => {
   const keys = module.settings.map((s) => s.key)
-  // 内部状态键（takenOver = 接管原值备份）：不进 settings 数组，面板不展示表单，只在状态里只读显示
-  const INTERNAL = ['takenOver']
+  // 内部状态键：不进 settings 数组，面板不展示表单，只在状态里只读展示
+  // （takenOver = 接管原值备份；presetIdOverride = hub 的 presetId 覆盖总闸，hub.js 直读）
+  const INTERNAL = ['takenOver', 'presetIdOverride']
   const visible = Object.keys(module.defaults).filter((k) => !INTERNAL.includes(k)).sort()
   assert.deepEqual(keys.sort(), visible, 'settings 数组与 defaults 对齐（内部键除外；面板按数组生成）')
   for (const k of INTERNAL) assert.equal(keys.includes(k), false, `内部键 ${k} 不该出现在面板表单里`)
   assert.equal(module.defaults.enabled, false, '总开关默认关')
   assert.equal(module.defaults.presetIdOverride, false, 'presetId 覆盖开关默认关（§9）')
   assert.equal(module.defaults.takeover, false, '接管默认关（主人手动点才生效，TAKEOVER §3）')
-  for (const forbidden of ['l2PerDay', 'budgetTokensPerDay']) {
-    assert.equal(keys.includes(forbidden), false, `${forbidden} 首期不存在（§2.2 / §4.8）`)
+  assert.equal(module.defaults.constraintRules, '', '强制约束规则默认空（主人没写约束=她只有代码层硬禁区）')
+  assert.equal(module.defaults.autoConfirmOwner, false, 'touch-owner 默认全要确认（§3.5）')
+  // v3 退役键不许回魂（D1：打分器整层删除）
+  for (const retired of ['minCuriosity', 'maxCandidates', 'allowFreeTasks', 'evalModel', 'allowAct']) {
+    assert.equal(keys.includes(retired), false, `${retired} 已随 v3 决策管线退役`)
+    assert.equal(retired in module.defaults, false, `${retired} 不再有默认值`)
   }
 })

@@ -22,7 +22,11 @@
   "chatId": "private:10001",
   "files": 0,
   "forwards": [
-  "fake-forward-001"
+  {
+  "content": null,
+  "id": "fake-forward-001",
+  "outerId": "901"
+}
 ],
   "groupId": "",
   "images": 0,

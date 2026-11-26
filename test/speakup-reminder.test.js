@@ -5,13 +5,13 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-let createSpeakUp
+let createPurpose
 let normalize
 const OWNER = '10000001'
 
 before(async () => {
   process.env.AURABOT_DATA_DIR = mkdtempSync(join(tmpdir(), 'aurabot-reminder-'))
-  ;({ createSpeakUp } = await import('../src/features/companion.js'))
+  ;({ createPurpose } = await import('../src/purpose/module.js'))
   ;({ normalize } = await import('../src/core/config.js'))
 })
 
@@ -22,10 +22,11 @@ function textOf(at) {
 }
 
 function setup({ remind = {}, onTurnEnd = () => ({ ok: true }), pushed = [] } = {}) {
-  try { writeFileSync(join(process.env.AURABOT_DATA_DIR, 'speakup-reminders.json'), '[]') } catch {}
+  process.env.AURABOT_DATA_DIR = mkdtempSync(join(tmpdir(), 'aurabot-reminder-'))
   const cfg = normalize({
     enabled: true,
     ownerQQ: OWNER,
+    ext: { purpose: { enabled: true } },
     speakUp: {
       awakeFrom: 0,
       awakeTo: 24,
@@ -45,7 +46,7 @@ function setup({ remind = {}, onTurnEnd = () => ({ ok: true }), pushed = [] } = 
     },
   }
   const identity = { owner: () => OWNER, accountOn: () => OWNER }
-  const s = createSpeakUp({ getConfig: () => cfg, hub, log: { info() {}, warn() {} }, identity, routeOwner: () => `private:${OWNER}` })
+  const s = createPurpose({ getConfig: () => cfg, hub, log: { info() {}, warn() {} }, identity, routeOwner: () => `private:${OWNER}` })
   return { s, cfg, pushed, hub }
 }
 
@@ -53,8 +54,8 @@ function makeDue(s, note = '问主人晚饭吃了没') {
   const at = Date.now() + 3600_000
   const r = s.addReminder(textOf(at), note)
   assert.equal(r.ok, true)
-  assert.equal(r.message, `记下了，我会在 ${textOf(at)} 提醒你`)
-  const file = join(process.env.AURABOT_DATA_DIR, 'speakup-reminders.json')
+  assert.equal(r.message, `已记下，${textOf(at)} 叫醒你`)
+  const file = join(process.env.AURABOT_DATA_DIR, 'purpose', 'reminders.json')
   const list = JSON.parse(readFileSync(file, 'utf8'))
   const item = list.find((x) => x.id === r.id)
   item.at = Date.now() - 1000
@@ -112,7 +113,7 @@ test('触发失败保留 15 分钟；重试开关关闭时直接丢弃', async (
   assert.ok(left[0].nextAt > Date.now())
 
   cfg.speakUp.reminderRetry = false
-  const file = join(process.env.AURABOT_DATA_DIR, 'speakup-reminders.json')
+  const file = join(process.env.AURABOT_DATA_DIR, 'purpose', 'reminders.json')
   const list = JSON.parse(readFileSync(file, 'utf8'))
   list[0].nextAt = Date.now() - 1
   writeFileSync(file, JSON.stringify(list))

@@ -1,3 +1,5 @@
 node_modules/
 *.log
 *.tmp-*
+# 本地测试流水账：AGENTS.md 约定的工作区文件，含本机号码/路径等信息，不进仓库
+TESTLOG.md

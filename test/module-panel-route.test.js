@@ -25,6 +25,7 @@ test('模块声明 panel 路由复用完整管理闸，普通客户端路由保�
     rmSync(dir, { recursive: true, force: true })
   })
   const app = (await import('../src/host.js')).apply(fake.ctx); await app.ready
+  assert.equal((await fake.call('/modules/community/update-all')).status, 405)
   const path = '/ext/route-probe/manage'
   assert.equal((await fake.call(path)).status, 200)
   assert.equal((await fake.call(path, undefined, {}, '127.0.0.1')).json().managed, true)

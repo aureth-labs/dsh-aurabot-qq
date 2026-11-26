@@ -7,7 +7,6 @@ import { normalize } from '../src/core/config.js'
 import { createMemoryStore } from '../src/features/memory.js'
 import { createHub } from '../src/chat/hub.js'
 import { createFakeDsh } from './helpers/fake-dsh.js'
-import { createSpeakUp } from '../src/features/companion.js'
 import { createPurpose } from '../src/purpose/module.js'
 import { existsSync } from 'node:fs'
 import { makeTestIdentity } from './helpers/identity.js'
@@ -124,14 +123,4 @@ test('目的引擎跳过讨厌的人', async (t) => {
   await p.tick()
   assert.equal(existsSync(join(dir, 'purpose', 'friends', `${a}.json`)), false)
 })
-
-test('主动搭话跳过讨厌的人', async (t) => {
-  const { cfg, identity } = fixture(t)
-  cfg.enabled = true
-  Object.assign(cfg.speakUp, { enabled: true, allow: [a], minIntervalMinutes: 0, maxIntervalMinutes: 0, idleMinutes: 0, maxPerDay: 1, awakeFrom: 0, awakeTo: 24 })
-  const sent = []
-  const hub = { lastOwnerChatAt: Date.now(), lastBotToOwner: { at: 0, text: '' }, lastPrivateAt: () => 0, pushToSession: async (chat) => sent.push(chat) }
-  const speak = createSpeakUp({ getConfig: () => cfg, hub, log, identity, routeOwner: identity.routeOwner, memory: () => ({ dislikes: (qq) => qq === a }) })
-  await speak.tick()
-  assert.ok(!sent.some((chat) => String(chat.userId) === a), `不该找讨厌的人：${sent.map((c) => c.chatId)}`)
-})
+// P5：原「主动搭话跳过讨厌的人」用例随 companion 删除——讨厌者守卫已由目的引擎承担（上一用例）。

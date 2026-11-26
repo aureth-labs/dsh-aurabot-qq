@@ -607,9 +607,11 @@ test('P4-3: 宿主启动平滑升级、无 ownerQQ 纯非 QQ 认主向导完成�
 test('P4-4: 前端 client.js 对纯非 QQ 主人的 GlobalAccess 展示、向导与状态栏支持', async () => {
   const source = readFileSync(new URL('../client/client.js', import.meta.url), 'utf8')
   const marker = '    exports.apply = apply'
-  assert.ok(source.includes(marker))
+  // 状态栏场景从已完成 bootstrap 的一帧开始。夹具不运行 useEffect。
+  const readyMarker = 'const [ready, setReady] = useState(false)'
+  assert.ok(source.includes(marker) && source.includes(readyMarker))
 
-  const instrumented = source.replace(
+  const instrumented = source.replace(readyMarker, 'const [ready, setReady] = useState(true)').replace(
     marker,
     '    exports.p4Test = { GlobalAccess, AurabotPage, Overview }\n' + marker,
   )
@@ -736,7 +738,7 @@ test('P4-4: 前端 client.js 对纯非 QQ 主人的 GlobalAccess 展示、向导
     modules: [],
   }
   hook = 0
-  state = [offlineSt, '', JSON.parse(JSON.stringify(nonQqCfg)), 'overview', null, false]
+  state = [offlineSt, '', JSON.parse(JSON.stringify(nonQqCfg)), 'overview']
   const offlinePageText = textOf(vmExport.p4Test.AurabotPage())
   assert.doesNotMatch(offlinePageText, /在线（多平台）/, '纯非 QQ 平台未连接时不得误报在线')
   assert.match(offlinePageText, /没连上/)
@@ -751,7 +753,7 @@ test('P4-4: 前端 client.js 对纯非 QQ 主人的 GlobalAccess 展示、向导
     platforms: [{ instance: 'feishu', platform: 'feishu', name: 'feishu', enabled: true, legacy: false, state: 'connected' }],
   }
   hook = 0
-  state = [onlineSt, '', JSON.parse(JSON.stringify(nonQqCfg)), 'overview', null, false]
+  state = [onlineSt, '', JSON.parse(JSON.stringify(nonQqCfg)), 'overview']
   const pageTree = vmExport.p4Test.AurabotPage()
   const pageText = textOf(pageTree)
   assert.doesNotMatch(pageText, /QQ 没连上/, '纯非 QQ 启用且已连接时状态栏不得误报「QQ 没连上」')
@@ -772,7 +774,7 @@ test('P4-4: 前端 client.js 对纯非 QQ 主人的 GlobalAccess 展示、向导
     snowluma: { installed: true, running: true },
   }
   hook = 0
-  state = [qqGwSt, '', JSON.parse(JSON.stringify(qqGwCfg)), 'overview', null, false]
+  state = [qqGwSt, '', JSON.parse(JSON.stringify(qqGwCfg)), 'overview']
   const qqGwText = textOf(vmExport.p4Test.AurabotPage())
   assert.match(qqGwText, /在线/, '网关 qq 已连接时顶部应在线')
   assert.doesNotMatch(qqGwText, /QQ 没连上/, '网关 qq 已连接时不得误报 QQ 没连上')
@@ -781,7 +783,7 @@ test('P4-4: 前端 client.js 对纯非 QQ 主人的 GlobalAccess 展示、向导
   qqGwCfg.platforms.qq.backend = 'onebot'
   qqGwSt.config = qqGwCfg
   hook = 0
-  state = [qqGwSt, '', JSON.parse(JSON.stringify(qqGwCfg)), 'overview', null, false]
+  state = [qqGwSt, '', JSON.parse(JSON.stringify(qqGwCfg)), 'overview']
   const qqOnebotText = textOf(vmExport.p4Test.AurabotPage())
   assert.match(qqOnebotText, /OneBot 已连接/, 'OneBot 后端应显示 OneBot 状态')
   assert.doesNotMatch(qqOnebotText, /SnowLuma/, 'OneBot 后端不应显示 SnowLuma 标签')

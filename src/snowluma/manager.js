@@ -187,6 +187,14 @@ export async function gatewayHealthy(endpoint, { fetchImpl = fetch, timeoutMs = 
   }
 }
 
+/**
+ * 启动前的单实例守卫（纯函数）：端口被占用、等待后仍未释放、且网关不健康 → 拒绝启动。
+ * 这种情况下继续 spawn 很可能拉起第二套 SnowLuma，两套同时写同一个 messages.db 会写坏数据库。
+ */
+export function shouldRefuseStart({ portOpen = false, portFree = true, gatewayHealthy = false } = {}) {
+  return Boolean(portOpen && !portFree && !gatewayHealthy)
+}
+
 /** 等端口释放（上一个 SnowLuma 还在退出）。返回 true = 已释放。 */
 export async function waitPortFree(hostPort, { timeoutMs = 20000, intervalMs = 500, isOpen = portOpen } = {}) {
   const until = Date.now() + timeoutMs
@@ -310,30 +318,41 @@ export function createSnowLumaManager({ getConfig, log, savePassword }) {
     }
   }
 
-  async function start() {
+  async function start({ probe = {} } = {}) {
+    // probe 只给测试注入：生产调用 start() 用真实的端口/网关探针
+    const probeRunning = probe.running || running
+    const probePortOpen = probe.portOpen || portOpen
+    const probeWaitPortFree = probe.waitPortFree || waitPortFree
+    const probeGatewayHealthy = probe.gatewayHealthy || gatewayHealthy
+    const spawnChild = probe.spawn || spawn
     const inst = detectInstall(cfg().dir)
     if (!inst.installed) return { ok: false, message: inst.reason }
-    if (await running()) return { ok: true, message: 'SnowLuma 已经在运行' }
+    if (await probeRunning()) return { ok: true, message: 'SnowLuma 已经在运行' }
     // 上一轮 DSH 退出时 SnowLuma 可能还没退干净：先看网关/端口，别在端口没释放时硬启
     // （硬启会 bind 失败，变成"WebUI 起来了但 OneBot 没监听"，之后所有消息都发不出去）
     // ⚠ botQQ 在配置顶层（snowluma 段里没有），这里要和 endpoint() 用同一个来源
     const ep = readOneBotEndpoint(cfg().dir, getConfig().botQQ)
-    if (await gatewayHealthy(ep)) {
+    if (await probeGatewayHealthy(ep)) {
       log.info('检测到还活着的 SnowLuma 网关，直接复用（不再启动第二个实例）')
       return { ok: true, message: 'SnowLuma 已经在跑（直接复用）' }
     }
     const hp = endpointHostPort(ep.httpUrl)
     if (!hp) {
       log.debug('启动前探测：读不到 OneBot 地址，直接启动')
-    } else if (await portOpen(hp)) {
+    } else if (await probePortOpen(hp)) {
       log.info(`OneBot 端口 ${hp.port} 还被占用（上一个 SnowLuma 还没退干净），等它释放…`)
-      const freed = await waitPortFree(hp, { timeoutMs: 20000 })
-      if (await gatewayHealthy(ep)) {
+      const freed = await probeWaitPortFree(hp, { timeoutMs: 20000 })
+      if (await probeGatewayHealthy(ep)) {
         log.info('端口释放后网关已经有响应，直接复用')
         return { ok: true, message: 'SnowLuma 已经在跑（直接复用）' }
       }
+      if (shouldRefuseStart({ portOpen: true, portFree: freed, gatewayHealthy: false })) {
+        const message = `OneBot 端口 ${hp.port} 被其他程序占用，可能已有另一套 SnowLuma 在运行；为避免双开写坏 messages.db，本次不启动。请先关闭另一个 SnowLuma 或改端口`
+        log.warn(message)
+        return { ok: false, message }
+      }
       if (freed) log.info(`OneBot 端口 ${hp.port} 已释放，开始启动`)
-      else log.warn(`OneBot 端口 ${hp.port} 等了 20 秒还被占用（可能是别的程序），仍然尝试启动`)
+      else log.warn(`OneBot 端口 ${hp.port} 等待结束（可能是别的程序），仍尝试启动`)
     } else {
       log.debug(`启动前探测：${hp.port} 端口空闲、网关没响应，正常启动`)
     }
@@ -359,7 +378,7 @@ export function createSnowLumaManager({ getConfig, log, savePassword }) {
     // 控制台端口：用 env 覆盖，SnowLuma 会按它起 WebUI（不改它的 runtime.json）
     env.SNOWLUMA_WEBUI_PORT = String(port())
     try {
-      child = spawn(exe, ['./index.mjs'], { cwd: inst.dir, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], detached: false })
+      child = spawnChild(exe, ['./index.mjs'], { cwd: inst.dir, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], detached: false })
     } catch (error) {
       return { ok: false, message: `启动失败：${error.message}` }
     }
@@ -393,7 +412,7 @@ export function createSnowLumaManager({ getConfig, log, savePassword }) {
     log.info(`已在后台启动 SnowLuma（pid ${childPid}，不弹窗口）`)
     for (let i = 0; i < 30; i++) {
       await new Promise((r) => setTimeout(r, 1000))
-      if (await running()) return { ok: true, message: '已启动' }
+      if (await probeRunning()) return { ok: true, message: '已启动' }
       if (!child) return { ok: false, message: 'SnowLuma 启动后马上退出了（看日志里的 SnowLuma 段）' }
     }
     return { ok: false, message: '等了 30 秒控制台还没起来' }

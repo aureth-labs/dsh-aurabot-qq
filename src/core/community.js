@@ -8,8 +8,8 @@
 //
 // 从内置搬到社区库的模块（MOVED），老用户升级时自动装回来，只装一次，卸载后不会再装。
 
-import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve, sep } from 'node:path'
 import { inflateRawSync, crc32 } from 'node:zlib'
 import { dataDir } from './store.js'
@@ -167,16 +167,23 @@ export function createCommunity({ mods, getConfig, setConfig, log, version, aliv
     return ''
   }
 
-  /** 把 Releases 列表按模块聚合成 { 模块 id: 下载次数 }。tag 形如 pet-v1.0.7。 */
+  /**
+   * 把 Releases 列表按模块聚合：下载次数 + 最近一次 Release 的发布时间（published_at，退 created_at）。
+   * tag 形如 pet-v1.0.7；日期只是排序用的参考值，索引里已有 publishedAt 时以索引为准。
+   */
   function sumReleases(releases) {
-    const out = {}
+    const counts = {}
+    const released = {}
     for (const rel of Array.isArray(releases) ? releases : []) {
       const m = String(rel?.tag_name || '').match(/^([a-z][a-z0-9-]{1,39})-v\d+\.\d+\.\d+$/)
       if (!m) continue
+      const id = m[1]
       const n = (Array.isArray(rel.assets) ? rel.assets : []).reduce((sum, a) => sum + (Number(a?.download_count) || 0), 0)
-      out[m[1]] = (out[m[1]] || 0) + n
+      counts[id] = (counts[id] || 0) + n
+      const at = String(rel?.published_at || rel?.created_at || '')
+      if (at && (!released[id] || at > released[id])) released[id] = at
     }
-    return out
+    return { counts, released }
   }
 
   /**
@@ -185,8 +192,8 @@ export function createCommunity({ mods, getConfig, setConfig, log, version, aliv
    */
   function statsWithin(index, { force = false } = {}) {
     return new Promise((done) => {
-      const timer = setTimeout(() => done({ counts: {}, source: '', at: 0, failed: true }), 6000)
-      loadStats(index, { force }).then((value) => { clearTimeout(timer); done(value) }, () => { clearTimeout(timer); done({ counts: {}, source: '', at: 0, failed: true }) })
+      const timer = setTimeout(() => done({ counts: {}, released: {}, source: '', at: 0, failed: true }), 6000)
+      loadStats(index, { force }).then((value) => { clearTimeout(timer); done(value) }, () => { clearTimeout(timer); done({ counts: {}, released: {}, source: '', at: 0, failed: true }) })
     })
   }
 
@@ -196,11 +203,12 @@ export function createCommunity({ mods, getConfig, setConfig, log, version, aliv
    */
   async function loadStats(index, { force = false } = {}) {
     const repo = repoOf(index)
-    if (!repo) return { counts: {}, source: '', at: 0 }
+    if (!repo) return { counts: {}, released: {}, source: '', at: 0 }
     if (!force && statsCache && statsCache.repo === repo && Date.now() - statsCache.at < STATS_TTL) return statsCache.value
-    if (!force && statsMiss && statsMiss.repo === repo && Date.now() - statsMiss.at < STATS_FAIL_TTL) return { counts: {}, source: repo, at: 0, failed: true }
+    if (!force && statsMiss && statsMiss.repo === repo && Date.now() - statsMiss.at < STATS_FAIL_TTL) return { counts: {}, released: {}, source: repo, at: 0, failed: true }
     try {
       const counts = {}
+      const released = {}
       // 有令牌就用上：没登录时 GitHub 接口一小时只给 60 次，用户多的机器会不够
       const token = String(process.env.AURABOT_GITHUB_TOKEN || process.env.GITHUB_TOKEN || '').trim()
       for (let page = 1; page <= RELEASES_PAGES; page++) {
@@ -211,17 +219,19 @@ export function createCommunity({ mods, getConfig, setConfig, log, version, aliv
         // 403 是没登录的额度用完了：别再翻页，已有的照用
         if (!r.ok) throw new Error(`HTTP ${r.status}`)
         const list = await r.json()
-        for (const [id, n] of Object.entries(sumReleases(list))) counts[id] = (counts[id] || 0) + n
+        const pageSum = sumReleases(list)
+        for (const [id, n] of Object.entries(pageSum.counts)) counts[id] = (counts[id] || 0) + n
+        for (const [id, at] of Object.entries(pageSum.released)) if (!released[id] || at > released[id]) released[id] = at
         if (!Array.isArray(list) || list.length < 100) break
       }
-      const value = { counts, source: repo, at: Date.now() }
+      const value = { counts, released, source: repo, at: Date.now() }
       statsCache = { at: value.at, repo, value }
       statsMiss = null
       return value
     } catch (error) {
       statsMiss = { at: Date.now(), repo }
       log.debug?.('读不到模块下载量：', error?.message || error)
-      return { counts: {}, source: repo, at: 0, failed: true }
+      return { counts: {}, released: {}, source: repo, at: 0, failed: true }
     }
   }
 
@@ -261,10 +271,14 @@ export function createCommunity({ mods, getConfig, setConfig, log, version, aliv
     return missing.length ? `要先装：${missing.join('、')}` : ''
   }
 
-  function view(index, e, counts = {}) {
+  function view(index, e, counts = {}, released = {}) {
     const src = readSource(e.id)
     return {
       ...e,
+      // 市场排序用的时间：新索引给 publishedAt；兼容 snake_case 的索引；都没有时退 GitHub Release 时间。
+      publishedAt: e.publishedAt || e.published_at || '',
+      updatedAt: e.updatedAt || e.updated_at || '',
+      releasedAt: released[e.id] || '',
       installed: src?.version || '',
       foreign: !src && hasFolder(e.id), // 同名文件夹是用户自己写的
       update: Boolean(src && compareVersions(e.version, src.version) > 0),
@@ -281,10 +295,11 @@ export function createCommunity({ mods, getConfig, setConfig, log, version, aliv
     const index = await loadIndex({ force })
     const stats = await statsWithin(index, { force })
     const counts = stats.counts || {}
-    const entries = (index.modules || []).filter((e) => ID_RE.test(String(e.id))).map((e) => view(index, e, counts))
+    const released = stats.released || {}
+    const entries = (index.modules || []).filter((e) => ID_RE.test(String(e.id))).map((e) => view(index, e, counts, released))
     // 已安装但索引里没有了（下架）的也列出来，好让用户卸载
     const known = new Set(entries.map((e) => e.id))
-    const delisted = mods.status().filter((m) => !known.has(m.id) && readSource(m.id)).map((m) => ({ id: m.id, name: m.name, description: m.description, version: readSource(m.id).version, installed: readSource(m.id).version, delisted: true, capabilities: [], platforms: [], platformNote: '', blocked: '', downloads: Number(counts[m.id]) || 0 }))
+    const delisted = mods.status().filter((m) => !known.has(m.id) && readSource(m.id)).map((m) => ({ id: m.id, name: m.name, description: m.description, version: readSource(m.id).version, installed: readSource(m.id).version, delisted: true, capabilities: [], platforms: [], platformNote: '', blocked: '', downloads: Number(counts[m.id]) || 0, publishedAt: '', updatedAt: '', releasedAt: released[m.id] || '' }))
     const revoked = entries.concat(delisted).filter((e) => e.installed && revokedReason(index, e.id, e.installed)).map((e) => ({ id: e.id, version: e.installed, reason: revokedReason(index, e.id, e.installed) }))
     return { list: [...entries, ...delisted], revoked, generatedAt: index.generatedAt || '', downloads: { source: stats.source || '', at: stats.at || 0, failed: Boolean(stats.failed) } }
   }
@@ -293,7 +308,8 @@ export function createCommunity({ mods, getConfig, setConfig, log, version, aliv
     const url = String(index.assetsBase || '') + e.path
     if (!/^https:\/\//.test(url)) throw new Error('下载地址不对')
     const buf = await withRetry(async () => {
-      progress = { id: e.id, name: e.name, stage: 'download', received: 0, total: 0 }
+      // 「一键更新」时外层会先写 batch 进度，这里只改本条目的字段，别把 batch 抹掉
+      progress = { ...(progress || {}), id: e.id, name: e.name, stage: 'download', received: 0, total: 0 }
       const r = await fetcher(url, { signal: AbortSignal.timeout(120_000), redirect: 'follow' })
       if (!r.ok) throw new Error(`下载失败（HTTP ${r.status}）`)
       progress.total = Number(r.headers?.get?.('content-length')) || 0
@@ -343,11 +359,16 @@ export function createCommunity({ mods, getConfig, setConfig, log, version, aliv
     return busy
   }
 
-  /** 安装或更新。同名但不是社区装的文件夹不碰；替换内置模块要明确 confirmReplace。 */
-  const install = (id, { confirmReplace = false } = {}) => exclusive(async () => {
+  /**
+   * 安装或更新的主体（**不含并发锁**）。
+   * 「一键更新」要在同一个 exclusive 里连着跑多个，自己再包一层 exclusive 会锁死自己，
+   * 所以锁留在外层 install()，批量复用它。
+   * 同名但不是社区装的文件夹不碰；替换内置模块要明确 confirmReplace。
+   */
+  async function installNow(id, { confirmReplace = false } = {}) {
     // id 会拼进目录路径（modules/.<id>.installing → modules/<id>）：先白名单，防被篡改的索引/调用方越目录写
     if (typeof id !== 'string' || !ID_RE.test(id)) return { ok: false, message: 'id 不对' }
-    progress = { id, name: id, stage: 'index', received: 0, total: 0 }
+    progress = { ...(progress || {}), id, name: id, stage: 'index', received: 0, total: 0 }
     const index = await loadIndex({ force: true })
     const e = (index.modules || []).find((x) => x.id === id)
     if (!e || e.id !== id) return { ok: false, message: `社区库里没有「${id}」` }
@@ -362,31 +383,86 @@ export function createCommunity({ mods, getConfig, setConfig, log, version, aliv
     const why = blocked(index, e)
     if (why) return { ok: false, message: why }
     const files = readZip(await download(index, e))
-    progress = { id, name: e.name, stage: 'install', received: 0, total: 0 }
+    progress = { ...(progress || {}), id, name: e.name, stage: 'install', received: 0, total: 0 }
     place(e, files)
-    progress = { id, name: e.name, stage: 'start', received: 0, total: 0 }
+    progress = { ...(progress || {}), id, name: e.name, stage: 'start', received: 0, total: 0 }
     await mods.sync()
     const m = mods.status().find((x) => x.id === id)
     if (m?.error) return { ok: false, message: `装好了，但加载失败：${m.error}` }
     log.info(`社区模块「${e.name}」${e.version} 已安装`)
     return { ok: true, message: `「${e.name}」${e.version} 装好了` }
+  }
+
+  /** 安装或更新（带并发锁）。 */
+  const install = (id, opts) => exclusive(() => installNow(id, opts))
+
+  /**
+   * 一键更新：把「已装、索引里有新版本、当前能装」的模块挨个更新一遍。
+   * 整批只占一个 exclusive（不会和自己抢锁）；单个失败不中断后面的。
+   * 替换内置的模块在批量里直接按「已在用」处理（confirmReplace=true），不再逐个弹确认。
+   * @returns {{ok:boolean, updated:object[], failed:object[], skipped:object[], message:string}}
+   */
+  const updateAll = () => exclusive(async () => {
+    const index = await loadIndex({ force: true })
+    const entries = (index.modules || []).filter((e) => ID_RE.test(String(e.id)))
+    const targets = []
+    const skipped = []
+    for (const e of entries) {
+      const src = readSource(e.id)
+      if (!src || compareVersions(e.version, src.version) <= 0) continue // 没装 / 已是最新
+      const why = blocked(index, e)
+      if (why) { skipped.push({ id: e.id, name: e.name, message: why }); continue }
+      targets.push(e)
+    }
+    const updated = []
+    const failed = []
+    for (let i = 0; i < targets.length; i++) {
+      const e = targets[i]
+      if (!alive()) { skipped.push({ id: e.id, name: e.name, message: '插件已卸载，先停下' }); break }
+      progress = { id: e.id, name: e.name, stage: 'index', received: 0, total: 0, batch: { index: i + 1, total: targets.length } }
+      try {
+        const r = await installNow(e.id, { confirmReplace: true })
+        if (r.ok) updated.push({ id: e.id, name: e.name, version: e.version })
+        else failed.push({ id: e.id, name: e.name, message: r.message })
+      } catch (error) {
+        failed.push({ id: e.id, name: e.name, message: String(error?.message || error) })
+      }
+    }
+    if (updated.length) log.info(`模块市场一键更新：成功 ${updated.length} 个${failed.length ? `，失败 ${failed.length} 个` : ''}`)
+    const parts = [`更新了 ${updated.length} 个`]
+    if (failed.length) parts.push(`${failed.length} 个没成功`)
+    if (skipped.length) parts.push(`${skipped.length} 个跳过`)
+    return { ok: failed.length === 0, updated, failed, skipped, message: targets.length || failed.length ? parts.join('，') : '没有可更新的模块' }
   })
 
-  /** 卸载。默认保留 modules-data/<id>/ 和设置；purge 才清掉。 */
+  /** 卸载时归档源码。默认也保留模块数据和设置，purge 才清掉这两项。 */
   const remove = (id, { purge = false } = {}) => exclusive(async () => {
-    if (!ID_RE.test(id)) return { ok: false, message: 'id 不对' }
+    if (typeof id !== 'string' || !ID_RE.test(id)) return { ok: false, message: 'id 不对' }
     if (!readSource(id)) return { ok: false, message: `「${id}」不是从社区库装的，不能在这里卸载` }
-    mods.stop(id)
-    rmSync(dirOf(id), { recursive: true, force: true })
-    if (purge) {
-      rmSync(dataDir('modules-data', id), { recursive: true, force: true })
-      const cfg = getConfig()
-      const { [id]: _ext, ...ext } = cfg.ext || {}
-      const { [id]: _mod, ...modules } = cfg.modules || {}
-      setConfig({ ...cfg, ext, modules })
+    const trash = join(userDir(), '.trash')
+    mkdirSync(trash, { recursive: true })
+    if (!lstatSync(trash).isDirectory() || !lstatSync(dirOf(id)).isDirectory()) {
+      throw new Error('模块目录或 modules/.trash 是链接，无法安全归档')
     }
-    await mods.sync()
-    return { ok: true, message: purge ? '卸载好了，数据和设置也清掉了' : '卸载好了，数据和设置还留着' }
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const folder = `${id}-${stamp}-${randomUUID().slice(0, 8)}`
+    const archive = `modules/.trash/${folder}`
+    mods.stop(id)
+    try {
+      renameSync(dirOf(id), join(trash, folder))
+      log.info(`面板卸载社区模块「${id}」，源码归档到 ${archive}`)
+      if (purge) {
+        rmSync(dataDir('modules-data', id), { recursive: true, force: true })
+        const cfg = getConfig()
+        const { [id]: _ext, ...ext } = cfg.ext || {}
+        const { [id]: _mod, ...modules } = cfg.modules || {}
+        setConfig({ ...cfg, ext, modules })
+      }
+    } finally {
+      await mods.sync()
+    }
+    const dataStatus = purge ? '数据和设置已清除' : '数据和设置已保留'
+    return { ok: true, archive, message: `卸载好了，源码和本地改动已移到 ${archive}。${dataStatus}。` }
   })
 
   /** 升级后把搬走的模块自动装回来：每个 id 只成功处理一次，失败下次启动重试。 */
@@ -411,5 +487,5 @@ export function createCommunity({ mods, getConfig, setConfig, log, version, aliv
     return result
   }
 
-  return { progress: () => progress, registryUrl: registryUrlOf, list, install, remove, migrate, source: readSource }
+  return { progress: () => progress, registryUrl: registryUrlOf, list, install, updateAll, remove, migrate, source: readSource }
 }

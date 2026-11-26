@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { forwardBody, MAX_FORWARD_DEPTH, MAX_FORWARD_IMAGES, MAX_FORWARD_LINES, readForward } from '../src/chat/forward.js'
+import { FORWARD_NOT_EXPANDED, forwardBody, MAX_FORWARD_DEPTH, MAX_FORWARD_IMAGES, MAX_FORWARD_LINES, readForward } from '../src/chat/forward.js'
 
 const node = (name, message) => ({ sender: { nickname: name, user_id: 2 }, message })
 const text = (t) => ({ type: 'text', data: { text: t } })
@@ -48,5 +48,12 @@ test('条数和图片数有上限', async () => {
 test('拉不到时不抛错', async () => {
   const onebot = { call: async () => { throw new Error('断网') } }
   const r = await readForward(onebot, 'a', { selfId: 9 })
-  assert.match(forwardBody(r), /内容没拉到/)
+  // 占位文案要说清可能的原因（过期 / 风控 / 内层消息），不能只写「内容没拉到」
+  assert.equal(forwardBody(r), FORWARD_NOT_EXPANDED)
+})
+
+test('转发里的无正文、语音和图片分别按实际消息段展示', async () => {
+  const r = await readForward(gateway({ a: [node('甲', [{ type: 'at', data: { qq: '9' } }]), node('乙', [{ type: 'record', data: {} }]), node('丙', [image(1)])] }), 'a', { selfId: 9 })
+  assert.deepEqual(r.lines.map(s => s.trim()), ['甲：（没有文字）', '乙：[语音]', '丙：[图片]'])
+  assert.equal(r.images.length, 1)
 })

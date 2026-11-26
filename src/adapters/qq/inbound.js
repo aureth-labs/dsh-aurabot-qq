@@ -104,7 +104,7 @@ function facePart(data, faceName) {
  *        selfId：机器人自己的号。@自己 不进 parts，只置 mentionedMe（契约 Part.mention 注释）。
  *        faceName：表情编号 → 名字（由调用方注入；平台端不自己维护表情表）。
  */
-export function segmentsToParts(message, { selfId = '', faceName } = {}) {
+export function segmentsToParts(message, { selfId = '', faceName, messageId = '', forwardDepth = 0, forwardBudget = { left: 200 } } = {}) {
   const self = String(selfId || '')
   const parts = []
   let mentionedMe = false
@@ -180,8 +180,28 @@ export function segmentsToParts(message, { selfId = '', faceName } = {}) {
         break
       case 'forward': {
         const id = String(d.id ?? d.res_id ?? d.forward_id ?? '')
-        if (id) parts.push({ type: 'forward', id })
-        else parts.push({ type: 'other', text: '[合并转发]', native: seg }) // 没 id 展不开，别丢占位
+        const messages = []
+        if (forwardDepth < 5 && Array.isArray(d.content)) {
+          for (const node of d.content) {
+            if (forwardBudget.left <= 0) break
+            if (!node || typeof node !== 'object') continue
+            forwardBudget.left--
+            const sender = node.sender || {}
+            const account = String(sender.user_id ?? node.user_id ?? '')
+            const nodeId = String(node.message_id ?? '')
+            const body = segmentsToParts(node.message ?? node.content ?? [], {
+              selfId, faceName, messageId: nodeId, forwardDepth: forwardDepth + 1, forwardBudget,
+            })
+            messages.push({
+              messageId: nodeId, sender: { account, name: String(sender.card || sender.nickname || account) },
+              parts: body.parts,
+            })
+          }
+        }
+        if (id || messageId || messages.length) parts.push({
+          type: 'forward', id, ...(messageId ? { outerId: messageId } : {}), ...(messages.length ? { messages } : {}),
+        })
+        else parts.push({ type: 'other', text: '[合并转发]', native: seg })
         break
       }
       case 'poke':
@@ -240,7 +260,7 @@ export function fromOneBotEvent(event, { selfId, faceName, messageIdFallback = 0
   const userId = String(event?.user_id ?? sender.user_id ?? '')
   // 临时会话（私聊）的来源群：出站时要带回去，放 ext（契约：平台专属附加信息）
   const sourceGroupId = kind === 'private' && event?.sub_type === 'group' && /^\d+$/.test(String(sender.group_id ?? '')) && Number(sender.group_id) > 0 ? String(sender.group_id) : ''
-  const { parts, mentionedMe, replyTo } = segmentsToParts(event?.message, { selfId: self, faceName })
+  const { parts, mentionedMe, replyTo } = segmentsToParts(event?.message, { selfId: self, faceName, messageId: String(event?.message_id ?? '') })
   // 时间：OneBot 给秒级；契约要毫秒。已经有 13 位的按毫秒算（有些实现对 time 做了毫秒扩展）
   const rawTime = Number(event?.time)
   const at = Number.isFinite(rawTime) && rawTime > 0 ? (rawTime < 1e12 ? rawTime * 1000 : rawTime) : Date.now()

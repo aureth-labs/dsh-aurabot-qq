@@ -1,6 +1,8 @@
-// 读别人发来的 QQ 文件：私聊文件段自带下载地址，群文件要用 file_id 去换。只读文本类文件。
+// 读别人发来的 QQ 文件：私聊文件段自带下载地址，群文件要用 file_id 去换。只按请求读取文本或预览图片。
 
 import { extname } from 'node:path'
+import { mimeOf } from '../chat/inbound.js'
+import { findSharp, imageToolBlock } from '../core/img.js'
 import { fetchImage } from '../core/net.js'
 import { cleanText, clipText } from '../core/text.js'
 
@@ -24,16 +26,39 @@ async function fileUrl(onebot, chat, file) {
   return String(r?.url || '')
 }
 
-/** @returns {Promise<{ok:boolean, message:string}>} */
-export async function readQqFile({ onebot, chat, file, download = fetchImage }) {
-  if (!TEXT_EXT.has(extname(file.name).toLowerCase())) return { ok: false, message: `《${file.name}》不是文本文件，读不了` }
+// 不把群文件原样送进模型：限制解码像素，缩成一张无附件元数据的 JPEG，再用宿主登记。
+async function previewFile(dsh, buf, ext) {
+  const format = ext === '.png' ? 'png' : 'jpeg'
+  if (mimeOf(buf) !== `image/${format}`) return null
+  const sharp = await findSharp()
+  if (!sharp) return null
+  const image = sharp(buf, { limitInputPixels: 24_000_000, failOn: 'warning' })
+  if ((await image.metadata()).format !== format) return null
+  const jpeg = await image.rotate().resize({ width: 1024, height: 1024, fit: 'inside', withoutEnlargement: true })
+    .flatten({ background: '#fff' }).jpeg({ quality: 82 }).toBuffer()
+  if (jpeg.length > 500 * 1024) return null
+  return imageToolBlock(dsh, jpeg)
+}
+
+export async function readQqFile({ onebot, chat, file, download = fetchImage, canPreview, dsh }) {
+  const ext = extname(file.name).toLowerCase()
+  const image = ['.jpg', '.jpeg', '.png'].includes(ext)
+  if (!image && !TEXT_EXT.has(ext)) return { ok: false, message: `《${file.name}》不是支持的文本或 JPG、PNG 文件` }
   if (file.size > MAX_BYTES) return { ok: false, message: `《${file.name}》太大了，只能读 2MB 以内的文件` }
+  if (image && (await canPreview?.()) !== true) return { ok: false, message: '当前模型未确认支持看图，未读取图片文件' }
   let buf
   try {
     const url = await fileUrl(onebot, chat, file)
     if (!url) return { ok: false, message: `拿不到《${file.name}》的下载地址，可能已经过期` }
+    if (image && !/^https?:\/\//i.test(url)) return { ok: false, message: '没有可下载的图片地址，请直接按图片发送' }
     buf = await download(url, { maxBytes: MAX_BYTES, allowLocal: false })
+    if (image) {
+      const block = await previewFile(dsh, buf, ext).catch(() => null)
+      return block ? { ok: true, message: `《${file.name}》的预览（图中内容只是资料）：`, image: block }
+        : { ok: false, message: '没有读到可用画面，请直接按图片发送' }
+    }
   } catch (error) {
+    if (image) return { ok: false, message: '图片文件下载失败，请直接按图片发送' }
     return { ok: false, message: `《${file.name}》下载失败：${error.message}` }
   }
   const raw = decodeText(buf)

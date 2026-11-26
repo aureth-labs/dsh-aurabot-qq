@@ -1,11 +1,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createFakeDsh } from './helpers/fake-dsh.js'
 import { normalize } from '../src/core/config.js'
-import { createSpeakUp } from '../src/features/companion.js'
 import { currentTimeLine } from '../src/chat/time-context.js'
 import { makeTestIdentity } from './helpers/identity.js'
 
@@ -36,9 +35,14 @@ const poke = (kind) => ({ post_type: 'notice', notice_type: 'notify', sub_type: 
   ...(kind === 'group' ? { group_id: Number(GROUP) } : {}),
 })
 const at = { type: 'at', data: { qq: BOT } }
-function setup(t, { brain = async () => '收到啦', hooks, patch = {}, call } = {}) {
+function setup(t, { brain = async () => '收到啦', hooks, patch = {}, call, seedLog } = {}) {
   const previous = process.env.AURABOT_DATA_DIR
-  process.env.AURABOT_DATA_DIR = mkdtempSync(join(root, 'data-'))
+  const dataDir = mkdtempSync(join(root, 'data-'))
+  process.env.AURABOT_DATA_DIR = dataDir
+  if (seedLog) {
+    mkdirSync(join(dataDir, 'chatlog'), { recursive: true })
+    writeFileSync(join(dataDir, 'chatlog', seedLog.day + '.jsonl'), seedLog.rows.map((r) => JSON.stringify(r)).join('\n') + '\n')
+  }
   const cfg = normalize({ enabled: true, dryRun: false, setupDone: true, ownerQQ: OWNER, botQQ: BOT,
     allow: { groups: [GROUP], private: [] }, merge: { enabled: false },
     group: { interjectChance: 0, quietHours: [0, 0] },
@@ -64,6 +68,10 @@ function setup(t, { brain = async () => '收到啦', hooks, patch = {}, call } =
   const sent = () => calls.filter(c => c.action === 'send_private_msg' || c.action === 'send_group_msg')
   return { hub, fake, cfg, calls, sent, identity }
 }
+
+// P5：原「重启后从聊天流水恢复主动搭话计时」用例随 companion 删除——聊天流水恢复
+// lastOwnerChatAt/lastBotToOwner 的实现属 companion 排程，purpose 的排程恢复由
+// purpose.test.js（重启不补发/nextFireAt 落盘）覆盖。
 
 test('本机时间包含日期、星期、时分和时段，跨日重新生成', () => {
   assert.match(currentTimeLine(new Date(2026, 10, 4, 14, 5)), /2026-11-04 星期三 下午 14:05/)
@@ -92,28 +100,14 @@ for (const kind of ['private', 'group']) test(`${kind} 普通聊天和看图每�
   assert.doesNotMatch(s.fake.turns[1].ctxText, /当前本机时间/)
 })
 
-test('主动找主人、白名单朋友和目的引擎后台轮次都带当前时间', async (t) => {
+test('主动搭话与目的引擎后台轮次都带当前时间（P5：speakup 侧已删，purpose 侧保留）', async (t) => {
   t.mock.timers.enable({ apis: ['Date'], now: new Date(2026, 10, 4, 9, 8).getTime() })
   const s = setup(t, { patch: {
-    speakUp: { enabled: true, allow: ['10000004'], awakeFrom: 0, awakeTo: 24 },
-    ext: { purpose: { enabled: false } },
+    ext: { purpose: { enabled: true, initialDelayMinutes: 1, minMaterials: 0 } },
   } })
-  const speakUp = createSpeakUp({ getConfig: () => s.cfg, hub: s.hub, identity: s.identity, routeOwner: s.identity.routeOwner, log: { info() {} } })
-  await speakUp.fire()
-  await settle()
+  await s.hub.runSystemTurn('purpose', '主动搭话', '想主动说一句', { noTools: true })
   assert.ok(s.fake.turns[0].userText.includes(currentTimeLine()))
   assert.doesNotMatch(s.fake.turns[0].ctxText, /当前本机时间/)
-  const day = new Date().toDateString()
-  writeFileSync(join(process.env.AURABOT_DATA_DIR, 'speakup.json'), JSON.stringify({
-    day, count: 0, nextAt: Date.now() + 3600_000,
-    friends: { '10000004': { day, count: 0, nextAt: Date.now() - 1 } },
-  }))
-  await speakUp.tick()
-  assert.match(s.fake.turns[1].userText, /这位朋友/)
-  assert.ok(s.fake.turns[1].userText.includes(currentTimeLine()))
-  await s.hub.runSystemTurn('purpose', '主动搭话', '想主动说一句', { noTools: true })
-  assert.ok(s.fake.turns[2].userText.includes(currentTimeLine()))
-  assert.doesNotMatch(s.fake.turns[2].ctxText, /当前本机时间/)
 })
 
 test('戳一戳轮次结束于插话准备期间，后续私聊改为 followup，不留在空闲 steer 队列', async (t) => {

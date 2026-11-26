@@ -221,17 +221,22 @@ test('面板注册人物记忆及四个子页，旧人格页仍可访问', () =>
   }
   const { panelTest: panel } = loader.factory(() => React)
   const tabs = Array.from(panel.TABS)
-  assert.equal(tabs.filter((tab) => tab.id === 'persona').length, 1)
-  assert.equal(tabs.find((tab) => tab.id === 'persona').label, '人物记忆')
-  // 心情与记忆已拆成两页：心情(mood) → 记忆(memory) → 人物记忆(persona)
+  // 【阶段三改版】persona 独立页签已并入「记忆」页（MemoryTab 双视图）：TABS 里不再有 persona
+  assert.equal(tabs.filter((tab) => tab.id === 'persona').length, 0)
+  assert.equal(tabs.find((tab) => tab.id === 'memory').label, '记忆')
+  // 心情与记忆仍是两页：心情(mood) → 记忆(memory)
   assert.equal(tabs.findIndex((tab) => tab.id === 'memory'), tabs.findIndex((tab) => tab.id === 'mood') + 1)
-  assert.equal(tabs.findIndex((tab) => tab.id === 'persona'), tabs.findIndex((tab) => tab.id === 'memory') + 1)
   assert.equal(tabs.find((tab) => tab.id === 'character').label, '人格')
-  assert.deepEqual(Array.from(panel.TAB_MODS.persona), ['memory'])
+  // 旧 TAB_MODS.persona=['memory'] 删除；persona 模块并进 TAB_MODS.memory
+  assert.ok(!panel.TAB_MODS.persona, 'TAB_MODS 不能再有 persona 键')
+  assert.ok(Array.from(panel.TAB_MODS.memory).includes('persona'), 'persona 模块归到 memory 页')
+  assert.ok(Array.from(panel.TAB_MODS.memory).includes('memory'))
   const self = panel.NAV_GROUPS.find((group) => group.id === 'self')
-  assert.ok(self.tabs.indexOf('persona') > self.tabs.indexOf('mood'))
+  assert.ok(!self.tabs.includes('persona'), 'self 组里不能再有 persona')
   assert.match(source, /character: Persona/)
-  assert.match(source, /persona: PersonaMemory/)
+  // 人物画像不再直挂页签：persona: PersonaMemory 映射删除，改由 MemoryTab 在「人物」视图内部挂载
+  assert.ok(!/persona: PersonaMemory/.test(source))
+  assert.match(source, /memory: MemoryTab/)
   assert.ok(!source.slice(source.indexOf('function Mood('), source.indexOf('const PERSON_FIELDS')).includes('ProfilesCard'))
 
   const render = () => { hook = 0; return panel.PersonaMemory({ toast() {} }) }
@@ -257,16 +262,33 @@ test('面板注册人物记忆及四个子页，旧人格页仍可访问', () =>
   assert.match(text(line), /主人爱我/)
   assert.match(text(line), /私聊 123/)
 
+  // 迁移历史语义（persona-tab-v2 哨兵，阶段三前）：
+  // 无 v2 哨兵的更老数据（tab=persona 指旧「人格」页）→ 按历史规则迁到 character
   storage.set('aurabot.tab', 'persona')
   storage.set('aurabot.navlast', JSON.stringify({ self: 'persona' }))
+  storage.delete('aurabot.persona-tab-v2')
+  storage.delete('aurabot.memory-tab-v1')
   state.length = 0; hook = 0
   panel.AurabotPage()
-  assert.equal(state[3], 'character', '旧版选中的人格页迁移到新标识')
+  assert.equal(state[3], 'character', '无 v2 哨兵的老数据：旧人格页仍按历史规则迁移到 character')
   assert.equal(JSON.parse(storage.get('aurabot.navlast')).self, 'character')
+  // 新语义（memory-tab-v1 哨兵，阶段三）：persona 页签迁到 memory + 「人物」子视图
+  storage.set('aurabot.tab', 'persona')
+  storage.set('aurabot.navlast', JSON.stringify({ self: 'persona' }))
+  storage.set('aurabot.persona-tab-v2', '1') // 已是阶段二后用户：v2 块跳过，memory 块接管
+  storage.delete('aurabot.memory-tab-v1')
+  state.length = 0; hook = 0
+  panel.AurabotPage()
+  assert.equal(state[3], 'memory', '有 v2 哨兵：persona 页签迁到 memory')
+  assert.equal(storage.get('aurabot.memory-view'), 'person', '迁移要顺带选中「人物」子视图')
+  assert.equal(JSON.parse(storage.get('aurabot.navlast')).self, 'memory')
+  assert.equal(storage.get('aurabot.memory-tab-v1'), '1')
+  // 哨兵只生效一次：两哨兵都在时不再动用户的 tab
   storage.set('aurabot.tab', 'persona')
   state.length = 0; hook = 0
   panel.AurabotPage()
-  assert.equal(state[3], 'persona', '迁移之后可以记住新的人物记忆页')
+  assert.equal(storage.get('aurabot.tab'), 'persona', '哨兵生效后不再迁移')
+  assert.equal(storage.get('aurabot.memory-view'), 'person', '哨兵生效后不覆盖子视图选择')
 })
 
 test('相处经验归到人物和群下面；只有经验的人和群也列得出来', (t) => {
@@ -314,6 +336,7 @@ test('人物关系：只认本人或主人说的，别人传的和规则都不�
   const names = new Map([['111', '小明'], ['222', '路人'], ['999', '主人']])
   const base = { chatId: 'group:1', names, owner: '999' }
   assert.equal(normalizeRelation({ subj: '小明', pred: '的女朋友是', obj: '阿花', speaker: '111' }, base).subj, '小明')
+  assert.deepEqual([normalizeRelation({ subj: '主人', pred: '是', obj: '小明', speaker: '111' }, base).subj, normalizeRelation({ subj: '主人', pred: '是', obj: '小明', speaker: '111' }, base).obj], ['小明', '主人'], '说话人被写成宾语时要翻回主语')
   assert.equal(normalizeRelation({ subj: '小明', pred: '的女朋友是', obj: '阿花', speaker: '222' }, base), null)
   assert.ok(normalizeRelation({ subj: '小明', pred: '的女朋友是', obj: '阿花', speaker: '999' }, base))
   assert.equal(normalizeRelation({ subj: '小明', pred: '的女朋友是', obj: '阿花', speaker: '333' }, base), null, '不在这批发言人里')
@@ -453,4 +476,12 @@ test('面板一键清理按 QQ 隔离，旧流水不再读入，下一条私聊�
     assert.equal(api.getConfig().ownerQQ, OWNER)
     assert.equal(memory.remembers(OWNER), true)
   } finally { fake.dispose() }
+})
+
+test('待重写的人物小档案仍显示旧正文，不因重写失败变空白（#107）', (t) => {
+  const s = setup(t)
+  const mem = s.make()
+  const detail = mem.personaPerson(ALICE)
+  assert.equal(detail.person.text, '旧档案')
+  assert.equal(detail.person.stale, true)
 })

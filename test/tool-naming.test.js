@@ -41,7 +41,6 @@ const MODULE_FILES = new Map([
   ['imagegen', 'src/modules/imagegen/index.js'],
   ['diary', 'src/modules/diary/index.js'],
   ['qzone-social', 'src/modules/qzone-social/index.js'],
-  ['speakup', 'src/modules/speakup/index.js'],
   ['purpose', 'src/modules/purpose/index.js'],
   ['autotelic', 'src/modules/autotelic/index.js'],
   ['bili', 'src/modules/bili/index.js'],
@@ -50,6 +49,7 @@ const MODULE_FILES = new Map([
   ['contacts', 'src/modules/contacts/index.js'],
   ['video', 'src/modules/video/index.js'],
   ['group-admin', 'src/modules/group-admin/index.js'],
+  ['image-recovery', 'src/modules/image-recovery/index.js'],
 ])
 
 const REGEX_PRECEDING_KEYWORDS = new Set([
@@ -319,7 +319,7 @@ function makeFullHarness(t, { builtins = ALL_MODS, platforms = null, adapters = 
     stickers: { enabled: true, autoCollect: 'owner' },
     imagegen: { enabled: true, apiKey: 'k', model: 'm' },
     bili: { enabled: true },
-    speakup: { enabled: true, reminders: true },
+    speakUp: { enabled: true, reminderEnabled: true },
     diary: { enabled: true },
     autotelic: { enabled: true },
     group: { crossRead: 'group' },

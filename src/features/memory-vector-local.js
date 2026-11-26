@@ -38,8 +38,8 @@ export function resolveAssets(dataDir) {
   return null
 }
 
-export function createLocalVectorIndex({ dataDir, log }) {
-  const file = join(dataDir, 'local-vectors.json')
+export function createLocalVectorIndex({ dataDir, indexDir = dataDir, log }) {
+  const file = join(indexDir, 'local-vectors.json')
   const store = createVecStore(file, { model: LOCAL_MODEL })
   let assets = resolveAssets(dataDir)
   let embedder = assets ? createEmbedder(assets) : null
@@ -49,6 +49,17 @@ export function createLocalVectorIndex({ dataDir, log }) {
   // 从来没有上传过资源（实测 404），只会让面板一直显示「下载失败」。
   // 现在模型不在时直接给一句能看懂的说明，让人知道该把文件放哪。
   let lastError = assets ? '' : '本地向量模型缺失：models/ 目录里应该有 model_int8.onnx 和 vocab.txt（插件包自带；手动安装时把它们放进数据目录的 models/ 也可以）'
+
+  let lastErrorAt = null
+  function inferenceFailed(error) {
+    lastError = String(error?.message || error || '本地向量计算失败')
+    lastErrorAt = Date.now()
+    log?.warn?.(`本地向量计算失败：${lastError}`)
+  }
+  function inferenceSucceeded() {
+    lastError = ''
+    lastErrorAt = null
+  }
 
   // 条目签名：文字 + 改写时间，变了就重算
   /**
@@ -101,10 +112,11 @@ export function createLocalVectorIndex({ dataDir, log }) {
       try {
         out.push(await embedder.embed(t))
       } catch (error) {
-        lastError = error.message
+        inferenceFailed(error)
         throw error
       }
     }
+    if (out.length) inferenceSucceeded()
     return out
   }
 
@@ -155,10 +167,11 @@ export function createLocalVectorIndex({ dataDir, log }) {
       try {
         const vec = await embedder.embed(String(m.text || ''))
         store.put(id, vec, sig)
+        inferenceSucceeded()
         computed++
         dirty = true
       } catch (error) {
-        lastError = error.message
+        inferenceFailed(error)
         break
       }
       // 让出事件循环，别把聊天/面板卡死
@@ -250,6 +263,7 @@ export function createLocalVectorIndex({ dataDir, log }) {
       total: Array.isArray(items) ? items.length : store.size,
       ready: ready(),
       lastError: lastError || '',
+      lastErrorAt,
     }),
     /** 面板「测试」按钮：真算一条，回报维度和耗时。 */
     test: async (text) => {

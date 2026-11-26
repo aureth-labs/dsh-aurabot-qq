@@ -126,7 +126,8 @@ test('刷一轮：看视频、按每天上限评论、分享给主人、记成�
   assert.equal(posted[0].message, '看饿了')
   assert.equal(sent.length, 1)
   assert.equal(sent[0].chatId, 'private:10000001')
-  assert.match(sent[0].text, /会做饭！\nhttps:\/\/www\.bilibili\.com\/video\/BV1/)
+  // #334：私聊分享改成 QQ 里点得开的网页播放器链接
+  assert.match(sent[0].text, /会做饭！\nhttps:\/\/www\.bilibili\.com\/blackboard\/webplayer\/mbplayer\.html\?bvid=BV1[^&]*&p=1&autoplay=true$/)
   const seen = eventRecords.filter((e) => e.kind === 'seen')
   assert.equal(seen.length, 2)
   assert.equal(seen[0].meta.title, '米饭大赛')

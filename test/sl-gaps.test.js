@@ -358,7 +358,10 @@ test('卡片工具在群和普通私聊可用，按 SnowLuma 字段发送', asyn
     [{ type: 'rps' }, { type: 'rps', data: {} }],
   ]
   for (const [args, segment] of cases) {
-    assert.equal((await tool.execute(args)).ok, true, JSON.stringify(args))
+    const result = await tool.execute(args)
+    assert.equal(result.ok, true, JSON.stringify(args))
+    if (args.type === 'share') assert.match(result.message, /分享卡片.*没有作为单独的图片发送/)
+    else assert.equal(result.message, '卡片发出去了')
     assert.equal(s.sent.at(-1)[0], otherChat.chatId)
     assert.deepEqual(s.sent.at(-1)[1], [segment])
     assert.equal(s.sent.at(-1)[3].throwOnError, true)
@@ -521,7 +524,7 @@ test('跨聊天发消息：群里只有主人那一轮能发，别人私聊没�
   let owner = false
   let build
   mod.setup({
-    core: { hub: { turnSendersAllOwner: () => owner, deliver: async (id, text) => { sent.push([id, text]); return {} } }, onebot: { call: async () => ({}) } },
+    core: { hub: { turnSendersAllOwner: () => owner, deliver: async (id, text) => { sent.push([id, text]); return { sentTypes: ['text'], queuedTypes: [] } } }, onebot: { call: async () => ({}) } },
     config: () => ({ enabled: true, ownerQQ: '1', allow: { private: ['2'], groups: ['9', '8'] }, files: {} }),
     tool: (fn) => { build = fn },
   })

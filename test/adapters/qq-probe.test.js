@@ -503,7 +503,8 @@ test('入站翻译与 parseMessageEvent 逐字段一致（text / wakeText / ment
     }
     if (expected.forwards.length) {
       const fwd = inbound.parts.find((p) => p.type === 'forward')
-      assert.equal(fwd.id, expected.forwards[0], `${name}：合并转发 id 一致`)
+      assert.equal(fwd.id, expected.forwards[0].id, `${name}：合并转发 id 一致`)
+      assert.equal(fwd.outerId, expected.forwards[0].outerId, `${name}：外层消息 id 一致`)
     }
   }
 })

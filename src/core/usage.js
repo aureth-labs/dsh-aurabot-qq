@@ -1,117 +1,27 @@
-// token 用量与花费：按「每次调用一行」存，读的时候再聚合（口径参考 qq-agent-plus）。
-//
-// 一行 = { at, module, chat, model, provider, in, out, cached }
-//   module   记账模块：聊天 / 后台会话 / 记忆 / 日记 / 心情 / 目的引擎……
-//   chat     哪个聊天（group:123 / private:456 / system:xxx）；后台任务的 ask 没有这个
-//   model    这次实际用的模型（拿不到就空着，按默认价估）
-//   in/out   prompt / completion tokens；cached = 其中命中前缀缓存的输入
-// 只记数字，不记聊天内容；按北京时间分天，保留 90 天。
-
+// Only provider-reported usage; no text/token estimation and no guessed gateway prices.
 import { dataDir, readJson, writeJson } from './store.js'
-import { beijingDayKey, isPeak } from './offpeak.js'
-
+import { officialCost, REFERENCE_DATE } from './official-reference.js'
+import { beijingDayKey } from './offpeak.js'
 export const KEEP_DAYS = 90
-const SAVE_DELAY = 1500
+export const DEFAULT_PRICING = { currency: '元', models: {} }
 const DAY_MS = 86_400_000
-
-// 价目表（元 / 百万 tokens）。单位、口径和 qq-agent-plus 的 prices.json 一致。
-//
-// 来源（2026-11-06 抓的）：
-//   · DeepSeek：官方定价页（元/百万，空闲价；peak 是高峰价，北京时间周一~周五 9:00-12:00、
-//     14:00-18:00，周末和法定节假日算空闲）
-//   · 其它厂商：LiteLLM 维护的 model_prices_and_context_window.json（USD/百万），按 1 USD = 7.2 元
-//     折成人民币；这些厂商没有峰谷价，所以不写 peak。
-// 匹配：先按模型的完整名字找同名条目，找不到就按定义顺序试每条的 match 正则（不区分大小写）。
-// 认不出来的模型 = 未定价（面板里单列，不计花费）——想加自己的价，在 config.usage.pricing.models
-// 里补一条即可（match 写成字符串形式的正则，例如 "^my-llm-"）。
-export const DEFAULT_PRICING = {
-  currency: '元',
-  fx: 7.2, // 美元价 → 人民币用的汇率，只影响下面按 USD 收录的条目
-  models: {
-    // ── DeepSeek（官方价，带峰谷）───────────────────────────────
-    'deepseek-pro': { match: 'deepseek.*pro|v4-pro', in: 4.5, out: 13.5, cached: 0.15, peak: { in: 9, out: 27, cached: 0.3 }, note: '官方价，峰时翻倍' },
-    'deepseek-flash': { match: 'deepseek', in: 1, out: 4, cached: 0.02, peak: { in: 2, out: 8, cached: 0.04 }, note: '官方价，峰时翻倍' },
-    // ── OpenAI（USD 折元）─────────────────────────────────────
-    'gpt-5.6': { match: 'gpt-5\\.6', in: 28.8, out: 144, cached: 2.88 },
-    'gpt-5.5': { match: 'gpt-5\\.5', in: 36, out: 216, cached: 3.6 },
-    'gpt-5.4': { match: 'gpt-5\\.4', in: 18, out: 108, cached: 1.8 },
-    'gpt-5.2': { match: 'gpt-5\\.2', in: 12.6, out: 100.8, cached: 1.26 },
-    'gpt-5': { match: 'gpt-5', in: 9, out: 72, cached: 0.9 },
-    'gpt-4.1': { match: 'gpt-4\\.1', in: 14.4, out: 57.6, cached: 3.6 },
-    'gpt-4o-mini': { match: 'gpt-4o-mini', in: 1.08, out: 4.32, cached: 0.54 },
-    'gpt-4o': { match: 'gpt-4o', in: 18, out: 72, cached: 9 },
-    // ── Anthropic ────────────────────────────────────────────
-    'claude-opus': { match: 'claude.*opus', in: 36, out: 180, cached: 3.6 },
-    'claude-sonnet': { match: 'claude.*sonnet', in: 21.6, out: 108, cached: 2.16 },
-    'claude-haiku': { match: 'claude.*haiku', in: 7.2, out: 36, cached: 0.72 },
-    // ── Google Gemini ────────────────────────────────────────
-    'gemini-3.1-pro': { match: 'gemini-3(\\.1)?-pro', in: 14.4, out: 86.4, cached: 1.44 },
-    'gemini-3-flash': { match: 'gemini-3.*flash', in: 3.6, out: 21.6, cached: 0.36 },
-    'gemini-2.5-pro': { match: 'gemini-2\\.5-pro', in: 9, out: 72, cached: 0.9 },
-    'gemini-2.5-flash': { match: 'gemini-2\\.5-flash', in: 2.16, out: 18, cached: 0.22 },
-    // ── 月之暗面 Kimi ─────────────────────────────────────────
-    'kimi-k3': { match: 'kimi-k3|moonshot.*k3', in: 21.6, out: 108, cached: 2.16 },
-    'kimi-k2.6': { match: 'kimi-k2\\.6', in: 6.84, out: 28.8, cached: 1.15 },
-    'kimi-k2.5': { match: 'kimi-k2\\.5', in: 4.32, out: 21.6, cached: 0.72 },
-    'kimi': { match: 'kimi|moonshot', in: 6.84, out: 28.8, cached: 1.15 },
-    // ── 智谱 GLM ─────────────────────────────────────────────
-    'glm-5.3': { match: 'glm-5\\.3(?!-flash)', in: 8.23, out: 28.8, cached: 2.06 },
-    'glm-5-flash': { match: 'glm-5.*flash', in: 0.82, out: 2.88, cached: 0.24 },
-    'glm-4': { match: 'glm-4', in: 4.32, out: 15.84, cached: 0.86 },
-    // ── 阿里通义千问 ──────────────────────────────────────────
-    'qwen-max': { match: 'qwen.*max', in: 12.17, out: 36.5, cached: 1.22 },
-    'qwen-plus': { match: 'qwen.*plus', in: 2.03, out: 8.12, cached: 0.41 },
-    'qwen-flash': { match: 'qwen.*flash', in: 0.81, out: 2.74, cached: 0.1 },
-    'qwen': { match: 'qwen', in: 2.03, out: 8.12, cached: 0.41 },
-    // ── 字节豆包 ─────────────────────────────────────────────
-    'doubao-pro': { match: 'doubao.*(pro|seed-2-0-pro)', in: 3.47, out: 17.36, cached: 0.69 },
-    'doubao': { match: 'doubao', in: 0.65, out: 3.91, cached: 0.13 },
-    // ── 其它常见开源/国产 ─────────────────────────────────────
-    'minimax': { match: 'minimax', in: 2.13, out: 8.52, cached: 0.43 },
-    'ernie': { match: 'ernie', in: 4.06, out: 18.25, cached: 4.06 },
-    'step': { match: 'step-', in: 1.58, out: 9.5, cached: 0.32 },
-  },
-}
-
-// 旧行没记模型名时按这个估（他们当时只用过 DeepSeek flash）
-const ASSUMED_MODEL = 'deepseek-flash'
-
-let state = null // { days: { 'YYYY-MM-DD': [row, ...] } }
+let state = null
 let pricing = DEFAULT_PRICING
-let holidays = []
-let saveTimer = null
-
+let timer = null
+let writeFailed = false
+const indexed = new Map()
 const file = () => dataDir('usage.json')
-const dayKey = (at) => beijingDayKey(Number(at || Date.now()))
+const count = v => Number.isSafeInteger(v) && v >= 0 ? v : 0
+const dayKey = at => beijingDayKey(at)
 
-const reCache = new Map()
-/** 条目里的 match 是字符串形式的正则（这样 config.json 里也能加），编译一次缓存起来。 */
-function matches(entry, name) {
-  if (!entry || !entry.match) return false
-  let re = reCache.get(entry.match)
-  if (re === undefined) {
-    try { re = new RegExp(entry.match, 'i') } catch (error) { re = null }
-    reCache.set(entry.match, re)
-  }
-  return Boolean(re && re.test(name))
-}
-
-/** 找模型对应的价目：先同名，再按定义顺序试 match；都认不出返回 null（= 未定价）。 */
-function priceEntry(p, model) {
-  const name = String(model || '').trim().toLowerCase()
-  if (!name) return null
-  if (p.models[name]) return p.models[name]
-  for (const entry of Object.values(p.models)) if (matches(entry, name)) return entry
-  return null
-}
-
-/** 一次调用的单价（按时刻区分峰谷，只有写了 peak 的（DeepSeek）才有峰谷价）；未定价返回 null。 */
-export function priceOf(model, at = Date.now(), p = pricing) {
-  const entry = priceEntry(p, model)
-  if (!entry) return null
-  const usePeak = Boolean(isPeak(at, { holidays })) && entry.peak
-  const src = usePeak ? entry.peak : entry
-  return { in: Number(src.in) || 0, out: Number(src.out) || 0, cached: Number(src.cached) || 0, peak: Boolean(usePeak) }
+// Explicit provider + exact model only. A reseller model name does not establish its tariff.
+export function priceOf(model, at = Date.now(), p = pricing, provider = '') {
+  if (!provider || !model) return null
+  const entry = p.models?.[provider + '::' + model] || p.models?.[model]
+  if (!entry || entry.peak || entry.match || entry.provider !== provider || (entry.from && at < Date.parse(entry.from))) return null
+  if (!['in', 'out', 'cached'].every(k => typeof entry[k] === 'number' && Number.isFinite(entry[k]) && entry[k] >= 0)) return null
+  if (entry.from && !Number.isFinite(Date.parse(entry.from))) return null
+  return entry
 }
 
 // 记账用的模块名：模块 id → 中文；system:xxx 的后台轮次标成「xxx（后台）」
@@ -204,223 +114,182 @@ const LEGACY_MODULES = {
 export function moduleOf(row) {
   const m = String(row?.module || '').trim()
   if (!m) return OTHER_BACKGROUND
-  if ((m === '后台任务' || m === '后台会话') && row?.model) return '记忆（回查）'
   return LEGACY_MODULES[m] || m
 }
 
-/**
- * 一次调用的花费（元）：新输入 / 缓存命中 / 输出三段分开算，峰谷按时刻取价。
- *
- * ⚠️ 字段口径（2026-11-06 对着 DSH 的会话投影核对）：DSH 上报的 usage.inputTokens 是
- * **未命中缓存的**输入，命中前缀缓存那部分单独在 cacheReadTokens 里（投影里两个字段就是
- * uncachedInputTokens / cacheReadTokens，实测后者能是前者的几十倍）。
- * 所以总输入 = inputTokens + cacheReadTokens，命中率按这两者算；早先按「input 含缓存」
- * 算会把命中率算成 100%、未命中算成 0，花费也少算一大截。
- * @returns {{cost:number, fresh:number, cached:number, output:number, unpriced:boolean, peak:boolean}}
- */
+
 export function costOf(row, at = row?.at) {
-  const fresh = Number(row?.in) || 0
-  const out = Number(row?.out) || 0
-  const cached = Number(row?.cached) || 0
-  // 没记模型名的（旧版本记下来的行）按默认模型估，别让它变成「未定价」白用 token；真认不出的模型名仍算未定价
-  const price = priceOf(String(row?.model || '').trim() || ASSUMED_MODEL, at)
-  if (!price) return { cost: 0, fresh: 0, cached: 0, output: 0, unpriced: true, peak: false }
-  const freshCost = (fresh / 1_000_000) * price.in
-  const cachedCost = (cached / 1_000_000) * price.cached
-  const outputCost = (out / 1_000_000) * price.out
-  return { cost: freshCost + cachedCost + outputCost, fresh: freshCost, cached: cachedCost, output: outputCost, unpriced: false, peak: price.peak }
+  const p = priceOf(row?.model, at, pricing, row?.provider)
+  const written = count(row?.written)
+  const unknown = { cost: 0, fresh: 0, cached: 0, output: 0, write: 0, unpriced: true }
+  if (!p || (written && !(typeof p.cacheWrite === 'number' && Number.isFinite(p.cacheWrite) && p.cacheWrite >= 0))) return unknown
+  const fresh = count(row.in) * p.in / 1e6
+  const cached = count(row.cached) * p.cached / 1e6
+  const output = count(row.out) * p.out / 1e6
+  const write = written ? written * p.cacheWrite / 1e6 : 0
+  const cost = fresh + cached + output + write
+  return Number.isFinite(cost) ? { cost, fresh, cached, output, write, unpriced: false } : unknown
 }
 
-function emptyTotals() {
-  return {
-    runs: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0, totalTokens: 0,
-    cost: 0, peakCost: 0, offPeakCost: 0, peakTokens: 0,
-    freshCost: 0, cachedCost: 0, outputCost: 0,
-    unpricedCalls: 0, unpricedTokens: 0, assumedCalls: 0,
-  }
-}
-
-/** 把一批调用行汇总成面板要的数字。 */
 function totalsOf(rows) {
-  const t = emptyTotals()
-  const unpricedModels = new Map()
+  const t = { runs: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0, cacheWriteTokens: 0, totalTokens: 0, cost: 0, unpricedCalls: 0, officialUSD: 0, officialMissing: 0 }
   for (const r of rows) {
-    // inputTokens 是未命中缓存的输入，命中那部分在 cached 里 —— 总输入要把两段加起来
-    const fresh = Number(r.in) || 0
-    const out = Number(r.out) || 0
-    const cached = Number(r.cached) || 0
-    const prompt = fresh + cached
-    const tk = prompt + out
     const c = costOf(r)
-    t.runs += 1
-    t.promptTokens += prompt
-    t.completionTokens += out
-    t.cachedTokens += cached
-    t.totalTokens += tk
+    t.runs += count(r.runs) || 1
+    t.promptTokens += count(r.in) + count(r.cached) + count(r.written)
+    t.completionTokens += count(r.out)
+    t.cachedTokens += count(r.cached)
+    t.cacheWriteTokens += count(r.written)
+    const usd = officialCost(r)
+    if (usd === null) t.officialMissing += count(r.runs) || 1
+    else t.officialUSD += usd
     t.cost += c.cost
-    t.freshCost += c.fresh
-    t.cachedCost += c.cached
-    t.outputCost += c.output
-    if (c.peak) { t.peakCost += c.cost; t.peakTokens += tk } else t.offPeakCost += c.cost
-    if (!String(r.model || '').trim()) t.assumedCalls += 1
-    if (c.unpriced) {
-      t.unpricedCalls += 1
-      t.unpricedTokens += tk
-      const key = r.model || '（未知模型）'
-      const cur = unpricedModels.get(key) || { model: key, calls: 0, tokens: 0 }
-      cur.calls += 1
-      cur.tokens += tk
-      unpricedModels.set(key, cur)
-    }
+    if (c.unpriced) t.unpricedCalls += count(r.runs) || 1
   }
-  t.cacheHitRate = t.promptTokens ? Math.min(1, t.cachedTokens / t.promptTokens) : 0
-  t.peakRatio = t.totalTokens ? t.peakTokens / t.totalTokens : 0
-  t.unpricedModels = [...unpricedModels.values()].sort((a, b) => b.tokens - a.tokens)
+  t.totalTokens = t.promptTokens + t.completionTokens
+  t.cacheHitRate = t.promptTokens ? t.cachedTokens / t.promptTokens : null
+  // An incomplete subtotal is not a total price. Unknown is never shown as free.
+  if (t.officialMissing === t.runs) t.officialUSD = null
+  t.pricedCost = t.runs > t.unpricedCalls ? t.cost : null
+  if (!t.runs || t.unpricedCalls) t.cost = null
   return t
 }
-
-/** 按某个字段分组后各自汇总（按花费从大到小）。 */
-function groupBy(rows, field, limit = 0) {
-  const map = new Map()
+function groupBy(rows, keyOf) {
+  const groups = new Map()
   for (const r of rows) {
-    const key = String(r[field] || '（未知）')
-    const list = map.get(key) || []
-    list.push(r)
-    map.set(key, list)
+    const key = keyOf(r)
+    if (!groups.has(key)) groups.set(key, [])
+    groups.get(key).push(r)
   }
-  let out = [...map.entries()].map(([key, list]) => ({ key, ...totalsOf(list) }))
-  out.sort((a, b) => b.cost - a.cost || b.totalTokens - a.totalTokens)
-  if (limit > 0) out = out.slice(0, limit)
-  return out
+  return [...groups].map(([key, rs]) => ({ key, ...totalsOf(rs) })).sort((a,b) => b.totalTokens-a.totalTokens || a.key.localeCompare(b.key))
 }
-
-function prune() {
-  const cut = dayKey(Date.now() - (KEEP_DAYS - 1) * DAY_MS)
-  for (const k of Object.keys(state.days)) if (k < cut) delete state.days[k]
+function prune(now = Date.now()) {
+  if (!state) return
+  const cut = dayKey(now - (KEEP_DAYS - 1) * DAY_MS)
+  for (const [day, rows] of Object.entries(state.days)) if (day < cut) {
+    for (const r of rows) if (r.id) indexed.delete(r.id)
+    delete state.days[day]
+  }
+  for (const [id, cursor] of Object.entries(state.sessions)) if (dayKey(cursor.at || 0) < cut) delete state.sessions[id]
 }
-
+export function flushUsage() {
+  if (timer) clearTimeout(timer)
+  timer = null
+  if (!state) return
+  try { writeJson(file(), state); writeFailed = false } catch { writeFailed = true }
+}
+export function closeUsage() { flushUsage(); state = null; indexed.clear() }
 function saveSoon() {
-  if (saveTimer) return
-  saveTimer = setTimeout(() => {
-    saveTimer = null
-    try { writeJson(file(), state) } catch (error) {}
-  }, SAVE_DELAY)
-  saveTimer.unref?.()
+  if (timer) return
+  timer = setTimeout(flushUsage, 1500)
+  timer.unref?.()
 }
-
-/**
- * 启动时调一次：把已经存下来的用量读进内存。
- * @param {object} [override] 价格表覆盖（config.usage.pricing）
- * @param {string[]} [holidayList] 中国法定节假日（config.cost.offPeakHolidays）——整天算空闲价
- */
-export function initUsage(override, holidayList) {
+export function initUsage(override) {
+  if (state) flushUsage()
   const raw = readJson(file(), {})
-  const days = raw && typeof raw.days === 'object' && raw.days ? raw.days : {}
-  // 老版本存的是「天 → 模块 → 累计 tokens」，读到就按调用次数摊成行，别丢数据
-  for (const [day, v] of Object.entries(days)) {
-    if (Array.isArray(v)) continue
-    const rows = []
-    for (const [module, b] of Object.entries(v || {})) {
-      const calls = Math.max(1, Number(b?.calls) || 1)
-      rows.push({
-        at: Date.parse(day + 'T00:00:01+08:00') || Date.now(),
-        module,
-        chat: '',
-        model: '',
-        provider: '',
-        in: Math.round((Number(b?.in) || 0) / calls),
-        out: Math.round((Number(b?.out) || 0) / calls),
-        cached: Math.round((Number(b?.hit) || 0) / calls),
-      })
+  const days = {}
+  for (const [day, value] of Object.entries(raw.days || {})) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) continue
+    if (Array.isArray(value)) days[day] = value.filter(r => r && Number.isFinite(r.at))
+    else {
+      // Older totals are already sums: don't divide by calls and lose most of the usage.
+      days[day] = Object.entries(value || {}).map(([module, b]) => ({
+        at: Date.parse(day + 'T00:00:01+08:00'), module, chat: '', model: '', provider: '',
+        in: count(b?.in), out: count(b?.out), cached: count(b?.hit), runs: count(b?.calls) || 1,
+      }))
     }
-    if (rows.length) days[day] = rows
   }
-  state = { days }
-  holidays = Array.isArray(holidayList) ? holidayList : []
-  pricing = override && typeof override === 'object'
-    ? { ...DEFAULT_PRICING, ...override, models: { ...DEFAULT_PRICING.models, ...(override.models || {}) } }
-    : DEFAULT_PRICING
+  state = { ...raw, version: 2, startedAt: raw.startedAt || Date.now(), days, sessions: raw.sessions || {} }
+  pricing = override && typeof override === 'object' ? { ...DEFAULT_PRICING, ...override } : DEFAULT_PRICING
+  indexed.clear()
+  prune()
+  for (const rows of Object.values(days)) for (const r of rows) if (r.id) indexed.set(r.id, r)
+  saveSoon()
   return state
 }
-
-/**
- * 记一次模型调用。
- * @param {{module?:string, chat?:string, provider?:string, model?:string, usage?:object, at?:number}} o
- *        usage 就是模型流 / session 事件里那块 { inputTokens, outputTokens, cacheReadTokens }
- */
-export function recordUsage({ module = '其它', chat = '', provider = '', model = '', usage, at = Date.now() } = {}) {
-  if (!state || !usage) return null
-  const prompt = Number(usage.inputTokens) || 0
-  const out = Number(usage.outputTokens) || 0
-  if (!prompt && !out) return null
-  const row = {
-    at: Number(at) || Date.now(),
-    module,
-    chat: String(chat || ''),
-    provider: String(provider || ''),
-    model: String(model || ''),
-    in: prompt,
-    out,
-    cached: Number(usage.cacheReadTokens) || 0,
+export function recordUsage({ module = '其他后台任务', task = '', chat = '', provider = '', model = '', usage, at = Date.now(), id = '' } = {}) {
+  if (!state || !usage || !Number.isFinite(at)) return null
+  const row = { at, module, chat: String(chat || ''), provider: String(provider || ''), model: String(model || ''),
+    in: count(usage.inputTokens), out: count(usage.outputTokens), cached: count(usage.cacheReadTokens), written: count(usage.cacheWriteTokens) }
+  const previous = id && indexed.get(id)
+  if (!row.in && !row.out && !row.cached && !row.written && !previous) return null
+  if (module === '记忆' && typeof task === 'string' && task) row.task = task
+  if (id) row.id = id
+  if (previous) {
+    // A revised settlement replaces the same billable attempt, including its timestamp.
+    const oldRows = state.days[dayKey(previous.at)]
+    const pos = oldRows?.indexOf(previous) ?? -1
+    if (pos >= 0) oldRows.splice(pos, 1)
   }
-  const day = dayKey(row.at)
-  ;(state.days[day] || (state.days[day] = [])).push(row)
+  ;(state.days[dayKey(at)] ||= []).push(row)
+  if (id) indexed.set(id, row)
   prune()
   saveSoon()
   return row
 }
 
-function rowsBetween(startMs, endMs) {
-  const out = []
-  for (const [day, rows] of Object.entries(state?.days || {})) {
-    const dayStart = Date.parse(day + 'T00:00:00+08:00')
-    if (!Number.isFinite(dayStart) || dayStart > endMs || dayStart + DAY_MS <= startMs) continue
-    for (const r of rows) if (r.at >= startMs && r.at <= endMs) out.push(r)
-  }
-  return out
+// Embedding / rerank endpoints report input-only usage; the endpoint URL is not a billing provider ID.
+export function recordRetrievalUsage(task, model, usage) {
+  const tokens = usage?.prompt_tokens ?? usage?.total_tokens
+  if (count(tokens)) recordUsage({ module: '记忆', task, model, usage: { inputTokens: tokens } })
 }
 
-/**
- * 面板要的汇总：ranges 只给总量（今日 / 昨日 / 近 7 天 / 近 30 天），
- * current 给所选区间 + 模块 / 聊天 / 模型三个维度的明细。
- * @param {{now?:number, range?:'today'|'yesterday'|'7'|'30'|'all'}} o
- */
+// Mirrors DSH's tokenUsage fold: last settlement wins within a turn/step; retry starts a new charge.
+// Stored cursors make a repeated event / a resumed session idempotent without retaining chat content.
+export function recordSessionUsage(sessionId, chat, event, target = {}) {
+  if (!state || !sessionId || !event || !Number.isSafeInteger(event.seq)) return
+  const old = state.sessions[sessionId]
+  if (old && event.seq <= old.seq) return
+  const c = old || { seq: -1, at: 0, model: '', provider: '', last: null }
+  state.sessions[sessionId] = c
+  c.seq = event.seq
+  c.at = Number.isFinite(event.time) ? event.time : Date.now()
+  const d = event.data || {}
+  if (event.type === 'model/selection') { c.provider = d.provider || ''; c.model = d.model || '' }
+  if (event.type === 'request/header') {
+    const cfg = d.header?.config
+    if (cfg?.provider) c.provider = cfg.provider
+    if (cfg?.model) c.model = cfg.model
+  }
+  if (event.type === 'tool/call') c.tool = { module: moduleOfTool(d.name), turn: d.turn }
+  if (event.type === 'llm/retry-started' && c.last?.turn === d.turn && c.last?.step === d.step) c.last = null
+  if (event.type === 'assistant/message' || event.type === 'assistant/attempt' || event.type === 'compaction/summary') {
+    const chunks = Array.isArray(d.stream) ? d.stream : d.stream?.chunks
+    const usage = d.usage ?? (Array.isArray(chunks) ? chunks.findLast(x => x?.type === 'usage')?.usage : null)
+    const summary = event.type === 'compaction/summary'
+    if (usage) {
+      const replaces = !summary && c.last?.turn === d.turn && c.last?.step === d.step
+      const id = replaces ? c.last.id : sessionId + ':' + event.seq
+      const module = summary ? '对话整理' : (replaces ? indexed.get(id)?.module : '') || (!chat.startsWith('system:') && c.tool?.turn === d.turn ? c.tool.module : '') || moduleLabel(chat)
+      recordUsage({ id, chat, module,
+        model: summary ? d.model || '' : c.model || target.model || '',
+        provider: summary ? d.provider || '' : c.provider || target.provider || '', usage, at: c.at })
+      if (!summary) { c.last = { turn: d.turn, step: d.step, id }; c.tool = null }
+    }
+  }
+  // Only numeric accounting metadata is persisted, never event messages or headers.
+  saveSoon()
+}
 export function usageReport({ now = Date.now(), range = '7' } = {}) {
-  const todayStart = Date.parse(dayKey(now) + 'T00:00:00+08:00')
-  const slim = (t) => ({
-    runs: t.runs,
-    promptTokens: t.promptTokens,
-    completionTokens: t.completionTokens,
-    cachedTokens: t.cachedTokens,
-    totalTokens: t.totalTokens,
-    cost: t.cost,
-    cacheHitRate: t.cacheHitRate,
-  })
-  const pick = String(range || '7')
-  const start = pick === 'today' ? todayStart
-    : pick === 'yesterday' ? todayStart - DAY_MS
-      : pick === '30' ? todayStart - 29 * DAY_MS
-        : pick === 'all' ? 0
-          : todayStart - 6 * DAY_MS
-  const end = pick === 'yesterday' ? todayStart - 1 : now
-  const rows = rowsBetween(start, end)
+  prune(now)
+  const all = Object.values(state?.days || {}).flat().filter(r => r.at <= now)
+  const startToday = Date.parse(dayKey(now) + 'T00:00:00+08:00')
+  const bounds = { today: [startToday, now], yesterday: [startToday - DAY_MS, startToday - 1],
+    '7': [startToday - 6 * DAY_MS, now], '30': [startToday - 29 * DAY_MS, now], all: [0, now] }
+  const pick = Object.hasOwn(bounds, String(range)) ? String(range) : '7'
+  const rowsFor = key => all.filter(r => r.at >= bounds[key][0] && r.at <= bounds[key][1])
+  const rows = rowsFor(pick)
   return {
-    currency: pricing.currency || '元',
-    peak: Boolean(isPeak(now, { holidays })),
-    days: KEEP_DAYS,
-    range: pick,
-    ranges: {
-      today: slim(totalsOf(rowsBetween(todayStart, now))),
-      yesterday: slim(totalsOf(rowsBetween(todayStart - DAY_MS, todayStart - 1))),
-      last7: slim(totalsOf(rowsBetween(todayStart - 6 * DAY_MS, now))),
-      last30: slim(totalsOf(rowsBetween(todayStart - 29 * DAY_MS, now))),
-    },
-    current: {
-      ...totalsOf(rows),
-      byModule: groupBy(rows.map((r) => ({ ...r, module: moduleOf(r) })), 'module'),
-      // 「按聊天」只列真正的群聊 / 私聊；后台会话（system:xxx）和没有 chat 的调用在「按模块」里看
-      byChat: groupBy(rows.filter((r) => /^(group|private):/.test(String(r.chat || ''))), 'chat', 12),
-      byModel: groupBy(rows, 'model'),
+    referenceDate: REFERENCE_DATE, currency: pricing.currency || '元', days: KEEP_DAYS, range: pick, startedAt: state?.startedAt,
+    firstRecordAt: all.length ? all.reduce((n,r) => Math.min(n,r.at), Infinity) : null,
+    writeFailed,
+    ranges: Object.fromEntries([['today','today'],['yesterday','yesterday'],['last7','7'],['last30','30'],['all','all']].map(([label,key]) => [label,totalsOf(rowsFor(key))])),
+    current: { ...totalsOf(rows),
+      byChat: groupBy(rows.filter(r => /^(group|private):/.test(r.chat || '')), r => r.chat),
+      background: totalsOf(rows.filter(r => !/^(group|private):/.test(r.chat || ''))),
+      byModule: groupBy(rows, moduleOf),
+      byMemoryTask: groupBy(rows.filter(r => moduleOf(r) === '记忆'), r => r.task || '未细分'),
+      byModel: groupBy(rows, r => [r.provider, r.model].filter(Boolean).join(' / ') || '未记录模型'),
     },
   }
 }

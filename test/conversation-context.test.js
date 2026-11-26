@@ -138,3 +138,44 @@ test('aliasesFor 只读合并旧键 qq:private 档案：去重、追加只写主
   })
   assert.throws(() => corruptArchive.recent('private:10002'), /Conversation journal is corrupt/)
 })
+
+test('追加消息后切块做增量：结果与全新重建一致，且不重扫旧消息', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'aurabot-archive-'))
+  const chat = 'group:fixture'
+  const archive = createConversationArchive({ directory, namespace: 'paperboat' })
+  for (let i = 0; i < 60; i++) {
+    archive.append(chat, { role: i % 3 ? 'user' : 'assistant', id: 'm' + i, at: 1700000000000 + i * 2000, text: '第' + i + '条 ' + 'x'.repeat(40) })
+  }
+  const first = archive.episodes(chat, { maxCharacters: 600 }).map(e => e.evidence_ids.join(','))
+  assert.ok(first.length > 1, '这一段够切成多块')
+  // 再追加几条：旧块应原地复用，只有尾部变化。
+  for (let i = 60; i < 66; i++) {
+    archive.append(chat, { role: 'user', id: 'm' + i, at: 1700000000000 + i * 2000, text: '第' + i + '条 ' + 'x'.repeat(40) })
+  }
+  const again = archive.episodes(chat, { maxCharacters: 600 }).map(e => e.evidence_ids.join(','))
+  // 与「重启后整份重算」对照：结果必须一致（除最后一段可能因边界不同重组）
+  const fresh = createConversationArchive({ directory, namespace: 'paperboat' })
+  const rebuilt = fresh.episodes(chat, { maxCharacters: 600 }).map(e => e.evidence_ids.join(','))
+  assert.deepEqual(again, rebuilt)
+  assert.deepEqual(again.slice(0, first.length - 1), first.slice(0, first.length - 1), '已封闭的旧块不动')
+})
+
+test('忘了某人之后切块缓存要整份重建', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'aurabot-archive-'))
+  const chat = 'group:forget'
+  const rules = []
+  const archive = createConversationArchive({
+    directory,
+    namespace: 'paperboat',
+    visible: (id, m) => !rules.some(r => r.qq === m.speakerId),
+    visibleKey: () => rules.length,
+  })
+  archive.append(chat, { role: 'user', id: 'a1', speakerId: '111', at: 1700000000000, text: '小明说周末去吃火锅' })
+  archive.append(chat, { role: 'user', id: 'a2', speakerId: '222', at: 1700000001000, text: '阿花说想去爬山' })
+  // recall 只看「近期窗口之外」的片段，先垫够条数把那两句顶出去
+  for (let i = 0; i < 40; i++) archive.append(chat, { role: 'user', id: 'p' + i, speakerId: '333', at: 1700000010000 + i * 1000, text: '闲聊第' + i + '句' })
+  assert.equal(archive.recall(chat, '火锅').text.includes('火锅'), true)
+  rules.push({ qq: '111' })
+  assert.equal(archive.recall(chat, '火锅').text.includes('火锅'), false, '忘了的人的原话不该再被召回')
+  assert.equal(archive.recall(chat, '爬山').text.includes('爬山'), true, '别人的话还在')
+})

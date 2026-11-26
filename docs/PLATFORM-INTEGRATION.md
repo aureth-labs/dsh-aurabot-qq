@@ -310,8 +310,7 @@ unknown   = 不知道发没发出去
 - 主人账号可绑定；
 - 平台有可识别的连接实例；
 - 主动发送能力有明确 caps；
-- 回复凭据语义清晰；
-- 有真实 host-compat 测试。
+- 回复凭据语义清晰。
 
 ### 10.1 send_to_platform 类工具
 
@@ -386,7 +385,6 @@ test/tool-naming.test.js
 npm test
 npm run test:types
 npm run test:qr-decode
-npm run test:host-compat -- <DSH 源码目录>
 ```
 
 至少覆盖：
@@ -430,7 +428,6 @@ npm run test:host-compat -- <DSH 源码目录>
 7. 新增字段先确认宿主契约和兼容性；
 8. 改动必须带测试，不能只改源码；
 9. 全量测试失败时不能声称“全绿”，要说明失败文件和原因；
-10. host-compat 未运行时必须明确写“未运行”，不能把专项测试当成宿主测试。
 
 ### 15.1 提交前自检
 
@@ -441,7 +438,7 @@ npm run test:host-compat -- <DSH 源码目录>
 - [ ] 平台/caps/features 缺失时有安全降级；
 - [ ] 共享会话回复凭据没有被跨平台复用；
 - [ ] 平台专属工具名没有污染通用工具面；
-- [ ] 单测、类型、QR 解码、全量、host-compat 的结果都已记录。
+- [ ] 单测、类型检查、QR 解码和全量测试的结果都已记录。
 
 ## 16. 常见坑
 

@@ -2,6 +2,7 @@
 
 import { dataDir, readJson, writeJson } from '../core/store.js'
 import { fetchImage } from '../core/net.js'
+import { windowMinutes } from '../core/time-window.js'
 import { resolveAudience } from './qzone-audience.js'
 import { cleanOutboundText } from '../chat/reply.js'
 
@@ -16,15 +17,20 @@ export function planDiaryTimes({ timesPerDay, windowStart, windowEnd, minGapMinu
   const a = toMin(windowStart)
   const b = toMin(windowEnd)
   const n = Math.max(0, Math.round(timesPerDay))
-  if (n === 0 || b <= a) return []
-  const span = b - a
+  // 跨天窗口（如 22:00–02:00）按绕回后的跨度排；from === to 与 proactive-policy 口径一致，视为全天。
+  const span = windowMinutes(a, b)
+  if (n === 0 || span <= 0) return []
   const gap = Math.min(minGapMinutes, Math.floor(span / Math.max(n, 1)))
   for (let attempt = 0; attempt < 200; attempt++) {
-    const pts = Array.from({ length: n }, () => a + Math.floor(rand() * span)).sort((x, y) => x - y)
-    if (pts.every((p, i) => i === 0 || p - pts[i - 1] >= gap)) return pts
+    // 先在「窗口内偏移」上排，保证跨天时两两间隔仍按真实先后算
+    const offsets = Array.from({ length: n }, () => Math.floor(rand() * span)).sort((x, y) => x - y)
+    if (offsets.every((p, i) => i === 0 || p - offsets[i - 1] >= gap)) {
+      return offsets.map((off) => ((a + off) % 1440 + 1440) % 1440).sort((x, y) => x - y)
+    }
   }
   // 实在排不开就均分
-  return Array.from({ length: n }, (_, i) => a + Math.floor((span / n) * (i + 0.5)))
+  return Array.from({ length: n }, (_, i) => Math.floor((span / n) * (i + 0.5)))
+    .map((off) => ((a + off) % 1440 + 1440) % 1440).sort((x, y) => x - y)
 }
 
 export function createQzone({ getConfig, onebot, hub, log, onDiary, pickImage, composeDiary }) {

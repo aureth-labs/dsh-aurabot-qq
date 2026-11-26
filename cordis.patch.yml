@@ -49,6 +49,12 @@
             config:
               - id: compaction-basic
                 name: '@deepseek-ai/dsh-compaction-basic'
+                # DSH 默认窗口的 80% 才压缩：DeepSeek V4 这类 100 万窗口要长到约 80 万 token 才压一次，
+                # 之前每轮都把几十万 token 的历史整段重发，越聊越慢、越聊越贵。改成 25% 就压缩、保留最近 5% 原文：
+                # 100 万窗口约 25 万压一次；12.8 万窗口约 3.2 万压一次，保留部分始终小于门槛。
+                config:
+                  thresholdRatio: 0.25
+                  retainRatio: 0.05
               - id: command-compact
                 name: '@deepseek-ai/dsh-command-compact'
               - id: tool-result-pruner
@@ -100,6 +106,12 @@
             config:
               - id: compaction-basic
                 name: '@deepseek-ai/dsh-compaction-basic'
+                # DSH 默认窗口的 80% 才压缩：DeepSeek V4 这类 100 万窗口要长到约 80 万 token 才压一次，
+                # 之前每轮都把几十万 token 的历史整段重发，越聊越慢、越聊越贵。改成 25% 就压缩、保留最近 5% 原文：
+                # 100 万窗口约 25 万压一次；12.8 万窗口约 3.2 万压一次，保留部分始终小于门槛。
+                config:
+                  thresholdRatio: 0.25
+                  retainRatio: 0.05
               - id: command-compact
                 name: '@deepseek-ai/dsh-command-compact'
               - id: tool-result-pruner
@@ -152,6 +164,12 @@
             config:
               - id: compaction-basic
                 name: '@deepseek-ai/dsh-compaction-basic'
+                # DSH 默认窗口的 80% 才压缩：DeepSeek V4 这类 100 万窗口要长到约 80 万 token 才压一次，
+                # 之前每轮都把几十万 token 的历史整段重发，越聊越慢、越聊越贵。改成 25% 就压缩、保留最近 5% 原文：
+                # 100 万窗口约 25 万压一次；12.8 万窗口约 3.2 万压一次，保留部分始终小于门槛。
+                config:
+                  thresholdRatio: 0.25
+                  retainRatio: 0.05
               - id: command-compact
                 name: '@deepseek-ai/dsh-command-compact'
               - id: tool-result-pruner
@@ -183,6 +201,12 @@
             config:
               - id: compaction-basic
                 name: '@deepseek-ai/dsh-compaction-basic'
+                # DSH 默认窗口的 80% 才压缩：DeepSeek V4 这类 100 万窗口要长到约 80 万 token 才压一次，
+                # 之前每轮都把几十万 token 的历史整段重发，越聊越慢、越聊越贵。改成 25% 就压缩、保留最近 5% 原文：
+                # 100 万窗口约 25 万压一次；12.8 万窗口约 3.2 万压一次，保留部分始终小于门槛。
+                config:
+                  thresholdRatio: 0.25
+                  retainRatio: 0.05
               - id: command-compact
                 name: '@deepseek-ai/dsh-command-compact'
     # 群聊「主人本机工具」档：只有 group.ownerTools 打开的群才用（默认关）。
@@ -224,6 +248,12 @@
             config:
               - id: compaction-basic
                 name: '@deepseek-ai/dsh-compaction-basic'
+                # DSH 默认窗口的 80% 才压缩：DeepSeek V4 这类 100 万窗口要长到约 80 万 token 才压一次，
+                # 之前每轮都把几十万 token 的历史整段重发，越聊越慢、越聊越贵。改成 25% 就压缩、保留最近 5% 原文：
+                # 100 万窗口约 25 万压一次；12.8 万窗口约 3.2 万压一次，保留部分始终小于门槛。
+                config:
+                  thresholdRatio: 0.25
+                  retainRatio: 0.05
               - id: command-compact
                 name: '@deepseek-ai/dsh-command-compact'
               - id: tool-result-pruner
@@ -271,6 +301,12 @@
             config:
               - id: compaction-basic
                 name: '@deepseek-ai/dsh-compaction-basic'
+                # DSH 默认窗口的 80% 才压缩：DeepSeek V4 这类 100 万窗口要长到约 80 万 token 才压一次，
+                # 之前每轮都把几十万 token 的历史整段重发，越聊越慢、越聊越贵。改成 25% 就压缩、保留最近 5% 原文：
+                # 100 万窗口约 25 万压一次；12.8 万窗口约 3.2 万压一次，保留部分始终小于门槛。
+                config:
+                  thresholdRatio: 0.25
+                  retainRatio: 0.05
               - id: command-compact
                 name: '@deepseek-ai/dsh-command-compact'
               - id: tool-result-pruner

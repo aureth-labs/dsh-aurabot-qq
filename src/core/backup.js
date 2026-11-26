@@ -44,9 +44,11 @@ const RESULT_FILE = '.restore-result.json'
 const REBUILD_NOTICE = '身份表是重建的，非 QQ 平台的绑定需要重新做'
 let cachedRestoreResult = null
 const SKIP = ['backups', '.restore', '.restore-sessions', '.restore-pending.json', '.restore-modules.json', RESULT_FILE, 'logs', 'tmp', 'voice-cache', 'archive-cache', 'douyin/edge-profile', ...LOCAL_RECOVERY_STATE_PATHS]
+const CONFIG_ONLY_SKIP = ['imagegen', 'stickers', 'bili-shots', 'douyin', 'video-out']
 // 仅配置备份：媒体不进包，但保留体积很小的聊天流水和当前工作区 DSH 会话
-const CONFIG_ONLY_SKIP = ['imagegen', 'stickers', 'bili-shots', 'douyin']
-const skipped = (rel) => SKIP.some((s) => rel === s || rel.startsWith(s + '/')) || rel.split('/').includes('node_modules') || rel.endsWith('.tmp') || rel === 'memory.sqlite-shm' || rel === `gateway/${IDENTITY_FILE}-shm` || rel.startsWith('memory.sqlite.migrating')
+const memoryPrefix = (rel) => rel.match(/^persona-data\/[^/]+\//)?.[0] || ''
+const memoryRel = (rel) => rel.slice(memoryPrefix(rel).length)
+const skipped = (rel) => SKIP.some((s) => rel === s || rel.startsWith(s + '/')) || rel.split('/').includes('node_modules') || rel.endsWith('.tmp') || memoryRel(rel) === 'memory.sqlite-shm' || memoryRel(rel).startsWith('memory.sqlite.migrating')
 
 // 旧版生活推进的暂存可能仍在数据目录。只在导出时排除，历史归档仍可导入。
 const LIFE_UUID = '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}'
@@ -226,14 +228,14 @@ export async function createBackup({ version = '', workspaceDir = '', now = new 
   const walked = []
   const skippedFiles = []
   await walk(data, '', walked, skippedFiles, market, configOnly ? CONFIG_ONLY_SKIP : [])
-  // 在同一个同步临界区分别锁住记忆库和身份库并连 WAL 一起读快照，后续异步打包只读内存副本。
-  // 任一库快照失败必须让备份失败，不能把缺一半的数据当成一致备份交给用户。
-  for (const rel of MEMORY_FILES) checkPath(data, rel)
-  const memoryFiles = captureMemoryBackup(data.root)
+  // 在同一个同步临界区取主库、WAL 和 JSON 回退状态，后续异步打包只读快照。
+  // 记忆快照失败必须让备份失败，不能把缺一半的记忆库当成功交给用户。
+  const memoryRoots = ['', ...new Set(walked.map(({ rel }) => memoryPrefix(rel)).filter(Boolean))]
+  for (const prefix of memoryRoots) for (const rel of MEMORY_FILES) checkPath(data, prefix + rel)
+  const memoryFiles = memoryRoots.flatMap((prefix) => [...captureMemoryBackup(join(data.root, prefix))].map(([rel, captured]) => [prefix + rel, captured]))
   for (const rel of GATEWAY_IDENTITY_FILES) checkPath(data, rel)
   const identityFiles = captureIdentityBackup(join(data.root, 'gateway'))
-  const paired = new Set([...MEMORY_FILES, ...GATEWAY_IDENTITY_FILES])
-  const files = walked.filter(({ rel }) => !paired.has(rel) && !LEGACY_LIFE_TEMP.some((pattern) => pattern.test(rel)))
+  const files = walked.filter(({ rel }) => !MEMORY_FILES.includes(memoryRel(rel)) && !GATEWAY_IDENTITY_FILES.includes(rel) && !LEGACY_LIFE_TEMP.some((pattern) => pattern.test(rel)))
   const queue = files.map((entry) => ({ base: data, entry, name: 'data/' + entry.rel }))
   for (const [rel, captured] of memoryFiles) queue.push({ name: 'data/' + rel, captured })
   for (const [rel, captured] of identityFiles) queue.push({ name: 'data/gateway/' + rel, captured })
@@ -920,14 +922,15 @@ export function applyPendingRestore(now = Date.now(), { root: customRoot = '', o
   const files = listFiles(data, '.restore').map((file) => ({ file, rel: file.rel.slice('.restore/'.length) }))
   const config = files.find(({ rel }) => rel === 'config.json')
   if (!config) throw unsafePath('config.json')
-  const restoreMemory = files.some(({ rel }) => rel === 'memory.sqlite' || rel === 'memories.json')
+  // 备份里带了哪几个记忆库（根目录、persona-data/<id>/）：这些库的主库、WAL、SHM、JSON 整组换掉
+  const restoreMemoryRoots = new Set(files.filter(({ rel }) => ['memory.sqlite', 'memories.json'].includes(memoryRel(rel))).map(({ rel }) => memoryPrefix(rel)))
+  const restoredMemory = (rel) => MEMORY_FILES.includes(memoryRel(rel)) && restoreMemoryRoots.has(memoryPrefix(rel))
+  const targets = new Set(files.map(({ rel }) => rel))
+  for (const prefix of restoreMemoryRoots) for (const rel of MEMORY_FILES) targets.add(prefix + rel)
+  const restoreMemory = restoreMemoryRoots.size > 0
   const restoreIdentity = files.some(({ rel }) => rel === 'gateway/' + IDENTITY_FILE)
   if (!restoreMemory && restoreIdentity) throw new Error('暂存的恢复内容里只有身份库没有记忆库，无法恢复')
-  const targets = new Set(files.map(({ rel }) => rel))
-  if (restoreMemory) {
-    for (const rel of MEMORY_FILES) targets.add(rel)
-    for (const rel of GATEWAY_IDENTITY_FILES) targets.add(rel)
-  }
+  if (restoreMemory) for (const rel of GATEWAY_IDENTITY_FILES) targets.add(rel)
   const modulesRel = '.restore-modules.json'
   if (info.market?.length) targets.add(modulesRel)
 
@@ -972,12 +975,10 @@ export function applyPendingRestore(now = Date.now(), { root: customRoot = '', o
         const current = originals.get(rel)
         if (current) move(data, current, data, keep + '/' + rel)
       }
-      if (restoreMemory) {
-        for (const rel of MEMORY_FILES) saveOriginal(rel)
-        for (const rel of GATEWAY_IDENTITY_FILES) saveOriginal(rel)
-      }
+      for (const prefix of restoreMemoryRoots) for (const rel of MEMORY_FILES) saveOriginal(prefix + rel)
+      if (restoreMemory) for (const rel of GATEWAY_IDENTITY_FILES) saveOriginal(rel)
       for (const { file, rel } of files) {
-        if (!restoreMemory || (!MEMORY_FILES.includes(rel) && !GATEWAY_IDENTITY_FILES.includes(rel))) saveOriginal(rel)
+        if (!restoredMemory(rel) && !(restoreMemory && GATEWAY_IDENTITY_FILES.includes(rel))) saveOriginal(rel)
         move(data, file, data, rel)
       }
       if (sessions?.target) {

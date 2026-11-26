@@ -50,6 +50,55 @@ const fresh = () => { rmSync(join(root, 'backups'), { recursive: true, force: tr
 // 读 .git/config（假 git 不一定造这个文件，读不到当空串）
 const readGitConfig = (wd) => { try { return readFileSync(join(wd, '.git', 'config'), 'utf8') } catch { return '' } }
 
+// #556：真实执行一次内联凭据助手（用真 sh / Windows 用 git 自带 sh），确认 helper 能
+// 从环境变量吐出正确的 username/password——不打网络，只验证助手脚本本身可执行。
+test('#556 凭据助手：env 里有 credential.helper，且助手能从环境变量吐出正确 username/password', async () => {
+  fresh()
+  backup('aurabot-backup-20261103-0330.zip')
+  await push.pushBackup(remote)
+  const env = commands[0].env
+  assert.equal(env.GIT_CONFIG_KEY_0, 'credential.helper')
+  assert.ok(env.GIT_CONFIG_VALUE_0.startsWith('!'), '助手必须是 `!` 前缀的 shell 一行式')
+  // 真·子进程模拟：跑助手脚本本身，比对它吐出来的凭据（不经 git，不经网络）
+  const { execFileSync } = await import('node:child_process')
+  const sh = process.platform === 'win32'
+    ? join(process.env['ProgramFiles'] || 'C:\\Program Files', 'Git', 'bin', 'sh.exe')
+    : '/bin/sh'
+  if (!existsSync(sh)) return // 这台机器没有 git 自带 sh 就跳过真实执行部分（env 断言在上面已完成）
+  const script = env.GIT_CONFIG_VALUE_0.slice(1) // 去掉 `!` 前缀
+  const out = execFileSync(sh, ['-c', script], { env, encoding: 'utf8' })
+  assert.deepEqual(out.trim().split('\n'), ['username=owner-x', 'password=SECRET_TOKEN_A1'])
+})
+
+test('#556 令牌不出现在 git spawn 参数，也不出现在任何 GIT_CONFIG_VALUE 里', async () => {
+  fresh()
+  backup('aurabot-backup-20261103-0330.zip')
+  await push.pushBackup(remote)
+  for (const c of commands) {
+    assert.equal(c.args.some((a) => String(a).includes('SECRET_TOKEN_A1')), false, '令牌出现在命令行参数里')
+    for (const [k, v] of Object.entries(c.env)) {
+      if (/^GIT_CONFIG/.test(k)) assert.equal(String(v).includes('SECRET_TOKEN_A1'), false, `令牌出现在 ${k} 里`)
+    }
+  }
+  // 唯一的令牌载体是环境变量 AURABOT_GITEE_TOKEN；助手脚本文本里不含令牌原文
+  assert.ok(commands[0].env.AURABOT_GITEE_TOKEN === 'SECRET_TOKEN_A1')
+  assert.equal(commands[0].env.GIT_CONFIG_VALUE_0.includes('SECRET_TOKEN_A1'), false)
+})
+
+test('#556 用户名白名单：非法字符回落 oauth2，合法用户名原样拼进助手', () => {
+  // 合法：字母数字点下划线连字符，1-64 位
+  const okEnv = push.gitEnv('SECRET_TOKEN_A1', 'a-b.c_d')
+  assert.equal(okEnv.GIT_CONFIG_VALUE_0, '!echo "username=a-b.c_d"; echo "password=$AURABOT_GITEE_TOKEN"')
+  // 非法（能改 sh 语义的字符、超长、空）一律回落 oauth2，且令牌只进环境变量
+  for (const bad of ['a;b', 'a b', '$x', 'a`b', 'x'.repeat(65), '', 'a"b']) {
+    const e = push.gitEnv('SECRET_TOKEN_A1', bad)
+    assert.ok(e.GIT_CONFIG_VALUE_0.includes('username=oauth2'), `非法用户名 ${JSON.stringify(bad)} 未回落 oauth2`)
+    assert.equal(e.GIT_CONFIG_VALUE_0.includes('SECRET_TOKEN_A1'), false)
+  }
+  // 未传用户名同样回落 oauth2
+  assert.ok(push.gitEnv('SECRET_TOKEN_A1').GIT_CONFIG_VALUE_0.includes('username=oauth2'))
+})
+
 test('保留 N 份的淘汰计划：文件夹倒序留前 N 个，非备份文件夹不掺和', () => {
   const plan = push.prunePlan(['aurabot-backup-20261102-0330', 'aurabot-backup-20261101-0330', 'aurabot-backup-20261031-0330', 'not-backup'], 2)
   assert.deepEqual(plan.keep, ['aurabot-backup-20261102-0330', 'aurabot-backup-20261101-0330'])
@@ -77,10 +126,14 @@ test('完整推送：init → remote → 校验私有 → ls-remote → add → 
   // remote 只记干净 URL，令牌不进 .git/config（P1-2）
   const urlArg = commands.find((c) => c.args[0] === 'remote').args.find((a) => a.startsWith('https://'))
   assert.equal(urlArg, 'https://gitee.com/owner-x/repo-x.git')
-  // 令牌经环境变量 http.extraheader（Basic base64）喂给 git，不进命令行（P1-2）
+  // 令牌经环境变量 AURABOT_GITEE_TOKEN 喂给内联凭据助手（#556，走 401 challenge），不进命令行
   const env = commands[0].env
-  assert.equal(env.GIT_CONFIG_VALUE_1, 'AUTHORIZATION: basic ' + Buffer.from('oauth2:SECRET_TOKEN_A1').toString('base64'))
+  assert.equal(env.GIT_CONFIG_KEY_0, 'credential.helper')
+  assert.equal(env.GIT_CONFIG_VALUE_0, '!echo "username=owner-x"; echo "password=$AURABOT_GITEE_TOKEN"')
+  assert.equal(env.AURABOT_GITEE_TOKEN, 'SECRET_TOKEN_A1')
   assert.equal(env.GIT_TERMINAL_PROMPT, '0')
+  assert.equal(env.GIT_AUTHOR_NAME, 'Aurabot')
+  assert.equal(env.GIT_COMMITTER_EMAIL, 'aurabot@localhost')
   // 推送前确实校验过私有性（P1-1）：API 被调用过，且查询参数里带了令牌
   let fetchUrl = ''
   push.pushHooks.fetch = async (url) => { fetchUrl = url; return okApi() }

@@ -26,7 +26,7 @@ function fixture(t, initial = { items: [] }) {
   const dir = mkdtempSync(join(tmpdir(), 'person-delete-forget-'))
   process.env.AURABOT_DATA_DIR = dir
   writeFileSync(join(dir, 'memories.json'), JSON.stringify(initial))
-  const cfg = normalize({ enabled: true, ownerQQ: OWNER, botQQ: BOT, allow: { groups: ['777'], private: [A, B] }, model: { provider: 'p', model: 'm' }, memory: { dailyConsolidate: false, compress: false, gistEnabled: false, keepChatlogDays: 7, extractDailyBatches: 100 } })
+  const cfg = normalize({ enabled: true, ownerQQ: OWNER, botQQ: BOT, allow: { groups: ['777'], private: [A, B] }, model: { provider: 'p', model: 'm' }, memory: { groupExtraction: { '777': 'all' }, dailyConsolidate: false, compress: false, gistEnabled: false, keepChatlogDays: 7, extractDailyBatches: 100 } })
   // 群聊用例必须自己提供互动或好友证据，不能靠私聊白名单隐式通过。
   cfg.allow.private = []
   const rows = [], calls = [], friends = new Set()

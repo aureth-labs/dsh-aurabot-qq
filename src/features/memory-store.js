@@ -231,6 +231,7 @@ export function createMemoryStorage({ directory = () => dataDir(), log = console
   }
   return {
     load, save,
+    snapshot: () => backend && lastState ? structuredClone(lastState) : null,
     status: () => { openDatabase(); closeDatabase(); return { backend, schema: backend === 'sqlite' ? MEMORY_SCHEMA : null, reason: backend === 'json' ? fallbackReason : '' } },
     close: () => { closeDatabase(); backend = undefined; snapshot = undefined },
   }

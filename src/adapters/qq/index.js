@@ -717,7 +717,7 @@ export function createQqAdapter(options = {}) {
     const selfAcc = String(selfId || config().selfId || config().account || '')
     const rawTime = Number(rawMsg?.time)
     const at = Number.isFinite(rawTime) && rawTime > 0 ? (rawTime < 1e12 ? rawTime * 1000 : rawTime) : undefined
-    const { parts } = segmentsToParts(rawMsg?.message ?? rawMsg?.raw_message ?? rawMsg?.content ?? [], { selfId, faceName: options.faceName })
+    const { parts } = segmentsToParts(rawMsg?.message ?? rawMsg?.raw_message ?? rawMsg?.content ?? [], { selfId, faceName: options.faceName, messageId: String(rawMsg?.message_id ?? '') })
     return {
       messageId: String(rawMsg?.message_id ?? rawMsg?.id ?? fallbackId),
       ...(at ? { at } : {}),

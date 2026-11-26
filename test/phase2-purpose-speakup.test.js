@@ -6,7 +6,6 @@ import { join } from 'node:path'
 import { makeTestIdentity } from './helpers/identity.js'
 
 let normalize
-let createSpeakUp
 let createPurpose
 let engine
 let parseCommand
@@ -15,7 +14,6 @@ let runCommand
 before(async () => {
   process.env.AURABOT_DATA_DIR = mkdtempSync(join(tmpdir(), 'aurabot-phase2-pr2d-'))
   ;({ normalize } = await import('../src/core/config.js'))
-  ;({ createSpeakUp } = await import('../src/features/companion.js'))
   ;({ createPurpose } = await import('../src/purpose/module.js'))
   engine = await import('../src/purpose/engine.js')
   ;({ parseCommand, runCommand } = await import('../src/chat/commands.js'))
@@ -43,57 +41,52 @@ test('PR-2D: config.normalize 与 /speak 支持飞书私聊 ChatId 并过滤群/
   assert.deepEqual(cfg.speakUp.allow, [])
 })
 
-test('PR-2D: speakup.json 旧 s.friends 只读归一解析 + 保存时按新键惰性重写，坏条目警告跳过', async () => {
+test('PR-2D: 目的引擎承接旧白名单排程，主人不可达时仍可正常投递给朋友', async () => {
   const warnings = []
   const file = join(process.env.AURABOT_DATA_DIR, 'speakup.json')
-  const rawOld = {
-    day: new Date().toDateString(),
-    count: 0,
-    nextAt: Date.now() + 3600_000,
+  const now = Date.now()
+  const legacy = {
+    day: new Date(now).toDateString(),
+    count: 1,
+    nextAt: now + 3600_000,
     friends: {
-      '22222': { day: new Date().toDateString(), count: 1, nextAt: Date.now() - 1 },
+      '22222': { day: new Date(now).toDateString(), count: 1, nextAt: now - 1 },
       'bad:::key': { count: 9 },
       'corrupt-val': 'not-an-object',
     },
   }
-  writeFileSync(file, JSON.stringify(rawOld))
+  writeFileSync(file, JSON.stringify(legacy))
 
   const sent = []
+  const friend = 'qq:private:22222'
   const cfg = normalize({
     enabled: true,
-    ownerQQ: '10000001',
-    speakUp: { enabled: true, allow: ['qq:private:22222', 'feishu:private:ou_f1', 'bad:::allow'], awakeFrom: 0, awakeTo: 24, idleMinutes: 1, minIntervalMinutes: 1, maxIntervalMinutes: 1, maxPerDay: 5 },
+    ext: { purpose: { enabled: true, minMaterials: 0 } },
+    speakUp: { enabled: true, allow: [friend], awakeFrom: 0, awakeTo: 24, idleMinutes: 1, maxPerDay: 5 },
   })
   const identity = makeTestIdentity('10000001', 'qq')
-  const su = createSpeakUp({
+  const purpose = createPurpose({
     getConfig: () => cfg,
     hub: {
-      get lastOwnerChatAt() { return Date.now() },
+      lastOwnerChatAt: now,
       lastBotToOwner: { at: 0, text: '' },
       lastPrivateAt: () => 0,
-      pushToSession: async (chat, content) => { sent.push({ chat, text: content[0].text }) },
+      chatLogDays: () => ['d'],
+      chatLogOf: () => [{ chatId: friend, t: now - 3600_000, who: '老朋友', text: '最近想学摄影构图' }],
+      async runSystemTurn() { return '最近摄影顺利吗？' },
+      async deliver(chatId, text) { sent.push({ chatId, text }); return { sent: text } },
     },
     identity,
-    routeOwner: identity.routeOwner,
+    resolveOwnerRoute: () => ({ chatId: '', blocked: true, reason: 'primary-offline' }),
     log: { info() {}, warn: (m) => warnings.push(String(m)), debug() {} },
   })
-
-  // 1) 只读 state() 返回归一化键，不提前写盘破坏旧文件
-  const stRead = su.state()
-  assert.equal(stRead.friends['qq:private:22222']?.count, 1)
-  assert.equal(stRead.friends['bad:::key'], undefined)
-  assert.equal(JSON.parse(readFileSync(file, 'utf8')).friends['22222']?.count, 1, '只读访问不应改写磁盘文件')
-
-  // 2) tickFriends 触发时读取旧槽 count=1（+1 变 2）并保存：按新键惰性重写且丢弃坏条目
-  await su.tick()
-  const saved = JSON.parse(readFileSync(file, 'utf8'))
-  assert.equal(saved.friends['qq:private:22222']?.count, 2, '继承旧键次数后写入规范新键')
-  assert.equal(saved.friends['22222'], undefined, '惰性重写后清除旧裸键')
-  assert.equal(saved.friends['bad:::key'], undefined)
-  assert.equal(saved.friends['corrupt-val'], undefined)
-  assert.ok(warnings.some((w) => w.includes('无效条目')), '坏条目应记警跳过不阻断')
-  assert.equal(sent.length, 1)
-  assert.equal(sent[0].chat.chatId, 'qq:private:22222')
+  assert.equal(purpose.state().countToday, 1)
+  await purpose.tick()
+  const newFriendState = join(process.env.AURABOT_DATA_DIR, 'purpose', 'friends', 'qq~private~22222.json')
+  assert.equal(JSON.parse(readFileSync(newFriendState, 'utf8')).countToday, 2)
+  assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), legacy, '旧数据只读')
+  assert.ok(warnings.some((w) => w.includes('speakup.json/friends')))
+  assert.deepEqual(sent.map((item) => item.chatId), [friend])
 })
 
 test('PR-2D: purpose.brokerReview 消除 ownerKey.slice 缺陷，兼容 feishu 与 qq 规范地址', async () => {

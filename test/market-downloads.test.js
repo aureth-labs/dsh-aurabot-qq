@@ -70,7 +70,7 @@ function setup(packs, { releases = [], releasesFail = null, assetsBase = 'https:
   return { c, asked, apiCalls: () => asked.filter((u) => u.includes('api.github.com')) }
 }
 
-const rel = (tag, counts) => ({ tag_name: tag, assets: counts.map((n) => ({ name: `x-${n}.zip`, download_count: n })) })
+const rel = (tag, counts, publishedAt) => ({ tag_name: tag, assets: counts.map((n) => ({ name: `x-${n}.zip`, download_count: n })), ...(publishedAt ? { published_at: publishedAt } : {}) })
 
 before(async () => {
   root = mkdtempSync(join(tmpdir(), 'aurabot-community-dl-'))
@@ -155,18 +155,13 @@ test('市场面板：卡片显示下载次数、可以按热度排', () => {
   const src = readFileSync(new URL('../client/client.js', import.meta.url), 'utf8')
   assert.match(src, /'下载 ' \+ num\(m\.downloads\) \+ ' 次'/)
   assert.match(src, /按热度/)
-  assert.match(src, /byHot/)
+  assert.match(src, /sortMarketModules/)
 })
 
-test('市场面板：分页渲染，筛选变化回第一页', () => {
+test('市场面板：连续滚动时延迟视口外卡片的布局', () => {
   const src = readFileSync(new URL('../client/client.js', import.meta.url), 'utf8')
-  // 只画当前页，不把整个市场一次全渲染出来
-  assert.match(src, /pageShown\.map\(card\)/)
-  assert.ok(!src.includes('shown.map(card)'), '不能整列表直接渲染')
-  assert.match(src, /PAGE_SIZE = 12/)
-  assert.match(src, /setPage\(1\)/, '筛选条件变化要回第一页')
-  assert.match(src, /Math\.min\(page, pages\)/, '旧页码越界要夹回来')
-  assert.match(src, /第 ' \+ cur \+ ' \/ ' \+ pages \+ ' 页/)
+  assert.match(src, /\.ab-market-grid>\.ab-card\{[^}]*content-visibility:auto/)
+  assert.match(src, /\.ab-market-grid>\.ab-card\{[^}]*contain-intrinsic-block-size:auto \d+px/)
 })
 
 test('市场面板：标题跳仓库，只认 http(s) 的 homepage', () => {
@@ -189,4 +184,32 @@ test('市场面板：地址设置默认折叠、放在市场上方', () => {
   assert.ok(registry >= 0 && market > registry, '地址卡要在市场卡的上方')
   assert.match(src, /collapsible: true, defaultOpen: false/, '地址卡要默认折叠')
   assert.match(src, /function Card\(\{ title, desc, icon, right, children, className, collapsible, defaultOpen = true/, 'Card 要支持折叠')
+})
+
+test('排序时间兜底：索引 publishedAt 原样带出，缺失时用 GitHub Release 最新 published_at', async () => {
+  const packs = [pack('pet', '1.0.0'), pack('douyin', '2.0.0')]
+  packs[0].entry.publishedAt = '2026-11-12T04:18:02.203Z'
+  const s = setup(packs, {
+    releases: [[
+      rel('pet-v1.0.7', [1], '2026-10-01T00:00:00Z'),
+      rel('pet-v1.0.8', [1], '2026-11-01T00:00:00Z'),
+      rel('douyin-v2.0.4', [0], '2026-09-01T00:00:00Z'),
+    ]],
+  })
+  const r = await s.c.list()
+  const byId = Object.fromEntries(r.list.map((m) => [m.id, m]))
+  assert.equal(byId.pet.publishedAt, '2026-11-12T04:18:02.203Z', '索引的发布时间要原样回传给面板排序')
+  assert.equal(byId.douyin.publishedAt, '', '没有 publishedAt 也不能凭空造')
+  assert.equal(byId.pet.releasedAt, '2026-11-01T00:00:00Z', '取模块最新一个 Release 的发布时间')
+  assert.equal(byId.douyin.releasedAt, '2026-09-01T00:00:00Z', '每个模块各取自己的最新 Release')
+})
+
+test('排序时间兜底：索引用 snake_case 的 published_at / updated_at 也认', async () => {
+  const p = pack('pet', '1.0.0')
+  p.entry.published_at = '2026-11-12T04:18:02.203Z'
+  p.entry.updated_at = '2026-11-13T04:18:02.203Z'
+  const s = setup([p], { releases: [] })
+  const r = await s.c.list()
+  assert.equal(r.list[0].publishedAt, '2026-11-12T04:18:02.203Z')
+  assert.equal(r.list[0].updatedAt, '2026-11-13T04:18:02.203Z')
 })

@@ -173,6 +173,22 @@ export async function segmentBytes(seg, onebot, o = {}) {
   throw lastErr || new Error('这个图片段没有可用的地址')
 }
 
+/** 把字节数写成「10.3MB」这种人话。错误信息里带上实际大小和上限，模型才知道该怎么补救。 */
+export function formatBytes(n) {
+  const v = Number(n) || 0
+  if (v >= 1024 * 1024) return (v / 1024 / 1024).toFixed(1) + 'MB'
+  if (v >= 1024) return Math.round(v / 1024) + 'KB'
+  return v + 'B'
+}
+
+/**
+ * 只丢一句「太大了」的话，模型只能猜是自己搞错了还是图真的太大，
+ * 拿不到「多大 / 上限多少」就只能让主人换一张再试一次 —— 所以消息里两个数都要给。
+ */
+function tooLarge(actual, maxBytes) {
+  return new Error(`图片太大：${formatBytes(actual)}，上限 ${formatBytes(maxBytes)}`)
+}
+
 /**
  * @param {string} src http(s) 地址 / base64://… / file:// / 本地绝对路径
  * @param {{maxBytes?:number, timeoutMs?:number, allowLocal?:boolean, fetchImpl?:Function}} [o]
@@ -183,14 +199,14 @@ export async function fetchImage(src, o = {}) {
   if (!s) throw new Error('没有地址')
   if (s.startsWith('base64://')) {
     const buf = Buffer.from(s.slice(9), 'base64')
-    if (buf.length > maxBytes) throw new Error('太大了')
+    if (buf.length > maxBytes) throw tooLarge(buf.length, maxBytes)
     return buf
   }
   if (/^https?:\/\//i.test(s)) {
     const r = await fetchGuarded(s, o)
     if (!r.ok) throw new Error(`HTTP ${r.status}`)
     const len = Number(r.headers.get('content-length') || 0)
-    if (len > maxBytes) throw new Error('太大了')
+    if (len > maxBytes) throw tooLarge(len, maxBytes)
     const reader = r.body.getReader()
     const chunks = []
     let total = 0
@@ -200,7 +216,7 @@ export async function fetchImage(src, o = {}) {
       total += value.length
       if (total > maxBytes) {
         try { reader.cancel() } catch (e) {}
-        throw new Error('太大了')
+        throw tooLarge(total, maxBytes)
       }
       chunks.push(Buffer.from(value))
     }
@@ -210,7 +226,7 @@ export async function fetchImage(src, o = {}) {
   if (o.allowLocal !== false) {
     const p = s.startsWith('file://') ? fileURLToPath(s) : s
     if (/^[a-zA-Z]:[\\/]/.test(p) || p.startsWith('/')) {
-      if (statSync(p).size > maxBytes) throw new Error('太大了')
+      if (statSync(p).size > maxBytes) throw tooLarge(statSync(p).size, maxBytes)
       return readFileSync(p)
     }
   }

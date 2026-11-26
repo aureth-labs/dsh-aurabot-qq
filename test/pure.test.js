@@ -25,6 +25,13 @@ test('parseReply 识别语音和表情标记', () => {
   assert.deepEqual(r2.items.map((x) => x.kind), ['text', 'sticker'])
 })
 
+test('中文参数标签 <参数 name="sticker"> 也转成真表情，不原样发出', () => {
+  const r = parseReply('<参数 name="sticker">N05_刷刷<参数>')
+  assert.deepEqual(r.items, [{ kind: 'sticker', value: 'N05_刷刷' }])
+  const v = parseReply('<参数 name="voice">晚安啦<参数>')
+  assert.deepEqual(v.items, [{ kind: 'voice', value: '晚安啦' }])
+})
+
 test('parseReply 沉默与空', () => {
   assert.equal(parseReply('[沉默]').silent, true)
   assert.equal(parseReply('   ').silent, true)
@@ -270,7 +277,7 @@ test('规则：画画、唱歌只在功能真的能用时告诉她', async () =>
   const off = rulesText('social', normalize({ imageGen: { enabled: true } }))
   assert.doesNotMatch(off, /你会画画|你会唱歌/, '没配生图服务就不说会画')
   const on = rulesText('social', normalize({ imageGen: { enabled: true, baseUrl: 'https://x/v1', model: 'm' }, song: { enabled: true } }))
-  assert.match(on, /你会画画：只给主人画/)
+  assert.match(on, /你会画画：只给管理者画/)
   assert.match(on, /你会唱歌/)
 })
 
@@ -353,7 +360,7 @@ test('解析：合并转发记下 id，回复里的 <poke> 变成戳一戳', asy
   const { parseMessageEvent } = await import('../src/chat/inbound.js')
   const { parseReply } = await import('../src/chat/reply.js')
   const m = parseMessageEvent({ message_type: 'group', group_id: 1, user_id: 2, message: [{ type: 'forward', data: { id: 'abc' } }] }, '9')
-  assert.deepEqual(m.forwards, ['abc'])
+  assert.deepEqual(m.forwards, [{ id: 'abc', outerId: '', content: null }])
   assert.match(m.text, /合并转发/)
   assert.deepEqual(parseReply('干嘛<poke>').items.map((i) => i.kind), ['text', 'poke'])
   assert.equal(parseReply('<poke><poke>').items.filter((i) => i.kind === 'poke').length, 1, '一轮最多戳一次')
@@ -419,8 +426,35 @@ test('群聊：没人叫她时接话有上限，叫她就重新开始', () => {
   assert.equal(decideGroupReply({ ...o, policy: { ...DEFAULT_GROUP_POLICY, engagedMax: 0 } }).reply, false)
 })
 
+test('人设识图模型：旧配置、脏值、两半选择与面板合并', async () => {
+  const { normalize, publicConfig, mergeFromPanel } = await import('../src/core/config.js')
+  const empty = { provider: '', model: '' }
+  for (const raw of [{}, { personaLook: null }, { personaLook: { visionModel: [] } }, { personaLook: { visionModel: { provider: 'p' } } }, { personaLook: { visionModel: { provider: {}, model: 'm' } } }]) {
+    assert.deepEqual(normalize(raw).personaLook.visionModel, empty)
+  }
+  const cfg = normalize({ personaLook: { visionModel: { provider: ' p ', model: ' v ' } } })
+  assert.deepEqual(cfg.personaLook.visionModel, { provider: 'p', model: 'v' })
+  assert.deepEqual(publicConfig(cfg).personaLook, cfg.personaLook)
+  assert.deepEqual(mergeFromPanel(cfg, { personaLook: { visionModel: empty } }).personaLook.visionModel, empty)
+})
+
 test('群聊：接话提示告诉她连着说了几次，让她自己停', () => {
   assert.doesNotMatch(engagedHint(1), /连着接了/)
   assert.match(engagedHint(3), /连着接了 2 次/)
   assert.match(engagedHint(3), /\[沉默\]/)
+})
+
+test('parseMessageEvent：群聊 @ 别人保留目标账号', () => {
+  const e = {
+    post_type: 'message', message_type: 'group', group_id: 555, user_id: 777, message_id: 43, self_id: SELF,
+    sender: { nickname: '小明', card: '明明', role: 'member' },
+    message: [
+      { type: 'at', data: { qq: '888', name: '小红' } },
+      { type: 'text', data: { text: ' 来唱一首' } },
+    ],
+  }
+  const m = parseMessageEvent(e, SELF)
+  assert.equal(m.mentioned, false)
+  assert.equal(m.atOthers, true)
+  assert.deepEqual(m.atTargets, [{ qq: '888', name: '小红' }])
 })

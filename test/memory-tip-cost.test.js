@@ -55,3 +55,33 @@ test('记忆和关系多时，contextFor / recallHint 不按条数反复读库',
   assert.match(ctx, /人物关系/, '关系仍然要进上下文')
   assert.doesNotThrow(() => mem.recallHint(chat, '上次说的那件事', '', 's', [owner]))
 })
+
+test('聊天流水逐行 rememberedRow 不按每行整库读盘', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aurabot-row-cost-'))
+  const oldDir = process.env.AURABOT_DATA_DIR
+  process.env.AURABOT_DATA_DIR = dir
+  t.after(() => {
+    if (oldDir === undefined) delete process.env.AURABOT_DATA_DIR
+    else process.env.AURABOT_DATA_DIR = oldDir
+    rmSync(dir, { recursive: true, force: true })
+  })
+  seed(dir, { items: 1000, relations: 0, people: 30 })
+  const now = Date.now()
+  const rows = Array.from({ length: 3000 }, (_, i) => ({
+    t: now - i * 1000,
+    chatId: 'private:' + owner,
+    who: 'user',
+    uid: owner,
+    text: '流水第 ' + i + ' 条，用来验证逐行过滤不会重复读整库。',
+  }))
+  const hub = { speakersOf: () => [owner], chatLogDays: () => ['2026-11-14'], chatLogOf: () => rows, chatLogRevision: () => 1 }
+  const mem = createMemoryStore({ dsh: {}, getConfig: () => ({ memory: { enabled: true }, ownerQQ: owner }), hub, log })
+  const chat = { kind: 'private', userId: owner, chatId: 'private:' + owner }
+
+  mem.recallHint(chat, '流水', '', 's', [owner]) // 预热
+  const t0 = performance.now()
+  const hint = mem.recallHint(chat, '流水', '', 's', [owner])
+  const ms = performance.now() - t0
+  assert.equal(typeof hint, 'string')
+  assert.ok(ms < 1500, `3000 行聊天流水过滤用了 ${ms.toFixed(0)}ms，像是又按行整库读盘了`)
+})

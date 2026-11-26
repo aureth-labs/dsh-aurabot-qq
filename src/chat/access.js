@@ -164,6 +164,23 @@ export function checkAllowed(cfg, msg, ownerRef = null) {
     : { allowed: false, reason: '不在群白名单' }
 }
 
+/** 群消息入口：白名单仍控制模块；仅模块名单只关闭群消息触发的 AI 接话。 */
+export function groupResponseMode(cfg, group) {
+  const target = typeof group === 'object' && group !== null ? group : { groupId: group }
+  const addr = parseChatId(target.chatId)
+  const msg = { chatId: target.chatId, platform: target.platform, instance: target.instance, groupId: target.groupId ?? addr?.id }
+  if (!allowMatches(cfg.allow?.groups, msg, 'group')) return 'off'
+  return allowMatches(cfg.group?.moduleOnlyGroups, msg, 'group') ? 'modules' : 'chat'
+}
+export const GROUP_RESPONSE_LABELS = { off: '不响应群消息', modules: '仅模块', chat: '允许 AI 聊天' }
+
+/** 只旁听指定的非白名单群：不开放回复、命令、工具或媒体下载。 */
+export function shouldObserveGroup(cfg, msg) {
+  return cfg.enabled === true && !cfg.debug && cfg.memory?.enabled === true &&
+    msg.kind === 'group' && !checkAllowed(cfg, msg).allowed &&
+    allowMatches(cfg.memory.passiveGroups, { chatId: msg.chatId, platform: msg.platform, instance: msg.instance, groupId: msg.groupId }, 'group')
+}
+
 /** 群聊里给不给本机工具：off = 不给；owner = 只有主人说话那一轮给。
  * 没有「谁问都给」这一档——群里任何人都能驱动本机读写，权限面太大，明确不做。 */
 export const GROUP_OWNER_TOOLS = ['off', 'owner']

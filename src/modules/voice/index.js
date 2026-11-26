@@ -2,16 +2,44 @@
 // 面板里的试听、语音识别自检也在这里。
 // 导出 speak(text) → { file, engine }：聊天中枢发语音时找它。替换这个模块就能换成任何你想要的念法。
 
-import { existsSync, readFileSync } from 'node:fs'
-import { textToSpeech, edgeInstalled, installEdge, voiceConverters, volcanoResourceFor, volcanoSynth } from '../../voice/tts.js'
+import { existsSync, readFileSync, unlinkSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { textToSpeech, edgeInstalled, installEdge, voiceConverters, volcanoResourceFor, volcanoSynth, systemVoiceEngine } from '../../voice/tts.js'
+import { fishBalances, fishPrimary } from '../../voice/fish.js'
+import { runCloud } from '../../voice/tts.js'
 import { VOLCANO_VOICES } from '../../voice/volcano-voices.js'
 import { breezeBalance, breezeClaim, breezeSession, autoClaimOnce, breezeVoices } from '../../voice/breeze.js'
 import { createSongVoice } from '../../voice/rvc.js'
 import { toMono16k } from '../../voice/wav.js'
 import { fileOf } from '../../local/local.js'
+
+/** 识别链路只吃 PCM16 WAV：自检拿到 mp3 时先用 ffmpeg 转一道（#255）。 */
+export function asPcmWav (file, buf, ffmpegPath = '', { platform = process.platform, findFfmpegFn = findFfmpeg, runFn = spawnSync } = {}) {
+  // RIFF 还要是 PCM16 才能直接进识别（WAVE_FORMAT_EXTENSIBLE / float 会被 toMono16k 拒掉）。
+  if (buf.length > 44 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.readUInt16LE(20) === 1 && buf.readUInt16LE(34) === 16) return buf
+  const ff = findFfmpegFn(ffmpegPath)
+  if (!ff) {
+    const hint = platform === 'linux'
+      ? '这台机器没有系统语音兜底，装好 ffmpeg 再试，或在「语音」页改用本地 TTS 服务'
+      : '装好 ffmpeg 再试，或在「语音」页改用系统语音 / 本地 TTS 服务'
+    throw new Error('自检拿到的音频不是 PCM16 WAV，这台机器也没找到 ffmpeg，转不了：' + hint)
+  }
+  const out = file.replace(/\.[a-z0-9]+$/i, '') + '.16k.wav'
+  const r = runFn(ff, ['-y', '-i', file, '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', out], { timeout: 60000, windowsHide: true })
+  let converted = null
+  try {
+    if (!r.error && r.status === 0 && existsSync(out)) converted = readFileSync(out)
+  } finally {
+    try { if (existsSync(out)) unlinkSync(out) } catch {}
+  }
+  if (!converted) throw new Error('音频转 WAV 失败：' + String(r.error?.message || r.stderr || '').slice(-200))
+  return converted
+}
+
 import { asrConfigured, transcribeAudio } from '../../voice/asr.js'
 import { mergeFromPanel, normalize } from '../../core/config.js'
 import { formatChatId, normalizeChatId, parseChatId } from '../../gateway/address.js'
+import { findFfmpeg } from '../../core/img.js'
 
 export default {
   id: 'voice',
@@ -21,7 +49,7 @@ export default {
   platforms: ['*'],
   description: '发语音条：把她的话念出来（关掉后想发语音时改发文字）',
   tab: 'voice',
-  files: ['voice/tts.js', 'voice/asr.js', 'voice/rvc.js', 'voice/volcano-voices.js'],
+  files: ['voice/tts.js', 'voice/key-pool.mjs', 'voice/fish.js', 'voice/asr.js', 'voice/rvc.js', 'voice/volcano-voices.js'],
   setup(api) {
     const { hub, local, http } = api.core
 
@@ -32,6 +60,10 @@ export default {
           const file = fileOf(await local.call('tts', { text }))
           if (file && existsSync(file)) return { file, engine: 'local' }
         } catch (error) {}
+      }
+      if (voice.engine === 'fish-free' && !voice.fishApiKey) {
+        const fishApiKey = await fishPrimary(voice, () => api.dsh?.get?.('credentials'))
+        return textToSpeech(text, { ...voice, fishApiKey }, api.log)
       }
       return textToSpeech(text, voice, api.log)
     }
@@ -63,6 +95,8 @@ export default {
         return { ok: false, available: false, voices: [], message: String(error.message || error) }
       }
     })
+
+    api.route('/voice/fish-balances', () => fishBalances(api.config().voice, () => api.dsh?.get?.('credentials')))
 
     api.route('/voice/test', async (req) => {
       const b = await http.body(req)
@@ -106,9 +140,10 @@ export default {
         resourceId: String(b.resourceId || saved.resourceId || '').trim(),
         speedRatio: Number(b.speedRatio) || Number(saved.speedRatio) || 1,
       }
-      if (!c.apiKey) return { ok: false, message: '先在上面把 API Key 填上，再试听' }
+      const pool = b.keyPool ? mergeFromPanel(api.config(), { voice: { keyPools: { volcano: b.keyPool } } }).voice.keyPools.volcano : api.config().voice.keyPools?.volcano
+      if (!c.apiKey && !pool?.accounts?.some(a => a.apiKey)) return { ok: false, message: '先在上面把 API Key 填上，再试听' }
       try {
-        const file = await volcanoSynth(String(b.text || '你好呀，我是大肥鱼。这个声音你听着怎么样？'), c)
+        const file = await runCloud('volcano', c.apiKey, pool, key => volcanoSynth(String(b.text || '你好呀，我是大肥鱼。这个声音你听着怎么样？'), { ...c, apiKey: key }))
         const buf = readFileSync(file)
         return { ok: true, engine: 'volcano', mime: 'audio/mpeg', data: buf.toString('base64') }
       } catch (error) {
@@ -199,15 +234,18 @@ export default {
         return { ok: false, message: error?.message || '语音识别失败' }
       }
     })
-    // 自检「听语音」：Windows 语音念一句 → 转 16k 单声道 → DSH 自带识别 → 看能不能认回来
+    // 自检「听语音」：系统/edge 语音念一句 → 转 16k 单声道 → DSH 自带识别 → 看能不能认回来
+    // 不写死 Windows 语音：有系统语音就先用系统语音（Windows System.Speech / macOS say，都是 WAV），
+    // 没有才回落 edge-tts，并把 mp3 用 ffmpeg 转成 WAV 再送识别（#255）。
     api.route('/voice/asr-test', async (req) => {
       const b = await http.body(req)
       const s0 = stt()
       if (!s0 || typeof s0.resolve !== 'function') return { ok: false, message: 'DSH 里没有开启语音识别（设置 → 插件 → 语音输入）' }
       const text = String(b.text || '今天想吃白米饭')
-      const { file } = await textToSpeech(text, { engine: 'windows' })
+      const system = systemVoiceEngine()
+      const { file } = await textToSpeech(text, system ? { engine: system } : {})
       const t = Date.now()
-      const spec = s0.resolve({ audio: new Uint8Array(toMono16k(readFileSync(file))) })
+      const spec = s0.resolve({ audio: new Uint8Array(toMono16k(asPcmWav(file, readFileSync(file), api.config().bili?.ffmpegPath || ''))) })
       const r = await s0.transcribe(spec, AbortSignal.timeout(120000))
       const heard = typeof r === 'string' ? r : r?.text || r?.transcript || JSON.stringify(r)
       return { ok: Boolean(heard), said: text, heard, ms: Date.now() - t }

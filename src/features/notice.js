@@ -27,6 +27,14 @@ export function createNoticeRelay({ getConfig, workspaceOf, compose, identity, h
   const buf = new Map()
   let timer = null
   let retry = 0
+  /** 合并窗口：每次攒批现读 config.notice.windowSec，面板改完保存即生效（不用重启）。 */
+  function windowMsNow() {
+    try {
+      const sec = Number(getConfig?.()?.notice?.windowSec)
+      if (!Number.isFinite(sec)) return windowMs
+      return Math.min(60, Math.max(1, Math.round(sec))) * 1000
+    } catch (error) { return windowMs }
+  }
 
   /** 这个会话的这一类事要不要上报：先看总开关，再看工作区覆盖。没认出主人就不报（发不出去）。 */
   function enabled(kind, sessionId) {
@@ -102,7 +110,8 @@ export function createNoticeRelay({ getConfig, workspaceOf, compose, identity, h
     prune()
     buf.set(key, { kind, at: Date.now(), ...info })
     if (buf.size >= maxItems) { schedule(0); return true }
-    if (!timer) schedule(windowMs)
+    // 合并窗口现读配置：面板改了 notice.windowSec 保存后，下一次审批立即按新值走，不用重启
+    if (!timer) schedule(windowMsNow())
     return true
   }
 

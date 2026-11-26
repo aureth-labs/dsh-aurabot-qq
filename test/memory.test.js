@@ -18,6 +18,13 @@ const dsh = {
       const text = messages[0].content[0].text
       asked.push({ system, text })
       let out = '[]'
+      // #346：第一次返回被截断的非空 JSON，用来验证会放宽预算重试一次。
+      if (system.includes('整理长期记忆') && dsh.__truncateOnce) {
+        dsh.__truncateOnce = false
+        yield { type: 'text-delta', text: '{"facts":[{"op":"add","text":"被截断的记' }
+        yield { type: 'finish', reason: { kind: 'completed' } }
+        return
+      }
       if (system.includes('整理长期记忆') && text.includes('戒辣')) {
         const id = (text.match(/#(\w+) [^\n]*喜欢吃辣/) || [])[1]
         out = JSON.stringify([{ op: 'outdated', id, text: '小明戒辣了', about: '小明', importance: 0.6 }])
@@ -379,3 +386,32 @@ test('persona notes 分页：首屏最多 20，offset 能接着取', () => {
   assert.equal(next.total, first.notesTotal)
 })
 
+
+
+test('提炼：非空但截断时放宽预算重试一次（#346）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'aurabot-mem-346-'))
+  const today = day(new Date())
+  const localLogs = new Map([[today, [line('触发截断')]]])
+  const localHub = {
+    chatLogDays: () => [...localLogs.keys()],
+    chatLogOf: (d) => localLogs.get(d) || [],
+    deleteChatLog: (d) => localLogs.delete(d),
+    lastTextOf: () => '',
+    speakersOf: () => [],
+    prevTextOf: () => '',
+    groupNames: new Map(),
+  }
+  const store = createMemoryStore({
+    dsh,
+    getConfig: () => normalize({ model: { provider: 'p', model: 'm' }, ownerQQ: '10000001', ownerName: '主人', allow: { private: ['30000003'] }, memory: { keepChatlogDays: 0, keepChatlogSet: true } }),
+    hub: localHub,
+    log: { info () {}, warn () {}, debug () {} },
+    directory: dir,
+  })
+  dsh.__truncateOnce = true
+  const before = asked.filter((a) => a.system.includes('整理长期记忆')).length
+  const r = await store.consolidate({ includeToday: true })
+  assert.equal(r.ok, true, r.message)
+  const calls = asked.filter((a) => a.system.includes('整理长期记忆')).length - before
+  assert.equal(calls, 2, '第一次返回被截断的非空 JSON，应当再重试一次')
+})

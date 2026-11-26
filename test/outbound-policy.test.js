@@ -354,17 +354,19 @@ test('registerPolicySource 幂等：同 name 覆盖；unregister 后回到未纳
   assert.equal(svc.admit({ to: 'private:10001' }).reason, 'no-policy-source')
 })
 
-test('setActivePolicy：显式选中的策略源未注册 → deny 而非悄悄放行', () => {
+test('setActivePolicy：存量 speakup 归一化为 purpose；显式选中未注册源 → deny 而非悄悄放行', () => {
   const { svc } = makeService({ config: makeConfig({ tier: 'gate' }) })
-  svc.registerPolicySource(fakePolicy('speakup'))
-  assert.equal(svc.setActivePolicy('purpose').ok, true)
+  // P3：'speakup' 档已从 ACTIVE_MODES 移除，存量值归一化为 'purpose'（不弹错）
+  assert.equal(svc.setActivePolicy('speakup').ok, true)
+  // purpose 尚未注册：显式档指向不存在的源 → deny（policy-error），绝不静默放行
   const r = svc.admit({ to: 'private:10001' })
   assert.equal(r.action, 'deny')
   assert.equal(r.reason, 'policy-error')
-  // auto 会回落到已注册且 ready 的那个
+  // 注册 purpose 源后 auto 与显式 purpose 都能走通
+  svc.registerPolicySource(fakePolicy('purpose'))
   svc.setActivePolicy('auto')
   assert.equal(svc.admit({ to: 'private:10001' }).action, 'allow')
-  assert.equal(svc.status().activePolicy, 'speakup')
+  assert.equal(svc.status().activePolicy, 'purpose')
   assert.equal(svc.setActivePolicy('nope').ok, false)
 })
 
@@ -386,7 +388,7 @@ test('submit 注入投递器后自己发出：返回 sent，模块不必管投�
     config: makeConfig({ tier: 'broker' }),
     send: (to, text) => { sent.push({ to, text }); return { message_id: 'm1' } },
   })
-  svc.registerPolicySource(fakePolicy('speakup'))
+  svc.registerPolicySource(fakePolicy('purpose'))
   const r = await svc.submit({ moduleId: 'm1', itemId: 'i1', to: 'private:10001', text: '你好' })
   assert.equal(r.state, 'sent')
   assert.equal(sent.length, 1, '应真的投递一次')
@@ -399,7 +401,7 @@ test('submit 投递失败（返回假值）→ failed，不重复打扰', async 
     config: makeConfig({ tier: 'broker' }),
     send: () => null,
   })
-  svc.registerPolicySource(fakePolicy('speakup'))
+  svc.registerPolicySource(fakePolicy('purpose'))
   const r = await svc.submit({ moduleId: 'm1', itemId: 'i1', to: 'private:10001', text: 'x' })
   assert.equal(r.state, 'failed')
   assert.equal(svc.statusOf(r.deliveryId).state, 'failed')
@@ -410,7 +412,7 @@ test('submit 投递超时（抛错）→ uncertain，不重试不退款', async 
     config: makeConfig({ tier: 'broker' }),
     send: () => { throw new Error('timeout: 网关超时') },
   })
-  const policy = fakePolicy('speakup')
+  const policy = fakePolicy('purpose')
   svc.registerPolicySource(policy)
   const r = await svc.submit({ moduleId: 'm1', itemId: 'i1', to: 'private:10001', text: 'x' })
   assert.equal(r.state, 'uncertain')
@@ -425,7 +427,7 @@ test('submit 被策略门闸拦下：不落账、不投递，返回 dropped 与�
     config: makeConfig({ tier: 'broker' }),
     send: (to, text) => { sent.push({ to, text }); return {} },
   })
-  svc.registerPolicySource(fakePolicy('speakup', { budget: 0 })) // 额度已用完
+  svc.registerPolicySource(fakePolicy('purpose', { budget: 0 })) // 额度已用完
   const r = await svc.submit({ moduleId: 'm1', itemId: 'i1', to: 'private:10001', text: 'x' })
   assert.equal(r.state, 'dropped')
   assert.equal(r.reason, 'budget')
@@ -440,7 +442,7 @@ test('submit 非 owner 目标：不受策略门闸约束，直接投递', async 
     config: makeConfig({ tier: 'broker' }),
     send: (to, text) => { sent.push({ to, text }); return {} },
   })
-  const policy = fakePolicy('speakup', { budget: 0 })
+  const policy = fakePolicy('purpose', { budget: 0 })
   svc.registerPolicySource(policy)
   const r = await svc.submit({ moduleId: 'm1', itemId: 'i1', to: 'private:20002', text: '给朋友' })
   assert.equal(r.state, 'sent')
@@ -469,7 +471,7 @@ test('flushPending：只发 pending，已 sent 的不会重发', async () => {
 test('面板原因：status().sources[name].reason 能显示策略源给的理由', () => {
   const { svc } = makeService({ config: makeConfig({ tier: 'gate' }) })
   svc.registerPolicySource({
-    name: 'speakup',
+    name: 'purpose',
     state: () => 'ready',
     ready: () => true,
     stateReason: '今天额度已用完',
@@ -479,5 +481,5 @@ test('面板原因：status().sources[name].reason 能显示策略源给的理�
     release: () => {},
   })
   const st = svc.status()
-  assert.equal(st.sources.speakup.reason, '今天额度已用完', '面板要能看到原因，不能只有状态')
+  assert.equal(st.sources.purpose.reason, '今天额度已用完', '面板要能看到原因，不能只有状态')
 })

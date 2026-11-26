@@ -44,7 +44,7 @@ export default {
   version: '1.0.0',
   api: 2,
   platforms: ['qq'],
-  description: '发送 QQ 专属卡片（qq_send_card：分享、音乐、位置、联系人、骰子、猜拳）；主人开口时读取聊天里发来的文本文件（qq_read_file）',
+  description: '发送 QQ 专属卡片（qq_send_card：分享、音乐、位置、联系人、骰子、猜拳）；主人开口时读取聊天里发来的文本或图片文件（qq_read_file）',
   setup(api) {
     const { hub, onebot } = api.core
     const qqOnebot = {
@@ -74,15 +74,21 @@ export default {
               const cfg = api.config()
               return { ok: false, message: !cfg.enabled ? '总开关关着，没发' : cfg.dryRun ? '试运行，只记了日志，没真发' : '卡片没发出去' }
             }
-            return { ok: true, message: '卡片发出去了' }
+            return { ok: true, message: card.segment.type === 'share' && card.segment.data.image
+              ? '分享卡片发出去了，封面没有作为单独的图片发送'
+              : '卡片发出去了' }
           },
         }),
         // 读文件：别人发来的内容不可信，只有主人开口才读
         defineTool({
           name: 'qq_read_file',
-          description: '读这个聊天里别人发来的文本文件（txt、md、json、日志、代码等，2MB 以内）。只有主人让你看的时候才用。name 填文件名，不填就读最新的一个。',
+          description: '读这个聊天里别人发来的文本或 JPG、PNG 图片文件（2MB 以内）。只有主人让你看的时候才用。name 填文件名，不填就读最新的一个。',
           properties: { name: str('可选：文件名，不填就读最新的') },
           required: [],
+          render: (_args, value) => {
+            const text = { type: 'text', text: (value.ok ? '' : '✗ ') + value.message }
+            return value.ok && value.image?.attachment ? [text, value.image] : [text]
+          },
           execute: async ({ name }) => {
             if (level !== 'full' && !hub.turnSendersAllOwner?.(sessionId)) return { ok: false, message: '只有主人让看时才能读文件' }
             const list = hub.recentFiles(chat.chatId)
@@ -91,7 +97,7 @@ export default {
             const file = want ? list.findLast((f) => f.name === want) || list.findLast((f) => f.name.includes(want)) : list.at(-1)
             if (!file) return { ok: false, message: `没找到「${want}」，最近的文件有：${list.map((f) => f.name).join('、')}` }
             try {
-              return await readQqFile({ onebot: qqOnebot, chat, file })
+              return await readQqFile({ onebot: qqOnebot, chat, file, dsh: api.dsh, canPreview: () => hub.canSeeImages?.(chat) })
             } catch (error) {
               if (error?.code === 'unsupported-action') return { ok: false, message: '当前 QQ 网关不支持读取聊天文件' }
               throw error

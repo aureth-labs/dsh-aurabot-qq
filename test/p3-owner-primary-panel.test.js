@@ -464,21 +464,31 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
   const tapMarker = 'const TAB_KEYS = {'
   assert.ok(source.includes(tapMarker))
 
+  // 此夹具不调度 useEffect，根组件的保存测试直接从已完成配置水合的状态开始。
+  const readyMarker = 'const [ready, setReady] = useState(false)'
+  const draftBaseMarker = 'const draftBaseRef = useRef(null)'
+  assert.ok(source.includes(readyMarker) && source.includes(draftBaseMarker))
   const instrumented = source
-    .replace(
-      'return h(\'div\', { className: \'ab-root\' },',
-      'exports.__tabKeys = TAB_KEYS;\n      return h(\'div\', { className: \'ab-root\' },',
-    )
+    .replace(readyMarker, 'const [ready, setReady] = useState(true)')
+    .replace(draftBaseMarker, 'const draftBaseRef = useRef(st?.config || null)')
     .replace(
       marker,
       '    exports.panelTest = { GlobalAccess, Platforms, AurabotPage }\n' + marker,
     )
 
   const posted = []
+  let saveConfigSnapshot = {}
   const fakeFetch = async (url, init) => {
     const parsedBody = init?.body ? JSON.parse(init.body) : {}
     if (init?.method === 'POST') posted.push({ url, body: parsedBody })
-    if (url === '/aurabot/api/save') return { json: async () => ({ ok: true, config: parsedBody }) }
+    if (url === '/aurabot/api/save') {
+      const config = { ...saveConfigSnapshot, ...parsedBody }
+      if (parsedBody.ownerPrimary) config.ownerPrimary = { ...saveConfigSnapshot.ownerPrimary, ...parsedBody.ownerPrimary }
+      return { json: async () => ({
+        ok: true, bootId: 'panel-test', configRevision: 2, config,
+        committedPaths: Object.keys(parsedBody).map((key) => '/' + key), unchangedPaths: [],
+      }) }
+    }
     return { json: async () => ({ ok: true }) }
   }
   const script = new Script(instrumented, { filename: 'client/client.js' })
@@ -1294,19 +1304,35 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
     assert.match(disabledText, /回退开关均关闭，不会自动发送/)
 
     // 验证 AurabotPage 真实 save() 入口：
-    // 1) 未修改 fallbackOrder 只改 ownerName 时，提交 /save 省略 fallbackOrder，不覆盖服务端新追加账号（审阅 §3.3）
+    // 1) 只改昵称时仅提交昵称，服务端新追加的接收顺位随保存回执回灌。
     const dirtyCfgUnchangedOrder = JSON.parse(JSON.stringify(prioCfg))
     dirtyCfgUnchangedOrder.ownerName = '主人在保存'
+    const newBinding = { platform: 'qqbot', instance: 'qqbot', account: 'qb_new' }
+    saveConfigSnapshot = { ...prioCfg, ownerPrimary: { ...prioCfg.ownerPrimary, fallbackOrder: [...prioCfg.ownerPrimary.fallbackOrder, newBinding] } }
     hook = 0
     refs.length = 0
-    state = [prioSt, '', dirtyCfgUnchangedOrder, 'access', null, false]
+    state = [prioSt, '', dirtyCfgUnchangedOrder, 'access']
     const pageTree = vmExport.panelTest.AurabotPage()
     const saveBtn = collectNodes(pageTree, (n) => n.type?.name === 'Btn' && textOf(n.children) === '保存设置')[0]
     assert.ok(saveBtn, '修改主配置后应渲染底部「保存设置」按钮')
     await saveBtn.props.onClick()
     const savedUnchangedCall = posted.find((x) => x.url === '/aurabot/api/save')
     assert.ok(savedUnchangedCall, '点击保存设置应调用 /aurabot/api/save')
-    assert.equal(Object.hasOwn(savedUnchangedCall.body.ownerPrimary, 'fallbackOrder'), false, '未改动顺位时应省略 fallbackOrder 避免覆盖服务端新增')
+    assert.deepEqual(savedUnchangedCall.body, { ownerName: '主人在保存' })
+    assert.deepEqual(JSON.parse(JSON.stringify(state[2].ownerPrimary.fallbackOrder)), saveConfigSnapshot.ownerPrimary.fallbackOrder)
+
+    // 仅切换回退开关时，ownerPrimary 本身需要提交，未编辑的顺位仍应省略。
+    posted.length = 0
+    hook = 0
+    refs.length = 0
+    const toggleDraft = JSON.parse(JSON.stringify(prioCfg))
+    toggleDraft.ownerPrimary.noticeFallback = !toggleDraft.ownerPrimary.noticeFallback
+    state = [prioSt, '', toggleDraft, 'access']
+    const togglePage = vmExport.panelTest.AurabotPage()
+    const toggleSaveBtn = collectNodes(togglePage, (n) => n.type?.name === 'Btn' && textOf(n.children) === '保存设置')[0]
+    await toggleSaveBtn.props.onClick()
+    const savedToggleCall = posted.find((x) => x.url === '/aurabot/api/save')
+    assert.equal(Object.hasOwn(savedToggleCall.body.ownerPrimary, 'fallbackOrder'), false)
 
     // 2) 改动顺位后按草稿提交。账号列表尚未返回的条目仍在请求里，由服务端校验。
     posted.length = 0
@@ -1318,7 +1344,7 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
     ]
     hook = 0
     refs.length = 0
-    state = [prioSt, '', dirtyCfgEditedOrder, 'access', null, false]
+    state = [prioSt, '', dirtyCfgEditedOrder, 'access']
     const pageTree2 = vmExport.panelTest.AurabotPage()
     const saveBtn2 = collectNodes(pageTree2, (n) => n.type?.name === 'Btn' && textOf(n.children) === '保存设置')[0]
     await saveBtn2.props.onClick()
@@ -1329,7 +1355,7 @@ test('P3-5: 前端 client.js 注册 TAB_KEYS.access、GlobalAccess 主账号与�
     posted.length = 0
     hook = 0
     refs.length = 0
-    state = [prioSt, '', resetDraft, 'access', null, false]
+    state = [prioSt, '', resetDraft, 'access']
     const resetPage = vmExport.panelTest.AurabotPage()
     const saveResetBtn = collectNodes(resetPage, (n) => n.type?.name === 'Btn' && textOf(n.children) === '保存设置')[0]
     await saveResetBtn.props.onClick()
