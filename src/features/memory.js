@@ -1053,6 +1053,11 @@ const COMPRESS_SENSITIVE = /密码|口令|验证码|token|api.?key|secret|身份
 export function compressionClusters (items, { now = Date.now(), afterDays = 14, minItems = COMPRESS.minItems, ownerCluster = null } = {}) {
   const days = Math.max(0, Number(afterDays) || 0)
   const cutoff = now - days * 86400_000
+  const ownerAbout = (m) => {
+    if (typeof ownerCluster?.aboutOf === 'function') return String(ownerCluster.aboutOf(m) || '')
+    if (ownerCluster?.about !== undefined) return String(ownerCluster.about || '')
+    return String(m.about || '')
+  }
   const by = new Map()
   for (const m of Array.isArray(items) ? items : []) {
     if (!m || !isCurrent(m, now) || m.kind === 'seen' || m.compressedAt || m.followUp) continue
@@ -1063,9 +1068,9 @@ export function compressionClusters (items, { now = Date.now(), afterDays = 14, 
     const group = m.scope === 'group'
     const sharedOwner = !group && Boolean(ownerCluster?.matches?.(m))
     const chatId = sharedOwner ? String(ownerCluster.chatId || m.chatId || '') : String(m.chatId || '')
-    const about = sharedOwner ? String(ownerCluster.about || m.about || '') : String(m.about || '')
+    const about = sharedOwner ? ownerAbout(m) : String(m.about || '')
     const key = `${group ? 'group' : 'normal'}|${chatId}|${about}`
-    if (!by.has(key)) by.set(key, { key, chatId, scope: group ? 'group' : '', about, aboutName: '', items: [] })
+    if (!by.has(key)) by.set(key, { key, chatId, scope: group ? 'group' : '', sharedOwner, about, aboutName: '', items: [] })
     const c = by.get(key)
     if (!c.aboutName && m.aboutName) c.aboutName = String(m.aboutName)
     c.items.push(m)
@@ -1076,7 +1081,7 @@ export function compressionClusters (items, { now = Date.now(), afterDays = 14, 
     // 稳定排序：越新越靠后，取最近 minItems~maxItems 条交给模型（簇内 about 本来一致，防御性检查 mixed）
     c.items.sort((a, b) => (saidTime(a) || 0) - (saidTime(b) || 0))
     const items = c.items.slice(-COMPRESS.maxItems)
-    const abouts = new Set(items.map((m) => String(m.about || '')))
+    const abouts = new Set(items.map((m) => String((c.sharedOwner ? ownerAbout(m) : m.about) || '')))
     const about = abouts.size === 1 ? [...abouts][0] : ''
     out.push({ key: c.key, chatId: c.chatId, scope: c.scope, about, aboutName: about ? c.aboutName : '', ids: items.map((m) => String(m.id)), items })
   }
@@ -3408,11 +3413,13 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
         if (x.scope === 'group' && (!scope || x.about_qq || x.about || /主人/.test(String(x.text)) || (ownerAcc && String(x.text).includes(ownerAcc)) || (cfg.ownerName && String(x.text).includes(cfg.ownerName)) || ownerNames.some((name) => String(x.text).includes(name)))) continue
         const rawAbout = String(x.about_qq ?? '').trim()
         if (rawAbout && botAccounts.has(rawAbout)) continue
+        // 安全优先：非空 about_qq 必须属于本批发言目录、已登记的合法 PersonId，
+        // 或历史兼容的 5 位以上纯数字账号；未在本批出现的陌生非数字账号 / 短数字 / 编造标识一律丢弃，不回退默认对象。
         let resolvedAbout = ''
         if (rawAbout) {
           if (speakerDir.rawToPerson.has(rawAbout)) resolvedAbout = speakerDir.rawToPerson.get(rawAbout)
           else if (speakerDir.personIds.has(rawAbout) || isPersonId(rawAbout) || /^\d{5,}$/.test(rawAbout)) resolvedAbout = rawAbout
-          else if (!/^\d+$/.test(rawAbout)) continue
+          else continue
         }
         const about = scope ? '' : (resolvedAbout || defaultActor)
         let status = ['fact', 'hearsay', 'guess'].includes(x.status) ? x.status : 'fact'
@@ -3811,11 +3818,17 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
   }
 
   function ownerClusterConfig() {
-    return ownerSharedEnabled() ? {
-      matches: (m) => m.scope !== 'group' && isOwnerChat(m.chatId) && (!m.about || ownerAboutIds().has(String(m.about))),
+    if (!ownerSharedEnabled()) return null
+    const own = ownerOf()
+    const ownerIds = own ? ownerAboutIds() : new Set()
+    return {
+      matches: (m) => m.scope !== 'group' && isOwnerChat(m.chatId),
       chatId: canonicalOwnerChatId(),
-      about: ownerOf(),
-    } : null
+      aboutOf: (m) => {
+        const raw = String(m.about || '')
+        return own && raw && ownerIds.has(raw) ? own : raw
+      },
+    }
   }
 
   /**

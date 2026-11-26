@@ -677,3 +677,106 @@ test('§9.3 只读审计 auditShared：零写盘零模型调用，准确报告�
   assert.deepEqual([...cmpIds].sort(), [softA.id, softB.id, softC.id, softD.id].sort())
   assert.ok(!cmpIds.has(perm.id) && !cmpIds.has(grp.id))
 })
+
+test('审阅意见 P1：主人多平台私聊中「关于朋友」的事实独立成簇压缩，与主人簇及群/非主人严格隔离', async (t) => {
+  const sharedIdentity = {
+    owner: () => 'p-owner001',
+    isOwner: (p) => p === 'p-owner001',
+    isValid: (v) => typeof v === 'string' && (/^p-/.test(v) || /^\d+$/.test(v)),
+    lookup: (p, a) => ((p === 'qq' && a === '1481') || (p === 'feishu' && a === 'ou_1')) ? 'p-owner001' : (p === 'feishu' && a === 'ou_2') ? 'p-friend001' : null,
+    accountsOf: (p) => p === 'p-owner001' ? [{ platform: 'qq', account: '1481' }, { platform: 'feishu', account: 'ou_1' }] : (p === 'p-friend001' ? [{ platform: 'feishu', account: 'ou_2' }] : []),
+    accountOn: (p, plat) => p === 'p-owner001' ? (plat === 'feishu' ? 'ou_1' : '1481') : null,
+  }
+  let compressPromptCount = 0
+  const s = setupStore(t, {
+    identity: sharedIdentity,
+    cfgPatch: {
+      multiPlatformPrivateSession: true,
+      ownerPrimary: { mode: 'fixed', platform: 'qq', instance: 'qq', account: '1481' },
+      memory: { compress: true, compressAfterDays: 7, mergeGroups: true },
+    },
+    llmHandler: ({ system, text }) => {
+      if (system.includes('概括成 1~2 句')) {
+        compressPromptCount++
+        if (text.includes('张三')) return { text: '主人经常在聊天里提起好朋友张三很靠谱，俩人平时常一起打球吃宵夜。' }
+        return { text: '主人平时喜欢早睡早起喝手冲咖啡，周末爱去公园散步放风。' }
+      }
+      return '[]'
+    },
+  })
+
+  const old20 = Date.now() - 20 * DAY_MS
+  // 主人在 QQ 和飞书私聊里分别提起的「关于张三」的 4 条低权重旧事实
+  const f1 = s.mem.add({ text: '张三上周请主人吃了一顿火锅', about: 'p-friend001', aboutName: '张三', chatId: 'qq:private:1481', speaker: '1481', source: 'auto', importance: 0.4, saidAt: old20 })
+  const f2 = s.mem.add({ text: '张三周末陪主人去羽毛球馆打球', about: 'p-friend001', aboutName: '张三', chatId: 'qq:private:1481', speaker: '1481', source: 'auto', importance: 0.4, saidAt: old20 })
+  const f3 = s.mem.add({ text: '张三新买了一把尤尼克斯球拍', about: 'p-friend001', aboutName: '张三', chatId: 'feishu:private:ou_1', speaker: 'p-owner001', source: 'auto', importance: 0.4, saidAt: old20 })
+  const f4 = s.mem.add({ text: '张三最近晚上常和主人约宵夜', about: 'p-friend001', aboutName: '张三', chatId: 'feishu:private:ou_1', speaker: 'p-owner001', source: 'auto', importance: 0.4, saidAt: old20 })
+
+  // 主人自己的 4 条低权重旧事实（混有旧数字 about='1481' 与 p-owner001）
+  const o1 = s.mem.add({ text: '主人周末喜欢去西湖边散步', about: '1481', aboutName: '主人', chatId: 'qq:private:1481', speaker: '1481', source: 'auto', importance: 0.4, saidAt: old20 })
+  const o2 = s.mem.add({ text: '主人每天早上习惯喝黑咖啡', about: '1481', aboutName: '主人', chatId: 'qq:private:1481', speaker: '1481', source: 'auto', importance: 0.4, saidAt: old20 })
+  const o3 = s.mem.add({ text: '主人最近坚持十一点前睡觉', about: 'p-owner001', aboutName: '主人', chatId: 'feishu:private:ou_1', speaker: 'p-owner001', source: 'auto', importance: 0.4, saidAt: old20 })
+  const o4 = s.mem.add({ text: '主人周日会在家看一部老电影', about: 'p-owner001', aboutName: '主人', chatId: 'feishu:private:ou_1', speaker: 'p-owner001', source: 'auto', importance: 0.4, saidAt: old20 })
+
+  // 群聊与张三本人非主人私聊中的事实（不得混入任何 owner 压缩簇）
+  const g1 = s.mem.add({ text: '张三在群里组织周六桌游局', scope: 'group', chatId: 'feishu:group:oc_team', about: '', source: 'auto', importance: 0.4, saidAt: old20 })
+  const nonOwner = s.mem.add({ text: '张三自己说过最讨厌下雨天打车', about: 'p-friend001', aboutName: '张三', chatId: 'feishu:private:ou_2', speaker: 'ou_2', source: 'auto', importance: 0.4, saidAt: old20 })
+
+  const audit = await s.mem.auditShared()
+  assert.equal(audit.plannedCompressions.ownerClusters, 2, '主人与张三应分别进入各自的 owner 压缩簇')
+  assert.equal(audit.plannedCompressions.groupLeakCount, 0)
+  const friendCluster = audit.plannedCompressions.clusters.find((c) => c.about === 'p-friend001')
+  const ownerCluster = audit.plannedCompressions.clusters.find((c) => c.about === 'p-owner001')
+  assert.ok(friendCluster && ownerCluster, '主人簇与朋友簇必须同时存在且不合并成空 about')
+  assert.equal(friendCluster.chatId, 'qq:private:1481')
+  assert.deepEqual(friendCluster.items.map((x) => x.id).sort(), [f1.id, f2.id, f3.id, f4.id].sort())
+  assert.deepEqual(ownerCluster.items.map((x) => x.id).sort(), [o1.id, o2.id, o3.id, o4.id].sort())
+  assert.ok(!friendCluster.items.some((x) => x.id === g1.id || x.id === nonOwner.id), '群聊和非主人私聊不得混入主人侧朋友压缩簇')
+
+  const cr = await s.mem.compressDetails({ maxCalls: 4 })
+  assert.equal(compressPromptCount, 2)
+  assert.equal(cr.created, 2)
+
+  const live = s.mem.list('').filter((m) => !m.invalidAt)
+  const friendAbs = live.find((m) => m.source === 'abstract' && m.about === 'p-friend001')
+  const ownerAbs = live.find((m) => m.source === 'abstract' && m.about === 'p-owner001')
+  assert.ok(friendAbs && friendAbs.chatId === 'qq:private:1481')
+  assert.ok(ownerAbs && ownerAbs.chatId === 'qq:private:1481')
+  assert.equal(live.some((m) => m.id === g1.id), true, '群记忆未被误压缩')
+  assert.equal(live.some((m) => m.id === nonOwner.id), true, '非主人私聊记忆未被误压缩')
+
+  // 两端主人私聊都可召回该长期印象，非主人私聊绝不可召回
+  assert.ok(s.mem.recall('张三 靠谱 宵夜', { where: 'feishu:private:ou_1' }).some((h) => h.it.id === friendAbs.id))
+  assert.ok(s.mem.recall('张三 靠谱 宵夜', { where: 'qq:private:1481' }).some((h) => h.it.id === friendAbs.id))
+  assert.equal(s.mem.recall('张三 靠谱 宵夜', { where: 'feishu:private:ou_2' }).some((h) => h.it.id === friendAbs.id), false, '主人侧对朋友的长期印象不得泄漏到非主人私聊')
+  assert.equal(s.mem.recall('张三 靠谱 宵夜', { where: 'feishu:group:oc_team' }).some((h) => h.it.id === friendAbs.id), false, '主人侧对朋友的长期印象不得泄漏到群聊')
+})
+
+test('审阅意见 P2：安全优先拦截未在本批出现的陌生非数字 about_qq 与短数字噪音，绝不回退默认对象', async (t) => {
+  const identity = makeTestIdentity('1481236341', 'qq', { personId: 'p-owner001' })
+  const validFriend = identity.resolve('feishu', 'ou_friend_present')
+  const day = dayKey()
+  const s = setupStore(t, {
+    identity,
+    llmHandler: ({ system }) => {
+      if (system.includes('整理长期记忆')) {
+        return {
+          facts: [
+            { op: 'add', text: '陌生非数字账号幻觉事实', about: '路人', speaker: 'ou_friend_present', about_qq: 'ou_unseen_stranger', status: 'fact' },
+            { op: 'add', text: '短数字编号幻觉事实', about: '路人', speaker: 'ou_friend_present', about_qq: '123', status: 'fact' },
+            { op: 'add', text: '本批在场好友合法事实', about: '在场友', speaker: 'ou_friend_present', about_qq: 'ou_friend_present', status: 'fact' },
+          ],
+        }
+      }
+      return '[]'
+    },
+  })
+
+  s.pushRow(day, { t: Date.now() - 2000, chatId: 'feishu:private:ou_friend_present', who: '在场友', uid: 'ou_friend_present', text: '今天天气真不错' })
+  await s.mem.consolidate({ includeToday: true })
+
+  const items = s.mem.list('')
+  assert.equal(items.some((m) => m.text.includes('陌生非数字账号幻觉事实')), false, '未在本批出现的陌生非数字 about_qq 必须直接丢弃')
+  assert.equal(items.some((m) => m.text.includes('短数字编号幻觉事实')), false, '未在目录且不足 5 位的数字 about_qq 必须直接丢弃')
+  assert.equal(items.some((m) => m.text === '本批在场好友合法事实' && m.about === validFriend), true)
+})
