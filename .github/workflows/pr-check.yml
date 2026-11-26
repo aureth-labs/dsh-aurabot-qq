@@ -18,16 +18,20 @@ concurrency:
 
 jobs:
   test:
-    name: test
+    name: test (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['22', '24']
     steps:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: ${{ matrix.node-version }}
       - name: Run tests
         run: npm test
 
@@ -41,7 +45,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
       - name: Typecheck contracts
         run: npm run test:types
 
@@ -55,6 +59,6 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
       - name: Verify QR decoding
         run: npm run test:qr-decode
