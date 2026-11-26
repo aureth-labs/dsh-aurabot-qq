@@ -1,3 +1,4 @@
+import { resolveReplyTargets } from './reply-targets.js'
 import { identityNote, flatHistory, requestIdentity } from './identity.js'
 import { ignoredGroupMember } from './member-filter.js'
 import { preserveReplyStickers } from './sticker-policy.js'
@@ -1829,8 +1830,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     // 一段只有一个人明确 @ / 引用她时，第一条回复引用并 @ 那个人；多人同时叫她不猜。
     // 模型明确选了引用编号时尊重它，不再自动引用另一条。
     const refs = inGroup ? groupRefs.get(chatId.slice(6)) || {} : {}
-    const explicit = items.some((item) => item.replyTo)
-    const firstSendable = items.findIndex((item) => item.kind === 'text' || item.kind === 'voice' || item.kind === 'image' || (item.kind === 'sticker' && cfg.stickers.enabled && Boolean(item.value && typeof item.value === 'object' ? item.value : stickers.match(item.value))))
+    const targets = replyTargets(items, { refs, autoReply: opts.autoReply })
     const missedAt = [] // 写了 @ 却没对上群里人的名字
     const failures = []
     const interacted = new Set()
@@ -1839,10 +1839,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       for (let i = 0; i < items.length; i++) {
         if (disposed) return
         const it = items[i]
-        const selected = it.replyTo ? refs[it.replyTo] : (!explicit && i === firstSendable ? opts.autoReply : null)
-        const replyId = selected?.mid
-        // 她自己引用了 @ 她的人就照常 @；自动回复只有一个人说话时才有（#160）
-        const userId = selected && (selected.direct || opts.autoReply?.uid === selected.uid) ? selected.uid : undefined
+        const { replyId, userId, sourceUserId } = targets[i]
         if (it.replyTo && !replyId) log.debug(`${chatId}：引用的编号 ${it.replyTo} 对不上，正常发`)
         // 这条真发出去没有，看 outputScope 的 sent 计数有没有涨（sendSegments 只在真发/捕获时计数；
         // dry-run 与总开关关闭都不涨 → sentTexts 为空，她没说出口的话不能算说过）。#211 review 二轮。
@@ -1858,7 +1855,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
           else await sendImage(chatId, it.value, replyId, userId)
         }
         if (outputScope.getStore().sent > sentBefore) {
-          if (selected?.uid) interacted.add(String(selected.uid))
+          if (sourceUserId) interacted.add(String(sourceUserId))
           if ((it.kind === 'text' || it.kind === 'voice') && String(it.value || '').trim()) sentTexts.push(it.value)
         }
         if (i < items.length - 1 && !opts.simulate) await pause(bubbleDelay(items[i + 1].kind === 'text' ? items[i + 1].value : '') * mood().delay)
@@ -2897,7 +2894,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     }
     const archiveMessages = fresh.filter(x => x.text).map(x => ({ role: 'user', text: x.text,
       speakerId: String(x.uid || ''), at: x.t, id: x.mid && x.mid !== '0' ? 'qq:' + chat.groupId + ':' + x.mid : randomUUID() }))
-    return { text: text + mediaNote, query, speakers, autoReply: pickAutoReply(fresh), directRequester: pickDirectRequester(fresh), images: [...quotedImages, ...extraImages], archiveMessages, freshCount: fresh.length }
+    return { text: text + mediaNote, query, speakers, replyRefs: refs, autoReply: pickAutoReply(fresh), directRequester: pickDirectRequester(fresh), images: [...quotedImages, ...extraImages], archiveMessages, freshCount: fresh.length }
   }
 
   // ---------- 连发合并：人常常一口气发好几句，等对方说完再一起交给她，别一句一回 ----------
@@ -3088,6 +3085,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       p.query = [p.retryQuery, gp.query].filter(Boolean).join('\n')
       p.speakers = [...new Set([...(p.retrySpeakers || []), ...gp.speakers])]
       p.autoReply = gp.autoReply
+      p.replyRefs = gp.replyRefs
       p.archiveMessages = [...(p.retryArchiveMessages || []), ...gp.archiveMessages.filter((message) => !retainedIds.has(message.id))]
       p.directRequester = gp.directRequester
     } else {
@@ -3102,7 +3100,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       const [first, ...rest] = [...p.senders]
       // 私聊：检索记忆时去掉「【私聊】某某(QQ)：」这个头
       const query = p.query ?? p.texts.map((t) => t.replace(/^【私聊】[^：]*：/, '')).join('\n')
-      await pushToSession(p.chat, content, first, { wantVoice: p.wantVoice, extraSenders: rest, queryText: query, speakers: p.speakers, autoReply: p.autoReply, turnToken, archiveMessages: p.archiveMessages, directRequester: p.directRequester })
+      await pushToSession(p.chat, content, first, { wantVoice: p.wantVoice, extraSenders: rest, queryText: query, speakers: p.speakers, replyRefs: p.replyRefs, autoReply: p.autoReply, turnToken, archiveMessages: p.archiveMessages, directRequester: p.directRequester })
     } catch (error) {
       if (isSessionBackoff(error)) {
         retainSessionMessages(chatId, p, content)
@@ -4059,8 +4057,15 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     recentMedia.dispose()
   }
 
+  // Shared with modules that inspect an edited reply before delivery.
+  function replyTargets(items, options = {}) {
+    return resolveReplyTargets(items, { ...options, canSendSticker: value =>
+      getConfig().stickers.enabled && Boolean(value && typeof value === 'object' ? value : stickers.match(value)) })
+  }
+
   return {
     dispose,
+    replyTargets,
     // 给模块用的出站清洗（和 QQ 投递同一套：工具标记 + 提示词复读 + 格式变体）。
     cleanOutbound: (chatId, text) => cleanOutboundText(String(text ?? ''), cleaningFor(chatId)),
     // 仅关闭本中枢持有的短期媒体缓存，迟到的事件不能重新写入。

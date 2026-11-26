@@ -194,6 +194,10 @@ QQ 主人命令的参数或回执涉及隐私时，可用 `api.command({ name: '
 - `onDelivery(chatId, fn)` 为同一私聊订阅 OneBot 确认送达的回执 `{ originId, chatId, platform, messageId, status: 'confirmed', at }`，返回取消订阅函数。每个模块实例只开一个有效订阅。模块停止时自动撤销，安全模式隐藏桥接。回执通过订阅直接交付，不进入模块事件总线。
 - 网关以有效的 `message_id` 确认实际发送后才发回执，排队、模拟、调试、敏感命令和失败均不发。补发成功沿用入队时的订阅与身份，旧实例撤销后的队列项按原规则补发。订阅内的近期重复回执按稳定的 `originId` 合并。
 
+### 检查改写是否换了引用对象
+
+检查改写后的回复是否仍接同一条消息时，先用 `api.lib('chat/reply.js').parseReply(text).items` 拆出消息，再调用 `api.core.hub.replyTargets(items, { refs: info.replyRefs, autoReply: info.autoReply })`。返回数组与消息逐条对应，包含实际消息 ID `replyId`、附带提醒的账号 `userId`，以及无法对应编号时的 `unresolvedReply`。这与发送端共用解析，不发消息、不访问网络；语音成功发送时不带引用和提醒，这些信息供失败转文字时使用。保留本轮 `prompt` 的信息，不要用下一轮的编号解释旧稿。旧版宿主没有该方法或 `replyRefs` 时，模块应保留原有行为。
+
 ### 已有聊天的外部主人入口（1.3.0 起）
 
 `api.core.hub.sessions()` 返回现有聊天映射（含 `sessionId/title`）；`chatLogDays()` 返回已有流水日期，按 `YYYY-MM-DD` 升序排列；`chatLogOf(day)` 返回当天流水。这些查询复用原数据，不创建平台专用的会话或历史副本。流水可能含系统、已忘记的条目；模块展示时必须过滤 `forgottenAt`、系统与记忆提示，不把管理视角给未验证身份的人。
@@ -219,7 +223,7 @@ QQ 主人命令的参数或回执涉及隐私时，可用 `api.command({ name: '
 | 事件 | 参数 | 改的是什么 |
 |---|---|---|
 | `group/decide` | `decision, { msg, policy, recentTexts, memScore }` | 群里这条消息（没被 `message` 接管的）她**回不回、怎么回**。返回 `null` 在这里无效（等于不改）。`decision` 是 `{ reply, mode, reason }`，mode 是 `must`（被叫到）/ `engaged`（正在参与话题）/ `interject`（插话）。返回 `{ reply: true, mode: 'must' }` 就让她必回，`{ reply: false }` 就让她不理。想整套换掉插话策略就在这里写 |
-| `prompt` | `content, { chat, senderId, queryText, sessionId, prevText, recentMessages }` | **交给她的内容**：`[{ type: 'text', text }, { type: 'image', … }]`。可以加背景信息、改格式、去掉图片；返回 `null` 这次不交给她 |
+| `prompt` | `content, { chat, senderId, queryText, sessionId, prevText, recentMessages, replyRefs, autoReply }` | **交给她的内容**：`[{ type: 'text', text }, { type: 'image', … }]`。可以加背景信息、改格式、去掉图片；返回 `null` 这次不交给她。群聊的 `replyRefs` 是本轮编号对应的消息信息，`autoReply` 是本轮自动引用对象；均只读 |
 | `reply/items` | `items, { chatId, text, userText }` | 她的回复**拆好之后**（哪条发语音、配不配表情都已经决定了）：每条 `{ kind: 'text' \| 'voice' \| 'sticker' \| 'poke' \| 'image', value, replyTo }`。可以改顺序、全部变语音、去掉表情、加图片 |
 | `send` | `message, { chatId, note, force }` | **最终发给 QQ 的消息段**（OneBot 格式）。所有发出去的消息都经过这里：她的回复、命令回复、模块发的。加签名、过滤词、抄送到别处都在这里 |
 | `model` | `selection, chat` | **这个聊天用哪个模型**（同步，不能 async）：返回 `{ provider, model, reasoningEffort }`。比如群里用便宜的、私聊用好的。`selection` 是面板选的（没选时是 DSH 默认，拿不到时是 `null`），主人在面板里「按聊天选模型」设过的话，已经按那个聊天算好了；模块在它之后还可以再改。换了之后从这个聊天的下一条消息起生效 |
