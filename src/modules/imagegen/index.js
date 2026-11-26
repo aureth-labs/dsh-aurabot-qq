@@ -2,7 +2,7 @@
 
 import { readFileSync } from 'node:fs'
 import { privateCapabilityAllowed } from '../../chat/access.js'
-import { createImageGen, drawResultBlocks, drawToolMessage, imageToolBlock, resolveDrawImage, isUnsupportedReference, isSingleReferenceOnly, fetchOpenAIModels } from '../../features/imagegen.js'
+import { createImageGen, drawResultBlocks, drawToolMessage, imageToolBlock, resolveDrawImages, isUnsupportedReference, isSingleReferenceOnly, fetchOpenAIModels } from '../../features/imagegen.js'
 import { listPaintings, openPaintFolder, paintingPath, rememberPainting, removePainting, savePainting } from '../../features/paintings.js'
 import { defineTool, str, int } from '../../tools/tools.js'
 import { SIZE_OPTIONS } from '../../features/image-shape.js'
@@ -144,7 +144,7 @@ export default {
         format: { type: 'string', enum: ['static', 'gif'], description: '默认 static 静态图。只有对方明确要求 GIF、动图或让画面动起来时才用 gif（需面板开启），并在 prompt 描述动作和循环。普通画画、动态姿势仍用静态。GIF 默认小尺寸、8 帧约 1.6 秒，不要为普通回复擅自改成动图' },
         notice: str('结合对方的要求和当前对话写一句自然简短的回应，开始画图前会直接发送'),
         image: str('可选参考图：self（自己/人设图）= 当前人格形象；last = 当前聊天最近收到的一张图；quote = 当前聊天引用消息里的图；或图库中的画作文件名。禁止本地路径、网址。优先填目标图旁提供的 msg:消息号:图片序号，以绑定具体图片。quote 用于引用带图的消息，引用机器人的文字回复不等于引用原图；只有确定最近一张就是目标图时才用 last。不确定就请对方引用目标原图。'),
-        images: { type: 'array', items: { type: 'string' }, maxItems: 16, description: '可选多张参考图（图库文件名或 last / quote）；只有支持多图参考的接法能用，失败会说明原因' },
+        images: { type: 'array', items: { type: 'string' }, maxItems: 16, description: '仅填写用户要求使用的参考图，按图 1、图 2 的顺序列出 msg 编号、图库文件名或 last / quote，并在 prompt 说明各图用途。不要附带无关聊天图片。通常与 image 二选一；同时填写时 image 是第一张，images 依次接在后面。不支持多图时会报错，不会少用几张代替' },
         shape: { type: 'string', enum: ['square', 'portrait', 'landscape', 'wide'], description: 'square 方图 1:1；portrait 竖图 2:3；landscape 横图 3:2；wide 宽幅 16:9。可不填' },
         size: { type: 'string', enum: SIZE_OPTIONS, description: '可选尺寸，例如 2048x2048（2K）、4096x4096（4K）；优先于 shape / 面板默认，不填沿用原逻辑' },
         count: int('一次生成几张，1~10，默认 1；目前只有 MiniMax H3 接法支持多张'),
@@ -163,11 +163,11 @@ export default {
         const self = typeof image === 'string' && /^(self|自己|人设图)$/i.test(image.trim())
         if (((image && !self) || (Array.isArray(images) && images.length)) && cfg.imageGen.img2img === false) return { ok: false, message: '参考图功能已关闭' }
         const startedAt = Date.now()
-        const reference = self ? null : await resolveDrawImage(image, { hub, chat })
-        const extraRefs = []
-        for (const item of Array.isArray(images) ? images.slice(0, 16) : []) {
-          const buf = await resolveDrawImage(item, { hub, chat })
-          if (buf) extraRefs.push(buf)
+        if (self && images != null && (!Array.isArray(images) || images.length)) return { ok: false, message: 'image=self 不能同时指定 images；请分别选择人设图或明确的参考图列表' }
+        const explicitRefs = self ? [] : await resolveDrawImages({ image, images }, { hub, chat })
+        if (explicitRefs.length > 1) {
+          const limit = await gen.referenceLimit()
+          if (explicitRefs.length > limit) return { ok: false, message: `本次指定了 ${explicitRefs.length} 张参考图，当前接法${limit ? `最多支持 ${limit} 张` : '不支持参考图'}。未开始生成，也没有减少参考图或改用文字生成。` }
         }
         const text = typeof notice === 'string' ? notice.trim().slice(0, 200) : ''
         // 画前提示是「她这个回合正在做的事」的进度说明，与最终回复是同一轮的产物。
@@ -206,15 +206,7 @@ export default {
             ? '本次未使用人设图，仅按外貌文字生成，形象一致性有限。'
             : '本次未使用人设图，且未配置外貌描述，仅按画面提示生成，形象一致性有限。'
         } else {
-          if (reference) references = [{ image: reference, note: '' }]
-          for (const buf of extraRefs) if (!reference || buf !== reference) references.push({ image: buf, note: '' })
-          if (references.length > 1) {
-            const limit = await gen.referenceLimit()
-            if (references.length > limit) {
-              references = limit > 0 ? references.slice(0, limit) : []
-              fallback = limit > 0 ? `当前服务最多支持 ${limit} 张参考图，本次使用前 ${limit} 张。` : '当前接法不支持多张参考图，本次只用文字生成。'
-            }
-          }
+          references = explicitRefs.map(image => ({ image, note: '' }))
         }
         const generate = () => {
           const notes = references.map((ref, index) => ref.note ? `参考图 ${index + 1} 备注：${JSON.stringify(ref.note)}` : '').filter(Boolean)
@@ -284,6 +276,7 @@ export default {
           message,
           prompt: String(prompt || ''),
           count: bufs.length,
+          referenceCount: references.length,
           bytes: bufs.reduce((n, item) => n + item.length, 0),
           elapsedMs: Date.now() - startedAt,
           ...(saved[0] ? { path: saved[0] } : {}),

@@ -176,6 +176,17 @@ export async function resolveDrawImage(image, { hub, chat }) {
   return buf
 }
 
+/** Explicit references only, in caller order. Missing entries must not shift image numbers. */
+export async function resolveDrawImages({ image, images }, context) {
+  if (images != null && !Array.isArray(images)) throw new Error('images 必须是参考图编号或文件名的数组')
+  const refs = image == null || image === '' ? [...(images || [])] : [image, ...(images || [])]
+  if (refs.length > 16) throw new Error('一次最多指定 16 张参考图')
+  if (refs.some(ref => typeof ref !== 'string' || !ref.trim())) throw new Error('每张参考图都需要有效的编号或文件名，不能留空')
+  const result = []
+  for (const ref of refs) result.push(await resolveDrawImage(ref, context))
+  return result
+}
+
 /**
  * OpenAI 兼容服务：按服务地址拉一次 /models（面板「获取模型」用）。
  * 返回模型 id 数组；地址不对 / 没 Key / 连不上都给一句能看懂的错误。
