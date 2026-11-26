@@ -1271,7 +1271,18 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     const id = String(qq)
     const p = s.profiles?.[id]
     if (!p) return
-    if (Array.isArray(p.tags) || p.tagsBy || p.noMemory) s.profiles[id] = { tags: p.tags || [], ...(p.tagsBy ? { tagsBy: p.tagsBy } : {}), ...(p.noMemory ? { noMemory: true } : {}) }
+    // 事实过时会重建画像，但标签、手动优先权和面板里主人手填的字段不该跟着丢：谁写的谁做主。
+    const keep = {}
+    if (Array.isArray(p.tags) || p.tagsBy || p.noMemory) {
+      keep.tags = p.tags || []
+      if (p.tagsBy) keep.tagsBy = p.tagsBy
+      if (p.noMemory) keep.noMemory = true
+    }
+    const manual = (Array.isArray(p.ownerFields) ? p.ownerFields : [])
+      .filter((key) => typeof p[key] === 'string' && p[key])
+    for (const key of manual) keep[key] = p[key]
+    if (manual.length) keep.ownerFields = [...manual]
+    if (Object.keys(keep).length) s.profiles[id] = keep
     else delete s.profiles[id]
   }
 
@@ -1872,7 +1883,17 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     s.profiles = s.profiles || {}
     const profile = { ...(s.profiles[id] || {}) }
     if (Object.hasOwn(patch, 'tags')) { profile.tags = patch.tags.map((tag) => tag.trim()); profile.tagsBy = 'owner' }
-    for (const key of fields) if (Object.hasOwn(patch, key)) profile[key] = String(patch[key] ?? '').trim()
+    const ownerFields = new Set(Array.isArray(profile.ownerFields) ? profile.ownerFields : [])
+    for (const key of fields) {
+      if (!Object.hasOwn(patch, key)) continue
+      const value = String(patch[key] ?? '').trim()
+      profile[key] = value
+      // 填了就记成手写字段，自动整理不再覆盖；清空等于交还给自动印象
+      if (value) ownerFields.add(key)
+      else ownerFields.delete(key)
+    }
+    if (ownerFields.size) profile.ownerFields = [...ownerFields]
+    else delete profile.ownerFields
     profile.at = Date.now()
     s.profiles[id] = profile
     if (s.dirtyProfiles) delete s.dirtyProfiles[id]
@@ -2071,6 +2092,16 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     const mine = state.items.filter((m) => isCurrent(m) && m.kind !== 'seen' && m.scope !== 'group' && !['hearsay', 'guess'].includes(m.status) && String(m.about) === String(qq)).sort((a, b) => a.at - b.at)
     if (mine.length < 3 && !dirty) return false
     if (!mine.length) { setProfile(qq, ''); return false }
+    // 小档案也被主人手写过：不让模型重写，顺手清掉待重建标记，免得每次整理白跑一遍
+    if ((state.profiles?.[String(qq)]?.ownerFields || []).includes('text')) {
+      if (dirty) {
+        state.dirtyProfiles = { ...(state.dirtyProfiles || {}) }
+        delete state.dirtyProfiles[String(qq)]
+        state.rev = (state.rev || 0) + 1
+        save(state)
+      }
+      return false
+    }
     const name = mine.filter((m) => m.aboutName).at(-1)?.aboutName || ''
     const old = dirty ? '' : profileOf(qq)?.text || ''
     const out = await askModel(dsh, {
@@ -2543,6 +2574,9 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
         const tags = personTags(qq).filter((tag) => tag !== '喜欢' && tag !== '讨厌')
         if (tags.length < 8) updates.tags = [...tags, like.text]
       }
+      // 主人手填的字段不参与自动更新，免得整理一跑就被模型写的版本盖掉
+      const manual = new Set(Array.isArray(old.ownerFields) ? old.ownerFields : [])
+      for (const key of Object.keys(updates)) if (manual.has(key)) delete updates[key]
       if (!Object.keys(updates).length) continue
       const name = human.find((l) => String(l.uid || '') === qq)?.who || ''
       state.profiles[qq] = { ...old, ...updates, text: old.text || '', name: old.name || name, at: Date.now() }

@@ -483,3 +483,32 @@ test('待重写的人物小档案仍显示旧正文，不因重写失败变空�
   assert.equal(detail.person.text, '旧档案')
   assert.equal(detail.person.stale, true)
 })
+
+test('手填字段记成 ownerFields，画像作废重建也不丢（#590）', async (t) => {
+  const s = setup(t)
+  const mem = s.make()
+  assert.equal(mem.savePersonaPerson(ALICE, { style: '说话很轻', persona: '安静', handle: '先问再答' }).ok, true)
+  let state = s.state()
+  assert.deepEqual(new Set(state.profiles[ALICE].ownerFields), new Set(['style', 'persona', 'handle']))
+
+  // 记忆变动 → 画像作废，手填字段要留下，自动字段被清掉
+  mem.update('alice-fact', { text: '阿明开始学油画' })
+  state = s.state()
+  const after = state.profiles[ALICE]
+  assert.equal(after.style, '说话很轻', '手填的说话方式不能被作废丢掉')
+  assert.equal(after.persona, '安静')
+  assert.equal(after.handle, '先问再答')
+  assert.deepEqual(after.ownerFields, state.profiles[ALICE].ownerFields)
+
+  // 面板读到的是手填内容，不是「还不了解」
+  const person = s.make().personaPerson(ALICE).person
+  assert.equal(person.style, '说话很轻')
+  assert.equal(person.persona, '安静')
+
+  // 清空等于交还给自动整理
+  assert.equal(mem.savePersonaPerson(ALICE, { style: '' }).ok, true)
+  state = s.state()
+  assert.equal(state.profiles[ALICE].style, '')
+  assert.ok(!(state.profiles[ALICE].ownerFields || []).includes('style'))
+  assert.ok((state.profiles[ALICE].ownerFields || []).includes('persona'))
+})
