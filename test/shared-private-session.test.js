@@ -1,13 +1,15 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { mergeFromPanel, normalize } from '../src/core/config.js'
 import { createHub } from '../src/chat/hub.js'
+import { createConversationArchive } from '../src/chat/conversation-context.js'
 import { createGateway } from '../src/gateway/index.js'
 import { createIdentity } from '../src/gateway/identity.js'
 import { createSharedPrivateSessions, selectSharedBase, sharedQuietHistory, sharedRetiredAuditPage } from '../src/chat/shared-private-sessions.js'
+import { createMemoryStore } from '../src/features/memory.js'
 import { fixedSharedPrimary, sessionRouteFor } from '../src/gateway/shared-private-route.js'
 import chatTools from '../src/modules/chat-tools/index.js'
 import { makeFakeAdapter } from './helpers/fake-adapter.js'
@@ -1295,4 +1297,1303 @@ test('共享主动回退 P2 #3：withDefaultQqWork 在准备/生成/投递全程
   sendGateB.resolve()
   assert.equal((await pushB).delivered, true)
   assert.equal(hB.hub.isDefaultQqTransportIdle(), true)
+})
+
+async function setupSharedMemoryHarness(t, {
+  primary = { platform: 'qq', instance: 'qq', account: '10001' },
+  primaryIsDefault = true,
+  cfgPatch = {},
+  sessionsSeed = null,
+  qqHistory = [],
+  feishuHistory = [],
+  onBeforeEnd = null,
+  turnFailNext = () => false,
+  steerRejectNext = () => false,
+  preStepRejectNext = () => false,
+} = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'aurabot-shared-mem-'))
+  const prevDir = process.env.AURABOT_DATA_DIR
+  process.env.AURABOT_DATA_DIR = dir
+  const log = { info() {}, debug() {}, warn() {}, error() {}, child() { return this } }
+  const id = createIdentity({ dataDir: join(dir, 'identity'), log })
+  const ownerId = id.claimOwner(primary.platform, primary.account)
+  if (primary.platform !== 'feishu') id.link('feishu', 'ou_owner', ownerId, 'owner')
+  if (primary.platform !== 'qq' && primaryIsDefault) id.link('qq', '10001', ownerId, 'owner')
+
+  if (sessionsSeed) {
+    writeFileSync(join(dir, 'sessions.json'), JSON.stringify(sessionsSeed(ownerId), null, 2))
+  }
+
+  let cfg = normalize({
+    enabled: true,
+    dryRun: false,
+    setupDone: true,
+    ownerLevel: 'social',
+    ownerPersonId: ownerId,
+    ownerQQ: primary.platform === 'qq' ? primary.account : '',
+    ownerAuthorization: { owner: ownerId, revision: '22222222-3333-4444-8555-666666666666' },
+    multiPlatformPrivateSession: true,
+    ownerPrimary: primary,
+    platforms: { qq: { enabled: true }, feishu: { enabled: true } },
+    voice: { enabled: false, autoChance: 0 },
+    stickers: { enabled: false, autoChance: 0 },
+    merge: { enabled: false },
+    chat: { thinkingGuard: { enabled: false }, ...(cfgPatch.chat || {}) },
+    ...cfgPatch,
+  })
+
+  const gateway = createGateway({ config: cfg, dataDir: (...p) => join(dir, ...p), identity: id, log })
+  const historyCalls = []
+  const qq = makeFakeAdapter({
+    id: 'qq',
+    self: { account: '20001' },
+    caps: { history: true, proactive: 'free', features: { 'message.history.read': true } },
+  })
+  qq.fetch = async (req) => {
+    if (req.kind === 'history') {
+      historyCalls.push({ platform: 'qq', req })
+      return { messages: qqHistory, hasMore: false }
+    }
+    return null
+  }
+  const feishu = makeFakeAdapter({
+    id: 'feishu',
+    self: { account: 'ou_bot_feishu' },
+    caps: { history: true, proactive: 'free', features: { 'message.history.read': true } },
+  })
+  feishu.fetch = async (req) => {
+    if (req.kind === 'history') {
+      historyCalls.push({ platform: 'feishu', req })
+      return { messages: feishuHistory, hasMore: false }
+    }
+    return null
+  }
+  gateway.register(() => qq)
+  gateway.register(() => feishu)
+  await gateway.sync()
+
+  const listeners = new Map()
+  const emit = (name, ...args) => { for (const fn of listeners.get(name) || []) fn(...args) }
+  const agents = new Map()
+  let createSeq = 0
+  let forkSeq = 0
+  const capturedFollowups = []
+  const capturedSteers = []
+
+  function makeAgent(sessionId) {
+    let dshTurn = 0
+    let seqCounter = 0
+    let idleChain = Promise.resolve()
+    const pendingSteers = []
+    const session = {
+      id: sessionId,
+      seq: 0,
+      inheritedEventCount: 0,
+      events: [],
+      isOwnSeq: () => true,
+      eventAt: (i) => session.events[i],
+      snapshotEvents: () => session.events,
+    }
+    const agent = {
+      id: sessionId,
+      session,
+      inbox: { nextTurn: [], nextStep: [], remove: () => false },
+      cancel() {},
+      ctx: {
+        tools: { register: () => () => {}, restrict: () => () => {} },
+        systemPrompt: { context: () => () => {} },
+      },
+      whenIdle: () => idleChain,
+      steer(msg) {
+        capturedSteers.push({ sessionId, msg })
+        if (steerRejectNext()) throw new Error('steer rejected')
+        pendingSteers.push(msg)
+      },
+      followup(msg) {
+        capturedFollowups.push({ sessionId, msg })
+        idleChain = idleChain.then(async () => {
+          dshTurn++
+          const myTurn = dshTurn
+          let step = 1
+          let emittedSteps = 0
+          const emitAssistant = (text, stepNum) => {
+            const s = Number.isFinite(stepNum) ? stepNum : Math.max(step, ++emittedSteps)
+            emittedSteps = Math.max(emittedSteps, s)
+            emit('session/event', session, {
+              type: 'assistant/message',
+              data: { turn: myTurn, step: s, message: { content: [{ type: 'text', text }] } },
+            })
+          }
+          emit('agent/inbox/claimed', { agent, message: msg, turn: myTurn })
+          const splicedSeq = seqCounter++
+          session.seq = splicedSeq + 1
+          session.events[splicedSeq] = { type: 'agent/inbox/spliced', seq: splicedSeq, data: { inserted: [{ id: msg.id }] } }
+          emit('session/event', session, session.events[splicedSeq])
+          for (const fn of listeners.get('agent/pre-step') || []) {
+            await fn(
+              { agent, messages: [msg], turn: myTurn, step: 1, signal: new AbortController().signal },
+              async () => ({ kind: 'allow', messages: [msg] }),
+            )
+          }
+          let turnCtrl = null
+          if (onBeforeEnd) turnCtrl = await onBeforeEnd({ agent, session, myTurn, msg, emitAssistant })
+          let blockedByPreStep = false
+          while (pendingSteers.length) {
+            const sm = pendingSteers.shift()
+            step++
+            emit('agent/inbox/claimed', { agent, message: sm, turn: myTurn })
+            for (const fn of listeners.get('agent/pre-step') || []) {
+              const res = await fn(
+                { agent, messages: [sm], turn: myTurn, step, signal: new AbortController().signal },
+                async () => (preStepRejectNext({ step, turn: myTurn, message: sm })
+                  ? { kind: 'reject' }
+                  : { kind: 'allow', messages: [sm] }),
+              )
+              if (res?.kind === 'reject') blockedByPreStep = true
+            }
+          }
+          const shouldFail = turnFailNext()
+          const endReason = blockedByPreStep ? 'blocked' : (shouldFail ? 'failed' : 'completed')
+          const endSeq = seqCounter++
+          session.seq = endSeq + 1
+          session.events[endSeq] = { type: 'turn/end', seq: endSeq, data: { turn: myTurn, reason: { kind: endReason } } }
+          if (!shouldFail && !blockedByPreStep && !turnCtrl?.skipFinalAssistant) {
+            emitAssistant(turnCtrl?.finalText ?? `回复第${myTurn}轮`, Math.max(step, emittedSteps + 1))
+          }
+          emit('session/event', session, session.events[endSeq])
+        })
+        return idleChain
+      },
+    }
+    agents.set(sessionId, agent)
+    return agent
+  }
+
+  const wsObj = {
+    id: 'workspace',
+    path: dir,
+    title: 'Aurabot · Shared',
+    sessionIds: [],
+    async attachSession(sid) {
+      if (!wsObj.sessionIds.includes(sid)) wsObj.sessionIds.push(sid)
+    },
+  }
+  const dsh = {
+    on(name, fn) {
+      if (!listeners.has(name)) listeners.set(name, new Set())
+      listeners.get(name).add(fn)
+      return () => listeners.get(name).delete(fn)
+    },
+    get: (name) => dsh.services?.[name],
+    agents: { get: (idKey) => agents.get(idKey) },
+    sessions: { flush: async () => true },
+    attachments: { admitPromptContent: async (c) => c },
+    workspaceRegistry: { list: () => [wsObj], get: (idKey) => (idKey === wsObj.id ? wsObj : null), create: async () => wsObj, archiveSession: async () => {}, archivedSessionIds: [], unarchiveSession: async () => {} },
+    llm: {
+      async *stream() {
+        yield { type: 'text-delta', text: '[]' }
+        yield { type: 'finish', reason: { kind: 'completed' } }
+      },
+    },
+    services: {
+      sessionProjections: {},
+      sessionController: {
+        create: async () => {
+          const sid = `s-shared-new-${++createSeq}`
+          makeAgent(sid)
+          return { sessionId: sid }
+        },
+        resolveAgent: async (idKey) => ({ agent: agents.get(idKey) || makeAgent(idKey) }),
+        fork: async (baseSid) => {
+          const sid = `s-shared-fork-${++forkSeq}-${baseSid}`
+          makeAgent(sid)
+          return { sessionId: sid }
+        },
+        rename: async () => {},
+      },
+    },
+  }
+
+  let promptHook = null
+  const createRuntime = (customPromptHook = null) => {
+    promptHook = customPromptHook
+    const hub = createHub({
+      dsh,
+      getConfig: () => cfg,
+      log,
+      gateway,
+      identity: id,
+      resolveSharedPrimary: () => fixedSharedPrimary({ cfg, identity: id, instances: gateway.instances() }),
+      hooks: { prompt: (content, info) => (promptHook ? promptHook(content, info) : content) },
+    })
+    const offSession = dsh.on('session/event', hub.onSessionEvent)
+    const submitted = []
+    const offGw = gateway.onMessage((m) => { submitted.push(hub.onGatewayMessage(m)) })
+    return {
+      hub,
+      submitted,
+      setPromptHook: (fn) => { promptHook = fn },
+      stopRuntime: () => { offGw(); offSession(); hub.dispose() },
+    }
+  }
+
+  let runtime = createRuntime()
+  t.after(async () => {
+    runtime.stopRuntime()
+    await gateway.stopAll()
+    id.close?.()
+    if (prevDir === undefined) delete process.env.AURABOT_DATA_DIR
+    else process.env.AURABOT_DATA_DIR = prevDir
+    try { rmSync(dir, { recursive: true, force: true }) } catch {}
+  })
+
+  const deliverInbound = async (adapter, { chatId, account, text, msgId }) => {
+    const idx = runtime.submitted.length
+    adapter.pushInbound({
+      messageId: msgId,
+      chat: { kind: 'private', id: chatId },
+      sender: { account, name: '主人' },
+      parts: [{ type: 'text', text }],
+    })
+    for (let i = 0; i < 100 && runtime.submitted.length <= idx; i++) await new Promise((r) => setTimeout(r, 10))
+    assert.ok(runtime.submitted[idx], `gateway 未投递 ${msgId}`)
+    await runtime.submitted[idx]
+  }
+
+  return {
+    dir,
+    id,
+    ownerId,
+    cfg,
+    dsh,
+    qq,
+    feishu,
+    log,
+    historyCalls,
+    capturedFollowups,
+    capturedSteers,
+    get runtime() { return runtime },
+    restartRuntime: () => {
+      runtime.stopRuntime()
+      runtime = createRuntime(promptHook)
+      return runtime
+    },
+    deliverInbound,
+  }
+}
+
+test('共享会话补齐 hooks.prompt 参数（queryText/prevText/speakers/recentMessages）并触发真实 memory 召回', async (t) => {
+  const h = await setupSharedMemoryHarness(t, {
+    cfgPatch: {
+      conversationContext: { enabled: false },
+      memory: { enabled: true },
+    },
+  })
+  const memory = createMemoryStore({ dsh: h.dsh, getConfig: () => h.cfg, hub: h.runtime.hub, log: h.log, identity: h.id })
+  memory.add({ text: '主人喝手冲咖啡固定用八十八度水温', about: h.ownerId, chatId: 'qq:private:10001' })
+
+  const hookInfos = []
+  h.runtime.setPromptHook(async (content, info) => {
+    hookInfos.push({
+      queryText: info.queryText,
+      prevText: info.prevText,
+      speakers: info.speakers,
+      sessionId: info.sessionId,
+      recentMessages: info.recentMessages,
+    })
+    const hint = await memory.recallHintAsync(info.chat, info.queryText || '', info.prevText || '', info.sessionId, info.speakers || [], [])
+    return hint ? [{ type: 'text', text: hint }, ...content] : content
+  })
+
+  await h.deliverInbound(h.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '今天想聊下手冲咖啡的参数', msgId: 'mem_t1' })
+  assert.equal(h.runtime.hub.sharedStatus().state, 'active')
+  assert.equal(existsSync(join(h.dir, 'conversation-context')), false)
+  assert.equal(hookInfos.length, 1)
+  assert.match(hookInfos[0].queryText, /手冲咖啡/)
+  assert.equal(hookInfos[0].prevText, '')
+  assert.deepEqual(hookInfos[0].speakers, ['ou_owner'])
+  assert.deepEqual(hookInfos[0].recentMessages, [])
+  assert.match(hookInfos[0].sessionId, /^s-shared-/)
+  const prompt1 = h.capturedFollowups[0].msg.content.map((b) => b.text).join('\n')
+  assert.match(prompt1, /八十八度水温/, '共享会话第 1 轮应注入按消息召回的 memory hint')
+
+  // 第 2 轮来自 QQ，上一轮通过 sharedPrevText 保留了上一句供短句召回使用
+  await h.deliverInbound(h.qq, { chatId: '10001', account: '10001', text: '那用几号滤杯', msgId: 'mem_t2' })
+  assert.equal(hookInfos.length, 2)
+  assert.match(hookInfos[1].prevText, /手冲咖啡/, '跨共享轮次必须保留 prevText')
+  assert.match(hookInfos[1].queryText, /滤杯/)
+  assert.deepEqual(hookInfos[1].speakers, ['10001'])
+})
+
+test('共享会话 conversationContext 注入近期/召回片段并双端写回同一档案，失败轮次与跨平台隔离成立', async (t) => {
+  let failTurn = false
+  const h = await setupSharedMemoryHarness(t, {
+    cfgPatch: { conversationContext: { enabled: true } },
+    turnFailNext: () => failTurn,
+  })
+  const hookInfos = []
+  h.runtime.setPromptHook((content, info) => {
+    hookInfos.push({ recentMessages: info.recentMessages, queryText: info.queryText })
+    return content
+  })
+
+  // Turn 1: 飞书说话 -> 写回 qq 主账号对应的共享档案（user + assistant）
+  await h.deliverInbound(h.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '手冲水温约定用八十八度', msgId: 'ctx_1' })
+  assert.equal(h.runtime.hub.sharedStatus().state, 'active')
+  assert.equal(existsSync(join(h.dir, 'conversation-context')), true)
+  const recAfter1 = h.runtime.hub.recentMessagesOf('qq:private:10001')
+  assert.equal(recAfter1.length, 2)
+  assert.equal(recAfter1[0].role, 'user')
+  assert.match(recAfter1[0].text, /八十八度/)
+  assert.equal(recAfter1[0].speakerId, 'ou_owner')
+  assert.equal(recAfter1[1].role, 'assistant')
+  assert.match(recAfter1[1].text, /回复第1轮/)
+
+  // Turn 2: QQ 继续说话 -> hook.recentMessages 收到飞书第 1 轮档案；再写回超过 12 条压入旧片段后跨重启可召回
+  await h.deliverInbound(h.qq, { chatId: '10001', account: '10001', text: '那明天试试看', msgId: 'ctx_2' })
+  assert.ok(hookInfos[1].recentMessages.some((m) => /八十八度/.test(m.text)))
+
+  for (let i = 0; i < 18; i++) {
+    await h.deliverInbound(i % 2 === 0 ? h.feishu : h.qq, {
+      chatId: i % 2 === 0 ? 'ou_owner' : '10001',
+      account: i % 2 === 0 ? 'ou_owner' : '10001',
+      text: `日常闲聊盆栽浇水第${i}轮`,
+      msgId: `ctx_fill_${i}`,
+    })
+  }
+  const reopened = h.restartRuntime()
+  await h.deliverInbound(h.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '手冲水温约定是多少', msgId: 'ctx_recall_q' })
+  const recallPrompt = h.capturedFollowups.at(-1).msg.content.map((b) => b.text).join('\n')
+  assert.match(recallPrompt, /【同一人格、同一聊天的对话资料/, '共享会话应注入 conversationArchive 检索结果')
+  assert.match(recallPrompt, /八十八度/)
+  assert.match(recallPrompt, /"source":"new_conversation"/)
+
+  // 失败轮次绝不能写入档案
+  failTurn = true
+  const countBeforeFail = reopened.hub.recentMessagesOf('qq:private:10001', 256).length
+  await h.deliverInbound(h.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '这句失败不应进档案', msgId: 'ctx_fail' })
+  failTurn = false
+  assert.equal(reopened.hub.recentMessagesOf('qq:private:10001', 256).length, countBeforeFail)
+
+  // 非默认主账号（例如飞书为主账号）同样能使用规范 ChatId 写入并召回档案
+  const hNonDefault = await setupSharedMemoryHarness(t, {
+    primary: { platform: 'feishu', instance: 'feishu', account: 'ou_owner' },
+    primaryIsDefault: false,
+    cfgPatch: { conversationContext: { enabled: true } },
+  })
+  await hNonDefault.deliverInbound(hNonDefault.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '非默认主账号飞书档案测试', msgId: 'nd_1' })
+  assert.equal(hNonDefault.runtime.hub.sharedStatus().state, 'active')
+  const ndRecent = hNonDefault.runtime.hub.recentMessagesOf('feishu:private:ou_owner')
+  assert.equal(ndRecent.length, 2)
+  assert.match(ndRecent[0].text, /非默认主账号飞书档案测试/)
+})
+
+test('共享会话 seedHistoryOnce 边界：fork 分支不重复补历史；空分支仅首次补且重启不重复', async (t) => {
+  // 1) inherit + baseSessionId（fork 普通会话历史） -> 不应调 gateway history
+  const hFork = await setupSharedMemoryHarness(t, {
+    cfgPatch: { chat: { seedHistory: true, seedHistoryCount: 5, thinkingGuard: { enabled: false } } },
+    qqHistory: [{ messageId: 'qq_h1', sender: { account: '10001', name: '主人' }, at: 1700000000000, parts: [{ type: 'text', text: '普通会话已有历史' }] }],
+    sessionsSeed: (ownerId) => ({
+      chats: {
+        'private:10001': {
+          sessionId: 'base-qq-live',
+          mode: 'live',
+          level: 'social',
+          preset: 'aurabot-social',
+          sessions: { live: 'base-qq-live' },
+          sessionOwners: {
+            live: {
+              sessionId: 'base-qq-live',
+              ownerPersonId: ownerId,
+              ownerAuthorizationRevision: '22222222-3333-4444-8555-666666666666',
+              level: 'social',
+              preset: 'aurabot-social',
+            },
+          },
+        },
+      },
+    }),
+  })
+  await hFork.deliverInbound(hFork.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: 'fork 后的第一句', msgId: 'seed_fork_1' })
+  assert.equal(hFork.runtime.hub.sharedStatus().state, 'active')
+  assert.equal(hFork.historyCalls.length, 0, '已继承主账号历史的 fork 分支不得重复 seedHistory')
+  assert.doesNotMatch(hFork.capturedFollowups[0].msg.content.map((b) => b.text).join('\n'), /你刚上线，先补看最近/)
+
+  // 2) 空新分支（无 baseSessionId，verifiedThroughSeq === null） -> Turn 1 补历史；Turn 2 与重启后均不重复补
+  const hEmpty = await setupSharedMemoryHarness(t, {
+    cfgPatch: { chat: { seedHistory: true, seedHistoryCount: 5, thinkingGuard: { enabled: false } } },
+    qqHistory: [{ messageId: 'qq_h_empty_1', sender: { account: '10001', name: '主人' }, at: 1700000000000, parts: [{ type: 'text', text: '冷启动补历史条目' }] }],
+  })
+  await hEmpty.deliverInbound(hEmpty.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '新空分支第一句', msgId: 'seed_empty_1' })
+  assert.equal(hEmpty.runtime.hub.sharedStatus().state, 'active')
+  assert.equal(hEmpty.historyCalls.length, 1, '空新建分支首次应调用一次 history 补看')
+  const seededPrompt = hEmpty.capturedFollowups[0].msg.content.map((b) => b.text).join('\n')
+  assert.match(seededPrompt, /你刚上线，先补看最近 1 条私聊记录/)
+  assert.match(seededPrompt, /冷启动补历史条目/)
+
+  await hEmpty.deliverInbound(hEmpty.qq, { chatId: '10001', account: '10001', text: '同进程第二句', msgId: 'seed_empty_2' })
+  assert.equal(hEmpty.historyCalls.length, 1, '同进程第二轮不得重复补看')
+
+  // 重启后恢复（branch.verifiedThroughSeq >= 0）同样不得重新补看
+  hEmpty.restartRuntime()
+  await hEmpty.deliverInbound(hEmpty.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '重启恢复后第一句', msgId: 'seed_empty_3' })
+  assert.equal(hEmpty.historyCalls.length, 1, '恢复已有核验检查点的分支不得重复 seedHistory')
+
+  // 3) 显式重置为 historyPolicy='empty' -> 即使开启 seedHistory 也不得把旧历史再补回来
+  hEmpty.runtime.hub.resetSessions()
+  const afterResetSessions = JSON.parse(readFileSync(join(hEmpty.dir, 'sessions.json'), 'utf8'))
+  assert.equal(afterResetSessions.multiPrivate.sessions.live.historyPolicy, 'empty')
+  await hEmpty.deliverInbound(hEmpty.qq, { chatId: '10001', account: '10001', text: '重置后的第一句', msgId: 'seed_empty_after_reset' })
+  assert.equal(hEmpty.runtime.hub.sharedStatus().state, 'active')
+  assert.equal(hEmpty.historyCalls.length, 1, 'historyPolicy=empty 的重置分支不得调用 seedHistory')
+  const postResetPrompt = hEmpty.capturedFollowups.at(-1).msg.content.map((b) => b.text).join('\n')
+  assert.doesNotMatch(postResetPrompt, /你刚上线，先补看最近/)
+  assert.doesNotMatch(postResetPrompt, /冷启动补历史条目/)
+})
+
+test('共享会话同源 steer 透传当前 prevText/queryText 并写入 conversationArchive', async (t) => {
+  const turnGate = Promise.withResolvers()
+  const enteredGate = Promise.withResolvers()
+  let holdFirst = true
+  t.after(() => turnGate.resolve())
+
+  const h = await setupSharedMemoryHarness(t, {
+    cfgPatch: { conversationContext: { enabled: true } },
+    onBeforeEnd: async () => {
+      if (holdFirst) {
+        holdFirst = false
+        enteredGate.resolve()
+        await turnGate.promise
+      }
+    },
+  })
+
+  const hookInfos = []
+  h.runtime.setPromptHook((content, info) => {
+    hookInfos.push({ queryText: info.queryText, prevText: info.prevText, speakers: info.speakers })
+    return content
+  })
+
+  const p1 = h.deliverInbound(h.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '第一句主需求', msgId: 'st_1' })
+  await enteredGate.promise
+  const p2 = h.deliverInbound(h.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '补充第二句条件', msgId: 'st_2' })
+  for (let i = 0; i < 100 && h.capturedSteers.length === 0; i++) await new Promise((r) => setTimeout(r, 10))
+  assert.equal(h.runtime.hub.sharedStatus().state, 'active')
+  assert.equal(h.capturedSteers.length, 1, '同源第二句应通过 steer 插入活跃共享轮次')
+  assert.equal(hookInfos.length, 2)
+  assert.match(hookInfos[1].queryText, /补充第二句条件/)
+  assert.match(hookInfos[1].prevText, /第一句主需求/)
+
+  turnGate.resolve()
+  await Promise.all([p1, p2])
+
+  const saved = h.runtime.hub.recentMessagesOf('qq:private:10001')
+  assert.ok(saved.some((m) => m.role === 'user' && /第一句主需求/.test(m.text)))
+  assert.ok(saved.some((m) => m.role === 'user' && /补充第二句条件/.test(m.text)))
+  assert.ok(saved.some((m) => m.role === 'assistant' && /回复第1轮/.test(m.text)))
+})
+
+test('共享会话升级兼容：旧版默认 QQ 裸键 private:<id> 档案可被多平台共享会话无缝读取、召回与续写', async (t) => {
+  const h = await setupSharedMemoryHarness(t, {
+    cfgPatch: { conversationContext: { enabled: true } },
+  })
+  const legacyArchive = createConversationArchive({
+    directory: join(h.dir, 'conversation-context'),
+    namespace: h.cfg.persona?.current || 'default',
+  })
+  const baseAt = Date.now() - 120_000
+  legacyArchive.append('private:10001', {
+    role: 'user',
+    text: '升级前旧档案约定每周五吃火锅',
+    id: 'legacy_u1',
+    speakerId: '10001',
+    at: baseAt,
+  })
+  legacyArchive.append('private:10001', {
+    role: 'assistant',
+    text: '好呀，记着每周五一起吃火锅。',
+    id: 'legacy_a1',
+    speakerId: '20001',
+    at: baseAt + 10_000,
+  })
+
+  const hookInfos = []
+  const reopened = h.restartRuntime()
+  reopened.setPromptHook((content, info) => {
+    hookInfos.push({ recentMessages: info.recentMessages, queryText: info.queryText })
+    return content
+  })
+
+  await h.deliverInbound(h.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '明天周五吃什么呀', msgId: 'upg_1' })
+  assert.equal(reopened.hub.sharedStatus().state, 'active')
+  assert.ok(hookInfos[0].recentMessages.some((m) => m.id === 'legacy_u1' && /每周五吃火锅/.test(m.text)))
+
+  const promptText = h.capturedFollowups[0].msg.content.map((b) => b.text).join('\n')
+  assert.match(promptText, /【同一人格、同一聊天的对话资料/)
+  assert.match(promptText, /每周五吃火锅/)
+
+  const byCanonical = reopened.hub.recentMessagesOf('qq:private:10001')
+  const byLegacy = reopened.hub.recentMessagesOf('private:10001')
+  assert.deepEqual(byCanonical, byLegacy)
+  assert.ok(byCanonical.some((m) => m.id === 'legacy_u1' && /每周五吃火锅/.test(m.text)))
+  assert.ok(byCanonical.some((m) => m.role === 'user' && m.speakerId === 'ou_owner' && /周五吃什么/.test(m.text)))
+  assert.ok(byCanonical.some((m) => m.role === 'assistant' && /回复第1轮/.test(m.text)))
+})
+
+test('共享会话升级兼容：旧键 qq:private:<id> 档案回退读取、召回与续写', async (t) => {
+  const h = await setupSharedMemoryHarness(t, {
+    cfgPatch: { conversationContext: { enabled: true } },
+  })
+  const prefixedWriter = createConversationArchive({
+    directory: join(h.dir, 'conversation-context'),
+    namespace: h.cfg.persona?.current || 'default',
+  })
+  const baseAt = Date.now() - 120_000
+  prefixedWriter.append('qq:private:10001', {
+    role: 'user',
+    text: '旧版qq前缀档案约定周六去看展',
+    id: 'prefixed_u1',
+    speakerId: '10001',
+    at: baseAt,
+  })
+  prefixedWriter.append('qq:private:10001', {
+    role: 'assistant',
+    text: '好呀，周六一起去看展。',
+    id: 'prefixed_a1',
+    speakerId: '20001',
+    at: baseAt + 10_000,
+  })
+
+  const hookInfos = []
+  const reopened = h.restartRuntime()
+  reopened.setPromptHook((content, info) => {
+    hookInfos.push({ recentMessages: info.recentMessages, queryText: info.queryText })
+    return content
+  })
+
+  await h.deliverInbound(h.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '周六去干嘛呀', msgId: 'pfx_upg_1' })
+  assert.equal(reopened.hub.sharedStatus().state, 'active')
+  assert.ok(hookInfos[0].recentMessages.some((m) => m.id === 'prefixed_u1' && /周六去看展/.test(m.text)))
+
+  const promptText = h.capturedFollowups[0].msg.content.map((b) => b.text).join('\n')
+  assert.match(promptText, /【同一人格、同一聊天的对话资料/)
+  assert.match(promptText, /周六去看展/)
+
+  const byCanonical = reopened.hub.recentMessagesOf('qq:private:10001')
+  const byLegacy = reopened.hub.recentMessagesOf('private:10001')
+  assert.deepEqual(byCanonical, byLegacy)
+  assert.ok(byCanonical.some((m) => m.id === 'prefixed_u1' && /周六去看展/.test(m.text)))
+  assert.ok(byCanonical.some((m) => m.role === 'user' && m.speakerId === 'ou_owner' && /周六去干嘛/.test(m.text)))
+  assert.ok(byCanonical.some((m) => m.role === 'assistant' && /回复第1轮/.test(m.text)))
+
+  // 重启后新写入的 private:10001 与只读回退的 qq:private:10001 仍完整合并
+  const restartedAgain = h.restartRuntime()
+  const persisted = restartedAgain.hub.recentMessagesOf('qq:private:10001')
+  assert.ok(persisted.some((m) => m.id === 'prefixed_u1' && /周六去看展/.test(m.text)))
+  assert.ok(persisted.some((m) => m.role === 'user' && m.speakerId === 'ou_owner' && /周六去干嘛/.test(m.text)))
+  assert.ok(persisted.some((m) => m.role === 'assistant' && /回复第1轮/.test(m.text)))
+})
+
+test('sharedReplyOnSteer：默认关闭与无插入只发最终回复；开启且插入时补发已生成中间段（含失败隔离/多段去重/everyStep/普通会话隔离）', async (t) => {
+  // 1) sharedReplyOnSteer=false + steer -> 只发最终回复
+  {
+    const turnGate = Promise.withResolvers()
+    const enteredGate = Promise.withResolvers()
+    let holdFirst = true
+    t.after(() => turnGate.resolve())
+    const h = await setupSharedMemoryHarness(t, {
+      cfgPatch: { sharedReplyOnSteer: false },
+      onBeforeEnd: async ({ emitAssistant }) => {
+        if (holdFirst) {
+          holdFirst = false
+          emitAssistant('插话前已生成的过程回复', 1)
+          enteredGate.resolve()
+          await turnGate.promise
+        }
+        return { finalText: '只发这一条最终回复' }
+      },
+    })
+    assert.equal(h.runtime.hub.sharedStatus().replyOnSteer, false)
+    const p1 = h.deliverInbound(h.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '第一条', msgId: 'ros_off_1' })
+    await enteredGate.promise
+    const p2 = h.deliverInbound(h.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '补一句', msgId: 'ros_off_2' })
+    for (let i = 0; i < 100 && h.capturedSteers.length === 0; i++) await new Promise((r) => setTimeout(r, 10))
+    assert.equal(h.capturedSteers.length, 1)
+    assert.equal(h.feishu.sent.length, 0)
+    turnGate.resolve()
+    await Promise.all([p1, p2])
+    assert.equal(h.feishu.sent.length, 1)
+    assert.equal(h.feishu.sent[0].payload.parts[0].text, '只发这一条最终回复')
+  }
+
+  // 2) sharedReplyOnSteer=true + steer -> 先发已生成中间段再发最终回复（顺序与 inResponseTo 正确），且中间段失败不阻断最终回复
+  {
+    const turnGate = Promise.withResolvers()
+    const enteredGate = Promise.withResolvers()
+    let holdFirst = true
+    t.after(() => turnGate.resolve())
+    const h = await setupSharedMemoryHarness(t, {
+      cfgPatch: { sharedReplyOnSteer: true },
+      onBeforeEnd: async ({ emitAssistant, myTurn }) => {
+        if (myTurn === 1 && holdFirst) {
+          holdFirst = false
+          emitAssistant('先帮你看一眼进展', 1)
+          enteredGate.resolve()
+          await turnGate.promise
+          return { finalText: '这是结合补充后的最终回复' }
+        }
+        if (myTurn === 2) {
+          emitAssistant('第二轮先说一句', 1)
+          await new Promise((r) => setTimeout(r, 30))
+          return { finalText: '第二轮最终答复' }
+        }
+        return null
+      },
+    })
+    assert.equal(h.runtime.hub.sharedStatus().replyOnSteer, true)
+    assert.equal(h.runtime.hub.sharedStatus().replyOnSteerMode, 'all')
+    const p1 = h.deliverInbound(h.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '查一下进度', msgId: 'ros_on_1' })
+    await enteredGate.promise
+    const p2 = h.deliverInbound(h.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '顺便看昨天记录', msgId: 'ros_on_2' })
+    for (let i = 0; i < 100 && h.capturedSteers.length === 0; i++) await new Promise((r) => setTimeout(r, 10))
+    // 严格在 shared-turn-guard onAccepted 后才补发，steer 提交阶段尚未发出
+    assert.equal(h.feishu.sent.length, 0)
+    turnGate.resolve()
+    await Promise.all([p1, p2])
+    assert.equal(h.feishu.sent.length, 2)
+    assert.deepEqual(
+      h.feishu.sent.map((x) => ({ text: x.payload.parts[0].text, inResponseTo: x.payload.inResponseTo })),
+      [
+        { text: '先帮你看一眼进展', inResponseTo: 'ros_on_1' },
+        { text: '这是结合补充后的最终回复', inResponseTo: 'ros_on_1' },
+      ],
+    )
+
+    // 2b) sharedReplyOnSteerMode='first' 只补发本轮第一条未发回复，同轮后续不再补发过程话
+    const firstModeGate = Promise.withResolvers()
+    const firstModeEntered = Promise.withResolvers()
+    const hFirst = await setupSharedMemoryHarness(t, {
+      cfgPatch: { sharedReplyOnSteer: true, sharedReplyOnSteerMode: 'first' },
+      onBeforeEnd: async ({ emitAssistant }) => {
+        emitAssistant('首条模式第一段回复', 1)
+        emitAssistant('首条模式过程补充话', 2)
+        firstModeEntered.resolve()
+        await firstModeGate.promise
+        return { finalText: '首条模式最终回复' }
+      },
+    })
+    t.after(() => firstModeGate.resolve())
+    assert.equal(hFirst.runtime.hub.sharedStatus().replyOnSteerMode, 'first')
+    const fm1 = hFirst.deliverInbound(hFirst.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '问一句', msgId: 'ros_fm_1' })
+    await firstModeEntered.promise
+    const fm2 = hFirst.deliverInbound(hFirst.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '插话1', msgId: 'ros_fm_2' })
+    const fm3 = hFirst.deliverInbound(hFirst.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '插话2', msgId: 'ros_fm_3' })
+    for (let i = 0; i < 100 && hFirst.capturedSteers.length < 2; i++) await new Promise((r) => setTimeout(r, 10))
+    assert.equal(hFirst.feishu.sent.length, 0)
+    firstModeGate.resolve()
+    await Promise.all([fm1, fm2, fm3])
+    assert.deepEqual(
+      hFirst.feishu.sent.map((x) => ({ text: x.payload.parts[0].text, inResponseTo: x.payload.inResponseTo })),
+      [
+        { text: '首条模式第一段回复', inResponseTo: 'ros_fm_1' },
+        { text: '首条模式最终回复', inResponseTo: 'ros_fm_1' },
+      ],
+    )
+
+    // 中间段发送失败时记 lastDeliveryFailure，但不阻断最终回复
+    const turn2Gate = Promise.withResolvers()
+    const entered2Gate = Promise.withResolvers()
+    const hFail = await setupSharedMemoryHarness(t, {
+      cfgPatch: { sharedReplyOnSteer: true },
+      onBeforeEnd: async ({ emitAssistant }) => {
+        emitAssistant('这条补发会被平台限流拒绝', 1)
+        entered2Gate.resolve()
+        await turn2Gate.promise
+        return { finalText: '最终回复依然发出' }
+      },
+    })
+    t.after(() => turn2Gate.resolve())
+    hFail.feishu.failNext('not-sent', 'reply-limit')
+    const f1 = hFail.deliverInbound(hFail.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '首条', msgId: 'ros_part_1' })
+    await entered2Gate.promise
+    const f2 = hFail.deliverInbound(hFail.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '第二条', msgId: 'ros_part_2' })
+    for (let i = 0; i < 100 && hFail.capturedSteers.length === 0; i++) await new Promise((r) => setTimeout(r, 10))
+    turn2Gate.resolve()
+    await Promise.all([f1, f2])
+    assert.equal(hFail.feishu.sent.length, 1)
+    assert.equal(hFail.feishu.sent[0].payload.parts[0].text, '最终回复依然发出')
+    assert.equal(hFail.runtime.hub.sharedStatus().lastDeliveryFailure?.kind, 'reply')
+    assert.equal(hFail.runtime.hub.sharedStatus().lastDeliveryFailure?.reason, 'reply-limit')
+  }
+
+  // 3) sharedReplyOnSteer=true 但无 steer -> 即使多段 assistant 也只发最终回复
+  {
+    const h = await setupSharedMemoryHarness(t, {
+      cfgPatch: { sharedReplyOnSteer: true },
+      onBeforeEnd: async ({ emitAssistant }) => {
+        emitAssistant('过程段不应该发出去', 1)
+        return { finalText: '无插入时唯一最终回复' }
+      },
+    })
+    await h.deliverInbound(h.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '单句问候', msgId: 'ros_nosteer_1' })
+    assert.equal(h.capturedSteers.length, 0)
+    assert.equal(h.feishu.sent.length, 1)
+    assert.equal(h.feishu.sent[0].payload.parts[0].text, '无插入时唯一最终回复')
+  }
+
+  // 4) steer 被拒绝 / 后续 guard pre-step 拒绝 / 超过上限 / prompt hook 拦截 / 跨 lane 到达 -> 都不补发
+  {
+    // 4a) steer 被拒绝
+    const gate = Promise.withResolvers()
+    const entered = Promise.withResolvers()
+    let rejectSteer = true
+    t.after(() => gate.resolve())
+    const hRej = await setupSharedMemoryHarness(t, {
+      cfgPatch: { sharedReplyOnSteer: true },
+      steerRejectNext: () => rejectSteer,
+      onBeforeEnd: async ({ emitAssistant, myTurn }) => {
+        if (myTurn === 1) {
+          emitAssistant('拒绝插话时不得提前发这段', 1)
+          entered.resolve()
+          await gate.promise
+          return { finalText: '第1轮最终回复' }
+        }
+        return { finalText: '第2轮排队回复' }
+      },
+    })
+    const p1 = hRej.deliverInbound(hRej.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '消息1', msgId: 'ros_rej_1' })
+    await entered.promise
+    const p2 = hRej.deliverInbound(hRej.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '消息2', msgId: 'ros_rej_2' })
+    for (let i = 0; i < 100 && hRej.capturedSteers.length === 0; i++) await new Promise((r) => setTimeout(r, 10))
+    await new Promise((r) => setTimeout(r, 40))
+    assert.equal(hRej.feishu.sent.length, 0, 'steer 被拒绝时不得提前补发中间段')
+    rejectSteer = false
+    gate.resolve()
+    await Promise.all([p1, p2])
+    assert.deepEqual(
+      hRej.feishu.sent.map((x) => x.payload.parts[0].text),
+      ['第1轮最终回复', '第2轮排队回复'],
+    )
+
+    // 4e) steer 提交成功，但后续 agent/pre-step 被 guard 拒绝 -> 不得补发中间段，只发失败回执
+    const guardGate = Promise.withResolvers()
+    const guardEntered = Promise.withResolvers()
+    t.after(() => guardGate.resolve())
+    const hGuard = await setupSharedMemoryHarness(t, {
+      cfgPatch: { sharedReplyOnSteer: true },
+      preStepRejectNext: ({ step }) => step === 2,
+      onBeforeEnd: async ({ emitAssistant }) => {
+        emitAssistant('提交后被守卫拦截不得补发的草稿', 1)
+        guardEntered.resolve()
+        await guardGate.promise
+        return { finalText: '被拦截不应到达' }
+      },
+    })
+    const gP1 = hGuard.deliverInbound(hGuard.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '主需求', msgId: 'ros_g_1' })
+    await guardEntered.promise
+    const gP2 = hGuard.deliverInbound(hGuard.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '被后续guard拒绝的插话', msgId: 'ros_g_2' })
+    for (let i = 0; i < 100 && hGuard.capturedSteers.length === 0; i++) await new Promise((r) => setTimeout(r, 10))
+    assert.equal(hGuard.feishu.sent.length, 0)
+    guardGate.resolve()
+    await Promise.all([gP1, gP2])
+    assert.equal(hGuard.feishu.sent.length, 1)
+    assert.match(hGuard.feishu.sent[0].payload.parts[0].text, /请重新发送/)
+
+    // 4b) 超上限 sharedSteerMaxPerTurn=1：第1条插入触发补发，第2条排队且不再额外触发补发；
+    // 4c) prompt hook 返回 null：过滤拦截不触发补发；4d) 跨 lane 消息不触发补发
+    const limGate = Promise.withResolvers()
+    const limEntered = Promise.withResolvers()
+    t.after(() => limGate.resolve())
+    const hLim = await setupSharedMemoryHarness(t, {
+      cfgPatch: { sharedReplyOnSteer: true, sharedSteerMaxPerTurn: 1 },
+      onBeforeEnd: async ({ emitAssistant, myTurn }) => {
+        if (myTurn === 1) {
+          emitAssistant('第1次steer前段', 1)
+          limEntered.resolve()
+          await limGate.promise
+          return { finalText: '限流第1轮最终' }
+        }
+        return { finalText: `排队后续${myTurn}` }
+      },
+    })
+    let allowHook = true
+    hLim.runtime.setPromptHook((content, info) => (allowHook || !/过滤掉的插话/.test(info.queryText || '') ? content : null))
+    const l1 = hLim.deliverInbound(hLim.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '主句', msgId: 'ros_lim_1' })
+    await limEntered.promise
+    allowHook = false
+    const lFiltered = hLim.deliverInbound(hLim.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '过滤掉的插话', msgId: 'ros_lim_filt' })
+    await lFiltered
+    assert.equal(hLim.feishu.sent.length, 0, 'prompt hook 返回 null 时不得补发')
+    allowHook = true
+    const l2 = hLim.deliverInbound(hLim.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '有效第1条steer', msgId: 'ros_lim_2' })
+    for (let i = 0; i < 100 && hLim.capturedSteers.length === 0; i++) await new Promise((r) => setTimeout(r, 10))
+    // 超出 maxPerTurn=1 的同源消息和跨 lane QQ 消息到达时都不再额外 steer，也不在 onAccepted 前发
+    const l3 = hLim.deliverInbound(hLim.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '超限第2条steer', msgId: 'ros_lim_3' })
+    const lCross = hLim.deliverInbound(hLim.qq, { chatId: '10001', account: '10001', text: '跨平台QQ消息', msgId: 'ros_lim_qq' })
+    await new Promise((r) => setTimeout(r, 40))
+    assert.equal(hLim.capturedSteers.length, 1)
+    assert.equal(hLim.feishu.sent.length, 0)
+    limGate.resolve()
+    await Promise.all([l1, l2, l3, lCross])
+    assert.deepEqual(
+      hLim.feishu.sent.map((x) => x.payload.parts[0].text),
+      ['第1次steer前段', '限流第1轮最终', '排队后续2'],
+    )
+    assert.deepEqual(hLim.qq.sent.map((x) => x.payload.parts[0].text), ['排队后续3'])
+  }
+
+  // 5) 多段 assistant 顺序补发（过滤空/[沉默]/连续重复）与 finalText 去重
+  {
+    const g1 = Promise.withResolvers()
+    const e1 = Promise.withResolvers()
+    t.after(() => g1.resolve())
+    const hMulti = await setupSharedMemoryHarness(t, {
+      cfgPatch: { sharedReplyOnSteer: true },
+      onBeforeEnd: async ({ emitAssistant }) => {
+        emitAssistant('', 1)
+        emitAssistant('[沉默]', 2)
+        emitAssistant('第一段回复', 3)
+        emitAssistant('第一段回复', 4)
+        emitAssistant('第二段回复', 5)
+        e1.resolve()
+        await g1.promise
+        return { finalText: '第二段回复' }
+      },
+    })
+    const m1 = hMulti.deliverInbound(hMulti.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '说说看', msgId: 'ros_m_1' })
+    await e1.promise
+    const m2 = hMulti.deliverInbound(hMulti.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '补充一下', msgId: 'ros_m_2' })
+    for (let i = 0; i < 100 && hMulti.capturedSteers.length === 0; i++) await new Promise((r) => setTimeout(r, 10))
+    assert.equal(hMulti.feishu.sent.length, 0)
+    g1.resolve()
+    await Promise.all([m1, m2])
+    assert.deepEqual(
+      hMulti.feishu.sent.map((x) => x.payload.parts[0].text),
+      ['第一段回复', '第二段回复'],
+      '多段应按顺序补发，且与 finalText 重复时不再二发',
+    )
+  }
+
+  // 6) chat.everyStep=true 时不与 sharedReplyOnSteer 重复补发
+  {
+    const gate = Promise.withResolvers()
+    const entered = Promise.withResolvers()
+    t.after(() => gate.resolve())
+    const hEvery = await setupSharedMemoryHarness(t, {
+      cfgPatch: { sharedReplyOnSteer: true, chat: { everyStep: true, thinkingGuard: { enabled: false } } },
+      onBeforeEnd: async ({ emitAssistant }) => {
+        emitAssistant('分步第一段', 1)
+        emitAssistant('分步第二段', 2)
+        entered.resolve()
+        await gate.promise
+        return { finalText: '分步最终第三段' }
+      },
+    })
+    const e1 = hEvery.deliverInbound(hEvery.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '开分步', msgId: 'ros_ev_1' })
+    await entered.promise
+    const e2 = hEvery.deliverInbound(hEvery.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '插话测试', msgId: 'ros_ev_2' })
+    for (let i = 0; i < 100 && hEvery.capturedSteers.length === 0; i++) await new Promise((r) => setTimeout(r, 10))
+    gate.resolve()
+    await Promise.all([e1, e2])
+    assert.deepEqual(
+      hEvery.feishu.sent.map((x) => x.payload.parts[0].text),
+      ['分步第一段', '分步第二段', '分步最终第三段'],
+    )
+  }
+
+  // 7) 普通非共享私聊开启 sharedReplyOnSteer 不受影响（everyStep=false 只发最终回复）
+  {
+    const gate = Promise.withResolvers()
+    const entered = Promise.withResolvers()
+    let hold = true
+    t.after(() => gate.resolve())
+    const hOrd = await setupSharedMemoryHarness(t, {
+      cfgPatch: {
+        multiPlatformPrivateSession: false,
+        sharedReplyOnSteer: true,
+        chat: { everyStep: false, thinkingGuard: { enabled: false } },
+      },
+      onBeforeEnd: async ({ emitAssistant }) => {
+        if (hold) {
+          hold = false
+          emitAssistant('普通会话中间过程话', 1)
+          entered.resolve()
+          await gate.promise
+        }
+        return { finalText: '普通会话最终回复' }
+      },
+    })
+    const o1 = hOrd.deliverInbound(hOrd.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '普通1', msgId: 'ros_ord_1' })
+    await entered.promise
+    const o2 = hOrd.deliverInbound(hOrd.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '普通2', msgId: 'ros_ord_2' })
+    await new Promise((r) => setTimeout(r, 40))
+    assert.equal(hOrd.feishu.sent.length, 0, '普通会话不应受 sharedReplyOnSteer 影响而提前发中间段')
+    gate.resolve()
+    await Promise.all([o1, o2])
+    for (let i = 0; i < 100 && hOrd.feishu.sent.length === 0; i++) await new Promise((r) => setTimeout(r, 10))
+    await new Promise((r) => setTimeout(r, 30))
+    assert.equal(hOrd.feishu.sent.length, 1)
+    assert.equal(hOrd.feishu.sent[0].payload.parts[0].text, '普通会话最终回复')
+  }
+})
+
+async function setupParentSessionCompatHarness(t, initialForkParentMode = 'omit') {
+  const dir = mkdtempSync(join(tmpdir(), 'aurabot-parent-session-'))
+  const prevDir = process.env.AURABOT_DATA_DIR
+  process.env.AURABOT_DATA_DIR = dir
+  const log = { info() {}, debug() {}, warn() {}, error() {}, child() { return this } }
+  const id = createIdentity({ dataDir: join(dir, 'identity'), log })
+  const ownerId = id.claimOwner('qq', '10001')
+  id.link('feishu', 'ou_owner', ownerId, 'owner')
+
+  const legacySid = 'ordinary-legacy-qq'
+  writeFileSync(join(dir, 'sessions.json'), JSON.stringify({
+    chats: {
+      'private:10001': { sessionId: legacySid, level: 'social', preset: 'aurabot-social', title: '旧主人私聊' },
+    },
+  }))
+
+  const cfg = normalize({
+    enabled: true,
+    dryRun: false,
+    setupDone: true,
+    ownerLevel: 'social',
+    ownerPersonId: ownerId,
+    ownerQQ: '10001',
+    ownerAuthorization: { owner: ownerId, revision: '22222222-3333-4444-8555-666666666666' },
+    multiPlatformPrivateSession: true,
+    ownerPrimary: { mode: 'fixed', platform: 'qq', instance: 'qq', account: '10001' },
+    platforms: { qq: { enabled: true }, feishu: { enabled: true } },
+    workspaceDir: dir,
+    voice: { enabled: false, autoChance: 0 },
+    stickers: { enabled: false, autoChance: 0 },
+    merge: { enabled: false },
+    conversationContext: { enabled: false },
+    chat: { thinkingGuard: { enabled: false } },
+  })
+
+  const gateway = createGateway({ config: cfg, dataDir: (...p) => join(dir, ...p), identity: id, log })
+  const qq = makeFakeAdapter({ id: 'qq', self: { account: '20001' }, caps: { proactive: 'free' } })
+  const feishu = makeFakeAdapter({ id: 'feishu', self: { account: 'ou_bot_feishu' }, caps: { proactive: 'free' } })
+  gateway.register(() => qq)
+  gateway.register(() => feishu)
+  await gateway.sync()
+
+  const listeners = new Map()
+  const emit = (name, ...args) => { for (const fn of listeners.get(name) || []) fn(...args) }
+  const agents = new Map()
+  const sessions = new Map()
+  let createSeq = 0
+  let forkSeq = 0
+  let forkParentMode = initialForkParentMode
+
+  function buildAgent(sessionId, { header, inheritedEventCount = 0, events = [] }) {
+    let dshTurn = 0
+    let idleChain = Promise.resolve()
+    const clonedEvents = structuredClone(events)
+    const session = {
+      id: sessionId,
+      header: { ...header },
+      seq: clonedEvents.length,
+      inheritedEventCount,
+      events: clonedEvents,
+      isOwnSeq: (s) => s >= inheritedEventCount,
+      eventAt: (i) => session.events[i],
+      snapshotEvents: () => [...session.events],
+    }
+    sessions.set(sessionId, session)
+    const agent = {
+      id: sessionId,
+      session,
+      inbox: { nextTurn: [], nextStep: [], remove: () => false },
+      cancel() {},
+      ctx: {
+        tools: { register: () => () => {}, restrict: () => () => {} },
+        systemPrompt: { context: () => () => {} },
+      },
+      whenIdle: () => idleChain,
+      followup(msg) {
+        idleChain = idleChain.then(async () => {
+          dshTurn++
+          const myTurn = dshTurn
+          emit('agent/inbox/claimed', { agent, message: msg, turn: myTurn })
+          const splicedSeq = session.seq++
+          session.events[splicedSeq] = { type: 'agent/inbox/spliced', seq: splicedSeq, data: { inserted: [{ id: msg.id }] } }
+          emit('session/event', session, session.events[splicedSeq])
+          for (const fn of listeners.get('agent/pre-step') || []) {
+            await fn(
+              { agent, messages: [msg], turn: myTurn, step: 1, signal: new AbortController().signal },
+              async () => ({ kind: 'allow', messages: [msg] }),
+            )
+          }
+          const endSeq = session.seq++
+          session.events[endSeq] = { type: 'turn/end', seq: endSeq, data: { turn: myTurn, reason: { kind: 'completed' } } }
+          emit('session/event', session, {
+            type: 'assistant/message',
+            data: { turn: myTurn, step: 1, message: { content: [{ type: 'text', text: `回复第${myTurn}轮` }] } },
+          })
+          emit('session/event', session, session.events[endSeq])
+        })
+        return idleChain
+      },
+    }
+    agents.set(sessionId, agent)
+    return agent
+  }
+
+  buildAgent(legacySid, {
+    header: { id: legacySid, cwd: dir, agentPreset: 'aurabot-social', delegationDepth: 0 },
+    inheritedEventCount: 0,
+    events: [
+      { type: 'user/message', seq: 0, time: 1000, data: { content: [{ type: 'text', text: '旧主人历史消息' }] } },
+      { type: 'turn/end', seq: 1, time: 2000, data: { turn: 1, reason: { kind: 'completed' } } },
+    ],
+  })
+
+  const wsObj = {
+    id: 'workspace',
+    path: dir,
+    title: 'Aurabot · Shared',
+    sessionIds: [legacySid],
+    async attachSession(sid) {
+      if (!wsObj.sessionIds.includes(sid)) wsObj.sessionIds.push(sid)
+    },
+  }
+  const dsh = {
+    on(name, fn) {
+      if (!listeners.has(name)) listeners.set(name, new Set())
+      listeners.get(name).add(fn)
+      return () => listeners.get(name).delete(fn)
+    },
+    get: (name) => dsh.services?.[name],
+    agents: { get: (idKey) => agents.get(idKey) },
+    sessions: { flush: async () => true },
+    attachments: { admitPromptContent: async (c) => c },
+    workspaceRegistry: {
+      list: () => [wsObj],
+      get: (idKey) => (idKey === wsObj.id ? wsObj : null),
+      create: async () => wsObj,
+      archivedSessionIds: [],
+      async archiveSession(sid) {
+        if (!this.archivedSessionIds.includes(sid)) this.archivedSessionIds.push(sid)
+      },
+      async unarchiveSession(sid) {
+        const idx = this.archivedSessionIds.indexOf(sid)
+        if (idx >= 0) this.archivedSessionIds.splice(idx, 1)
+      },
+    },
+    services: {
+      sessionProjections: {},
+      sessionQuery: {
+        async observeSession(sid) {
+          const s = sessions.get(sid)
+          if (!s) throw Object.assign(new Error('session not found'), { code: 'SESSION_QUERY_SESSION_NOT_FOUND' })
+          return {
+            header: { ...s.header },
+            events: structuredClone(s.events),
+            persistedEventCount: s.events.length,
+            [Symbol.dispose]() {},
+          }
+        },
+      },
+      sessionController: {
+        create: async () => {
+          const sid = `s-shared-new-${++createSeq}`
+          buildAgent(sid, { header: { id: sid, cwd: dir, agentPreset: 'aurabot-social' } })
+          return { sessionId: sid }
+        },
+        resolveAgent: async (idKey) => {
+          const existing = agents.get(idKey)
+          if (existing) return { agent: existing }
+          const stored = sessions.get(idKey)
+          if (!stored) return { error: { code: 'session/not-found', message: 'not found' } }
+          return { agent: buildAgent(idKey, stored) }
+        },
+        fork: async ({ sessionId, atSeq }) => {
+          const source = sessions.get(sessionId)
+          if (!source) throw new Error('missing source session')
+          const boundary = atSeq ?? (source.events.length - 1)
+          const count = boundary + 1
+          const childId = `s-shared-fork-${++forkSeq}`
+          const forkedEvents = [
+            ...structuredClone(source.events.slice(0, count)),
+            { type: 'session/end-seed', seq: count, time: Date.now(), data: { inherited: true } },
+          ]
+          const parentHeader = forkParentMode === 'match'
+            ? { parentSession: sessionId }
+            : forkParentMode === 'mismatch'
+              ? { parentSession: 'wrong-parent' }
+              : {}
+          buildAgent(childId, {
+            header: {
+              id: childId,
+              cwd: source.header.cwd,
+              agentPreset: source.header.agentPreset,
+              ...parentHeader,
+            },
+            inheritedEventCount: count,
+            events: forkedEvents,
+          })
+          await wsObj.attachSession(childId)
+          return { sessionId: childId }
+        },
+        rename: async () => {},
+      },
+    },
+  }
+
+  const createRuntime = () => {
+    const hub = createHub({
+      dsh,
+      getConfig: () => cfg,
+      log,
+      gateway,
+      identity: id,
+      resolveSharedPrimary: () => fixedSharedPrimary({ cfg, identity: id, instances: gateway.instances() }),
+    })
+    const offSession = dsh.on('session/event', hub.onSessionEvent)
+    const submitted = []
+    const offGw = gateway.onMessage((m) => { submitted.push(hub.onGatewayMessage(m)) })
+    return {
+      hub,
+      submitted,
+      stopRuntime: () => { offGw(); offSession(); hub.dispose() },
+    }
+  }
+
+  let runtime = createRuntime()
+  t.after(async () => {
+    runtime.stopRuntime()
+    await gateway.stopAll()
+    id.close?.()
+    if (prevDir === undefined) delete process.env.AURABOT_DATA_DIR
+    else process.env.AURABOT_DATA_DIR = prevDir
+    try { rmSync(dir, { recursive: true, force: true }) } catch {}
+  })
+
+  const readSessionsJson = () => JSON.parse(readFileSync(join(dir, 'sessions.json'), 'utf8'))
+  const deliverInbound = async (adapter, { chatId, account, text, msgId }) => {
+    const idx = runtime.submitted.length
+    adapter.pushInbound({
+      messageId: msgId,
+      chat: { kind: 'private', id: chatId },
+      sender: { account, name: '主人' },
+      parts: [{ type: 'text', text }],
+    })
+    for (let i = 0; i < 100 && runtime.submitted.length <= idx; i++) await new Promise((r) => setTimeout(r, 10))
+    assert.ok(runtime.submitted[idx], `gateway 未投递 ${msgId}`)
+    await runtime.submitted[idx]
+  }
+
+  return {
+    legacySid,
+    qq,
+    feishu,
+    sessions,
+    agents,
+    setForkParentMode: (mode) => { forkParentMode = mode },
+    get runtime() { return runtime },
+    restartRuntime: () => {
+      runtime.stopRuntime()
+      runtime = createRuntime()
+      return runtime
+    },
+    readSessionsJson,
+    deliverInbound,
+  }
+}
+
+test('DSH 0.2.2 parentSession 兼容：verifyCandidate 与 verifyRecovered 允许缺失 parentSession，存在时仍校验一致', async (t) => {
+  // 1) parentSession 缺失（0.2.2 independent fork）与匹配（0.2.1）均应通过 candidate 校验与 checkpoint 恢复
+  for (const mode of ['omit', 'match']) {
+    const h = await setupParentSessionCompatHarness(t, mode)
+    const review = await h.runtime.hub.prepareLegacyHistory('live')
+    assert.equal(review.ok, true, `${mode}: prepareLegacyHistory 失败`)
+    const confirmed = await h.runtime.hub.confirmLegacyHistory('live', review.token)
+    assert.equal(confirmed.ok, true, `${mode}: confirmLegacyHistory 失败`)
+
+    await h.deliverInbound(h.qq, { chatId: '10001', account: '10001', text: '首次共享消息', msgId: `ps_${mode}_1` })
+    assert.equal(h.runtime.hub.sharedStatus().state, 'active', `${mode}: verifyCandidate 应通过`)
+    const mapAfterFirst = h.readSessionsJson()
+    const childId = mapAfterFirst.multiPrivate.sessions.live.sessionId
+    const checkpoint = mapAfterFirst.multiPrivate.sessions.live.verifiedThroughSeq
+    assert.equal(mapAfterFirst.multiPrivate.sessions.live.baseSessionId, h.legacySid)
+    assert.ok(Number.isSafeInteger(checkpoint) && checkpoint > review.atSeq)
+
+    // 注入未核验事件并模拟冷重启，触发 restored-history-unverified 暂停
+    const childSession = h.sessions.get(childId)
+    childSession.events.push({
+      type: 'assistant/message',
+      seq: childSession.seq++,
+      time: Date.now(),
+      data: { message: { content: [{ type: 'text', text: '崩溃前未落盘核验点' }] } },
+    })
+    h.agents.delete(childId)
+    h.restartRuntime()
+
+    await h.deliverInbound(h.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '重启后消息', msgId: `ps_${mode}_2` })
+    assert.deepEqual(
+      {
+        state: h.runtime.hub.sharedStatus().state,
+        pauseReason: h.runtime.hub.sharedStatus().pauseReason,
+        recoverable: h.runtime.hub.sharedStatus().recoverable,
+        recoverCheckpoint: h.runtime.hub.sharedStatus().recoverCheckpoint,
+      },
+      {
+        state: 'paused',
+        pauseReason: 'restored-history-unverified',
+        recoverable: true,
+        recoverCheckpoint: checkpoint,
+      },
+      `${mode}: 重启检测到未核验事件后应进入可恢复暂停状态`,
+    )
+
+    const recovered = await h.runtime.hub.recoverSharedFromCheckpoint('live')
+    assert.equal(recovered.ok, true, `${mode}: recoverSharedFromCheckpoint 失败: ${JSON.stringify(recovered)}`)
+    assert.notEqual(recovered.sessionId, childId)
+    assert.equal(h.runtime.hub.sharedStatus().state, 'active')
+    assert.equal(h.readSessionsJson().multiPrivate.sessions.live.recoveredFrom, childId)
+  }
+
+  // 2) parentSession 存在但不一致时，verifyCandidate 与 verifyRecovered 均必须拒绝
+  {
+    const hCand = await setupParentSessionCompatHarness(t, 'mismatch')
+    const review = await hCand.runtime.hub.prepareLegacyHistory('live')
+    assert.equal(review.ok, true)
+    assert.equal((await hCand.runtime.hub.confirmLegacyHistory('live', review.token)).ok, true)
+    await hCand.deliverInbound(hCand.qq, { chatId: '10001', account: '10001', text: '触发错误 parentSession candidate', msgId: 'ps_mismatch_cand' })
+    const status = hCand.runtime.hub.sharedStatus()
+    assert.equal(status.state, 'paused')
+    assert.equal(status.pauseReason, 'candidate-history-unverified')
+    assert.equal(hCand.readSessionsJson().multiPrivate.sessions.live.sessionId, undefined)
+    assert.ok(hCand.readSessionsJson().multiPrivate.retiredSessions['s-shared-fork-1'])
+  }
+
+  {
+    const hRec = await setupParentSessionCompatHarness(t, 'omit')
+    const review = await hRec.runtime.hub.prepareLegacyHistory('live')
+    assert.equal(review.ok, true)
+    assert.equal((await hRec.runtime.hub.confirmLegacyHistory('live', review.token)).ok, true)
+    await hRec.deliverInbound(hRec.qq, { chatId: '10001', account: '10001', text: '正常分叉第一轮', msgId: 'ps_mismatch_rec_1' })
+    const childId = hRec.readSessionsJson().multiPrivate.sessions.live.sessionId
+    const childSession = hRec.sessions.get(childId)
+    childSession.events.push({
+      type: 'assistant/message',
+      seq: childSession.seq++,
+      time: Date.now(),
+      data: { message: { content: [{ type: 'text', text: '崩溃前未核验回复' }] } },
+    })
+    hRec.agents.delete(childId)
+    hRec.restartRuntime()
+    await hRec.deliverInbound(hRec.feishu, { chatId: 'ou_owner', account: 'ou_owner', text: '触发暂停', msgId: 'ps_mismatch_rec_2' })
+    assert.equal(hRec.runtime.hub.sharedStatus().recoverable, true)
+
+    hRec.setForkParentMode('mismatch')
+    const badRecover = await hRec.runtime.hub.recoverSharedFromCheckpoint('live')
+    assert.equal(badRecover.ok, false)
+    assert.equal(badRecover.reason, 'candidate-unavailable')
+    assert.equal(hRec.runtime.hub.sharedStatus().state, 'paused')
+    assert.equal(hRec.readSessionsJson().multiPrivate.sessions.live.sessionId, childId)
+    assert.ok(hRec.readSessionsJson().multiPrivate.retiredSessions['s-shared-fork-2'])
+  }
 })

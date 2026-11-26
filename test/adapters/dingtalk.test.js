@@ -6,7 +6,9 @@
 //   - 本地路径白名单、SSRF 防护与 replyGuard/proactiveGuard 撤销门控
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
+import http from 'node:http'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -20,6 +22,7 @@ import {
   createDingtalkAdapter,
   makeDingtalkMediaId,
   normalizeDingtalkSessionWebhook,
+  normalizeDingtalkStreamEndpoint,
   parseDingtalkInbound,
   TOPIC_ROBOT,
 } from '../../src/adapters/dingtalk/index.js'
@@ -745,4 +748,197 @@ test('dingtalk quote 媒体通道：repliedMsg picture/richText 原图入站缓�
     () => adapter.fetch({ kind: 'message', messageId: 'dt_q_pic_1' }),
     (e) => e.certainty === 'not-sent' && e.code === 'message-not-found',
   )
+})
+
+test('dingtalk connections/open endpoint 域名白名单校验（含自定义 apiBaseUrl 与拦截不建连）', async () => {
+  assert.equal(normalizeDingtalkStreamEndpoint('wss://wss-open.dingtalk.com/connect').hostname, 'wss-open.dingtalk.com')
+  assert.equal(normalizeDingtalkStreamEndpoint('wss://wss-open-connection.dingtalk.com:443/connect').hostname, 'wss-open-connection.dingtalk.com')
+
+  for (const bad of [
+    'wss://evil.example.com/connect',
+    'wss://dingtalk.com.evil.com/connect',
+    'ws://wss-open.dingtalk.com/connect',
+    'wss://wss-open.dingtalk.com:8443/connect',
+    'wss://user:pass@wss-open.dingtalk.com/connect',
+  ]) {
+    assert.throws(() => normalizeDingtalkStreamEndpoint(bad), /不受信任的 WebSocket 地址/)
+  }
+
+  // 默认官方 apiBaseUrl 下，返回非 dingtalk.com endpoint 时拒绝启动且绝不拨号泄漏 ticket
+  const evilMock = makeDingtalkMock({
+    customFetch: ({ url }) => url.endsWith('/v1.0/gateway/connections/open')
+      ? jsonResp({ endpoint: 'wss://evil.example.com/connect', ticket: 'secret_dt_ticket' })
+      : null,
+  })
+  const adapterBad = createDingtalkAdapter({
+    fetchImpl: evilMock.fetchImpl,
+    createWebSocket: evilMock.createWebSocket,
+  })
+  const ctxBad = makeCtx(adapterBad, { clientId: 'ding_bot_1', clientSecret: 'ding_secret_1' })
+  await assert.rejects(() => adapterBad.start(ctxBad), /不受信任的 WebSocket 地址/)
+  assert.equal(evilMock.sockets.length, 0)
+
+  // 自定义 apiBaseUrl 允许同主机 ws:// 地址，仍拒绝未知外域
+  const customMock = makeDingtalkMock({
+    customFetch: ({ url }) => url.endsWith('/v1.0/gateway/connections/open')
+      ? jsonResp({ endpoint: 'ws://127.0.0.1:9999/connect', ticket: 'local_ticket' })
+      : null,
+  })
+  const adapterLocal = createDingtalkAdapter({
+    fetchImpl: customMock.fetchImpl,
+    createWebSocket: customMock.createWebSocket,
+  })
+  const ctxLocal = makeCtx(adapterLocal, {
+    clientId: 'ding_bot_1',
+    clientSecret: 'ding_secret_1',
+    apiBaseUrl: 'http://127.0.0.1:9999',
+  })
+  await adapterLocal.start(ctxLocal)
+  assert.equal(customMock.sockets.length, 1)
+  assert.equal(customMock.sockets[0].url, 'ws://127.0.0.1:9999/connect?ticket=local_ticket')
+  await adapterLocal.stop()
+
+  const customEvilMock = makeDingtalkMock({
+    customFetch: ({ url }) => url.endsWith('/v1.0/gateway/connections/open')
+      ? jsonResp({ endpoint: 'wss://evil.example.com/connect', ticket: 'secret_dt_ticket' })
+      : null,
+  })
+  const adapterLocalBad = createDingtalkAdapter({
+    fetchImpl: customEvilMock.fetchImpl,
+    createWebSocket: customEvilMock.createWebSocket,
+  })
+  const ctxLocalBad = makeCtx(adapterLocalBad, {
+    clientId: 'ding_bot_1',
+    clientSecret: 'ding_secret_1',
+    apiBaseUrl: 'http://127.0.0.1:9999',
+  })
+  await assert.rejects(() => adapterLocalBad.start(ctxLocalBad), /不受信任的 WebSocket 地址/)
+  assert.equal(customEvilMock.sockets.length, 0)
+})
+
+test('dingtalk Stream 心跳保活：控制帧 ping/pong 重置 idle 看门狗，半开死连接仍能超时重连，且默认走真实 RFC 6455 客户端', async (t) => {
+  // 1) 周期性收到 WS ping 控制帧且无应用层消息时，不得触发 ws-idle 断连重连
+  {
+    const mock = makeDingtalkMock()
+    const adapter = createDingtalkAdapter({
+      fetchImpl: mock.fetchImpl,
+      createWebSocket: mock.createWebSocket,
+      idleTimeoutMs: 70,
+      pingIntervalMs: 0,
+      reconnectBaseMs: 20,
+      reconnectMaxMs: 40,
+    })
+    const ctx = makeCtx(adapter, { clientId: 'ding_hb_1', clientSecret: 'ding_hb_sec_1' })
+    await adapter.start(ctx)
+    const ws0 = mock.sockets[0]
+    const hb = setInterval(() => {
+      if (!ws0.closed) ws0.emit('ping', Buffer.from('hb'))
+    }, 20)
+    await delay(190)
+    clearInterval(hb)
+    assert.equal(mock.sockets.length, 1, '存在服务端 WS ping 时不得误重连')
+    assert.equal(ctx.states.some(([s]) => s === 'disconnected'), false)
+    assert.equal(ctx.states.at(-1)?.[0], 'connected')
+    await adapter.stop()
+  }
+
+  // 2) 客户端主动 ws.ping() -> pong 保活，停止回 pong 后按 idleTimeoutMs 发现死连接并重连
+  {
+    const mock = makeDingtalkMock()
+    const sockets = []
+    let respondPong = true
+    const adapter = createDingtalkAdapter({
+      fetchImpl: mock.fetchImpl,
+      createWebSocket: (url) => {
+        const s = new FakeWs(url)
+        s.ping = () => {
+          if (respondPong && !s.closed) queueMicrotask(() => s.emit('pong', Buffer.alloc(0)))
+        }
+        sockets.push(s)
+        return s
+      },
+      idleTimeoutMs: 75,
+      pingIntervalMs: 20,
+      reconnectBaseMs: 20,
+      reconnectMaxMs: 40,
+    })
+    const ctx = makeCtx(adapter, { clientId: 'ding_hb_2', clientSecret: 'ding_hb_sec_2' })
+    await adapter.start(ctx)
+    await delay(190)
+    assert.equal(sockets.length, 1, '正常收到 pong 期间不得重连')
+    assert.equal(ctx.states.some(([s]) => s === 'disconnected'), false)
+
+    respondPong = false
+    await delay(170)
+    assert.ok(sockets.length >= 2, '停止响应 pong 的死连接仍应被 idle 看门狗重连')
+    assert.ok(ctx.states.some(([s]) => s === 'disconnected'))
+    await adapter.stop()
+  }
+
+  // 3) 默认 wsFactory（不传 createWebSocket）直接走 createTitleCaseWebSocket 接收真实服务端 ping 控制帧保活
+  {
+    const wsGuid = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+    const srvSockets = []
+    const pingTimers = []
+    let upgradeCount = 0
+    let pongsReceived = 0
+    const server = http.createServer()
+    server.on('upgrade', (req, sock) => {
+      upgradeCount++
+      srvSockets.push(sock)
+      const accept = createHash('sha1').update(`${req.headers['sec-websocket-key']}${wsGuid}`).digest('base64')
+      sock.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`)
+      let rx = Buffer.alloc(0)
+      sock.on('data', (chunk) => {
+        rx = Buffer.concat([rx, chunk])
+        while (rx.length >= 2) {
+          const opcode = rx[0] & 0x0f
+          const masked = (rx[1] & 0x80) !== 0
+          const len = rx[1] & 0x7f
+          if (len >= 126) break
+          const total = 2 + (masked ? 4 : 0) + len
+          if (rx.length < total) break
+          rx = rx.subarray(total)
+          if (opcode === 0x0a) pongsReceived++
+          if (opcode === 0x08) sock.end()
+        }
+      })
+      const timer = setInterval(() => {
+        if (!sock.destroyed) sock.write(Buffer.from([0x89, 0x02, 0x68, 0x62]))
+      }, 25)
+      pingTimers.push(timer)
+    })
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const { port } = server.address()
+    t.after(async () => {
+      for (const tm of pingTimers) clearInterval(tm)
+      for (const s of srvSockets) s.destroy()
+      server.closeAllConnections?.()
+      await new Promise((resolve) => server.close(resolve))
+    })
+
+    const mock = makeDingtalkMock({
+      customFetch: ({ url }) => url.endsWith('/v1.0/gateway/connections/open')
+        ? jsonResp({ endpoint: `ws://127.0.0.1:${port}/connect`, ticket: 'real_hb_ticket' })
+        : null,
+    })
+    const adapter = createDingtalkAdapter({
+      fetchImpl: mock.fetchImpl,
+      idleTimeoutMs: 90,
+      pingIntervalMs: 0,
+      reconnectBaseMs: 20,
+      reconnectMaxMs: 40,
+    })
+    const ctx = makeCtx(adapter, {
+      clientId: 'ding_real_hb',
+      clientSecret: 'ding_real_sec',
+      apiBaseUrl: `http://127.0.0.1:${port}`,
+    })
+    await adapter.start(ctx)
+    await delay(210)
+    assert.equal(upgradeCount, 1, '真实 WS 控制帧 ping 应维持单一长连接不误重连')
+    assert.ok(pongsReceived >= 3, `客户端应回发 pong（实际 ${pongsReceived} 次）`)
+    assert.equal(ctx.states.some(([s]) => s === 'disconnected'), false)
+    await adapter.stop()
+  }
 })

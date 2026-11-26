@@ -242,6 +242,10 @@ export function createTitleCaseWebSocket(rawUrl, options = {}) {
         failProtocol(1002, '不支持非零 WebSocket RSV 扩展位')
         return
       }
+      if (masked) {
+        failProtocol(1002, '服务端 WebSocket 帧不得设置 MASK 位')
+        return
+      }
 
       let offset = 2
       if (payloadLen === 126) {
@@ -269,27 +273,17 @@ export function createTitleCaseWebSocket(rawUrl, options = {}) {
         return
       }
 
-      const maskLen = masked ? 4 : 0
-      const frameTotal = offset + maskLen + payloadLen
+      const frameTotal = offset + payloadLen
       if (rxBuffer.length < frameTotal) break
 
-      let payload = rxBuffer.subarray(offset + maskLen, frameTotal)
-      if (masked) {
-        const mask = rxBuffer.subarray(offset, offset + 4)
-        const unmasked = Buffer.allocUnsafe(payloadLen)
-        for (let i = 0; i < payloadLen; i++) {
-          unmasked[i] = payload[i] ^ mask[i & 3]
-        }
-        payload = unmasked
-      } else {
-        payload = Buffer.from(payload)
-      }
+      const payload = Buffer.from(rxBuffer.subarray(offset, frameTotal))
       rxBuffer = frameTotal === rxBuffer.length ? Buffer.alloc(0) : Buffer.from(rxBuffer.subarray(frameTotal))
 
       if (opcode === 0x09) {
         if (readyState === WS_READY_STATE.OPEN && socket && !socket.destroyed) {
           try { socket.write(encodeClientFrame(0x0a, payload, true)) } catch {}
         }
+        emitEvent('ping', [payload], { data: payload })
         continue
       }
       if (opcode === 0x0a) {

@@ -57,7 +57,7 @@ export function registerSharedTurnGuard(ctx, { lookup, isAuthorized, onAccepted,
     }
     if (!valid() || !matchesStep(decision.messages, expected)) return reject()
     for (const entry of injected) entry.accepted = true
-    onAccepted(active)
+    onAccepted(active, { first, acceptedSteers: injected })
     return decision
   }, { prepend: true })
 }

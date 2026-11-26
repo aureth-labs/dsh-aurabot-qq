@@ -36,6 +36,18 @@
 > 未确认点：官方文档没有「哪种更推荐」的明确表述，也没有说明 Webhook 是否有事件量上限。
 > 官方 FAQ 里提到 Webhook 中断优先排查防火墙，说明 Webhook 在部分环境不稳。
 
+**连接状态含义**（面板上 QQ 官方机器人的状态来自平台端的 `ctx.state()`，不是 UI 自己猜的）：
+
+| 模式 | 状态变化 |
+|---|---|
+| 内建 WebSocket（默认） | `start()` → `connecting`；收到 `op=10 Hello` 只说明传输层建立，仍是 `connecting`；收到 `READY` / `RESUMED` 才是 `connected` |
+| 内建 WebSocket 断线 | `onerror` / `onclose` → `disconnected`（`onclose` 会带关闭码）；重连 timer 触发 → `connecting`（带第几次）；取网关地址失败 → `disconnected`（带原因）并继续退避重试；新连接 `READY` / `RESUMED` → `connected` |
+| Webhook | 回调路由挂好即 `connected`（没有 READY 概念，是否真有平台回调要看日志） |
+| 宿主注入的 `connectEvents` | 平台端看不到其内部就绪时机，connector 返回即 `connected`（旧行为）；其内部断线不会被上报 |
+| `stop()` | `stopped`；之后迟到的 close / error / READY 都不再改状态 |
+
+WebSocket 模式下 `connected` 与能否发送一致：不是 `connected` 时 `send()` 直接抛 `not-sent` / `offline`。如果网关长期不发 `READY` / `RESUMED`，面板会一直停在 `connecting`，应视为未就绪而不是在线。
+
 ### 2. 鉴权：AppID + AppSecret → access_token
 
 来源：[获取访问凭证](https://bot.q.qq.com/wiki/develop/api-v2/dev-prepare/access-token.html)

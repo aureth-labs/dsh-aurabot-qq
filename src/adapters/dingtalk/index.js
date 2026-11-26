@@ -11,7 +11,7 @@ import { readFileSync, realpathSync, statSync } from 'node:fs'
 import { extname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { assertPublicUrl } from '../../core/net.js'
-import { normalizeWsError } from '../../core/ws-client.js'
+import { createTitleCaseWebSocket, normalizeWsError } from '../../core/ws-client.js'
 import { sanitizeFeaturesInput } from '../../gateway/features.js'
 import { assertReplyCurrent, makeSendError } from '../../gateway/errors.js'
 import {
@@ -43,6 +43,7 @@ export const DEFAULT_MAX_VOICE_BYTES = 2 * 1024 * 1024
 export const DEFAULT_TIMEOUT_MS = 15_000
 export const DEFAULT_CONNECT_TIMEOUT_MS = 15_000
 export const DEFAULT_IDLE_TIMEOUT_MS = 120_000
+export const DEFAULT_PING_INTERVAL_MS = 30_000
 
 const CONNECT_REFUSED_CODES = new Set([
   'ECONNREFUSED',
@@ -186,6 +187,34 @@ export function normalizeDingtalkSessionWebhook(rawUrl) {
 }
 
 /**
+ * 校验并规范化钉钉 connections/open 返回的 Stream WebSocket 地址。
+ * 默认要求默认端口 443 的 wss:// *.dingtalk.com；当显式配置自定义 apiBaseUrl 时，
+ * 允许同主机的自定义测试/代理地址或 dingtalk.com 域名。
+ */
+export function normalizeDingtalkStreamEndpoint(rawUrl, { allowedHost = '', allowInsecure = false } = {}) {
+  const raw = cleanString(rawUrl)
+  if (!raw) throw new Error('钉钉 connections/open 未返回有效 endpoint')
+  let parsed
+  try {
+    parsed = new URL(raw)
+  } catch {
+    throw new Error('钉钉 connections/open 返回了无效的 WebSocket 地址')
+  }
+  const protoOk = parsed.protocol === 'wss:' || (allowInsecure === true && parsed.protocol === 'ws:')
+  if (!protoOk || parsed.username || parsed.password) {
+    throw new Error('钉钉 connections/open 返回了不受信任的 WebSocket 地址')
+  }
+  const hostOk = allowInsecure === true
+    ? (isDingtalkHost(parsed.hostname) || (Boolean(allowedHost) && parsed.hostname.toLowerCase() === String(allowedHost).toLowerCase()))
+    : (isDingtalkHost(parsed.hostname) && (!parsed.port || parsed.port === '443'))
+  if (!hostOk) {
+    throw new Error('钉钉 connections/open 返回了不受信任的 WebSocket 地址')
+  }
+  parsed.hash = ''
+  return parsed
+}
+
+/**
  * 按换行符与长度上限切分钉钉文本，保证拼接后与原文逐字一致。
  */
 export function splitDingtalkText(text, maxChars = DEFAULT_MAX_TEXT_CHARS) {
@@ -239,20 +268,26 @@ function wsRawToText(ev) {
   return String(raw ?? '')
 }
 
-function attachWsListeners(ws, { onOpen, onMessage, onClose, onError }) {
+function attachWsListeners(ws, { onOpen, onMessage, onPing, onPong, onClose, onError }) {
   if (typeof ws.addEventListener === 'function') {
     const hOpen = () => onOpen?.()
     const hMsg = (ev) => onMessage?.(wsRawToText(ev))
+    const hPing = (ev) => onPing?.(ev?.data ?? ev)
+    const hPong = (ev) => onPong?.(ev?.data ?? ev)
     const hClose = (ev) => onClose?.(ev?.code, ev?.reason)
     const hErr = (ev) => onError?.(normalizeWsError(ev, 'WebSocket 连接或握手失败'))
     ws.addEventListener('open', hOpen)
     ws.addEventListener('message', hMsg)
+    ws.addEventListener('ping', hPing)
+    ws.addEventListener('pong', hPong)
     ws.addEventListener('close', hClose)
     ws.addEventListener('error', hErr)
     return () => {
       try {
         ws.removeEventListener('open', hOpen)
         ws.removeEventListener('message', hMsg)
+        ws.removeEventListener('ping', hPing)
+        ws.removeEventListener('pong', hPong)
         ws.removeEventListener('close', hClose)
         ws.removeEventListener('error', hErr)
       } catch {}
@@ -261,10 +296,14 @@ function attachWsListeners(ws, { onOpen, onMessage, onClose, onError }) {
   if (typeof ws.on === 'function') {
     const hOpen = () => onOpen?.()
     const hMsg = (data) => onMessage?.(wsRawToText(data))
+    const hPing = (data) => onPing?.(data)
+    const hPong = (data) => onPong?.(data)
     const hClose = (code, reason) => onClose?.(code, reason)
     const hErr = (err) => onError?.(normalizeWsError(err, 'WebSocket 连接或握手失败'))
     ws.on('open', hOpen)
     ws.on('message', hMsg)
+    ws.on('ping', hPing)
+    ws.on('pong', hPong)
     ws.on('close', hClose)
     ws.on('error', hErr)
     return () => {
@@ -273,6 +312,8 @@ function attachWsListeners(ws, { onOpen, onMessage, onClose, onError }) {
         try {
           off.call(ws, 'open', hOpen)
           off.call(ws, 'message', hMsg)
+          off.call(ws, 'ping', hPing)
+          off.call(ws, 'pong', hPong)
           off.call(ws, 'close', hClose)
           off.call(ws, 'error', hErr)
         } catch {}
@@ -594,7 +635,7 @@ export function createDingtalkAdapter(options = {}) {
   const resolveFetch = () => (typeof options.getFetch === 'function' ? options.getFetch() : null) || options.fetchImpl || globalThis.fetch
   const wsFactory = typeof options.createWebSocket === 'function'
     ? options.createWebSocket
-    : (typeof options.getWebSocket === 'function' ? ((u) => options.getWebSocket()(u)) : ((u) => new WebSocket(u)))
+    : (typeof options.getWebSocket === 'function' ? ((u) => options.getWebSocket()(u)) : ((u) => createTitleCaseWebSocket(u)))
   const verifyPublicUrl = typeof options.assertUrl === 'function' ? options.assertUrl : assertPublicUrl
   const resolveFfmpegPath = () => cleanString(typeof options.getFfmpegPath === 'function' ? options.getFfmpegPath() : options.ffmpegPath)
   const hasAllowedDirsOption = typeof options.allowedLocalDirs === 'function' || Array.isArray(options.allowedLocalDirs)
@@ -604,6 +645,10 @@ export function createDingtalkAdapter(options = {}) {
   const connectTimeoutMs = Math.max(100, Number(options.connectTimeoutMs) || DEFAULT_CONNECT_TIMEOUT_MS)
   const rawIdleMs = options.idleTimeoutMs === undefined ? DEFAULT_IDLE_TIMEOUT_MS : Number(options.idleTimeoutMs)
   const idleTimeoutMs = Number.isFinite(rawIdleMs) && rawIdleMs > 0 ? Math.max(50, rawIdleMs) : 0
+  const rawPingMs = options.pingIntervalMs === undefined
+    ? (idleTimeoutMs ? Math.max(20, Math.min(DEFAULT_PING_INTERVAL_MS, Math.floor(idleTimeoutMs / 3))) : 0)
+    : Number(options.pingIntervalMs)
+  const pingIntervalMs = Number.isFinite(rawPingMs) && rawPingMs > 0 && idleTimeoutMs > 0 ? Math.max(15, rawPingMs) : 0
 
   let ctx = null
   let instance = id
@@ -614,6 +659,7 @@ export function createDingtalkAdapter(options = {}) {
   let detachWs = null
   let reconnectTimer = null
   let idleTimer = null
+  let pingTimer = null
   let reconnectAttempts = 0
   let connGen = 0
   let failSend = null
@@ -650,8 +696,31 @@ export function createDingtalkAdapter(options = {}) {
     }
   }
 
+  function clearPingTimer() {
+    if (pingTimer) {
+      clearInterval(pingTimer)
+      pingTimer = null
+    }
+  }
+
+  function armPingTimer(myGen = connGen) {
+    clearPingTimer()
+    if (!pingIntervalMs || !running || stopped || !connected || myGen !== connGen) return
+    pingTimer = setInterval(() => {
+      if (!running || stopped || !connected || myGen !== connGen) {
+        clearPingTimer()
+        return
+      }
+      if (typeof ws?.ping === 'function') {
+        try { ws.ping() } catch {}
+      }
+    }, pingIntervalMs)
+    pingTimer.unref?.()
+  }
+
   function closeWsOnly() {
     clearIdleWatchdog()
+    clearPingTimer()
     if (detachWs) {
       try { detachWs() } catch {}
       detachWs = null
@@ -942,10 +1011,16 @@ export function createDingtalkAdapter(options = {}) {
     if (!endpoint || !ticket) {
       throw new Error('钉钉 connections/open 未返回有效 endpoint 或 ticket')
     }
-    const wsUrlObj = new URL(endpoint)
-    if (wsUrlObj.protocol !== 'wss:' && !(apiBaseOf() !== DINGTALK_API_BASE_URL && wsUrlObj.protocol === 'ws:')) {
-      throw new Error('钉钉 connections/open 返回了不受信任的 WebSocket 协议')
+    const apiBase = apiBaseOf()
+    const customApiBase = apiBase !== DINGTALK_API_BASE_URL
+    let customApiHost = ''
+    if (customApiBase) {
+      try { customApiHost = new URL(apiBase).hostname } catch {}
     }
+    const wsUrlObj = normalizeDingtalkStreamEndpoint(endpoint, {
+      allowInsecure: customApiBase,
+      allowedHost: customApiHost,
+    })
     wsUrlObj.searchParams.set('ticket', ticket)
     const socket = wsFactory(wsUrlObj.toString())
     ws = socket
@@ -982,11 +1057,20 @@ export function createDingtalkAdapter(options = {}) {
           connected = true
           reconnectAttempts = 0
           armIdleWatchdog(myGen)
+          armPingTimer(myGen)
           settleOk()
         },
         onMessage: (rawText) => {
           if (myGen !== connGen) return
           handleWsMessage(rawText)
+        },
+        onPing: () => {
+          if (!running || stopped || !connected || myGen !== connGen) return
+          armIdleWatchdog(myGen)
+        },
+        onPong: () => {
+          if (!running || stopped || !connected || myGen !== connGen) return
+          armIdleWatchdog(myGen)
         },
         onClose: () => {
           const wasInitialPending = !settled
@@ -999,6 +1083,7 @@ export function createDingtalkAdapter(options = {}) {
           ws = null
           detachWs = null
           clearIdleWatchdog()
+          clearPingTimer()
           ctx?.state?.('disconnected', '钉钉 Stream 连接已断开，准备重连')
           scheduleReconnect('ws-close')
         },
@@ -1011,6 +1096,7 @@ export function createDingtalkAdapter(options = {}) {
         connected = true
         reconnectAttempts = 0
         armIdleWatchdog(myGen)
+        armPingTimer(myGen)
         settleOk()
       }
     })

@@ -26,6 +26,8 @@ export const DEFAULTS = {
   multiPlatformPrivateSession: false,
   sharedSteerEnabled: true,
   sharedSteerMaxPerTurn: 0,
+  sharedReplyOnSteer: false,
+  sharedReplyOnSteerMode: 'all',
   ownerPrimary: {
     mode: 'fixed', // 'fixed'（固定主账号）| 'recent'（跟随最近私聊平台）
     platform: '',
@@ -641,6 +643,8 @@ export function normalize(raw) {  const c = deepMerge(DEFAULTS, raw)
   c.sharedSteerEnabled = bool(c.sharedSteerEnabled, true)
   const steerMax = ['number', 'string'].includes(typeof c.sharedSteerMaxPerTurn) ? Number(c.sharedSteerMaxPerTurn) : NaN
   c.sharedSteerMaxPerTurn = Number.isFinite(steerMax) && steerMax >= 0 && steerMax <= 100 ? Math.floor(steerMax) : 0
+  c.sharedReplyOnSteer = bool(c.sharedReplyOnSteer, false)
+  c.sharedReplyOnSteerMode = c.sharedReplyOnSteerMode === 'first' ? 'first' : 'all'
   c.ownerPrimary = normalizeOwnerPrimary(c.ownerPrimary)
   c.longTasks = bool(c.longTasks, true)
   c.subagentBackground = bool(c.subagentBackground, false)
@@ -1365,6 +1369,8 @@ export function mergeFromPanel(current, incoming) {
   next.multiPlatformPrivateSession = current.multiPlatformPrivateSession === true
   next.sharedSteerEnabled = current.sharedSteerEnabled
   next.sharedSteerMaxPerTurn = current.sharedSteerMaxPerTurn
+  next.sharedReplyOnSteer = current.sharedReplyOnSteer === true
+  next.sharedReplyOnSteerMode = current.sharedReplyOnSteerMode === 'first' ? 'first' : 'all'
   // 主人身份编号仅由宿主按身份库同步，面板不可篡改
   next.ownerPersonId = typeof current?.ownerPersonId === 'string' || typeof current?.ownerPersonId === 'number'
     ? String(current.ownerPersonId).trim()

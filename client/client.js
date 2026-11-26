@@ -2673,6 +2673,39 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
               },
             }, '应用'),
           )),
+          h(Row, {
+            label: '插入消息时先发已生成的回复',
+            hint: multiPrivate.steerEnabled === false
+              ? '允许插入消息关闭时不会生效。只在同一共享轮次被后续消息插入时生效，会先发本轮已生成未发出的回复，再发最终回复。'
+              : '只在同一共享轮次被后续消息插入时生效。会先发本轮已经生成、但尚未发出的回复，再发最终回复；没有插入时不生效。可能包含工具调用前后的过程话，介意可保持关闭。',
+          }, h(Switch, {
+            on: multiPrivate.replyOnSteer === true,
+            disabled: changingShared || multiPrivate.steerEnabled === false,
+            onChange: () => changeShared({
+              steerEnabled: multiPrivate.steerEnabled !== false,
+              steerMaxPerTurn: multiPrivate.steerMaxPerTurn ?? 0,
+              replyOnSteer: multiPrivate.replyOnSteer !== true,
+              replyOnSteerMode: multiPrivate.replyOnSteerMode === 'first' ? 'first' : 'all',
+            }, '/settings'),
+          })),
+          h(Row, {
+            label: '插入补发范围',
+            hint: '全部未发段会按顺序发出插入前已生成的所有未发文本；仅首条回复只补发本轮第一段未发回复，避免后续过程话刷屏。',
+          }, h('select', {
+            className: 'ab-select sm',
+            'aria-label': '插入补发范围',
+            value: multiPrivate.replyOnSteerMode === 'first' ? 'first' : 'all',
+            disabled: changingShared || multiPrivate.steerEnabled === false || multiPrivate.replyOnSteer !== true,
+            onChange: (event) => changeShared({
+              steerEnabled: multiPrivate.steerEnabled !== false,
+              steerMaxPerTurn: multiPrivate.steerMaxPerTurn ?? 0,
+              replyOnSteer: multiPrivate.replyOnSteer === true,
+              replyOnSteerMode: event.target.value,
+            }, '/settings'),
+          },
+            h('option', { value: 'all' }, '全部未发段'),
+            h('option', { value: 'first' }, '仅首条回复'),
+          )),
           h('div', { className: 'ab-small ab-muted' }, multiPrivate.available && multiPrivate.binding
             ? '基座及模型使用主账号 · ' + platformLabel(multiPrivate.binding.platform) + ' · ' + multiPrivate.binding.account
             : ({

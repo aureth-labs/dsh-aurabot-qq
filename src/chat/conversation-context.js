@@ -107,30 +107,58 @@ export function recentWithin(messages, maxCharacters = 6000) {
   return result
 }
 
+const CHAT_ID_RE = /^(?:[a-z][a-z0-9-]*(?:#[a-zA-Z0-9_-]+)?:)?(private|group):[^\s:]+$/
+
 /** Durable, persona- and chat-isolated archive; append-only journal is the source. */
-export function createConversationArchive({ directory, namespace = 'default', now = Date.now, visible = () => true } = {}) {
+export function createConversationArchive({ directory, namespace = 'default', now = Date.now, visible = () => true, aliasesFor = () => [] } = {}) {
   if (!directory) throw new Error('Conversation archive directory required')
   const cache = new Map()
   const keyFor = chatId => createHash('sha256').update(namespace + '\0' + String(chatId)).digest('hex')
+  function readJournal(filePath) {
+    const messages = []
+    if (!existsSync(filePath)) return messages
+    const raw = readFileSync(filePath, 'utf8'), lines = raw.split('\n')
+    for (let i = 0; i < lines.length; i++) {
+      if (!lines[i].trim()) continue
+      try { messages.push(JSON.parse(lines[i])) }
+      catch {
+        if (i !== lines.length - 1) throw new Error('Conversation journal is corrupt; preserving source')
+        throw new Error('Conversation journal has an incomplete tail; preserving source for recovery')
+      }
+    }
+    return messages
+  }
   function state(chatId) {
-    if (!/^(private|group):[^\s:]+$/.test(String(chatId))) throw new Error('Invalid conversation identity')
-    const key = keyFor(chatId)
+    const cid = String(chatId)
+    if (!CHAT_ID_RE.test(cid)) throw new Error('Invalid conversation identity')
+    const key = keyFor(cid)
     if (cache.has(key)) return cache.get(key)
     const journal = join(directory, key + '.jsonl'), checkpoint = join(directory, key + '.json')
     const value = { journal, checkpoint, messages: [], revision: 0 }
-    // Recover from the journal, including a turn appended before a checkpoint
-    // write was interrupted. Reject malformed committed lines rather than reset.
-    if (existsSync(journal)) {
-      const raw = readFileSync(journal, 'utf8'), lines = raw.split('\n')
-      for (let i = 0; i < lines.length; i++) {
-        if (!lines[i].trim()) continue
-        try { value.messages.push(JSON.parse(lines[i])) }
-        catch (error) {
-          if (i !== lines.length - 1) throw new Error('Conversation journal is corrupt; preserving source')
-          throw new Error('Conversation journal has an incomplete tail; preserving source for recovery')
-        }
+    const aliasIds = []
+    const seenAliases = new Set([cid])
+    if (typeof aliasesFor === 'function') {
+      for (const raw of aliasesFor(cid) || []) {
+        const alias = String(raw || '').trim()
+        if (!alias || seenAliases.has(alias) || !CHAT_ID_RE.test(alias)) continue
+        seenAliases.add(alias)
+        aliasIds.push(alias)
       }
     }
+    const seenIds = new Set()
+    let loadedSources = 0
+    // Recover from the journal (plus optional read-only alias journals),
+    // rejecting malformed committed lines rather than resetting.
+    for (const sourcePath of [...aliasIds.map(a => join(directory, keyFor(a) + '.jsonl')), journal]) {
+      const items = readJournal(sourcePath)
+      if (existsSync(sourcePath)) loadedSources++
+      for (const item of items) {
+        if (item?.id && seenIds.has(item.id)) continue
+        if (item?.id) seenIds.add(item.id)
+        value.messages.push(item)
+      }
+    }
+    if (loadedSources > 1) value.messages.sort((a, b) => (Number(a.at) || 0) - (Number(b.at) || 0))
     cache.set(key, value); return value
   }
   function append(chatId, { role, text, id = randomUUID(), speakerId = '', at = now(), contextAt = at }) {

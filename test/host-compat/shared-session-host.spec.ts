@@ -21,7 +21,7 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import SkillRegistry from '@deepseek-ai/dsh-skill'
 import * as ToolSkill from '@deepseek-ai/dsh-tool-skill'
-import ToolRuntime, { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
+import ToolRuntime, * as DshTools from '@deepseek-ai/dsh-tools'
 import WorkspaceRegistry from '@deepseek-ai/dsh-workspace'
 import { ArchivedSessionGate } from 'dsh-probe-source/packages/api/session-controller/src/archived-session-gate.ts'
 import { createSessionTestController } from 'dsh-probe-source/packages/api/session-controller/tests/test-remote.ts'
@@ -37,6 +37,19 @@ import chatTools from '../../src/modules/chat-tools/index.js'
 import { currentPromptSources } from '../../src/security/leak-guard.js'
 import { makeFakeAdapter } from '../helpers/fake-adapter.js'
 import { fakeFactory } from '../gateway/helpers.js'
+
+const toolTestkitSpecifier = '@deepseek-ai/dsh-tool-testkit'
+const defineContentToolFixture = await (async () => {
+  try {
+    const mod = await import(toolTestkitSpecifier)
+    if (typeof mod.defineContentToolFixture === 'function') return mod.defineContentToolFixture
+  } catch {
+    // Older DSH exports defineContentToolFixture directly from @deepseek-ai/dsh-tools.
+  }
+  const legacy = (DshTools as Record<string, unknown>).defineContentToolFixture
+  if (typeof legacy === 'function') return legacy as (...args: any[]) => any
+  throw new Error('Target DSH exports defineContentToolFixture neither from @deepseek-ai/dsh-tool-testkit nor @deepseek-ai/dsh-tools')
+})()
 
 const fixtures: Array<{ ctx: Context; cwd: string }> = []
 afterEach(async () => {
@@ -1342,7 +1355,8 @@ it('recovers the verified shared prefix with the real DSH controller and reopens
     const { sessionId: childId, verifiedThroughSeq } = (await readMap()).multiPrivate.sessions.live
     const child = ctx.sessions.get(childId)!
     expect((await readMap()).multiPrivate.sessions.live).toMatchObject({ state: 'active', baseSessionId: sourceId })
-    expect(child.header.parentSession).toBe(sourceId)
+    const childParentSession = child.header.parentSession
+    if (childParentSession !== undefined) expect(childParentSession).toBe(sourceId)
     expect(child.inheritedEventCount).toBe(review.atSeq + 1)
     expect(ctx.workspaceRegistry.get(workspace.id)?.sessionIds).toContain(childId)
     expect(child.snapshotEvents().findLast(event => event.type === 'session/title')?.data.title).toBe('多平台 · 主人私聊')
@@ -1368,7 +1382,8 @@ it('recovers the verified shared prefix with the real DSH controller and reopens
     await host.send('wx', 'cold-wx', '冷恢复后的微信消息')
     expect(host.qq.sent).toEqual([])
     expect(host.wx.sent.map(record => record.payload.inResponseTo)).toEqual(['cold-wx'])
-    expect(ctx.sessions.get(childId)?.header.parentSession).toBe(sourceId)
+    expect(ctx.sessions.get(childId)?.header.parentSession).toBe(childParentSession)
+    expect(ctx.sessions.get(childId)?.inheritedEventCount).toBe(review.atSeq + 1)
     const restoredMessages = JSON.stringify(host.adapter.requests.at(-1)?.messages)
     expect(restoredMessages).toContain('共享中的 QQ 消息')
     expect(restoredMessages).toContain('共享中的微信消息')
@@ -1509,7 +1524,8 @@ it('recovers the verified shared prefix with the real DSH controller and reopens
     const recoveredId = SessionId(result.sessionId)
     expect(recoveredId).not.toBe(childId)
     const recovered = ctx.sessions.get(recoveredId)!
-    expect(recovered.header.parentSession).toBe(childId)
+    const recoveredParentSession = recovered.header.parentSession
+    if (recoveredParentSession !== undefined) expect(recoveredParentSession).toBe(childId)
     expect(recovered.inheritedEventCount).toBe(recoveredCheckpoint + 1)
     expect(recovered.snapshotEvents().slice(0, recoveredCheckpoint + 1))
       .toEqual(pausedChild.snapshotEvents().slice(0, recoveredCheckpoint + 1))
@@ -1576,7 +1592,8 @@ it('recovers the verified shared prefix with the real DSH controller and reopens
     await host.send('wx', 'after-recovered-restart', '恢复分支再次启动后的微信消息')
     expect(host.hub.sharedStatus().state).toBe('active')
     expect((await readMap()).multiPrivate.sessions.live.sessionId).toBe(recoveredId)
-    expect(ctx.sessions.get(recoveredId)?.header.parentSession).toBe(childId)
+    expect(ctx.sessions.get(recoveredId)?.header.parentSession).toBe(recoveredParentSession)
+    expect(ctx.sessions.get(recoveredId)?.inheritedEventCount).toBe(recoveredCheckpoint + 1)
     const reopenedMessages = JSON.stringify(host.adapter.requests.at(-1)?.messages)
     expect(reopenedMessages).toContain(inboundAfterRecovery)
     expect(reopenedMessages).toContain(steeredAfterRecovery)
@@ -1669,5 +1686,155 @@ it('verifies persisted agent/inbox/spliced events through real DSH JsonlSessionP
     await agent.whenIdle()
   } finally {
     await ctxPersist.fiber.dispose().catch(() => {})
+  }
+}, 20_000)
+
+it('flushes pre-steer assistant replies only after shared-turn-guard accepts steer, honoring all/first modes', async () => {
+  const h = await harness({
+    responses: [
+      textResponse('全部模式第一段'),
+      textResponse('全部模式第二段'),
+      textResponse('全部模式最终回复'),
+      textResponse('首条模式第一段'),
+      textResponse('首条模式第二段'),
+      textResponse('首条模式最终回复'),
+      textResponse('被守卫拦截绝不发出的草稿'),
+    ],
+  })
+  vi.stubEnv('AURABOT_DATA_DIR', h.cwd)
+  const log = { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() }
+  const identity = createIdentity({ dataDir: join(h.cwd, 'identity'), log })
+  const owner = identity.claimOwner('qq', '10001')
+  const cfg = normalize({
+    enabled: true, dryRun: false, ownerLevel: 'social', ownerPersonId: owner, ownerQQ: '10001',
+    ownerAuthorization: { owner, revision: '11111111-2222-4333-8444-555555555555' },
+    multiPlatformPrivateSession: true,
+    sharedSteerEnabled: true,
+    sharedReplyOnSteer: true,
+    sharedReplyOnSteerMode: 'all',
+    ownerPrimary: { platform: 'qq', instance: 'qq', account: '10001' },
+    platforms: { qq: { enabled: true } },
+    workspaceDir: h.cwd, merge: { enabled: false }, voice: { enabled: false },
+    stickers: { enabled: false, collect: false },
+    chat: { everyStep: false, thinkingGuard: { enabled: false } },
+  })
+  const gateway = createGateway({ config: cfg, dataDir: (...path) => join(h.cwd, ...path), identity, log })
+  const qq = makeFakeAdapter({ id: 'qq', self: { account: '20001' } })
+  gateway.register(() => qq)
+  await gateway.sync()
+
+  const sessionId = SessionId('session-shared-reply-on-steer')
+  h.ctx.provide('sessionController', {
+    create: async () => {
+      await h.ctx.agentLoop.create(sessionId, { provider: 'mock', model: 'mock' }, { cwd: h.cwd })
+      return { sessionId }
+    },
+    fork: vi.fn(), rename: vi.fn(),
+    resolveAgent: async id => ({ agent: h.ctx.agents.get(id) }),
+  } as never)
+  h.ctx.workspaceRegistry.list = () => [{ id: 'workspace', path: h.cwd }]
+  vi.spyOn(h.ctx.sessions, 'flush').mockResolvedValue(true)
+
+  const streamEntered = Array.from({ length: 7 }, () => Promise.withResolvers<void>())
+  const streamRelease = Array.from({ length: 7 }, () => Promise.withResolvers<void>())
+  let streamIdx = 0
+  const origStream = h.adapter.stream.bind(h.adapter)
+  vi.spyOn(h.adapter, 'stream').mockImplementation(async function* (options) {
+    const idx = streamIdx++
+    streamEntered[idx]?.resolve()
+    await streamRelease[idx]?.promise
+    yield* origStream(options)
+  })
+
+  const hub = createHub({
+    dsh: h.ctx, getConfig: () => cfg, log, gateway, identity,
+    resolveSharedPrimary: () => fixedSharedPrimary({ cfg, identity, instances: gateway.instances() }),
+  })
+  const off = h.ctx.on('session/event', hub.onSessionEvent)
+  const submitted: Promise<unknown>[] = []
+  const stop = gateway.onMessage(message => { submitted.push(hub.onGatewayMessage(message)) })
+  const submit = async (messageId: string, text: string) => {
+    const index = submitted.length
+    qq.pushInbound({
+      messageId, chat: { kind: 'private', id: '10001' },
+      sender: { account: '10001', name: '主人' }, parts: [{ type: 'text', text }],
+    })
+    await vi.waitFor(() => expect(submitted).toHaveLength(index + 1))
+    return { done: submitted[index] }
+  }
+
+  try {
+    // 1) mode='all'：多次插入依次先补发插入前已生成段，再发最终回复
+    const t1 = await submit('qq-all-1', 'all第1句')
+    await streamEntered[0].promise
+    const s1 = await submit('qq-all-s1', 'all插话1')
+    await s1.done
+    expect(qq.sent).toHaveLength(0)
+    streamRelease[0].resolve()
+    await streamEntered[1].promise
+    await vi.waitFor(() => expect(qq.sent).toHaveLength(1))
+    expect(qq.sent[0].payload.parts[0].text).toBe('全部模式第一段')
+
+    const s2 = await submit('qq-all-s2', 'all插话2')
+    await s2.done
+    expect(qq.sent).toHaveLength(1)
+    streamRelease[1].resolve()
+    await streamEntered[2].promise
+    await vi.waitFor(() => expect(qq.sent).toHaveLength(2))
+    expect(qq.sent[1].payload.parts[0].text).toBe('全部模式第二段')
+
+    streamRelease[2].resolve()
+    await t1.done
+    expect(qq.sent.map(r => [r.payload.inResponseTo, r.payload.parts[0].text])).toEqual([
+      ['qq-all-1', '全部模式第一段'],
+      ['qq-all-1', '全部模式第二段'],
+      ['qq-all-1', '全部模式最终回复'],
+    ])
+
+    // 2) mode='first'：同一轮多次插入只补发第1条未发回复，跳过第2次插入前的过程段
+    cfg.sharedReplyOnSteerMode = 'first'
+    const t2 = await submit('qq-first-1', 'first第1句')
+    await streamEntered[3].promise
+    const fs1 = await submit('qq-first-s1', 'first插话1')
+    await fs1.done
+    streamRelease[3].resolve()
+    await streamEntered[4].promise
+    await vi.waitFor(() => expect(qq.sent).toHaveLength(4))
+
+    const fs2 = await submit('qq-first-s2', 'first插话2')
+    await fs2.done
+    streamRelease[4].resolve()
+    await streamEntered[5].promise
+    expect(qq.sent).toHaveLength(4)
+    streamRelease[5].resolve()
+    await t2.done
+    expect(qq.sent.slice(3).map(r => [r.payload.inResponseTo, r.payload.parts[0].text])).toEqual([
+      ['qq-first-1', '首条模式第一段'],
+      ['qq-first-1', '首条模式最终回复'],
+    ])
+
+    // 3) steer 提交后若 step 2 被真实 shared-turn-guard 拦截，不得补发插入前已生成内容
+    cfg.sharedReplyOnSteerMode = 'all'
+    const t3 = await submit('qq-rej-1', 'guard拒绝测试首句')
+    await streamEntered[6].promise
+    const rs1 = await submit('qq-rej-s1', '已通过steer提交的插话')
+    await rs1.done
+    const agent = h.ctx.agents.get(sessionId)!
+    agent.inject(prompt('unregistered mixed steer'))
+    expect(qq.sent).toHaveLength(5)
+    streamRelease[6].resolve()
+    await t3.done
+    expect(qq.sent.slice(5)).toHaveLength(1)
+    expect(qq.sent[5].payload.inResponseTo).toBe('qq-rej-1')
+    expect(qq.sent[5].payload.parts[0].text).toContain('请重新发送')
+    expect(JSON.stringify(qq.sent)).not.toContain('被守卫拦截绝不发出的草稿')
+    expect(hub.sharedStatus().state).toBe('active')
+  } finally {
+    for (const gate of streamRelease) gate.resolve()
+    stop()
+    off()
+    hub.dispose()
+    await gateway.stopAll()
+    identity.close?.()
   }
 }, 20_000)

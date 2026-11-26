@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createConversationArchive, queriesFor, retrieve, packEvidence, recentWithin } from '../src/chat/conversation-context.js'
@@ -72,4 +73,68 @@ test('大段粘贴不会让旁边的小事实一起超过检索预算，原始�
   assert.ok(recalled.characters <= 900)
   assert.ok(recalled.selected.some(e => e.context.some(m => m.id === 'fact' && m.role === 'user')))
   assert.equal(archive.recent(chat, 100).find(m => m.id === 'paste').text, pasted)
+})
+
+test('规范多平台 ChatId 支持归档与隔离，系统会话和畸形标识仍拒绝', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'aurabot-multiplatform-archive-'))
+  const archive = createConversationArchive({ directory, namespace: 'default' })
+  archive.append('feishu:private:ou_1', { id: 'f1', role: 'user', text: '飞书约定周三上线' })
+  archive.append('wecom:private:zhangsan', { id: 'w1', role: 'user', text: '企微讨论周五评审' })
+  archive.append('dingtalk:group:cid_1', { id: 'd1', role: 'user', text: '钉钉群同步部署进度' })
+  archive.append('qq#2:private:10001', { id: 'q2', role: 'user', text: '副号QQ确认收到' })
+
+  assert.equal(archive.recent('feishu:private:ou_1').length, 1)
+  assert.match(archive.recall('feishu:private:ou_1', '周三上线', { recentMessages: [] }).text, /周三上线/)
+  assert.equal(archive.recall('wecom:private:zhangsan', '周三上线', { recentMessages: [] }).text, '')
+  assert.match(archive.recall('dingtalk:group:cid_1', '部署进度', { recentMessages: [] }).text, /部署进度/)
+  assert.equal(archive.recent('qq#2:private:10001')[0].text, '副号QQ确认收到')
+
+  for (const bad of ['system:bg', '', 'private:bad id', 'private:a:b:c', 'invalid']) {
+    assert.throws(() => archive.recent(bad), /Invalid conversation identity/)
+  }
+})
+
+test('aliasesFor 只读合并旧键 qq:private 档案：去重、追加只写主键且别名损坏仍 fail-closed', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'aurabot-archive-alias-'))
+  const writer = createConversationArchive({ directory, namespace: 'default' })
+  writer.append('qq:private:10001', { id: 'old-1', role: 'user', text: '旧前缀档案约定周三露营', at: 1000 })
+  writer.append('qq:private:10001', { id: 'dup-1', role: 'assistant', text: '收到露营安排', at: 2000 })
+  writer.append('private:10001', { id: 'dup-1', role: 'assistant', text: '收到露营安排', at: 2000 })
+
+  const aliasKey = createHash('sha256').update('default\0qq:private:10001').digest('hex')
+  const primaryKey = createHash('sha256').update('default\0private:10001').digest('hex')
+  const aliasJournal = join(directory, aliasKey + '.jsonl')
+  const primaryJournal = join(directory, primaryKey + '.jsonl')
+  const aliasBefore = readFileSync(aliasJournal, 'utf8')
+
+  const archive = createConversationArchive({
+    directory,
+    namespace: 'default',
+    aliasesFor: (chatId) => (/^(private|group):[^\s:]+$/.test(chatId) ? [`qq:${chatId}`] : []),
+  })
+  const initial = archive.recent('private:10001')
+  assert.deepEqual(initial.map((m) => m.id), ['old-1', 'dup-1'])
+  assert.match(archive.recall('private:10001', '周三露营', { recentMessages: [] }).text, /周三露营/)
+
+  archive.append('private:10001', { id: 'new-1', role: 'user', text: '新主键补充账篷型号', at: 3000 })
+  assert.equal(existsSync(aliasJournal), true)
+  assert.equal(readFileSync(aliasJournal, 'utf8'), aliasBefore, '只读回退不得修改或删除别名旧档')
+  assert.match(readFileSync(primaryJournal, 'utf8'), /new-1/)
+
+  const reopened = createConversationArchive({
+    directory,
+    namespace: 'default',
+    aliasesFor: (chatId) => (/^(private|group):[^\s:]+$/.test(chatId) ? [`qq:${chatId}`] : []),
+  })
+  assert.deepEqual(reopened.recent('private:10001').map((m) => m.id), ['old-1', 'dup-1', 'new-1'])
+
+  const corruptDir = mkdtempSync(join(tmpdir(), 'aurabot-archive-alias-corrupt-'))
+  const corruptAliasFile = join(corruptDir, createHash('sha256').update('default\0qq:private:10002').digest('hex') + '.jsonl')
+  writeFileSync(corruptAliasFile, '{"bad"\n{"id":"ok"}\n', 'utf8')
+  const corruptArchive = createConversationArchive({
+    directory: corruptDir,
+    namespace: 'default',
+    aliasesFor: (chatId) => (/^(private|group):[^\s:]+$/.test(chatId) ? [`qq:${chatId}`] : []),
+  })
+  assert.throws(() => corruptArchive.recent('private:10002'), /Conversation journal is corrupt/)
 })

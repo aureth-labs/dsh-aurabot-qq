@@ -101,7 +101,9 @@ function makeCtx(adapter, config = {}) {
   return ctx
 }
 
-const BASE_CONFIG = { appId: '102030405', clientSecret: 'client-secret-xyz', botSecret: 'naOC0ocQE3shWLAfffVLB1rhYPG7' }
+// 默认走 webhook：内建 WebSocket 要等 READY 才算 connected，HTTP/契约类测试不需要真去连网关。
+// WebSocket 相关测试自己显式写 transport: 'websocket'。
+const BASE_CONFIG = { appId: '102030405', clientSecret: 'client-secret-xyz', botSecret: 'naOC0ocQE3shWLAfffVLB1rhYPG7', transport: 'webhook' }
 
 /** 一份官方「单聊消息事件」样例（C2C_MESSAGE_CREATE） */
 const C2C_EVENT = {
@@ -910,6 +912,7 @@ test('WebSocket transport：拿 gateway、Identify、心跳和 op=0 事件', asy
   const adapter = createQqbotAdapter({ client, WebSocketImpl: FakeWebSocket })
   const ctx = makeCtx(adapter, { ...BASE_CONFIG, transport: 'websocket' })
   await adapter.start(ctx)
+  assert.equal(ctx.states.at(-1)?.[0], 'connecting', 'WebSocket 握手前不能报 connected')
   const ws = FakeWebSocket.instances.at(-1)
   assert.equal(ws.url, 'wss://fake-gateway.example/websocket')
   ws.onmessage({ data: JSON.stringify({ op: 10, s: 1, d: { heartbeat_interval: 60000 } }) })
@@ -917,7 +920,10 @@ test('WebSocket transport：拿 gateway、Identify、心跳和 op=0 事件', asy
   const identify = ws.sent.find((x) => x.op === 2)
   assert.equal(identify.d.token, 'QQBot token-1')
   assert.equal(identify.d.intents, 1 << 25)
-  ws.onmessage({ data: JSON.stringify({ op: 0, s: 2, t: 'C2C_MESSAGE_CREATE', d: C2C_EVENT }) })
+  assert.equal(ctx.states.at(-1)?.[0], 'connecting', '收到 Hello 只说明传输层建立，不算 connected')
+  ws.onmessage({ data: JSON.stringify({ op: 0, s: 2, t: 'READY', d: { session_id: 'sess-basic', user: { id: 'BOT_BASIC', username: '基础机器人' } } }) })
+  assert.equal(ctx.states.at(-1)?.[0], 'connected', 'READY 之后才是 connected')
+  ws.onmessage({ data: JSON.stringify({ op: 0, s: 3, t: 'C2C_MESSAGE_CREATE', d: C2C_EVENT }) })
   assert.equal(ctx.emitted.length, 1)
   await adapter.stop()
 })
@@ -1065,7 +1071,10 @@ test('WebSocket Resume：READY 记下 session_id 与 seq，op=7/断线重连发 
   })
   assert.equal(ws2.sent.some((x) => x.op === 2), false, 'Resume 时不应退回 Identify')
 
-  // 收到 RESUMED 后可继续收到补发与实时事件并刷新 seq
+  // 收到 RESUMED 后才回到 connected，之后可继续收到补发与实时事件并刷新 seq
+  assert.equal(ctx.states.at(-1)?.[0], 'connecting', '重连期间在 RESUMED 之前保持 connecting')
+  ws2.onmessage({ data: JSON.stringify({ op: 0, s: 43, t: 'RESUMED', d: {} }) })
+  assert.equal(ctx.states.at(-1)?.[0], 'connected', 'RESUMED 之后恢复 connected')
   ws2.onmessage({ data: JSON.stringify({ op: 0, s: 45, t: 'C2C_MESSAGE_CREATE', d: C2C_EVENT }) })
   assert.equal(ctx.emitted.length, 1)
 
@@ -1093,4 +1102,153 @@ test('WebSocket Resume：READY 记下 session_id 与 seq，op=7/断线重连发 
   assert.equal(ws3.sent.some((x) => x.op === 6), false)
 
   await adapter.stop()
+})
+
+// ───────────────────────── 10. 连接状态上报（ctx.state） ─────────────────────────
+
+const stateNames = (ctx) => ctx.states.map(([name]) => name)
+const wsText = (payload) => ({ data: JSON.stringify(payload) })
+const READY = (id = 'BOT_STATE', session = 'sess-state', s = 2) => wsText({ op: 0, s, t: 'READY', d: { session_id: session, user: { id, username: '状态机器人' } } })
+const HELLO = wsText({ op: 10, s: 1, d: { heartbeat_interval: 60000 } })
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+async function bootWs() {
+  FakeWebSocket.instances = []
+  const client = makeFakeClient()
+  const adapter = createQqbotAdapter({ client, WebSocketImpl: FakeWebSocket })
+  const ctx = makeCtx(adapter, { ...BASE_CONFIG, transport: 'websocket' })
+  await adapter.start(ctx)
+  return { adapter, client, ctx, ws: FakeWebSocket.instances.at(-1) }
+}
+
+const reply = (adapter) => adapter.send({ chat: { kind: 'private', id: 'U1' }, parts: [{ type: 'text', text: 'hi' }], inResponseTo: 'state-msg' })
+
+test('连接状态：内建 WebSocket 在 READY 之前保持 connecting 且不能发送，READY 后才 connected', async () => {
+  const { adapter, ctx, ws } = await bootWs()
+  assert.equal(ctx.states.at(-1)?.[0], 'connecting')
+  assert.equal(stateNames(ctx).includes('connected'), false, 'start() 返回时 WebSocket 还没 READY，不能报 connected')
+  await assert.rejects(() => reply(adapter), { code: 'offline', certainty: 'not-sent' })
+
+  ws.onmessage(HELLO)
+  await sleep(20)
+  assert.equal(ctx.states.at(-1)?.[0], 'connecting', 'op=10 Hello 不直接算 connected')
+
+  ws.onmessage(READY())
+  assert.equal(ctx.states.at(-1)?.[0], 'connected')
+  assert.equal((await adapter.whoami()).account, 'BOT_STATE', 'READY 里的机器人身份要先于 connected 就位')
+  assert.ok((await reply(adapter)).messageId, 'READY 之后可以发送')
+  await adapter.stop()
+})
+
+test('连接状态：onerror / onclose 报 disconnected 且立刻不能发送，重连 timer 报 connecting，READY / RESUMED 恢复 connected', async () => {
+  const { adapter, ctx, ws } = await bootWs()
+  ws.onmessage(HELLO)
+  ws.onmessage(READY())
+  assert.equal(ctx.states.at(-1)?.[0], 'connected')
+
+  ws.onerror?.()
+  assert.deepEqual(ctx.states.at(-1), ['disconnected', 'QQBot WebSocket 错误，准备重连'])
+  await assert.rejects(() => reply(adapter), { code: 'offline' })
+
+  ws.onclose?.({ code: 1006 })
+  assert.equal(ctx.states.at(-1)?.[0], 'disconnected')
+  assert.match(String(ctx.states.at(-1)?.[1]), /已断开（1006）/)
+
+  await sleep(1150)
+  const ws2 = FakeWebSocket.instances.at(-1)
+  assert.notEqual(ws2, ws)
+  assert.deepEqual(ctx.states.at(-1), ['connecting', 'QQBot WebSocket 重连中（第 1 次）'])
+  await assert.rejects(() => reply(adapter), { code: 'offline' })
+
+  ws2.onmessage(HELLO)
+  await sleep(20)
+  assert.equal(ctx.states.at(-1)?.[0], 'connecting')
+  ws2.onmessage(wsText({ op: 0, s: 3, t: 'RESUMED', d: {} }))
+  assert.equal(ctx.states.at(-1)?.[0], 'connected')
+  assert.ok((await reply(adapter)).messageId)
+
+  // 再断一次，这次用 Invalid Session 之后的全新 READY 恢复
+  ws2.onclose?.({ code: 4009 })
+  assert.match(String(ctx.states.at(-1)?.[1]), /已断开（4009）/)
+  await sleep(1150)
+  const ws3 = FakeWebSocket.instances.at(-1)
+  assert.notEqual(ws3, ws2)
+  ws3.onmessage(HELLO)
+  ws3.onmessage(READY('BOT_STATE', 'sess-state-2', 4))
+  assert.equal(ctx.states.at(-1)?.[0], 'connected')
+  await adapter.stop()
+})
+
+test('连接状态：重连时取网关地址失败报 disconnected 并继续退避重试，不停留在 connected', async () => {
+  const { adapter, client, ctx, ws } = await bootWs()
+  ws.onmessage(HELLO)
+  ws.onmessage(READY())
+  ws.onclose?.({ code: 1006 })
+
+  // 下一次非 token 请求（重连取 /gateway）连不上
+  client.faults.push(() => { throw new NetworkError(Object.assign(new Error('网关连不上'), { code: 'ECONNREFUSED' })) })
+  await sleep(1150)
+  assert.equal(ctx.states.at(-1)?.[0], 'disconnected')
+  assert.match(String(ctx.states.at(-1)?.[1]), /重连失败：网关连不上/)
+  assert.equal(FakeWebSocket.instances.length, 1, '取网关失败时不会新建 WebSocket')
+  await assert.rejects(() => reply(adapter), { code: 'offline' })
+
+  // 第二次重试（退避 2000ms）成功
+  await sleep(2150)
+  assert.equal(FakeWebSocket.instances.length, 2)
+  assert.deepEqual(ctx.states.at(-1), ['connecting', 'QQBot WebSocket 重连中（第 2 次）'])
+  FakeWebSocket.instances.at(-1).onmessage(READY('BOT_STATE', 'sess-after-fail', 5))
+  assert.equal(ctx.states.at(-1)?.[0], 'connected')
+  await adapter.stop()
+})
+
+test('连接状态：首次取网关地址失败时 start 抛错并报 disconnected，之后可重新 start', async () => {
+  FakeWebSocket.instances = []
+  const client = makeFakeClient()
+  const adapter = createQqbotAdapter({ client, WebSocketImpl: FakeWebSocket })
+  const ctx = makeCtx(adapter, { ...BASE_CONFIG, transport: 'websocket' })
+  client.faults.push(() => { throw new NetworkError(Object.assign(new Error('首连失败'), { code: 'ECONNREFUSED' })) })
+  await assert.rejects(() => adapter.start(ctx), /首连失败/)
+  assert.deepEqual(ctx.states.at(-1), ['disconnected', '首连失败'])
+
+  await adapter.start(ctx)
+  assert.equal(ctx.states.at(-1)?.[0], 'connecting')
+  FakeWebSocket.instances.at(-1).onmessage(READY())
+  assert.equal(ctx.states.at(-1)?.[0], 'connected')
+  await adapter.stop()
+})
+
+test('连接状态：Webhook 挂好路由即 connected；自定义 connectEvents 返回即 connected（旧行为）', async () => {
+  const hook = await boot({ config: { transport: 'webhook' } })
+  assert.equal(hook.ctx.states.at(-1)?.[0], 'connected')
+  assert.ok(hook.ctx.routes.has('/callback'))
+  await hook.adapter.stop()
+
+  let stopped = 0
+  const adapter = createQqbotAdapter({ client: makeFakeClient(), connectEvents: () => () => { stopped++ } })
+  const ctx = makeCtx(adapter, { ...BASE_CONFIG, transport: 'websocket' })
+  await adapter.start(ctx)
+  assert.equal(ctx.states.at(-1)?.[0], 'connected')
+  await adapter.stop()
+  assert.equal(stopped, 1)
+  assert.equal(ctx.states.at(-1)?.[0], 'stopped')
+})
+
+test('连接状态：stop 之后迟到的 close / error / READY 不会再改状态，也不会再排重连', async () => {
+  const { adapter, ctx, ws } = await bootWs()
+  ws.onmessage(HELLO)
+  ws.onmessage(READY())
+  await adapter.stop()
+  assert.equal(ctx.states.at(-1)?.[0], 'stopped')
+  const count = ctx.states.length
+
+  ws.onerror?.()
+  ws.onclose?.({ code: 1000 })
+  ws.onmessage(READY('LATE_BOT', 'late-session', 9))
+  ws.onmessage(wsText({ op: 0, s: 10, t: 'RESUMED', d: {} }))
+  await sleep(1150)
+  assert.equal(ctx.states.length, count, 'stop 之后不能再有任何状态上报')
+  assert.equal(ctx.states.at(-1)?.[0], 'stopped')
+  assert.equal(FakeWebSocket.instances.length, 1, 'stop 之后不能再新建 WebSocket')
+  await assert.rejects(() => reply(adapter), { code: 'offline' })
 })

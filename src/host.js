@@ -5829,12 +5829,28 @@ export function apply(ctx, opts = {}) {
   })
   route('/platforms/multi-private/settings', async req => {
     if (req.method !== 'POST') return { ok: false, message: '仅支持 POST' }
-    const { steerEnabled, steerMaxPerTurn } = await readBody(req)
+    const { steerEnabled, steerMaxPerTurn, replyOnSteer, replyOnSteerMode } = await readBody(req)
     if (typeof steerEnabled !== 'boolean') return { ok: false, message: '允许插入消息必须是布尔值' }
     if (!Number.isInteger(steerMaxPerTurn) || steerMaxPerTurn < 0 || steerMaxPerTurn > 100) {
       return { ok: false, message: '每轮最多插入数必须是 0–100 的整数' }
     }
-    setConfig({ ...getConfig(), sharedSteerEnabled: steerEnabled, sharedSteerMaxPerTurn: steerMaxPerTurn })
+    if (replyOnSteer !== undefined && typeof replyOnSteer !== 'boolean') {
+      return { ok: false, message: '插入时先发已生成回复必须是布尔值' }
+    }
+    if (replyOnSteerMode !== undefined && replyOnSteerMode !== 'all' && replyOnSteerMode !== 'first') {
+      return { ok: false, message: '补发范围必须是 all 或 first' }
+    }
+    const nextReplyOnSteer = replyOnSteer === undefined ? (getConfig().sharedReplyOnSteer === true) : replyOnSteer
+    const nextReplyOnSteerMode = replyOnSteerMode === undefined
+      ? (getConfig().sharedReplyOnSteerMode === 'first' ? 'first' : 'all')
+      : replyOnSteerMode
+    setConfig({
+      ...getConfig(),
+      sharedSteerEnabled: steerEnabled,
+      sharedSteerMaxPerTurn: steerMaxPerTurn,
+      sharedReplyOnSteer: nextReplyOnSteer,
+      sharedReplyOnSteerMode: nextReplyOnSteerMode,
+    })
     return { ok: true, ...hub.sharedStatus(), message: '已保存共享私聊插入设置' }
   })
   for (const action of ['prepare', 'confirm']) {

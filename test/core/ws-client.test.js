@@ -308,3 +308,118 @@ test('16-bit 长度帧超出 maxPayloadBytes 时立即报错并按 1009 关闭',
   assert.match(events[0][1], /超限/)
   assert.deepEqual(events[1], ['close', 1009])
 })
+
+test('按 RFC 6455 拒绝服务端发送的 masked 帧并回发 1002 close', async (t) => {
+  const srvSockets = []
+  const clientFrames = []
+  const srv = await startTestServer((req, socket) => {
+    srvSockets.push(socket)
+    const key = req.headers['sec-websocket-key']
+    const accept = createHash('sha1').update(`${key}${WS_GUID}`).digest('base64')
+    socket.write(
+      `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
+    )
+    const feed = createFrameDecoder((f) => {
+      clientFrames.push(f)
+      if (f.opcode === 0x08) socket.end()
+    })
+    socket.on('data', feed)
+    setTimeout(() => {
+      const plain = Buffer.from('bad-masked', 'utf8')
+      const mask = Buffer.from([0x12, 0x34, 0x56, 0x78])
+      const frame = Buffer.allocUnsafe(6 + plain.length)
+      frame[0] = 0x81
+      frame[1] = 0x80 | plain.length
+      mask.copy(frame, 2)
+      for (let i = 0; i < plain.length; i++) frame[6 + i] = plain[i] ^ mask[i & 3]
+      socket.write(frame)
+    }, 10)
+  })
+  t.after(async () => {
+    for (const s of srvSockets) s.destroy()
+    await srv.close()
+  })
+
+  const ws = createTitleCaseWebSocket(srv.url)
+  const messages = []
+  const events = []
+  ws.on('message', (data) => messages.push(data))
+  await new Promise((resolve) => {
+    ws.on('error', (err) => events.push(['error', err.message]))
+    ws.on('close', (code, reason) => {
+      events.push(['close', code, reason])
+      resolve()
+    })
+  })
+  assert.deepEqual(messages, [])
+  assert.equal(events[0][0], 'error')
+  assert.match(events[0][1], /MASK/)
+  assert.equal(events[1][0], 'close')
+  assert.equal(events[1][1], 1002)
+  const closeFrame = clientFrames.find((f) => f.opcode === 0x08)
+  assert.ok(closeFrame, '客户端应向服务端发送 close 帧')
+  assert.equal(closeFrame.payload.readUInt16BE(0), 1002)
+})
+
+test('控制帧 ping/pong：服务端 ping 触发客户端 ping 事件并自动回 pong；ws.ping() 触发 pong 事件', async (t) => {
+  const srvSockets = []
+  const clientFrames = []
+  const srv = await startTestServer((req, socket) => {
+    srvSockets.push(socket)
+    const key = req.headers['sec-websocket-key']
+    const accept = createHash('sha1').update(`${key}${WS_GUID}`).digest('base64')
+    socket.write(
+      `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
+    )
+    const feed = createFrameDecoder((f) => {
+      clientFrames.push(f)
+      if (f.opcode === 0x09) {
+        socket.write(encodeServerFrame(0x0a, f.payload, true))
+      } else if (f.opcode === 0x08) {
+        socket.write(encodeServerFrame(0x08, f.payload.subarray(0, 2), true))
+        socket.end()
+      }
+    })
+    socket.on('data', feed)
+    setTimeout(() => {
+      socket.write(encodeServerFrame(0x09, Buffer.from('srv-hb', 'utf8'), true))
+    }, 10)
+  })
+  t.after(async () => {
+    for (const s of srvSockets) s.destroy()
+    await srv.close()
+  })
+
+  const ws = createTitleCaseWebSocket(srv.url)
+  const nodePings = []
+  const domPings = []
+  const nodePongs = []
+  ws.on('ping', (data) => nodePings.push(Buffer.from(data).toString('utf8')))
+  ws.addEventListener('ping', (ev) => domPings.push(Buffer.from(ev.data).toString('utf8')))
+  ws.on('pong', (data) => nodePongs.push(Buffer.from(data).toString('utf8')))
+
+  await new Promise((resolve, reject) => {
+    ws.on('open', resolve)
+    ws.on('error', reject)
+  })
+  for (let i = 0; i < 100 && nodePings.length === 0; i++) await new Promise((r) => setTimeout(r, 10))
+  for (let i = 0; i < 100 && !clientFrames.some((f) => f.opcode === 0x0a); i++) await new Promise((r) => setTimeout(r, 10))
+
+  assert.deepEqual(nodePings, ['srv-hb'])
+  assert.deepEqual(domPings, ['srv-hb'])
+  const replyPong = clientFrames.find((f) => f.opcode === 0x0a)
+  assert.ok(replyPong, '收到服务端 ping 应自动回发 pong')
+  assert.equal(replyPong.masked, true)
+  assert.equal(replyPong.payload.toString('utf8'), 'srv-hb')
+
+  assert.equal(ws.ping('hb-client'), true)
+  for (let i = 0; i < 100 && nodePongs.length === 0; i++) await new Promise((r) => setTimeout(r, 10))
+  assert.deepEqual(nodePongs, ['hb-client'])
+  const clientPing = clientFrames.find((f) => f.opcode === 0x09)
+  assert.ok(clientPing && clientPing.masked && clientPing.payload.toString('utf8') === 'hb-client')
+
+  await new Promise((resolve) => {
+    ws.on('close', resolve)
+    ws.close(1000, 'done')
+  })
+})

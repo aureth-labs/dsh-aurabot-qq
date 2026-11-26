@@ -620,17 +620,29 @@ export function createQqbotAdapter(options = {}) {
       sessionId = ''
       seq = 0
       shouldResume = false
-      try { socket?.close() } catch (error) {}
+      // 先摘掉 socket 再关：同步触发的 onclose 看到 socket !== ws 就不会再上报状态或排重连。
+      const prev = socket
       socket = null
+      try { prev?.close() } catch (error) {}
+    }
+    // 面板状态来自 ctx.state()：连接真实变化必须在这里上报，stop 之后不再上报。
+    const reportState = (state, detail) => {
+      if (stopped || !running) return
+      try { ctx?.state?.(state, detail) } catch (error) {}
     }
     const scheduleReconnect = (reason) => {
-      if (stopped || retryTimer) return
-      const delay = Math.min(30000, 1000 * 2 ** Math.min(retry++, 5))
+      if (stopped || !running || retryTimer) return
+      const attempt = ++retry
+      const delay = Math.min(30000, 1000 * 2 ** Math.min(attempt - 1, 5))
       logWs('warn', `WebSocket 断开（${reason || 'unknown'}），${delay}ms 后重连`)
       retryTimer = setTimeout(() => {
         retryTimer = null
-        connectOnce().catch((error) => {
+        if (stopped || !running) return
+        connectOnce(`QQBot WebSocket 重连中（第 ${attempt} 次）`).catch((error) => {
+          if (stopped || !running) return
+          connected = false
           logWs('warn', `WebSocket 重连失败：${error.message}`)
+          reportState('disconnected', `QQBot WebSocket 重连失败：${error.message}`)
           scheduleReconnect(error.message)
         })
       }, delay)
@@ -643,15 +655,22 @@ export function createQqbotAdapter(options = {}) {
         else logger?.[level]?.(message)
       } catch (error) {}
     }
-    const connectOnce = async () => {
+    const connectOnce = async (detail = 'QQBot WebSocket 连接中') => {
       if (stopped || !running) return
+      reportState('connecting', detail)
       const res = await authedRequest({ path: PATH_GATEWAY, method: 'GET', timeoutMs: Math.max(1, Number(cfgOf().timeoutMs) || DEFAULT_TIMEOUT_MS) })
+      if (stopped || !running) return
       const data = res?.data || res?.json?.data || {}
       const url = String(data.url || data.gateway || res?.url || res?.json?.url || '').trim()
       if (!/^wss?:\/\//i.test(url)) throw new Error(`QQ 网关没有返回 wss 地址（HTTP ${res?.status ?? '?'}）`)
+      // 还有没收尾的旧 socket：先摘掉再关，避免它的 onclose 把新连接的状态改回去。
+      const prev = socket
+      socket = null
+      try { prev?.close() } catch (error) {}
       const ws = new WebSocketImpl(url)
       socket = ws
       ws.onmessage = (event) => {
+        if (stopped || !running || socket !== ws) return
         let payload
         try { payload = JSON.parse(String(event?.data ?? '')) } catch (error) { return }
         const op = Number(payload?.op)
@@ -691,11 +710,22 @@ export function createQqbotAdapter(options = {}) {
             try { ws.close() } catch (closeError) {}
           })
         } else if (op === 0) {
-          if (payload.t === 'READY' && payload?.d?.session_id) {
-            sessionId = String(payload.d.session_id)
-            shouldResume = true
+          if (payload.t === 'READY') {
+            if (payload?.d?.session_id) {
+              sessionId = String(payload.d.session_id)
+              shouldResume = true
+            }
+            // 先记下 READY 里的机器人身份，再报 connected：网关收到 connected 会立刻核对 whoami。
+            if (payload?.d?.user?.id) self.account = String(payload.d.user.id)
+            if (payload?.d?.user?.username) self.name = String(payload.d.user.username)
+            retry = 0
+            connected = true
+            reportState('connected')
           } else if (payload.t === 'RESUMED') {
             shouldResume = true
+            retry = 0
+            connected = true
+            reportState('connected')
           }
           onEvent(payload)
         } else if (op === 7) {
@@ -712,11 +742,20 @@ export function createQqbotAdapter(options = {}) {
           try { ws.close() } catch (error) {}
         }
       }
-      ws.onerror = () => scheduleReconnect('error')
-      ws.onclose = () => {
+      ws.onerror = () => {
+        if (stopped || !running || socket !== ws) return
+        connected = false
+        reportState('disconnected', 'QQBot WebSocket 错误，准备重连')
+        scheduleReconnect('error')
+      }
+      ws.onclose = (event) => {
+        if (socket !== ws) return
         socket = null
         clearHeartbeat()
+        if (stopped || !running) return
+        connected = false
         if (sessionId) shouldResume = true
+        reportState('disconnected', `QQBot WebSocket 已断开${event?.code ? `（${event.code}）` : ''}，准备重连`)
         scheduleReconnect('closed')
       }
     }
@@ -1116,6 +1155,8 @@ export function createQqbotAdapter(options = {}) {
       try { ctx.capsChanged?.() } catch (error) {}
 
       ctx.state('connecting')
+      connected = false
+      self = { account: '', name: '' }
 
       const secret = cfg.botSecret || cfg.secret || cfg.clientSecret || cfg.appSecret
       keys = deriveEd25519(secret)
@@ -1132,35 +1173,50 @@ export function createQqbotAdapter(options = {}) {
         // 官方允许的回调端口只有 80/443/8080/8443，路径由插件 HTTP 服务挂成 /platform/<实例>/callback
         const off = ctx.route('/callback', webhookHandler)
         offs.push(off)
+        // Webhook 没有 READY：路由挂好就算就绪。
+        connected = true
+        ctx.state('connected')
       } else {
+        const builtInGateway = !connectEvents
         const connector = connectEvents || ((onEvent) => gatewayEvents(onEvent))
         if (!connector) {
           running = false
           ctx.state('disconnected', 'transport=websocket 需要 WebSocket 客户端')
           throw new Error('qqbot：transport=websocket 需要 WebSocket 客户端')
         }
-        const stop = await connector((payload) => {
-          if (!running) return
-          if (Number(payload?.op) === 0) {
-            if (payload.t === 'READY' && payload?.d?.user) {
-              if (payload.d.user.id) self.account = String(payload.d.user.id)
-              if (payload.d.user.username) self.name = String(payload.d.user.username)
+        let stop
+        try {
+          stop = await connector((payload) => {
+            if (!running) return
+            if (Number(payload?.op) === 0) {
+              if (payload.t === 'READY' && payload?.d?.user) {
+                if (payload.d.user.id) self.account = String(payload.d.user.id)
+                if (payload.d.user.username) self.name = String(payload.d.user.username)
+              }
+              handleDispatch(payload.t, payload.d, payload)
             }
-            handleDispatch(payload.t, payload.d, payload)
-          }
-          else if (Number(payload?.op) === 12) { /* READY / ACK，忽略 */ }
-        })
+            else if (Number(payload?.op) === 12) { /* READY / ACK，忽略 */ }
+          })
+        } catch (error) {
+          running = false
+          connected = false
+          ctx.state('disconnected', String(error?.message || '连接失败'))
+          throw error
+        }
         if (typeof stop === 'function') offs.push(stop)
+        // 内建网关要等 READY / RESUMED 才算连上（由 gatewayEvents 上报）；
+        // 宿主注入的 connectEvents 看不到内部就绪时机，沿用旧行为：connector 返回即 connected。
+        if (!builtInGateway) {
+          connected = true
+          ctx.state('connected')
+        }
       }
-
-      connected = true
-      ctx.state('connected')
 
       // 连上后核对身份（READY 里也有 user.id/username；GET /users/@me 同样可查）
       try {
         const res = await authedRequest({ path: '/users/@me', method: 'GET', timeoutMs: Math.max(1, Number(cfg.timeoutMs) || DEFAULT_TIMEOUT_MS) })
         const data = res?.data || {}
-        if (data.id || data.username) {
+        if ((data.id || data.username) && !self.account) {
           self = { account: String(data.id || ''), name: String(data.username || '') }
         }
       } catch (error) {
