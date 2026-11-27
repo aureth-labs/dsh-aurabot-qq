@@ -2,9 +2,10 @@
 
 <img src="assets/banner.svg" alt="Aurabot · 大肥鱼" width="100%" />
 
-**"Dafeiyu" — an AI companion living inside QQ · A DeepSeek Harness plugin**
+**"Dafeiyu" — an AI companion living in your chat apps · A DeepSeek Harness plugin**
 
 A persona, a mood, and a memory of her own. She chats, sees images, sends voice notes, collects stickers, sings in her own voice, writes Qzone diaries, browses Bilibili — and sometimes reaches out to you first.
+Supports **QQ, QQ Official Bot, Feishu, WeChat ClawBot, WeCom, and DingTalk** — one persona, several platforms.
 
 **English** · [简体中文](README.md)
 
@@ -15,18 +16,63 @@ A persona, a mood, and a memory of her own. She chats, sees images, sends voice 
 [![stars](https://img.shields.io/github/stars/aureth-labs/dsh-aurabot-qq?color=f5b301)](https://github.com/aureth-labs/dsh-aurabot-qq/stargazers)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](#-contributing)
 
+<p>
+  <img src="https://img.shields.io/badge/QQ-1EBAFC?logo=qq&logoColor=white" alt="QQ">
+  <img src="https://img.shields.io/badge/QQ%20Official%20Bot-1EBAFC?logo=qq&logoColor=white" alt="QQ Official Bot">
+  <img src="https://img.shields.io/badge/Feishu-3370FF" alt="Feishu">
+  <img src="https://img.shields.io/badge/WeChat-07C160?logo=wechat&logoColor=white" alt="WeChat">
+  <img src="https://img.shields.io/badge/WeCom-3370FF?logo=wechat&logoColor=white" alt="WeCom">
+  <img src="https://img.shields.io/badge/DingTalk-1677FF?logo=dingtalk&logoColor=white" alt="DingTalk">
+</p>
+
 </div>
 
-> Aurabot turns the AI inside **DeepSeek Harness (DSH)** into someone with a QQ account: her own persona, moods, a long-term memory of your chats, and a personality that shows in every reply. She can follow group conversations, send voice notes, sing with her own voice, keep a Qzone diary, and browse Bilibili.
+> Aurabot turns the AI inside **DeepSeek Harness (DSH)** into a chat companion with a real persona: she has moods, remembers details, knows your friends, follows group conversations, sends voice notes, sings in her own voice, keeps a Qzone diary, and browses Bilibili.
 >
-> This is not another keyword-reply bot: every reply, every decision to join a conversation, every model choice, and every outgoing message is a pluggable module. Everything is off by default — **not a single message reaches QQ until you turn it on.**
+> She is no longer QQ-only: connect QQ Personal via SnowLuma/OneBot, QQ Official Bot, Feishu, WeChat ClawBot, WeCom, or DingTalk. **Each platform is an adapter; persona, memory, tools, and the panel are shared. Owner DMs from multiple platforms can also share one session.**
+>
+> This is not another keyword-reply bot: every reply, every decision to join a conversation, every model choice, and every outgoing message is a pluggable module. Everything is off by default — **not a single message reaches any platform until you turn it on.**
 
 ```
-QQ ⇄ SnowLuma (OneBot v11; or your existing bot) ⇄ Aurabot plugin ⇄ DSH sessions
-                                                       ├─ persona + mood + memory
-                                                       ├─ tools / hot-reloadable modules
-                                                       └─ web panel (DSH Web)
+QQ Personal ⇄ SnowLuma (OneBot v11)┐
+QQ Official Bot / Feishu / WeChat / WeCom / DingTalk
+              ⇅ official long connection / callback / iLink
+           Aurabot plugin ⇄ DSH sessions
+                         ├─ persona + mood + memory
+                         ├─ tools / hot-reloadable modules
+                         └─ web panel (DSH Web)
 ```
+
+## 🌐 Multi-platform support
+
+One DSH persona can live on several platforms at once. Each adapter declares its real `caps` honestly, so platform limits are visible instead of being hidden behind a “fully supported” label.
+
+| Platform | Connection | What she can do / limits |
+|---|---|---|
+| **QQ Personal** | SnowLuma (OneBot v11), or any existing OneBot v11 gateway | The fullest QQ form: DM/group, images, native voice, quotes, stickers, proactive messages; file/video/recall support depends on the gateway probe. |
+| **QQ Official Bot** | AppID + AppSecret, WebSocket or Webhook; QR creation is also supported | Official hosting, DM/group @; images, video, and files; voice is sent as an audio file; no quote reply; proactive messages are quota-limited. |
+| **Feishu** | QR-created bot or App ID + App Secret; long connection/callback | DM/group @, images, native voice, video, files, quotes, and cards; reading all group messages requires an extra sensitive permission. |
+| **WeChat ClawBot** | WeChat QR bind, iLink long polling | DM-first text chat with images/video/files; voice is sent as a file by default; group chat requires experimental rollout; proactive messages are limited by context token and rate. |
+| **WeCom** | QR bind or Bot ID + Secret; official WebSocket | DM/group @, images, native voice, video, files; proactive messages are free; incoming quotes can be read, but no native outgoing quote reply. |
+| **DingTalk** | QR creation or Client ID + Client Secret; Stream long connection | DM/group @, images, native voice, files; proactive messages are free; no video or native quote reply. |
+
+> “Group” here means **responding when mentioned or allow-listed** by default. “All group messages” means the platform permits receiving unmentioned group messages for passive listening.
+> QQ Personal file/video/recall support depends on the OneBot gateway.
+> QQ Zone, Bilibili, and cover-song modules still use their own platform/workspace entry; what is shared across platforms is persona, memory, tools, and session routing.
+
+### Feature matrix
+
+| Platform | DM | Group | Image | Voice | Video | File | Quote reply | Proactive | All group messages |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| QQ Personal (SnowLuma / OneBot v11) | ✅ | ✅ | ✅ | ✅ native | ⚠️ gateway | ⚠️ gateway | ✅ | ✅ free | ✅ |
+| QQ Official Bot | ✅ | ✅ @ | ✅ | ⚠️ audio file | ✅ | ✅ | ❌ | ⚠️ limited | ⚠️ group owner opt-in |
+| Feishu | ✅ | ✅ @ | ✅ | ✅ native | ✅ | ✅ | ✅ | ✅ availability range | ⚠️ sensitive permission |
+| WeChat ClawBot | ✅ | ⚠️ opt-in/gray | ✅ | ⚠️ file default | ✅ | ✅ | ❌ | ⚠️ limited | ❌ |
+| WeCom | ✅ | ✅ @ only | ✅ | ✅ native | ✅ | ✅ | ⚠️ inbound read only | ✅ free | ❌ |
+| DingTalk | ✅ | ✅ @ only | ✅ | ✅ native | ❌ | ✅ | ⚠️ inbound read only | ✅ free | ❌ |
+
+**Legend:** ✅ native; ⚠️ limited by platform permission, gateway, or configuration; ❌ not declared.
+**Note:** proactive messages are also subject to platform quotas, user/group settings, and Aurabot’s own master switch. QQ Personal “gateway” capabilities are shown in the panel when the current gateway does not support them.
 
 ---
 
@@ -45,7 +91,7 @@ QQ ⇄ SnowLuma (OneBot v11; or your existing bot) ⇄ Aurabot plugin ⇄ DSH se
 
 | | Capability | Details |
 |---|---|---|
-| 💬 | **DM & group chat** | Each QQ DM/group maps to its own DSH session — watch her reasoning and tool calls, or jump in |
+| 💬 | **DM & group chat** | Each platform DM/group usually maps to its own DSH session; with shared private sessions enabled, the owner’s DMs across platforms merge into one. Watch her reasoning and tool calls, or jump in |
 | 🎨 | **Persona & mood** | Switchable persona cards edited section by section; mood driven by praise/anger, affecting tone, stickers, voice and reply speed |
 | 🗣️ | **Voice notes & singing** | edge-tts, Doubao (Volcano) / MiniMax online voices, local CosyVoice / GPT-SoVITS, or any HTTP TTS; import RVC voices for covers so she talks and sings with the same voice |
 | 😀 | **Stickers** | Auto-collect, AI naming/tagging, context-aware sticker choice; marketplace stickers sent as-is |
@@ -53,7 +99,7 @@ QQ ⇄ SnowLuma (OneBot v11; or your existing bot) ⇄ Aurabot plugin ⇄ DSH se
 | 📺 | **Bilibili** | Picks videos from interests and memory, reads info/subtitles/comments, comments, shares to your DM; follows up on replies to her comments |
 | 🖼️ | **Image gen & local APIs** | Built-in or your own image/TTS/cover/ASR services; the panel generates scripts that take effect instantly |
 | 🧠 | **Memory** | Memory store, per-person profiles, relationship insights, speaking style and diaries go into context; import old notes; search/edit/delete and adjust automatic memory capacity in the panel (default 3,000) |
-| 🐟 | **Desktop pet (optional)** | A pet module puts her on your desktop: idle actions, muttering, work-status reactions — never posts to QQ |
+| 🐟 | **Desktop pet (optional)** | A pet module puts her on your desktop: idle actions, muttering, work-status reactions — never posts to a chat platform |
 | 🌙 | **Proactive** | Proactive chats, a purpose engine, good-night moods — with awake hours, frequency and allow-lists |
 | 🧩 | **Module market** | One-click community modules (pet, Douyin, Heybox, group admin, phone automation, …), configs and logins kept |
 | 🔐 | **Permission page** | Every sensitive action is 关 / owner-DM only / everyone, re-checked at execution; dry run never performs side effects |
@@ -62,7 +108,7 @@ QQ ⇄ SnowLuma (OneBot v11; or your existing bot) ⇄ Aurabot plugin ⇄ DSH se
 
 ## 🚀 Quick start
 
-**Requirements:** a machine that runs DeepSeek Harness (Windows is easiest), a spare QQ account for the bot, and a QQ gateway (SnowLuma on Windows; any OneBot v11 implementation on Linux/Docker).
+**Requirements:** a machine that runs DeepSeek Harness (Windows is easiest) and at least one platform account to connect. QQ Personal needs a QQ gateway (SnowLuma on Windows; any OneBot v11 implementation on Linux/Docker); QQ Official Bot, Feishu, WeChat ClawBot, WeCom, and DingTalk can be connected directly from the setup wizard via QR or credentials.
 
 ### 1. Install the plugin
 
@@ -82,11 +128,12 @@ Restart DSH; **Aurabot** appears in the sidebar under *Automation*.
 
 ### 2. Follow the setup wizard
 
-1. Enter the bot’s QQ number (a spare account) and your own QQ number
-2. Choose a gateway:
+1. Choose the platform(s) to connect in the wizard; scan the QR code or enter the bot credentials
+2. If you choose **QQ Personal**, choose a gateway:
    - **SnowLuma (Windows)**: download & extract [SnowLuma](https://github.com/SnowLuma/SnowLuma/releases) → start it → accept its EULA yourself in the panel (a console password is generated) → log in the bot account → click “attach bot account”
    - **Existing OneBot bot**: NapCat, LLOneBot, Lagrange or Dockerized SnowLuma all work; paste the forward WebSocket URL (and token). The plugin only connects — it never starts or injects into anything
-3. Start in dry run (replies only, nothing sent) or go live
+3. Other platforms need no QQ gateway: choose QQ Official Bot, Feishu, WeChat ClawBot, WeCom, or DingTalk directly in the wizard, then scan the QR code or enter credentials
+4. Start in dry run (replies only, nothing sent) or go live
 
 > **Linux / Docker notes:** voice needs `python3-venv` or [uv](https://docs.astral.sh/uv/); RVC covers are Windows-only for now; when connecting to OneBot on the host or another container, use a reachable host/port instead of `127.0.0.1`.
 
@@ -96,7 +143,7 @@ Re-run the install command and restart DSH — settings, persona and memory are 
 
 ## 🧩 Module system
 
-Apart from the core (config, QQ gateway, chat hub, persona, permissions, panel), **every feature is a module**.
+Apart from the core (config, platform gateway, chat hub, persona, permissions, panel), **every feature is a module**.
 
 - Install/update/remove community modules from the panel’s **Module market** — registry: [dsh-aurabot-qq-mods](https://github.com/aureth-labs/dsh-aurabot-qq-mods)
 - Your own modules live in the data directory `modules/` — never overwritten by upgrades, hot-reloaded on save (multi-file and npm deps supported)
@@ -108,9 +155,9 @@ Apart from the core (config, QQ gateway, chat hub, persona, permissions, panel),
 
 ## 🛡️ Security & privacy
 
-- **Off by default**: master switch off + dry run on — nothing goes to QQ until you enable it
+- **Off by default**: master switch off + dry run on — nothing goes to any platform until you enable it
 - **Per-context permissions**: owner DMs get the full toolset; group chats and other people’s DMs get **no local tools**; sensitive actions (profiles, files, song covers, image gen, …) require the whole turn to be the owner
-- **Execution-level guards**: dangerous shell commands need a “confirm” reply in QQ (optional); DSH approvals can be confirmed from your QQ DM (can be disabled); unload/reload clears pending confirmations and timers
+- **Execution-level guards**: dangerous shell commands need a “confirm” reply in chat (optional); DSH approvals can be confirmed from your owner DM (can be disabled); unload/reload clears pending confirmations and timers
 - **Privacy boundaries**: what you say in an owner DM is never fed into groups or other DMs; memory is isolated by chat origin; social contexts only recall memories from that chat
 - **Local data**: `%USERPROFILE%\.dsh\plugins-data\aurabot\`; use *System → Backup* to export everything as a zip and restore on a new machine
 
