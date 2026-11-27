@@ -8,20 +8,27 @@
 //
 // 从内置搬到社区库的模块（MOVED），老用户升级时自动装回来，只装一次，卸载后不会再装。
 
-import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve, sep } from 'node:path'
 import { inflateRawSync, crc32 } from 'node:zlib'
 import { dataDir } from './store.js'
 import { API_VERSION, builtinDir, userDir } from './modules.js'
 
 export const REGISTRY_URL = 'https://raw.githubusercontent.com/aureth-labs/dsh-aurabot-qq-mods/registry/index.json'
+// Gitee 官方镜像（由 github-to-gitee-sync 每天从 registry 分支同步），国内访问更稳
+export const GITEE_MIRROR = 'https://raw.giteeusercontent.com/aureth-labs/dsh-aurabot-qq-mods/raw/registry/index.json'
 export const SOURCE_FILE = '.aurabot-source.json'
 const MAX_ZIP_BYTES = 25 * 1024 * 1024
 const MAX_FILE_BYTES = 64 * 1024 * 1024
 const ID_RE = /^[a-z][a-z0-9-]{1,39}$/
 const INDEX_TTL = 5 * 60_000
 const RETRY_MS = 1000
+// 安装量用模块库 Releases 里安装包的下载次数：不用额外服务，代价是 GitHub 接口没登录时一小时只给 60 次，
+// 所以读一次缓存一小时；读失败也记下来，5 分钟内不再试，别把额度耗在断网上。
+const STATS_TTL = 60 * 60_000
+const STATS_FAIL_TTL = 5 * 60_000
+const RELEASES_PAGES = 3
 
 /** fetch 断网时只说 fetch failed，这里把真正的原因换成人话。 */
 const isNetError = (error) => error instanceof TypeError || error?.name === 'TimeoutError' || error?.name === 'AbortError' || Boolean(error?.cause?.code)
@@ -109,11 +116,27 @@ function safeName(name) {
   return name.split('/').every((seg) => seg && seg !== '.' && seg !== '..')
 }
 
-export function createCommunity({ mods, getConfig, setConfig, log, version, alive = () => true, registryUrl = process.env.AURABOT_REGISTRY_URL || REGISTRY_URL, fetcher = fetch, retryMs = RETRY_MS }) {
+// registry 地址的优先级：调用方显式传入 > 配置 ext.market.registryUrl > 环境变量 AURABOT_REGISTRY_URL > 内置默认。
+// 让模块市场支持换地址（自建索引 / 国内镜像 / 内网部署）而不必改代码或设环境变量。
+function resolveRegistryUrl(arg, getConfig) {
+  if (typeof arg === 'string' && arg.trim() && arg !== REGISTRY_URL) return arg // 显式传参优先（测试 / 旧式调用）
+  const fromConfig = String(getConfig?.()?.ext?.market?.registryUrl || '').trim()
+  if (fromConfig && /^https?:\/\//i.test(fromConfig)) return fromConfig
+  const fromEnv = String(process.env.AURABOT_REGISTRY_URL || '').trim()
+  if (fromEnv) return fromEnv
+  return REGISTRY_URL
+}
+
+export function createCommunity({ mods, getConfig, setConfig, log, version, alive = () => true, registryUrl, fetcher = fetch, retryMs = RETRY_MS }) {
   const dirOf = (id) => join(userDir(), id)
+  // 模块市场索引地址：单一真相，index 下载 / 安装量读取都用它。
+  // 支持换地址（自建索引 / 镜像 / 内网）：先看配置 ext.market.registryUrl，再退环境变量，最后回到内置 github。
+  const registryUrlOf = () => resolveRegistryUrl(registryUrl, getConfig)
   let cache = null // { at, index }
   let busy = null // 同一时间只跑一个安装 / 卸载
   let progress = null // 安装中：{ id, name, stage: 'index' | 'download' | 'install' | 'start', received, total }
+  let statsCache = null // { at, repo, value }：安装量，见 loadStats
+  let statsMiss = null // { at, repo }：上次读安装量失败的时间
 
   const readSource = (id) => {
     try { return JSON.parse(readFileSync(join(dirOf(id), SOURCE_FILE), 'utf8')) } catch (error) { return null }
@@ -121,18 +144,97 @@ export function createCommunity({ mods, getConfig, setConfig, log, version, aliv
   const hasFolder = (id) => existsSync(dirOf(id))
 
   async function loadIndex({ force = false } = {}) {
-    if (!force && cache && Date.now() - cache.at < INDEX_TTL) return cache.index
+    const url = registryUrlOf()
+    // 换地址后旧缓存作废（按 URL 判），否则改完地址可能 5 分钟内仍读到旧的索引。
+    if (!force && cache && cache.url === url && Date.now() - cache.at < INDEX_TTL) return cache.index
     const index = await withRetry(async () => {
-      const r = await fetcher(registryUrl, { signal: AbortSignal.timeout(20_000), cache: 'no-store' })
+      const r = await fetcher(url, { signal: AbortSignal.timeout(20_000), cache: 'no-store' })
       if (!r.ok) throw new Error(`读不到社区模块索引（HTTP ${r.status}）`)
       return r.json()
     }, retryMs)
     if (index?.schema !== 1) throw new Error('社区模块索引的格式是新版的，先更新插件')
-    cache = { at: Date.now(), index }
+    cache = { at: Date.now(), url, index }
     return index
   }
 
   const revokedReason = (index, id, v) => (index.revoked || []).find((r) => r.id === id && r.versions?.includes(v))?.reason || ''
+
+  /** 索引里的仓库地址 → owner/repo。索引是可下载的第三方数据，只认长得对的。 */
+  function repoOf(index) {
+    for (const url of [index?.assetsBase, index?.homepage, registryUrlOf()]) {
+      const m = String(url || '').match(/github\.com\/([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)/)
+      if (m && ID_RE.test(m[1].toLowerCase()) && ID_RE.test(m[2].toLowerCase())) return `${m[1]}/${m[2]}`
+    }
+    return ''
+  }
+
+  /**
+   * 把 Releases 列表按模块聚合：下载次数 + 最近一次 Release 的发布时间（published_at，退 created_at）。
+   * tag 形如 pet-v1.0.7；日期只是排序用的参考值，索引里已有 publishedAt 时以索引为准。
+   */
+  function sumReleases(releases) {
+    const counts = {}
+    const released = {}
+    for (const rel of Array.isArray(releases) ? releases : []) {
+      const m = String(rel?.tag_name || '').match(/^([a-z][a-z0-9-]{1,39})-v\d+\.\d+\.\d+$/)
+      if (!m) continue
+      const id = m[1]
+      const n = (Array.isArray(rel.assets) ? rel.assets : []).reduce((sum, a) => sum + (Number(a?.download_count) || 0), 0)
+      counts[id] = (counts[id] || 0) + n
+      const at = String(rel?.published_at || rel?.created_at || '')
+      if (at && (!released[id] || at > released[id])) released[id] = at
+    }
+    return { counts, released }
+  }
+
+  /**
+   * 下载量是锦上添花：最多等 6 秒，等不到就先当没有，别把市场页拖住。
+   * 超时后台继续，下一次进来就用缓存了（不重复打接口）。
+   */
+  function statsWithin(index, { force = false } = {}) {
+    return new Promise((done) => {
+      const timer = setTimeout(() => done({ counts: {}, released: {}, source: '', at: 0, failed: true }), 6000)
+      loadStats(index, { force }).then((value) => { clearTimeout(timer); done(value) }, () => { clearTimeout(timer); done({ counts: {}, released: {}, source: '', at: 0, failed: true }) })
+    })
+  }
+
+  /**
+   * 每个模块的安装量（近似值：Releases 里安装包的下载次数，更新也算一次）。
+   * 读不到就返回空表，市场照常能用——统计不是必需功能，不能因为它挂掉。
+   */
+  async function loadStats(index, { force = false } = {}) {
+    const repo = repoOf(index)
+    if (!repo) return { counts: {}, released: {}, source: '', at: 0 }
+    if (!force && statsCache && statsCache.repo === repo && Date.now() - statsCache.at < STATS_TTL) return statsCache.value
+    if (!force && statsMiss && statsMiss.repo === repo && Date.now() - statsMiss.at < STATS_FAIL_TTL) return { counts: {}, released: {}, source: repo, at: 0, failed: true }
+    try {
+      const counts = {}
+      const released = {}
+      // 有令牌就用上：没登录时 GitHub 接口一小时只给 60 次，用户多的机器会不够
+      const token = String(process.env.AURABOT_GITHUB_TOKEN || process.env.GITHUB_TOKEN || '').trim()
+      for (let page = 1; page <= RELEASES_PAGES; page++) {
+        const r = await fetcher(`https://api.github.com/repos/${repo}/releases?per_page=100&page=${page}`, {
+          signal: AbortSignal.timeout(5000),
+          headers: { accept: 'application/vnd.github+json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+        })
+        // 403 是没登录的额度用完了：别再翻页，已有的照用
+        if (!r.ok) throw new Error(`HTTP ${r.status}`)
+        const list = await r.json()
+        const pageSum = sumReleases(list)
+        for (const [id, n] of Object.entries(pageSum.counts)) counts[id] = (counts[id] || 0) + n
+        for (const [id, at] of Object.entries(pageSum.released)) if (!released[id] || at > released[id]) released[id] = at
+        if (!Array.isArray(list) || list.length < 100) break
+      }
+      const value = { counts, released, source: repo, at: Date.now() }
+      statsCache = { at: value.at, repo, value }
+      statsMiss = null
+      return value
+    } catch (error) {
+      statsMiss = { at: Date.now(), repo }
+      log.debug?.('读不到模块下载量：', error?.message || error)
+      return { counts: {}, released: {}, source: repo, at: 0, failed: true }
+    }
+  }
 
   /** 这一条现在装不了的原因；能装返回空串。 */
   function blocked(index, e) {
@@ -144,33 +246,43 @@ export function createCommunity({ mods, getConfig, setConfig, log, version, aliv
     return missing.length ? `要先装：${missing.join('、')}` : ''
   }
 
-  function view(index, e) {
+  function view(index, e, counts = {}, released = {}) {
     const src = readSource(e.id)
     return {
       ...e,
+      // 市场排序用的时间：新索引给 publishedAt；兼容 snake_case 的索引；都没有时退 GitHub Release 时间。
+      publishedAt: e.publishedAt || e.published_at || '',
+      updatedAt: e.updatedAt || e.updated_at || '',
+      releasedAt: released[e.id] || '',
       installed: src?.version || '',
       foreign: !src && hasFolder(e.id), // 同名文件夹是用户自己写的
       update: Boolean(src && compareVersions(e.version, src.version) > 0),
       blocked: blocked(index, e),
       moved: e.id in MOVED,
+      // 安装量：模块库 Releases 里安装包的下载次数（更新也算），读不到时是 0
+      downloads: Number(counts[e.id]) || 0,
     }
   }
 
   async function list({ force = false } = {}) {
     const index = await loadIndex({ force })
-    const entries = (index.modules || []).filter((e) => ID_RE.test(String(e.id))).map((e) => view(index, e))
+    const stats = await statsWithin(index, { force })
+    const counts = stats.counts || {}
+    const released = stats.released || {}
+    const entries = (index.modules || []).filter((e) => ID_RE.test(String(e.id))).map((e) => view(index, e, counts, released))
     // 已安装但索引里没有了（下架）的也列出来，好让用户卸载
     const known = new Set(entries.map((e) => e.id))
-    const delisted = mods.status().filter((m) => !known.has(m.id) && readSource(m.id)).map((m) => ({ id: m.id, name: m.name, description: m.description, version: readSource(m.id).version, installed: readSource(m.id).version, delisted: true, capabilities: [], blocked: '' }))
+    const delisted = mods.status().filter((m) => !known.has(m.id) && readSource(m.id)).map((m) => ({ id: m.id, name: m.name, description: m.description, version: readSource(m.id).version, installed: readSource(m.id).version, delisted: true, capabilities: [], blocked: '', downloads: Number(counts[m.id]) || 0, publishedAt: '', updatedAt: '', releasedAt: released[m.id] || '' }))
     const revoked = entries.concat(delisted).filter((e) => e.installed && revokedReason(index, e.id, e.installed)).map((e) => ({ id: e.id, version: e.installed, reason: revokedReason(index, e.id, e.installed) }))
-    return { list: [...entries, ...delisted], revoked, generatedAt: index.generatedAt || '' }
+    return { list: [...entries, ...delisted], revoked, generatedAt: index.generatedAt || '', downloads: { source: stats.source || '', at: stats.at || 0, failed: Boolean(stats.failed) } }
   }
 
   async function download(index, e) {
     const url = String(index.assetsBase || '') + e.path
     if (!/^https:\/\//.test(url)) throw new Error('下载地址不对')
     const buf = await withRetry(async () => {
-      progress = { id: e.id, name: e.name, stage: 'download', received: 0, total: 0 }
+      // 「一键更新」时外层会先写 batch 进度，这里只改本条目的字段，别把 batch 抹掉
+      progress = { ...(progress || {}), id: e.id, name: e.name, stage: 'download', received: 0, total: 0 }
       const r = await fetcher(url, { signal: AbortSignal.timeout(120_000), redirect: 'follow' })
       if (!r.ok) throw new Error(`下载失败（HTTP ${r.status}）`)
       progress.total = Number(r.headers?.get?.('content-length')) || 0
@@ -220,46 +332,110 @@ export function createCommunity({ mods, getConfig, setConfig, log, version, aliv
     return busy
   }
 
-  /** 安装或更新。同名但不是社区装的文件夹不碰；替换内置模块要明确 confirmReplace。 */
-  const install = (id, { confirmReplace = false } = {}) => exclusive(async () => {
+  /**
+   * 安装或更新的主体（**不含并发锁**）。
+   * 「一键更新」要在同一个 exclusive 里连着跑多个，自己再包一层 exclusive 会锁死自己，
+   * 所以锁留在外层 install()，批量复用它。
+   * 同名但不是社区装的文件夹不碰；替换内置模块要明确 confirmReplace。
+   */
+  async function installNow(id, { confirmReplace = false } = {}) {
     // id 会拼进目录路径（modules/.<id>.installing → modules/<id>）：先白名单，防被篡改的索引/调用方越目录写
     if (typeof id !== 'string' || !ID_RE.test(id)) return { ok: false, message: 'id 不对' }
-    progress = { id, name: id, stage: 'index', received: 0, total: 0 }
+    progress = { ...(progress || {}), id, name: id, stage: 'index', received: 0, total: 0 }
     const index = await loadIndex({ force: true })
     const e = (index.modules || []).find((x) => x.id === id)
     if (!e || e.id !== id) return { ok: false, message: `社区库里没有「${id}」` }
     if (hasFolder(id) && !readSource(id)) return { ok: false, message: `modules/${id} 是你自己的文件夹，不会覆盖；先挪走它` }
-    // 替换内置按真实文件判断：index 里的 replacesBuiltin 可能被篡改/漏填，不能只信它
-    const replacesBuiltin = Boolean(e.replacesBuiltin) || existsSync(join(builtinDir(), id))
+    // 替换内置按「已注册的内置模块」判断：index 里的 replacesBuiltin 可能被篡改/漏填，不能只信它；
+    // 但也不能只看 builtin 目录是否存在——内置搬到社区库后残留的旧目录会让这里误报（群管就是这样）。
+    const builtinRegistered = (() => {
+      try { return mods.status().some((m) => m.id === id && m.builtin === true) } catch { return existsSync(join(builtinDir(), id)) }
+    })()
+    const replacesBuiltin = Boolean(e.replacesBuiltin) || builtinRegistered
     if (replacesBuiltin && !confirmReplace) return { ok: false, needConfirm: true, message: `「${e.name}」会替换内置模块，请确认` }
     const why = blocked(index, e)
     if (why) return { ok: false, message: why }
     const files = readZip(await download(index, e))
-    progress = { id, name: e.name, stage: 'install', received: 0, total: 0 }
+    progress = { ...(progress || {}), id, name: e.name, stage: 'install', received: 0, total: 0 }
     place(e, files)
-    progress = { id, name: e.name, stage: 'start', received: 0, total: 0 }
+    progress = { ...(progress || {}), id, name: e.name, stage: 'start', received: 0, total: 0 }
     await mods.sync()
     const m = mods.status().find((x) => x.id === id)
     if (m?.error) return { ok: false, message: `装好了，但加载失败：${m.error}` }
     log.info(`社区模块「${e.name}」${e.version} 已安装`)
     return { ok: true, message: `「${e.name}」${e.version} 装好了` }
+  }
+
+  /** 安装或更新（带并发锁）。 */
+  const install = (id, opts) => exclusive(() => installNow(id, opts))
+
+  /**
+   * 一键更新：把「已装、索引里有新版本、当前能装」的模块挨个更新一遍。
+   * 整批只占一个 exclusive（不会和自己抢锁）；单个失败不中断后面的。
+   * 替换内置的模块在批量里直接按「已在用」处理（confirmReplace=true），不再逐个弹确认。
+   * @returns {{ok:boolean, updated:object[], failed:object[], skipped:object[], message:string}}
+   */
+  const updateAll = () => exclusive(async () => {
+    const index = await loadIndex({ force: true })
+    const entries = (index.modules || []).filter((e) => ID_RE.test(String(e.id)))
+    const targets = []
+    const skipped = []
+    for (const e of entries) {
+      const src = readSource(e.id)
+      if (!src || compareVersions(e.version, src.version) <= 0) continue // 没装 / 已是最新
+      const why = blocked(index, e)
+      if (why) { skipped.push({ id: e.id, name: e.name, message: why }); continue }
+      targets.push(e)
+    }
+    const updated = []
+    const failed = []
+    for (let i = 0; i < targets.length; i++) {
+      const e = targets[i]
+      if (!alive()) { skipped.push({ id: e.id, name: e.name, message: '插件已卸载，先停下' }); break }
+      progress = { id: e.id, name: e.name, stage: 'index', received: 0, total: 0, batch: { index: i + 1, total: targets.length } }
+      try {
+        const r = await installNow(e.id, { confirmReplace: true })
+        if (r.ok) updated.push({ id: e.id, name: e.name, version: e.version })
+        else failed.push({ id: e.id, name: e.name, message: r.message })
+      } catch (error) {
+        failed.push({ id: e.id, name: e.name, message: String(error?.message || error) })
+      }
+    }
+    if (updated.length) log.info(`模块市场一键更新：成功 ${updated.length} 个${failed.length ? `，失败 ${failed.length} 个` : ''}`)
+    const parts = [`更新了 ${updated.length} 个`]
+    if (failed.length) parts.push(`${failed.length} 个没成功`)
+    if (skipped.length) parts.push(`${skipped.length} 个跳过`)
+    return { ok: failed.length === 0, updated, failed, skipped, message: targets.length || failed.length ? parts.join('，') : '没有可更新的模块' }
   })
 
-  /** 卸载。默认保留 modules-data/<id>/ 和设置；purge 才清掉。 */
+  /** 卸载时归档源码。默认也保留模块数据和设置，purge 才清掉这两项。 */
   const remove = (id, { purge = false } = {}) => exclusive(async () => {
-    if (!ID_RE.test(id)) return { ok: false, message: 'id 不对' }
+    if (typeof id !== 'string' || !ID_RE.test(id)) return { ok: false, message: 'id 不对' }
     if (!readSource(id)) return { ok: false, message: `「${id}」不是从社区库装的，不能在这里卸载` }
-    mods.stop(id)
-    rmSync(dirOf(id), { recursive: true, force: true })
-    if (purge) {
-      rmSync(dataDir('modules-data', id), { recursive: true, force: true })
-      const cfg = getConfig()
-      const { [id]: _ext, ...ext } = cfg.ext || {}
-      const { [id]: _mod, ...modules } = cfg.modules || {}
-      setConfig({ ...cfg, ext, modules })
+    const trash = join(userDir(), '.trash')
+    mkdirSync(trash, { recursive: true })
+    if (!lstatSync(trash).isDirectory() || !lstatSync(dirOf(id)).isDirectory()) {
+      throw new Error('模块目录或 modules/.trash 是链接，无法安全归档')
     }
-    await mods.sync()
-    return { ok: true, message: purge ? '卸载好了，数据和设置也清掉了' : '卸载好了，数据和设置还留着' }
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const folder = `${id}-${stamp}-${randomUUID().slice(0, 8)}`
+    const archive = `modules/.trash/${folder}`
+    mods.stop(id)
+    try {
+      renameSync(dirOf(id), join(trash, folder))
+      log.info(`面板卸载社区模块「${id}」，源码归档到 ${archive}`)
+      if (purge) {
+        rmSync(dataDir('modules-data', id), { recursive: true, force: true })
+        const cfg = getConfig()
+        const { [id]: _ext, ...ext } = cfg.ext || {}
+        const { [id]: _mod, ...modules } = cfg.modules || {}
+        setConfig({ ...cfg, ext, modules })
+      }
+    } finally {
+      await mods.sync()
+    }
+    const dataStatus = purge ? '数据和设置已清除' : '数据和设置已保留'
+    return { ok: true, archive, message: `卸载好了，源码和本地改动已移到 ${archive}。${dataStatus}。` }
   })
 
   /** 升级后把搬走的模块自动装回来：每个 id 只成功处理一次，失败下次启动重试。 */
@@ -284,5 +460,5 @@ export function createCommunity({ mods, getConfig, setConfig, log, version, aliv
     return result
   }
 
-  return { progress: () => progress, list, install, remove, migrate, source: readSource }
+  return { progress: () => progress, registryUrl: registryUrlOf, list, install, updateAll, remove, migrate, source: readSource }
 }

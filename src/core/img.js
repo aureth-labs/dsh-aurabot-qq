@@ -75,7 +75,7 @@ export function shrinkImage(buf, maxSide, ffmpeg, { timeoutMs = 30000 } = {}) {
         '-hide_banner', '-loglevel', 'error', '-nostdin',
         '-i', 'pipe:0',
         '-vf', `scale='min(${maxSide},iw)':-2`,
-        '-q:v', '4', '-f', 'image2', '-c:v', 'mjpeg', 'pipe:1',
+        '-frames:v', '1', '-q:v', '4', '-f', 'image2', '-c:v', 'mjpeg', 'pipe:1',
       ], { windowsHide: true })
     } catch (error) {
       return finish(null)
@@ -102,13 +102,13 @@ export async function imageToolBlock (dsh, buf, { ffmpegPath = '', maxSide = 102
   if (!dsh) return null
   let data = buf
   let mediaType = mimeOf(buf)
-  if (buf.length > maxBytes) {
+  if (buf.length > maxBytes || mediaType === 'image/gif') {
     const ffmpeg = findFfmpeg(ffmpegPath)
     let small = ffmpeg ? await shrinkImage(buf, maxSide, ffmpeg) : null
     // 没装 ffmpeg 时用 DSH 自带的 sharp（libvips），用户不必额外安装
     if (!small) small = await shrinkWithSharp(await findSharp(), buf, maxSide)
     if (!small || small.length > maxBytes) {
-      log?.debug?.(`图片 ${Math.round(buf.length / 1024)}KB 太大又缩不了，工具结果里就不带图了`)
+      log?.debug?.(`图片无法生成安全静态预览，工具结果里就不带图了`)
       return null
     }
     log?.debug?.(`工具结果里的图缩到 ${Math.round(small.length / 1024)}KB（原 ${Math.round(buf.length / 1024)}KB）`)

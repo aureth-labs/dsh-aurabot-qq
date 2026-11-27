@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { startMockOneBot } from './helpers/mock-onebot.js'
 
 const REPO = new URL('..', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')
 const { modelVision, canSeeImages, clearVisionCache } = await import(`file:///${REPO}/src/core/llm.js`)
@@ -104,7 +105,9 @@ test('模型不支持看图：图片换成一行文字提示，这一轮照常�
   const t = fake.turns.at(-1)
   assert.ok(t, '应该跑了一轮')
   assert.equal(t.images, 0, '不该把图片塞给不支持看图的模型')
-  assert.match(String(t.ctxText || t.userText || ''), /看不了图|图片/, '要有文字提示: ' + (t.ctxText || t.userText))
+  // 上下文和用户消息都要看：系统提示里另有注入内容时，不能用 || 短路掉用户消息。
+  const prompt = String(t.ctxText || '') + '\n' + String(t.userText || '')
+  assert.match(prompt, /看不了图|图片/, '要有文字提示: ' + prompt)
 })
 
 test('模型支持看图：图片照常交给她', async () => {
@@ -134,5 +137,42 @@ test('模型看不了图：prompt 钩子还能拿到图片，发给模型前才�
   await sendImage()
   assert.equal(globalThis.__peekImages, 1)
   assert.equal(fake.turns.at(-1).images, 0)
+})
+
+test('文本模型仍把引用图片交给模块处理', async (t) => {
+  const mock = await startMockOneBot({ selfId: BOT })
+  t.after(() => mock.close())
+  const cfg = api.getConfig()
+  api.setConfig({
+    ...cfg,
+    dryRun: false,
+    model: { provider: 'p', model: 'blind', vision: 'off' },
+    snowluma: { ...cfg.snowluma, httpUrl: mock.httpUrl, wsUrl: mock.wsUrl, httpToken: mock.token, wsToken: mock.token },
+  })
+  await fake.call('/onebot/reconnect')
+  mock.state.messages = {
+    7201: {
+      message_id: 7201,
+      sender: { user_id: Number(OWNER), nickname: '主人' },
+      message: [{ type: 'image', data: { sub_type: 0, file: 'base64://' + PNG.toString('base64') } }],
+    },
+  }
+
+  globalThis.__peekImages = -1
+  const firstTurn = fake.turns.length
+  await api.hub.onMessage({
+    post_type: 'message', message_type: 'private', sub_type: 'friend',
+    self_id: Number(BOT), user_id: Number(OWNER), time: Math.floor(Date.now() / 1000),
+    message_id: 7202,
+    message: [{ type: 'reply', data: { id: '7201' } }, { type: 'text', data: { text: '看看引用里的图' } }],
+    sender: { user_id: Number(OWNER), nickname: '主人' },
+  })
+  const deadline = Date.now() + 5000
+  while (fake.turns.length === firstTurn && Date.now() < deadline) await wait(50)
+  const turn = fake.turns[firstTurn]
+  assert.ok(turn, '引用消息应进入聊天轮次')
+  assert.equal(mock.sent('get_msg').length, 1)
+  assert.equal(globalThis.__peekImages, 1)
+  assert.equal(turn.images, 0)
 })
 

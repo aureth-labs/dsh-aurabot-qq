@@ -30,7 +30,9 @@ export function createApprovalRelay({ getConfig, deliver, chatOfSession, timeout
     const left = queue.length - 1
     const lines = ['【要授权】' + (item.toolName || '未知工具')]
     if (item.reason) lines.push('原因：' + String(item.reason).slice(0, 300))
-    lines.push(`回复「确认」批准这一次，回复「取消」拒绝；${Math.round(timeoutMs / 60_000)} 分钟没回就不批。` + (left ? `后面还有 ${left} 条。` : ''))
+    // 等待时长可配置：不到 1 分钟就按秒说，别显示「0 分钟」
+    const waitText = timeoutMs >= 60_000 ? `${Math.round(timeoutMs / 60_000)} 分钟` : `${Math.max(1, Math.round(timeoutMs / 1000))} 秒`
+    lines.push(`回复「确认」批准这一次，回复「取消」拒绝；${waitText}没回就不批。` + (left ? `后面还有 ${left} 条。` : ''))
     item.timer = setTimeout(() => {
       settle(item, 'unavailable')
       send(`「${item.toolName}」的授权超时了，没有批准。`)

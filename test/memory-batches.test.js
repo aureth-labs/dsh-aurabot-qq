@@ -32,7 +32,7 @@ function setup(t, lines, day = dateKey(new Date())) {
   } } }
   const hub = { chatLogDays: () => [...logs.keys()], chatLogOf: (d) => logs.get(d) || [], deleteChatLog: (d) => logs.delete(d) }
   const cfg = normalize({ model: { provider: 'p', model: 'm' }, memory: { keepChatlogDays: 0, keepChatlogSet: true, gistDailyBatches: 12 } })
-  const make = () => createMemoryStore({ dsh, getConfig: () => cfg, hub, log })
+  const make = (extra = {}) => createMemoryStore({ dsh, getConfig: () => cfg, hub: { ...hub, ...extra }, log })
   t.after(() => {
     if (old === undefined) delete process.env.AURABOT_DATA_DIR
     else process.env.AURABOT_DATA_DIR = old
@@ -122,4 +122,47 @@ test('单条聊天和只含机器人的批次也送去提炼，新增流水不�
   s.logs.get(s.day).push({ chatId: 'private:2', who: '朋友', text: '消息-1-结束' })
   await mem.consolidate({ includeToday: true })
   assert.deepEqual(ids(s.calls), [0, 1])
+})
+
+
+test('她有回合在跑时，后台提炼立刻让路，已完成的批次进度保留（#376）', async (t) => {
+  const lines = linesOf(1500)
+  const yesterday = dateKey(new Date(Date.now() - 86400_000))
+  const s = setup(t, lines, yesterday)
+  let busy = false
+  let mem = s.make({ busy: () => busy })
+  const first = await mem.consolidate({ background: true })
+  assert.equal(first.ok, true)
+  const before = s.calls.length
+  assert.ok(before > 0 && before <= 12, '第一轮只做一部分（EXTRACT_LIMIT 上限），剩下的留着')
+  const progressAfterFirst = s.progress()
+
+  busy = true
+  const second = await mem.consolidate({ background: true })
+  assert.equal(second.ok, true)
+  assert.equal(s.calls.length, before, '回合进行中不再抢模型端点')
+  assert.deepEqual(s.progress(), progressAfterFirst, '进度原样保留，下一轮从断点继续')
+
+  busy = false
+  mem = s.make({ busy: () => busy })
+  for (let i = 0; i < 5 && s.logs.has(yesterday); i++) {
+    const r = await mem.consolidate({ background: true })
+    assert.equal(r.ok, true)
+  }
+  assert.deepEqual(ids(s.calls), lines.map((_, i) => i))
+  assert.equal(s.progress().offset, lines.length, '全部流水都已提炼完成')
+})
+
+test('手动整理不因为她在说话而半途让路（后台才让，人点了就得跑完）', async (t) => {
+  const lines = linesOf(1500)
+  const yesterday = dateKey(new Date(Date.now() - 86400_000))
+  const s = setup(t, lines, yesterday)
+  // 一开始就有回合在跑：后台整理会整轮跳过，手动整理必须照常提炼并把往日流水清掉。
+  const mem = s.make({ busy: () => true })
+  for (let i = 0; i < 5 && s.logs.has(yesterday); i++) {
+    const r = await mem.consolidate({ includeToday: true })
+    assert.equal(r.ok, true)
+  }
+  assert.ok(s.calls.length > 0, '手动整理不能被回合挡回去')
+  assert.equal(s.progress().offset, lines.length, '往日流水反复手动整理能提炼完，不会卡在让路')
 })

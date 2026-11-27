@@ -23,7 +23,7 @@ export function savePainting (buf, prompt, { now = new Date() } = {}) {
     const p = (n) => String(n).padStart(2, '0')
     const stamp = `${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}-${p(now.getHours())}${p(now.getMinutes())}${p(now.getSeconds())}`
     const slug = String(prompt || '图').replace(/[\\/:*?"<>|\s]+/g, '-').slice(0, 20)
-    const ext = mimeOf(buf) === 'image/jpeg' ? 'jpg' : 'png'
+    const ext = ({ 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' })[mimeOf(buf)] || 'png'
     const file = join(d, `${stamp}-${slug}.${ext}`)
     writeFileSync(file, buf)
     return file

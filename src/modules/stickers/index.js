@@ -2,10 +2,11 @@
 // 导出的就是表情库（createStickerStore 的返回值），聊天中枢发表情、偷表情都找它。
 
 import { readFileSync, existsSync } from 'node:fs'
-import { createStickerStore, stickerPath } from '../../features/stickers.js'
+import { createStickerStore, stickerPath, MAX_STICKER_BYTES, PANEL_UPLOAD_MAX_BYTES } from '../../features/stickers.js'
 import { defineTool, int, str } from '../../tools/tools.js'
-import { fetchImage, segmentBytes } from '../../core/net.js'
+import { fetchImage, segmentBytes, formatBytes } from '../../core/net.js'
 import { resolvePainting } from '../../features/paintings.js'
+import { imageSize } from '../../chat/inbound.js'
 
 export default {
   id: 'stickers',
@@ -78,12 +79,13 @@ export default {
         description: '悄悄把聊天里刚出现的表情收进自己的表情库（喜欢才收，不喜欢就别调）。index 从 1 开始；name 是你给它起的名字。收表情是你自己的小习惯，通常不用跟对方说你收没收到。主人让你收哪张，你收哪张（「只听主人的」模式下：主人私聊里可以自己挑着收；群里这一轮只有主人说话时也能自己收，有别人在场就要等主人发话）。传 painting（画作编号，如 #1）时，收的是你自己刚画的那张图，不是聊天里的表情。',
         properties: {
           index: int('第几张表情（从 1 开始，默认 1）'),
+          latest_image: { type: 'boolean', description: '仅当对方明确要求收藏一张以普通图片发来的表情时设为 true，选最近一张图片（近方形且最长边不超过 1024 像素），与 index、painting 二选一' },
           name: str('给它起的名字（≤12 字）'),
           tags: { type: 'array', items: { type: 'string' }, description: '标签，如 开心/委屈' },
           painting: str('画作编号（如 #1）：收你自己刚画的图时填，和 index 二选一'),
         },
         required: [],
-        execute: async ({ index, name, tags, painting }) => {
+        execute: async ({ index, name, tags, painting, latest_image }) => {
           // 收自己的画：不受「只听主人的」限制（这是她自己画的，不是别人的表情）
           if (painting) {
             const p = resolvePainting(current, painting)
@@ -108,13 +110,26 @@ export default {
           if (mode === 'owner' && !hub.turnSendersAllOwner(sessionId)) {
             return { ok: false, message: '现在是「只听主人的」模式：这一轮有别人在，得主人让我收才行' }
           }
-          const seg = hub.stickerOf(current, index || 1)
+          if (latest_image && !(current.startsWith('group:') ? api.config().stickers.fromGroups : api.config().stickers.fromPrivate)) {
+            return { ok: false, message: '没有开启从这个会话收表情' }
+          }
+          const photo = latest_image ? hub.recentMedia(current).at(-1) : null
+          const seg = latest_image
+            ? (photo?.seg.type === 'image' && !photo.sticker ? photo.seg : null)
+            : hub.stickerOf(current, index || 1)
           if (!seg) return { ok: false, message: '这张表情已经拿不到了（超过 30 分钟，或者这一轮里没有这张）' }
           let buf
           try {
-            buf = await segmentBytes(seg, onebot, { maxBytes: 5 * 1024 * 1024 })
+            buf = await segmentBytes(seg, onebot, { maxBytes: MAX_STICKER_BYTES })
           } catch (error) {
             return { ok: false, message: '这张表情下载失败了：' + error.message }
+          }
+          if (latest_image) {
+            const { width, height } = imageSize(buf)
+            const ratio = width / height
+            if (!(ratio >= 0.75 && ratio <= 4 / 3) || Math.max(width, height) > 1024) {
+              return { ok: false, message: '普通图片需要近方形且最长边不超过 1024 像素才能作为表情收藏' }
+            }
           }
           const r = await store.addFromBuffer(buf, {
             name: String(name || '').trim().slice(0, 12),
@@ -152,7 +167,13 @@ export default {
             // 优先主人自己发的，其次这个聊天里最近的
             const pick = media.filter((x) => x.userId === String(api.config().ownerQQ)).at(-1) || media.at(-1)
             if (!pick) return { ok: false, message: '最近半小时这个聊天里没有人发表情或图片，先把那张发过来' }
-            buf = await segmentBytes(pick.seg, api.core.onebot, { maxBytes: 5 * 1024 * 1024 })
+            // 下载失败要说清是哪一步、多大：以前这里没 try，异常直接冒到工具层，
+            // 模型只看到三个字「太大了」，只能让主人换一张反复试（#332）
+            try {
+              buf = await segmentBytes(pick.seg, api.core.onebot, { maxBytes: MAX_STICKER_BYTES })
+            } catch (error) {
+              return { ok: false, message: '这张表情下载失败了：' + error.message }
+            }
           }
           const r = await store.addFromBuffer(buf, { name: String(name || '').slice(0, 12), tags: Array.isArray(tags) ? tags.slice(0, 3) : [], from: 'tool' })
           if (!r.ok) return { ok: false, message: r.reason || '没存成' }
@@ -175,7 +196,12 @@ export default {
         properties: { source: str('本地路径或 http(s) 地址'), name: str('备注（≤12 字）'), tags: { type: 'array', items: { type: 'string' }, description: '标签，如 开心/委屈' } },
         required: ['source'],
         execute: async ({ source, name, tags }) => {
-          const buf = await fetchImage(String(source), { maxBytes: 5 * 1024 * 1024 })
+          let buf
+          try {
+            buf = await fetchImage(String(source), { maxBytes: MAX_STICKER_BYTES })
+          } catch (error) {
+            return { ok: false, message: '这张图取不下来：' + error.message }
+          }
           const r = await store.addFromBuffer(buf, { name: name || '', tags: Array.isArray(tags) ? tags.slice(0, 3) : [], from: 'tool' })
           return r.ok ? { ok: true, message: r.existed ? '库里已经有这张了' : `收好了「${r.item.name || '未命名'}」` } : { ok: false, message: r.reason }
         },
@@ -183,7 +209,13 @@ export default {
       return tools
     })
 
-    api.route('/stickers', async () => ({ ok: true, items: store.library().items.slice().reverse() }))
+    api.route('/stickers', async (req) => {
+      const q = http.query(req)
+      const limit = Math.min(200, Math.max(1, Math.trunc(Number(q.limit) || 40)))
+      const offset = Math.max(0, Math.trunc(Number(q.offset) || 0))
+      const all = store.library().items.slice().reverse()
+      return { ok: true, items: all.slice(offset, offset + limit), total: all.length, hasMore: offset + limit < all.length }
+    })
     api.route('/sticker/image', async (req, res) => {
       const it = store.library().items.find((i) => i.md5 === http.query(req).md5)
       if (!it || !existsSync(stickerPath(it))) return http.send(res, 404, '')
@@ -216,7 +248,10 @@ export default {
     api.route('/sticker/upload', async (req) => {
       const b = await http.body(req)
       const buf = Buffer.from(String(b.data || '').replace(/^data:[^,]+,/, ''), 'base64')
-      if (!buf.length || buf.length > 5 * 1024 * 1024) return { ok: false, message: '图片太大或是空的' }
+      if (!buf.length) return { ok: false, message: '图片是空的' }
+      // 面板上传走 JSON + base64（体积 ×1.33 且整个在内存里），
+      // 所以这里比 QQ 侧的 MAX_STICKER_BYTES 小：QQ 动图那点体积够用，别让浏览器把内存撑爆。
+      if (buf.length > PANEL_UPLOAD_MAX_BYTES) return { ok: false, message: `图片太大：${formatBytes(buf.length)}，面板上传最多 ${formatBytes(PANEL_UPLOAD_MAX_BYTES)}` }
       return store.addFromBuffer(buf, { name: b.name || '', tags: b.tags || [], from: 'panel' })
     })
 

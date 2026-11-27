@@ -8,6 +8,8 @@ import { Script } from 'node:vm'
 import { normalize } from '../src/core/config.js'
 import { createMemoryStore } from '../src/features/memory.js'
 import { readMemoryState } from './helpers/memory-state.js'
+import { createFakeDsh } from './helpers/fake-dsh.js'
+import { createConversationArchive } from '../src/chat/conversation-context.js'
 import memoryModule from '../src/modules/memory/index.js'
 
 const OWNER = '10000001'
@@ -61,7 +63,7 @@ function setup(t) {
       { uid: ALICE, who: 'bot', t: now - 10 },
     ],
   }
-  const cfg = normalize({ ownerQQ: OWNER, memory: { dailyConsolidate: false } })
+  const cfg = normalize({ ownerQQ: OWNER, allow: { private: [ALICE, BOB, '424242'] }, memory: { dailyConsolidate: false } })
   const make = () => createMemoryStore({ getConfig: () => cfg, hub, log })
   const state = () => readMemoryState(dir)
   t.after(() => {
@@ -217,26 +219,36 @@ test('面板注册人物记忆及四个子页，旧人格页仍可访问', () =>
   }
   const { panelTest: panel } = loader.factory(() => React)
   const tabs = Array.from(panel.TABS)
-  assert.equal(tabs.filter((tab) => tab.id === 'persona').length, 1)
-  assert.equal(tabs.find((tab) => tab.id === 'persona').label, '人物记忆')
-  assert.equal(tabs.findIndex((tab) => tab.id === 'persona'), tabs.findIndex((tab) => tab.id === 'mood') + 1)
+  // 【阶段三改版】persona 独立页签已并入「记忆」页（MemoryTab 双视图）：TABS 里不再有 persona
+  assert.equal(tabs.filter((tab) => tab.id === 'persona').length, 0)
+  assert.equal(tabs.find((tab) => tab.id === 'memory').label, '记忆')
+  // 心情与记忆仍是两页：心情(mood) → 记忆(memory)
+  assert.equal(tabs.findIndex((tab) => tab.id === 'memory'), tabs.findIndex((tab) => tab.id === 'mood') + 1)
   assert.equal(tabs.find((tab) => tab.id === 'character').label, '人格')
-  assert.deepEqual(Array.from(panel.TAB_MODS.persona), ['memory'])
+  // 旧 TAB_MODS.persona=['memory'] 删除；persona 模块并进 TAB_MODS.memory
+  assert.ok(!panel.TAB_MODS.persona, 'TAB_MODS 不能再有 persona 键')
+  assert.ok(Array.from(panel.TAB_MODS.memory).includes('persona'), 'persona 模块归到 memory 页')
+  assert.ok(Array.from(panel.TAB_MODS.memory).includes('memory'))
   const self = panel.NAV_GROUPS.find((group) => group.id === 'self')
-  assert.ok(self.tabs.indexOf('persona') > self.tabs.indexOf('mood'))
+  assert.ok(!self.tabs.includes('persona'), 'self 组里不能再有 persona')
   assert.match(source, /character: Persona/)
-  assert.match(source, /persona: PersonaMemory/)
+  // 人物画像不再直挂页签：persona: PersonaMemory 映射删除，改由 MemoryTab 在「人物」视图内部挂载
+  assert.ok(!/persona: PersonaMemory/.test(source))
+  assert.match(source, /memory: MemoryTab/)
   assert.ok(!source.slice(source.indexOf('function Mood('), source.indexOf('const PERSON_FIELDS')).includes('ProfilesCard'))
 
   const render = () => { hook = 0; return panel.PersonaMemory({ toast() {} }) }
   let tree = render()
   const seg = tree.children[0].children[0]
-  assert.deepEqual(Array.from(seg.props.options, (o) => o.label), ['人物墙', '群印象', '时间轴'])
-  assert.equal(tree.children[1].type.name, 'PersonaWall')
+  assert.deepEqual(Array.from(seg.props.options, (o) => o.label), ['人物墙', '关系星图', '群印象', '时间轴'])
+  assert.equal(tree.children[1].type.name, 'MemoryPlatforms')
+  assert.equal(tree.children[2].type.name, 'PersonaWall')
+  seg.props.onChange('graph')
+  assert.equal(render().children[2].type.name, 'PersonaGraph')
   seg.props.onChange('chats')
-  assert.equal(render().children[1].type.name, 'PersonaChats')
+  assert.equal(render().children[2].type.name, 'PersonaChats')
   seg.props.onChange('timeline')
-  assert.equal(render().children[1].type.name, 'PersonaTimeline')
+  assert.equal(render().children[2].type.name, 'PersonaTimeline')
 
   const text = (node) => (node == null || node === false ? '' : typeof node !== 'object' ? String(node) : Array.isArray(node) ? node.map(text).join('') : text(node.children))
   state.length = 0; hook = 0
@@ -248,16 +260,33 @@ test('面板注册人物记忆及四个子页，旧人格页仍可访问', () =>
   assert.match(text(line), /主人爱我/)
   assert.match(text(line), /私聊 123/)
 
+  // 迁移历史语义（persona-tab-v2 哨兵，阶段三前）：
+  // 无 v2 哨兵的更老数据（tab=persona 指旧「人格」页）→ 按历史规则迁到 character
   storage.set('aurabot.tab', 'persona')
   storage.set('aurabot.navlast', JSON.stringify({ self: 'persona' }))
+  storage.delete('aurabot.persona-tab-v2')
+  storage.delete('aurabot.memory-tab-v1')
   state.length = 0; hook = 0
   panel.AurabotPage()
-  assert.equal(state[3], 'character', '旧版选中的人格页迁移到新标识')
+  assert.equal(state[3], 'character', '无 v2 哨兵的老数据：旧人格页仍按历史规则迁移到 character')
   assert.equal(JSON.parse(storage.get('aurabot.navlast')).self, 'character')
+  // 新语义（memory-tab-v1 哨兵，阶段三）：persona 页签迁到 memory + 「人物」子视图
+  storage.set('aurabot.tab', 'persona')
+  storage.set('aurabot.navlast', JSON.stringify({ self: 'persona' }))
+  storage.set('aurabot.persona-tab-v2', '1') // 已是阶段二后用户：v2 块跳过，memory 块接管
+  storage.delete('aurabot.memory-tab-v1')
+  state.length = 0; hook = 0
+  panel.AurabotPage()
+  assert.equal(state[3], 'memory', '有 v2 哨兵：persona 页签迁到 memory')
+  assert.equal(storage.get('aurabot.memory-view'), 'person', '迁移要顺带选中「人物」子视图')
+  assert.equal(JSON.parse(storage.get('aurabot.navlast')).self, 'memory')
+  assert.equal(storage.get('aurabot.memory-tab-v1'), '1')
+  // 哨兵只生效一次：两哨兵都在时不再动用户的 tab
   storage.set('aurabot.tab', 'persona')
   state.length = 0; hook = 0
   panel.AurabotPage()
-  assert.equal(state[3], 'persona', '迁移之后可以记住新的人物记忆页')
+  assert.equal(storage.get('aurabot.tab'), 'persona', '哨兵生效后不再迁移')
+  assert.equal(storage.get('aurabot.memory-view'), 'person', '哨兵生效后不覆盖子视图选择')
 })
 
 test('相处经验归到人物和群下面；只有经验的人和群也列得出来', (t) => {
@@ -305,6 +334,7 @@ test('人物关系：只认本人或主人说的，别人传的和规则都不�
   const names = new Map([['111', '小明'], ['222', '路人'], ['999', '主人']])
   const base = { chatId: 'group:1', names, owner: '999' }
   assert.equal(normalizeRelation({ subj: '小明', pred: '的女朋友是', obj: '阿花', speaker: '111' }, base).subj, '小明')
+  assert.deepEqual([normalizeRelation({ subj: '主人', pred: '是', obj: '小明', speaker: '111' }, base).subj, normalizeRelation({ subj: '主人', pred: '是', obj: '小明', speaker: '111' }, base).obj], ['小明', '主人'], '说话人被写成宾语时要翻回主语')
   assert.equal(normalizeRelation({ subj: '小明', pred: '的女朋友是', obj: '阿花', speaker: '222' }, base), null)
   assert.ok(normalizeRelation({ subj: '小明', pred: '的女朋友是', obj: '阿花', speaker: '999' }, base))
   assert.equal(normalizeRelation({ subj: '小明', pred: '的女朋友是', obj: '阿花', speaker: '333' }, base), null, '不在这批发言人里')
@@ -361,4 +391,124 @@ test('人物关系进常驻上下文，说忘掉时一起忘', (t) => {
   assert.match(mem.contextFor(chat, 's'), /人物关系.*奶茶店老板/)
   mem.handleCommand(chat, '忘掉奶茶店')
   assert.doesNotMatch(mem.contextFor(chat, 's'), /奶茶店老板/)
+})
+
+test('面板一键清理按 QQ 隔离，旧流水不再读入，下一条私聊走新会话', async (t) => {
+  const s = setup(t)
+  const dir = process.env.AURABOT_DATA_DIR
+  const chatId = `private:${ALICE}`
+  const oldSession = 'old-alice-session'
+  const debugSession = 'old-alice-debug-session'
+  writeFileSync(join(dir, 'sessions.json'), JSON.stringify({ chats: { [chatId]: { sessionId: oldSession, sessions: { live: oldSession, debug: debugSession } } } }))
+  writeFileSync(join(dir, 'config.json'), JSON.stringify({ enabled: true, dryRun: true, setupDone: true,
+    ownerQQ: OWNER, botQQ: '20000002', allow: { private: [ALICE, BOB] }, workspaceDir: join(dir, 'workspace'),
+    snowluma: { autoStart: false, autoAttach: false }, chat: { seedHistory: true }, conversationContext: { enabled: true }, memory: { dailyConsolidate: false } }))
+  const fake = createFakeDsh({ brain: async () => '' })
+  try {
+    const { apply } = await import('../src/host.js')
+    const api = apply(fake.ctx)
+    await api.ready
+    const memory = api.modules.use('memory')
+    const archive = createConversationArchive({ directory: join(dir, 'conversation-context'), namespace: api.getConfig().persona.current })
+    archive.append(chatId, { role: 'user', speakerId: ALICE, text: '清理前归档的原话', at: s.now - 1000 })
+    assert.equal(api.hub.recentMessagesOf(chatId).at(-1).text, '清理前归档的原话')
+    memory.setInsights(`qq:${ALICE}`, ['旧的相处经验'])
+    memory.setStyle(`qq:${ALICE}`, ['旧的说话方式'])
+    memory.setInsights(`qq:${BOB}`, ['其他人的经验'])
+    memory.saveRelation({ ...relation({ subjQq: ALICE }), id: 'alice-relation' })
+    memory.saveRelation({ ...relation({ subjQq: BOB, obj: '另一个人' }), id: 'bob-relation' })
+    api.hub.logChat(chatId, '用户', '清理前的私聊', ALICE, { at: s.now - 1000 })
+    api.hub.logChat('group:777', '用户', '清理前的群发言', ALICE, { at: s.now - 1000 })
+    api.hub.logChat('group:777', '其他人', '其他人的群发言', BOB, { at: s.now - 1000 })
+    const headers = { 'content-type': 'application/json' }
+    assert.equal((await fake.call('/persona/person/reset', { qq: ALICE }, { ...headers, host: 'evil.example' })).status, 403)
+    assert.equal((await fake.call(`/persona/person/reset?qq=${ALICE}`)).json().ok, false)
+    assert.equal((await fake.call('/persona/person/reset', { qq: ALICE }, { ...headers, origin: 'https://evil.example' })).status, 403)
+    assert.equal((await fake.call('/persona/person/reset', { qq: ALICE }, { ...headers, 'content-type': 'text/plain' })).json().ok, false)
+    assert.ok(memory.personaPerson(ALICE))
+    assert.equal((await fake.call('/persona/person/reset', { qq: ALICE }, headers)).json().ok, true)
+    assert.equal(memory.personaPerson(ALICE), null)
+    assert.deepEqual(api.hub.recentMessagesOf(chatId), [])
+    assert.deepEqual(memory.personaPerson(BOB).insights.map((entry) => entry.text), ['其他人的经验'])
+    assert.ok(memory.gists().some((entry) => entry.id === 'group-gist'))
+    assert.equal(memory.chats().find((entry) => entry.chatId === 'group:777').impression, '很友好')
+    assert.deepEqual(api.getConfig().allow.private, [ALICE, BOB])
+    assert.equal(api.hub.chatOfSession(oldSession), '')
+    assert.deepEqual(fake.ctx.workspaceRegistry.archivedSessionIds, [oldSession, debugSession])
+    assert.equal(api.hub.chatOfSession(debugSession), '')
+    const day = api.hub.chatLogDays()[0]
+    const rows = () => api.hub.chatLogOf(day)
+    assert.deepEqual(rows().map((entry) => entry.text), ['', '', '其他人的群发言'])
+    assert.ok(rows().slice(0, 2).every((entry) => entry.forgottenAt))
+    const cutoff = api.hub.memoryResetAt(ALICE)
+    assert.equal(JSON.parse(readFileSync(join(dir, 'sessions.json'), 'utf8')).memoryCutoffs[ALICE], cutoff)
+    api.hub.logChat(chatId, '用户', '清理后新消息', ALICE, { at: cutoff + 1000 })
+    assert.equal(rows().at(-1).text, '清理后新消息')
+    assert.equal(api.hub.logChat(chatId, '用户', '旧消息迟到', ALICE, { at: cutoff - 1 }), false)
+    assert.deepEqual(api.hub.filterHistory('group:777', [
+      { user_id: ALICE, time: cutoff - 1, message: '旧群消息' },
+      { user_id: BOB, time: cutoff - 1, message: '其他人的群消息' },
+    ]).map((message) => message.message), ['其他人的群消息'])
+    api.setConfig({ ...api.getConfig(), dryRun: false })
+    api.onebot.call = async (action) => {
+      assert.equal(action, 'get_friend_msg_history')
+      return { messages: [
+        { time: Math.floor((cutoff - 10000) / 1000), message: 'QQ 历史里的旧消息' },
+        { message: 'QQ 历史里没有时间的消息' },
+        { time: Math.ceil((cutoff + 1000) / 1000), message: 'QQ 历史里的新消息' },
+      ] }
+    }
+    await api.hub.pushToSession({ chatId, kind: 'private', userId: ALICE }, [{ type: 'text', text: '你好' }], ALICE)
+    assert.notEqual(fake.turns.at(-1).sessionId, oldSession)
+    assert.match(fake.turns.at(-1).userText, /QQ 历史里的新消息/)
+    assert.doesNotMatch(fake.turns.at(-1).userText, /旧消息|没有时间/)
+    const tools = api.modules.buildTools({ chat: { chatId, kind: 'private', userId: ALICE }, level: 'social', sessionId: fake.turns.at(-1).sessionId })
+    const result = await tools.find((tool) => tool.name === 'qq_chat_history').execute({})
+    assert.match(result.message, /QQ 历史里的新消息/)
+    assert.doesNotMatch(result.message, /旧消息|没有时间/)
+    assert.equal(api.hub.recentMessagesOf(chatId).at(-1).text, '你好')
+    memory.setNoMemory(BOB, true)
+    assert.equal((await fake.call('/persona/person/reset', { qq: BOB }, headers)).json().ok, true)
+    assert.equal(memory.remembers(BOB), false)
+    assert.equal((await fake.call('/persona/person/reset', { qq: OWNER }, headers)).json().ok, true)
+    assert.equal(api.getConfig().ownerQQ, OWNER)
+    assert.equal(memory.remembers(OWNER), true)
+  } finally { fake.dispose() }
+})
+
+test('待重写的人物小档案仍显示旧正文，不因重写失败变空白（#107）', (t) => {
+  const s = setup(t)
+  const mem = s.make()
+  const detail = mem.personaPerson(ALICE)
+  assert.equal(detail.person.text, '旧档案')
+  assert.equal(detail.person.stale, true)
+})
+
+test('手填字段记成 ownerFields，画像作废重建也不丢（#590）', async (t) => {
+  const s = setup(t)
+  const mem = s.make()
+  assert.equal(mem.savePersonaPerson(ALICE, { style: '说话很轻', persona: '安静', handle: '先问再答' }).ok, true)
+  let state = s.state()
+  assert.deepEqual(new Set(state.profiles[ALICE].ownerFields), new Set(['style', 'persona', 'handle']))
+
+  // 记忆变动 → 画像作废，手填字段要留下，自动字段被清掉
+  mem.update('alice-fact', { text: '阿明开始学油画' })
+  state = s.state()
+  const after = state.profiles[ALICE]
+  assert.equal(after.style, '说话很轻', '手填的说话方式不能被作废丢掉')
+  assert.equal(after.persona, '安静')
+  assert.equal(after.handle, '先问再答')
+  assert.deepEqual(after.ownerFields, state.profiles[ALICE].ownerFields)
+
+  // 面板读到的是手填内容，不是「还不了解」
+  const person = s.make().personaPerson(ALICE).person
+  assert.equal(person.style, '说话很轻')
+  assert.equal(person.persona, '安静')
+
+  // 清空等于交还给自动整理
+  assert.equal(mem.savePersonaPerson(ALICE, { style: '' }).ok, true)
+  state = s.state()
+  assert.equal(state.profiles[ALICE].style, '')
+  assert.ok(!(state.profiles[ALICE].ownerFields || []).includes('style'))
+  assert.ok((state.profiles[ALICE].ownerFields || []).includes('persona'))
 })

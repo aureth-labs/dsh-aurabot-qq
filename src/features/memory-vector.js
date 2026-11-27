@@ -1,9 +1,17 @@
-// 实验性语义索引：向量存在本机，文字只发给用户配置的 embedding 服务。
+// 实验性语义索引：两种模式
+//   local  —— 用本机 bge-small 小模型，纯离线，不联网（默认推荐）
+//   remote —— 把文字发给用户配置的兼容 OpenAI 的 embedding 服务
+// 向量本身都只存在本机；开关默认关闭，用户主动打开才生效。
 import { createHash } from 'node:crypto'
+import { join } from 'node:path'
+import { STATUS_CODES } from 'node:http'
+import { recordRetrievalUsage } from '../core/usage.js'
 import { dataDir, readJson, writeJson } from '../core/store.js'
+import { createLocalVectorIndex } from './memory-vector-local.js'
 
-const BATCH = 32
-const QUERY_TIMEOUT = 2000
+// 一批多少条：方舟等服务的单次 input 上限比 OpenAI 小，默认 10 最稳；面板可调。
+const DEFAULT_BATCH = 10
+const DEFAULT_QUERY_TIMEOUT = 3000
 const SYNC_TIMEOUT = 30_000
 const COOLDOWN = 10 * 60_000
 const CACHE_TTL = 5 * 60_000
@@ -11,9 +19,54 @@ const hash = (s) => createHash('sha256').update(s).digest('hex')
 const stamp = (text, vec) => hash(JSON.stringify([String(text || ''), vec]))
 const validVector = (v, dims) => Array.isArray(v) && v.length > 0 && (!dims || v.length === dims) && v.every((n) => typeof n === 'number' && Number.isFinite(n)) && v.some((n) => n !== 0)
 
-export function createVectorIndex({ getConfig, log, fetchImpl = globalThis.fetch }) {
-  const file = () => dataDir('memory-vectors.json')
-  const metaFile = () => dataDir('memory-vectors-meta.json')
+/** 请求头：一行一个「Key: Value」；也兼容手写成对象。 */
+function parseHeaders(raw) {
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) return { ...raw }
+  const out = {}
+  for (const line of String(raw || '').split(/\r?\n/)) {
+    const s = line.trim()
+    if (!s || s.startsWith('#')) continue
+    const i = s.indexOf(':')
+    if (i <= 0) continue
+    const k = s.slice(0, i).trim()
+    const v = s.slice(i + 1).trim()
+    if (k && v) out[k] = v
+  }
+  return out
+}
+
+/** 有的网关用 base64 返回 float32 数组；统一成普通数组再校验。 */
+function toVector(v) {
+  if (Array.isArray(v)) return v
+  if (typeof v !== 'string' || !v) return v
+  try {
+    const bytes = Uint8Array.from(Buffer.from(v, 'base64'))
+    return Array.from(new Float32Array(bytes.buffer, 0, Math.floor(bytes.length / 4)))
+  } catch (error) { return v }
+}
+
+function failureMessage(error, c, texts) {
+  if (Number.isInteger(error?.httpStatus)) return error.message
+  let message = String(error?.message || error || '请求失败')
+  const code = error?.cause?.code || error?.code
+  if (typeof code === 'string' && !message.includes(code)) message += ` (${code})`
+  const headerValues = Object.values(c.headers).map(String)
+  const credentials = headerValues.flatMap((value) => [value, value.replace(/^(?:Bearer|Basic)\s+/i, '')])
+  const privateValues = [c.apiKey, ...credentials, ...texts.map((text) => String(text || ''))].filter(Boolean)
+  for (const value of privateValues.sort((a, b) => b.length - a.length)) {
+    for (const variant of new Set([value, JSON.stringify(value).slice(1, -1), encodeURIComponent(value.toWellFormed())])) {
+      message = message.replaceAll(variant, '[已隐藏]')
+    }
+  }
+  // fetch 的异常可能附带带票据的 URL；只保留请求失败文案。
+  message = message.replace(/https?:\/\/[^\s<>"']+/gi, '[地址已隐藏]')
+  return message.replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 500)
+}
+
+/** directory：索引文件放在哪个人格的数据目录（默认根目录）。 */
+export function createVectorIndex({ getConfig, log, fetchImpl = globalThis.fetch, directory = dataDir() }) {
+  const file = () => join(directory, 'memory-vectors.json')
+  const metaFile = () => join(directory, 'memory-vectors-meta.json')
   let data, meta
   let loaded = false
   let identity = ''
@@ -22,6 +75,9 @@ export function createVectorIndex({ getConfig, log, fetchImpl = globalThis.fetch
   let retryAt = 0
   let syncing = null
   let needsSave = false
+  let lastError = ''
+  let lastErrorAt = null
+  let errorKey = ''
   const cache = new Map()
   const pending = new Map()
   const verified = new Map()
@@ -42,21 +98,30 @@ export function createVectorIndex({ getConfig, log, fetchImpl = globalThis.fetch
     const memory = getConfig()?.memory
     const c = memory?.vector
     if (memory?.enabled === false || c?.enabled !== true) return null
-    const baseUrl = String(c.baseUrl || '').trim().replace(/\/+$/, '')
+    // 只填到 /v1；误贴完整 /embeddings 时自动去掉，避免拼成双路径 404
+    const baseUrl = String(c.baseUrl || '').trim().replace(/\/+$/, '').replace(/\/embeddings\/?$/i, '')
     const model = String(c.model || '').trim()
     if (!baseUrl || !model) return null
     try {
       const url = new URL(baseUrl)
       if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) return null
     } catch (error) { return null }
-    return { baseUrl, model, apiKey: String(c.apiKey || '') }
+    return {
+      baseUrl,
+      model,
+      apiKey: String(c.apiKey || ''),
+      dimensions: Math.max(0, Math.min(8192, Math.round(Number(c.dimensions) || 0))),
+      batchSize: Math.max(1, Math.min(64, Math.round(Number(c.batchSize) || DEFAULT_BATCH))),
+      queryTimeoutMs: Math.max(500, Math.min(15_000, Number(c.queryTimeoutMs) || DEFAULT_QUERY_TIMEOUT)),
+      headers: parseHeaders(c.headers),
+    }
   }
 
   function prepare() {
     const c = settings()
     if (!c) return null
     load()
-    const key = JSON.stringify([c.baseUrl, c.model, c.apiKey])
+    const key = JSON.stringify([c.baseUrl, c.model, c.apiKey, c.dimensions])
     if (key !== identity) {
       identity = key
       generation++
@@ -78,15 +143,17 @@ export function createVectorIndex({ getConfig, log, fetchImpl = globalThis.fetch
 
   function current(c) {
     const next = settings()
-    return next && c.generation === generation && JSON.stringify([next.baseUrl, next.model, next.apiKey]) === c.key
+    return next && c.generation === generation && JSON.stringify([next.baseUrl, next.model, next.apiKey, next.dimensions]) === c.key
   }
 
-  function failed(c) {
+  function failed(c, error, texts) {
     if (!current(c)) return
     failures++
     if (failures >= 3) retryAt = Date.now() + COOLDOWN
-    // 不记录服务返回的错误文字：里面可能包含密钥或用户内容。
-    log?.debug?.('向量检索请求失败，暂时使用关键词检索')
+    lastError = failureMessage(error, c, texts)
+    lastErrorAt = Date.now()
+    errorKey = c.key
+    log?.warn?.(`向量检索请求失败：${lastError}`)
   }
 
   async function request(texts, timeout) {
@@ -96,12 +163,28 @@ export function createVectorIndex({ getConfig, log, fetchImpl = globalThis.fetch
     let timer
     try {
       const work = async () => {
-        const headers = { 'Content-Type': 'application/json' }
-        if (c.apiKey) headers.Authorization = `Bearer ${c.apiKey}`
+        const headers = { 'Content-Type': 'application/json', ...c.headers }
+        const hasAuth = Object.keys(headers).some((k) => k.toLowerCase() === 'authorization')
+        if (c.apiKey && !hasAuth) headers.Authorization = `Bearer ${c.apiKey}`
         const input = texts.map((text) => String(text || ''))
-        const response = await fetchImpl(`${c.baseUrl}/embeddings`, { method: 'POST', headers, body: JSON.stringify({ model: c.model, input }), signal: controller.signal, redirect: 'error' })
-        if (!response.ok) throw new Error('请求失败')
-        const json = await response.json()
+        const body = { model: c.model, input }
+        if (c.dimensions) body.dimensions = c.dimensions
+        const response = await fetchImpl(`${c.baseUrl}/embeddings`, { method: 'POST', headers, body: JSON.stringify(body), signal: controller.signal, redirect: 'error' })
+        if (!response.ok) {
+          // 服务正文可能回显凭证或记忆；只使用 HTTP 状态与标准状态名。
+          const status = Number.isInteger(response.status) ? response.status : null
+          const label = STATUS_CODES[status]
+          const error = new Error(status ? `HTTP ${status}${label ? ' ' + label : ''}` : 'HTTP 请求失败')
+          error.httpStatus = status
+          throw error
+        }
+        let json
+        try { json = await response.json() } catch (error) {
+          // JSON 解析错误可能包含响应正文片段。
+          if (error instanceof SyntaxError) throw new Error('向量响应不是有效 JSON')
+          throw error
+        }
+        recordRetrievalUsage('生成记忆向量', c.model, json?.usage)
         if (!current(c)) return []
         if (!Array.isArray(json?.data) || json.data.length !== texts.length) throw new Error('向量数量不符')
         const rows = [...json.data]
@@ -109,21 +192,24 @@ export function createVectorIndex({ getConfig, log, fetchImpl = globalThis.fetch
           rows.sort((a, b) => a.index - b.index)
           if (rows.some((row, i) => row.index !== i)) throw new Error('向量顺序不符')
         }
-        const vectors = rows.map((row) => row?.embedding)
+        const vectors = rows.map((row) => toVector(row?.embedding))
         const dims = data.dims || vectors[0]?.length
         if (!vectors.every((v) => validVector(v, dims))) throw new Error('向量无效')
+        if (c.dimensions && vectors.some((v) => v.length !== c.dimensions)) throw new Error('返回维度与配置不符')
         return vectors
       }
       const vectors = await Promise.race([work(), new Promise((resolve, reject) => {
-        timer = setTimeout(() => { controller.abort(); reject(new Error('请求超时')) }, timeout)
+        timer = setTimeout(() => { reject(new Error('请求超时')); controller.abort() }, timeout)
       })])
       if (!current(c) || Date.now() < retryAt) return []
       if (!vectors.every((v) => validVector(v, data.dims))) throw new Error('向量维度已变化')
       failures = 0
       retryAt = 0
+      lastError = ''
+      lastErrorAt = null
       return vectors
     } catch (error) {
-      failed(c)
+      failed(c, error, texts)
       return []
     } finally {
       clearTimeout(timer)
@@ -143,7 +229,7 @@ export function createVectorIndex({ getConfig, log, fetchImpl = globalThis.fetch
     if (saved) cache.delete(q)
     if (pending.has(q)) return pending.get(q)
     const task = (async () => {
-      const [vec] = await request([q], QUERY_TIMEOUT)
+      const [vec] = await request([q], c.queryTimeoutMs)
       if (!vec || !current(c)) return null
       cache.delete(q)
       cache.set(q, { at: Date.now(), vec })
@@ -176,7 +262,7 @@ export function createVectorIndex({ getConfig, log, fetchImpl = globalThis.fetch
   // 关闭开关后仍能在面板看到本机已经同步的条数。
   function count(items) {
     const c = getConfig()?.memory?.vector
-    const base = String(c?.baseUrl || '').trim().replace(/\/+$/, '')
+    const base = String(c?.baseUrl || '').trim().replace(/\/+$/, '').replace(/\/embeddings\/?$/i, '')
     const model = String(c?.model || '').trim()
     if (!base || !model) return 0
     load()
@@ -232,7 +318,7 @@ export function createVectorIndex({ getConfig, log, fetchImpl = globalThis.fetch
         const changed = prune(items)
         if (changed) needsSave = true
         if (needsSave) save()
-        const batch = (items || []).filter((it) => it && it.id && !it.invalidAt && String(it.text || '').trim() && !data.items[it.id]).slice(0, BATCH).map((it) => ({ id: it.id, text: it.text }))
+        const batch = (items || []).filter((it) => it && it.id && !it.invalidAt && String(it.text || '').trim() && !data.items[it.id]).slice(0, c.batchSize).map((it) => ({ id: it.id, text: it.text }))
         if (!batch.length) return
         const vectors = await embed(batch.map((it) => it.text))
         if (vectors.length !== batch.length || !current(c)) return
@@ -254,5 +340,83 @@ export function createVectorIndex({ getConfig, log, fetchImpl = globalThis.fetch
     try { await syncing } finally { syncing = null }
   }
 
-  return { embed, queryVector, search, sync, validIds, count }
+  /** 面板用：已同步多少 / 一共多少、模型、维度和最后一次错误。 */
+  function status(items) {
+    const c = settings()
+    const cfg = getConfig()?.memory?.vector || {}
+    const hasError = c && errorKey === JSON.stringify([c.baseUrl, c.model, c.apiKey, c.dimensions])
+    load()
+    return {
+      enabled: Boolean(cfg.enabled),
+      configured: Boolean(c),
+      provider: String(cfg.provider || ''),
+      model: c?.model || String(cfg.model || ''),
+      dims: data?.dims || 0,
+      indexed: c ? count(items) : 0,
+      total: (items || []).filter((it) => it && !it.invalidAt).length,
+      lastError: hasError ? lastError : '',
+      lastErrorAt: hasError ? lastErrorAt : null,
+    }
+  }
+
+  /** 面板「测试」：真发一条短文本，返回维度，不写进索引。 */
+  async function test(text = '今天想吃白米饭') {
+    const t = Date.now()
+    const [vec] = await embed([String(text || '测试')])
+    if (!vec) throw new Error(status().lastError || '没有返回向量（检查地址、模型和 Key）')
+    return { dims: vec.length, ms: Date.now() - t }
+  }
+
+  /** 清空本机向量，下一次 tick / rebuild 会按当前记忆重新同步。 */
+  function reset() {
+    const c = prepare()
+    if (!c) return false
+    data = { model: c.model, dims: 0, items: Object.create(null) }
+    meta = { model: c.model, base: hash(c.baseUrl), items: Object.create(null) }
+    verified.clear()
+    cache.clear()
+    needsSave = true
+    save()
+    return true
+  }
+
+  return { embed, queryVector, search, sync, validIds, count, status, test, reset }
+}
+
+/**
+ * 按配置挑一个向量实现，没开就返回 null（上层自动退回纯关键词）。
+ *
+ * 模式判定（要兼容老配置）：
+ *   mode === 'remote'            → 在线服务
+ *   mode === 'local'             → 本地模型
+ *   mode 没写、但填了 baseUrl     → 老配置，按原来的在线服务跑（不然升级后向量直接断）
+ *   mode 没写、也没填 baseUrl     → 新装用户，用本地模型
+ */
+export function createVectorIndexByMode({ getConfig, log, fetchImpl = globalThis.fetch, directory = dataDir() }) {
+  const memory = getConfig()?.memory
+  const c = memory?.vector
+  if (memory?.enabled === false || c?.enabled !== true) return null
+  const hasBase = Boolean(String(c.baseUrl || '').trim())
+  const mode = c.mode === 'remote' || c.mode === 'local'
+    ? c.mode
+    : (hasBase ? 'remote' : 'local')
+  if (mode === 'local') {
+    try {
+      // 模型文件所有人格共用（数据目录根下），向量索引跟着人格走
+      const idx = createLocalVectorIndex({ dataDir: dataDir(), indexDir: directory, log })
+      if (!idx.ready || !idx.ready()) {
+        // 用户显式选了本地模式就绝不回退远端：界面承诺「本地离线」，静默把私密查询
+        // 发到在线服务是隐私问题（#520 复审）。老配置（mode 没写、只有 baseUrl）的 mode 是
+        // normalize 派生的 remote，不在此分支。
+        if (hasBase && c.mode !== 'local') return createVectorIndex({ getConfig, log, fetchImpl, directory })
+        log?.debug?.('本地向量不可用：' + (idx.error || '模型未就绪') + '，这次只走关键词')
+        return null
+      }
+      return idx
+    } catch (error) {
+      log?.warn?.('本地向量初始化失败，退回关键词检索：' + error.message)
+      return hasBase && c.mode !== 'local' ? createVectorIndex({ getConfig, log, fetchImpl, directory }) : null
+    }
+  }
+  return createVectorIndex({ getConfig, log, fetchImpl, directory })
 }

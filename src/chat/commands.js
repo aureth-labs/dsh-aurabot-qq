@@ -1,6 +1,11 @@
 // QQ 里的主人命令：/silent /active 之类，直接在 QQ 上管她。只认主人；在总开关关着时也能用（所以 /on 才有用）。
 
+import { parseSingRequest } from '../song/segment.js'
+import { runEffortCommand } from './effort-command.js'
+import { policyFor } from './group-policy.js'
 import { dataDir, readJson, writeJson } from '../core/store.js'
+import { runGroupSettingsCommand } from './group-settings-command.js'
+import { runPermissionsCommand } from './permissions-command.js'
 
 /**
  * 解析命令：「/silent 30」→ { name: 'silent', arg: '30' }。不是命令返回 null。支持全角斜杠和中文别名。
@@ -10,6 +15,9 @@ export function parseCommand(text, extra = []) {
   const m = String(text || '').trim().match(/^[/／]\s*([A-Za-z0-9一-龥_-]+)\s*([\s\S]*)$/)
   if (!m) return null
   const word = m[1].toLowerCase()
+  // 权限管理是保留命令，扩展模块不能抢占。
+  if (word === '权限' || word === 'permissions' || word === 'perms') return { name: 'permissions', arg: m[2].trim() }
+  if (word === 'groupsettings' || word.startsWith('群设置')) return { name: 'groupsettings', arg: (word === 'groupsettings' ? m[2] : m[1].slice(3) + ' ' + m[2]).trim() }
   for (const c of extra) {
     const names = [c.name, ...(c.aliases || [])].map((x) => String(x).toLowerCase())
     if (names.includes(word)) return { name: c.name, arg: m[2].trim(), ext: c }
@@ -24,13 +32,18 @@ export function parseCommand(text, extra = []) {
   return pre ? { name: ALIASES[pre], arg: (m[1].slice(pre.length) + ' ' + m[2]).trim() } : null
 }
 
+// Only command-shaped messages: ordinary paths, URLs and prose remain chat content.
+export const isSlashCommand = (text) => /^[/／]\s*[A-Za-z一-龥][A-Za-z0-9一-龥_-]*(?:\s+[\s\S]*)?$/.test(String(text || '').trim())
+
 const ALIASES = {
+  群设置: 'groupsettings',
   闭嘴: 'silent', 安静: 'silent', 静音: 'silent', shutup: 'silent', mute: 'silent',
   说话: 'active', 醒醒: 'active', 解除静音: 'active', unmute: 'active',
   少说: 'quiet', 话少: 'quiet',
   多说: 'chatty', 话多: 'chatty',
   正常: 'normal',
   模型: 'model', 换模型: 'model',
+  思考: 'effort', 思考强度: 'effort',
   唱: 'sing', 点歌: 'sing', 翻唱: 'sing',
   状态: 'status', 心情: 'mood', 日记: 'diary', 记住: 'remember', 记一下: 'remember',
   搭话: 'speak', 主动搭话: 'speak',
@@ -39,13 +52,16 @@ const ALIASES = {
 
 const COMMANDS = {
   help: '看这份命令列表',
+  permissions: '主人私聊管理权限：/权限 查看用法',
+  groupsettings: '主人私聊管理群发言和记忆：/群设置 查看用法',
   silent: '在这里闭嘴（可带分钟数，如 /silent 30；不带就一直到 /active）',
   active: '解除闭嘴；在群里还会接着参与话题一会儿',
   quiet: '这个群里只在被叫到时说话，不插话',
   chatty: '这个群里话多一点，更爱插话',
   normal: '这个群恢复默认的插话频率',
   model: '看或换她用的模型：/model 看列表，/model 2 或 /model 名字 换，/model 默认 跟随 DSH',
-  sing: '让她翻唱一首：/sing 小幸运 田馥甄；后面加 +12 / -3 之类可以变调（原唱是男声一般 +12）',
+  effort: '查看当前聊天的模型思考档位；发 /effort 序号 或 档位名切换，/effort 默认恢复跟随',
+  sing: '让她翻唱一首：/sing 小幸运 田馥甄；可加 +12 变调，或 开始=60 时长=30 唱指定片段',
   status: '看她现在的状态',
   mood: '看她现在的心情',
   diary: '马上写一篇空间日记',
@@ -109,6 +125,10 @@ export async function runCommand(cmd, msg, deps) {
     setConfig({ ...cfg, group: { ...cfg.group, overrides } })
   }
   switch (cmd.name) {
+    case 'groupsettings':
+      return runGroupSettingsCommand(cmd.arg, msg, deps)
+    case 'permissions':
+      return runPermissionsCommand(cmd.arg, msg, deps)
     case 'help':
       return helpText(deps.extraCommands || [])
     case 'silent': {
@@ -125,7 +145,7 @@ export async function runCommand(cmd, msg, deps) {
       return inGroup ? '我回来啦' : '在呢'
     case 'quiet':
       if (!inGroup) return '这个命令要在群里用'
-      setGroup({ interjectChance: 0 })
+      setGroup({ interjectChance: 0, proactiveEnabled: false, engagedEnabled: false })
       return '好，这个群里没人叫我我就不插话'
     case 'speak': {
       const c = getConfig()
@@ -146,7 +166,7 @@ export async function runCommand(cmd, msg, deps) {
     }
     case 'chatty':
       if (!inGroup) return '这个命令要在群里用'
-      setGroup({ interjectChance: 0.4, minRelevance: 0.1 })
+      setGroup({ interjectChance: 0.4, minRelevance: 0.1, proactiveEnabled: true, engagedEnabled: true })
       return '好耶，那我在这个群多说两句'
     case 'normal':
       if (!inGroup) return '这个命令要在群里用'
@@ -162,8 +182,10 @@ export async function runCommand(cmd, msg, deps) {
         `${here}：${mu === undefined ? '正常说话' : mu === 0 ? '闭嘴中' : '闭嘴到 ' + new Date(mu).toLocaleTimeString().slice(0, 5)}`,
       ]
       if (inGroup) {
-        const o = (cfg.group.overrides || {})[msg.groupId] || {}
-        lines.push(`插话：${o.interjectChance === 0 ? '不插话' : o.interjectChance >= 0.4 ? '话多' : '默认'}`)
+        const p = policyFor(cfg.group, cfg.group.overrides, msg.groupId)
+        const proactive = p.proactiveEnabled !== false && p.interjectChance > 0
+        const engaged = typeof p.engagedEnabled === 'boolean' ? p.engagedEnabled : p.interjectChance > 0
+        lines.push(`主动加入话题：${proactive ? '开' : '关'}；窗口内接话：${engaged ? '开' : '关'}`)
       }
       return lines.join('\n')
     }
@@ -189,26 +211,32 @@ export async function runCommand(cmd, msg, deps) {
       setConfig({ ...cfg, model: { ...cfg.model, provider: hit.provider, model: hit.model } })
       return `好，换成 ${label(hit)} 了，下一句起生效`
     }
+    case 'effort':
+      return runEffortCommand(cmd.arg, msg, deps)
     case 'sing': {
       if (!deps.song) return '翻唱功能不可用'
-      // 末尾的 +12 / -3 是变调
-      const m = cmd.arg.match(/^(.*?)\s+([+-]\d{1,2})$/)
-      const name = (m ? m[1] : cmd.arg).trim()
-      if (!name) return '唱哪首？比如 /sing 小幸运 田馥甄'
-      return deps.song.request({ song: name, pitch: m ? Number(m[2]) : undefined, chatId: msg.chatId }).message
+      const request = parseSingRequest(cmd.arg)
+      if (request.error) return request.error
+      if (!request.song) return '唱哪首？比如 /sing 小幸运 田馥甄；只唱一段可加 开始=60 时长=30（秒）'
+      return deps.song.request({ ...request, chatId: msg.chatId }).message
     }
     case 'mood':
       return mood ? `现在${mood.label()}` : '心情模块关着'
     case 'diary': {
       if (!qzone) return '空间日记没开'
       const r = await qzone.writeDiary()
-      return r.ok ? (r.dryRun ? '写好了，不过现在是试运行，没真发' : '写好发出去啦，去空间看看') : '没写成：' + (r.message || '不知道为啥')
+      if (r.ok) return r.dryRun ? '写好了，不过现在是试运行，没真发' : '写好发出去啦，去空间看看'
+      deps.log?.warn?.('日记命令失败：', r.message)
+      const known = ['上一篇还在写', '她这次没写出来', '总开关关着', '说说是空的', '发布前开关已变化，本次未发布。', '说说可见范围配置无效，已停止发布。', '未知的说说可见范围，已停止发布。', '选择了部分好友范围，但 QQ 名单为空，已停止发布；不会改成公开。']
+      return known.includes(r.message) ? '没写成：' + r.message : '日记发布未确认，请先查看空间是否已发出，再决定是否重试；详细原因请主人查看本机日志。'
     }
     case 'remember': {
       if (!memory) return '记忆模块关着'
       if (!cmd.arg) return '要我记住什么呀？比如 /remember 我不吃香菜'
       const r = memory.add({ text: cmd.arg, aboutName: cfg.ownerName || '主人', about: cfg.ownerQQ, importance: 0.8, source: 'panel', chatId: msg.chatId })
-      return r.ok ? '记住了' : '没记上：' + (r.message || '')
+      if (r.ok) return '记住了'
+      deps.log?.warn?.('记忆命令失败：', r.message)
+      return '这次记忆保存未确认，请先在记忆面板查看；详细原因请主人查看本机日志。'
     }
     case 'reset':
       hub.resetChat(msg.chatId)

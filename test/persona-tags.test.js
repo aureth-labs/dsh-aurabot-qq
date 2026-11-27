@@ -7,7 +7,6 @@ import { normalize } from '../src/core/config.js'
 import { createMemoryStore } from '../src/features/memory.js'
 import { createHub } from '../src/chat/hub.js'
 import { createFakeDsh } from './helpers/fake-dsh.js'
-import { createSpeakUp } from '../src/features/companion.js'
 import { createPurpose } from '../src/purpose/module.js'
 import { existsSync } from 'node:fs'
 
@@ -52,7 +51,7 @@ test('提炼只接受本人或主人来源，手动标签优先', async (t) => {
   const output = { facts: [], people: [{ qq: a, like: { text: '讨厌', speaker: a } }, { qq: b, like: { text: '喜欢', speaker: a } }, { qq: owner, like: { text: '讨厌', speaker: owner } }] }
   const { memory, rows } = fixture(t, output)
   memory.savePersonaPerson(a, { tags: ['朋友'] })
-  for (const uid of [a, b, owner]) rows.push({ chatId: 'group:777', uid, who: uid, text: '聊天', t: Date.now() })
+  for (const uid of [a, b, owner]) rows.push({ chatId: 'group:777', uid, who: uid, text: '聊天', t: Date.now(), interaction: [uid] })
   await memory.consolidate({ includeToday: true })
   assert.deepEqual(memory.personTags(a), ['朋友'])
   assert.deepEqual(memory.personTags(b), [])
@@ -62,7 +61,7 @@ test('提炼只接受本人或主人来源，手动标签优先', async (t) => {
 test('模型形成喜恶并替换原来的喜恶，其他标签保留', async (t) => {
   const { memory, rows, dir } = fixture(t, { facts: [], people: [{ qq: a, like: { text: '讨厌', speaker: a } }] })
   writeFileSync(join(dir, 'memories.json'), JSON.stringify({ items: [], profiles: { [a]: { tags: ['喜欢', '朋友'] } } }))
-  rows.push({ chatId: 'group:777', uid: a, who: '甲', text: '你好', t: Date.now() })
+  rows.push({ chatId: 'group:777', uid: a, who: '甲', text: '你好', t: Date.now(), interaction: [a] })
   await memory.consolidate({ includeToday: true })
   assert.deepEqual(memory.personTags(a), ['朋友', '讨厌'])
   assert.equal(memory.dislikes(a), true)
@@ -122,14 +121,4 @@ test('目的引擎跳过讨厌的人', async (t) => {
   await p.tick()
   assert.equal(existsSync(join(dir, 'purpose', 'friends', `${a}.json`)), false)
 })
-
-test('主动搭话跳过讨厌的人', async (t) => {
-  const { cfg } = fixture(t)
-  cfg.enabled = true
-  Object.assign(cfg.speakUp, { enabled: true, allow: [a], minIntervalMinutes: 0, maxIntervalMinutes: 0, idleMinutes: 0, maxPerDay: 1, awakeFrom: 0, awakeTo: 24 })
-  const sent = []
-  const hub = { lastOwnerChatAt: Date.now(), lastBotToOwner: { at: 0, text: '' }, lastPrivateAt: () => 0, pushToSession: async (chat) => sent.push(chat) }
-  const speak = createSpeakUp({ getConfig: () => cfg, hub, log, memory: () => ({ dislikes: (qq) => qq === a }) })
-  await speak.tick()
-  assert.ok(!sent.some((chat) => String(chat.userId) === a), `不该找讨厌的人：${sent.map((c) => c.chatId)}`)
-})
+// P5：原「主动搭话跳过讨厌的人」用例随 companion 删除——讨厌者守卫已由目的引擎承担（上一用例）。

@@ -27,11 +27,13 @@
 - 返回：音频文件路径（wav / mp3 / silk），或 `{ file }`
 
 ### image.mjs
-- 参数：`{ prompt, size, image?, outDir, log }`（`size` 形如 `"1024x1024"`，`prompt` 已带上面板里的固定风格）
+- 参数：`{ prompt, size, image?, images?, outDir, log }`（`size` 形如 `"1024x1024"`，`prompt` 已带上面板里的固定风格）
 - `image` 是可选参考图的纯 base64，不带 `data:` 前缀；来自当前聊天收到 / 引用的图或她自己的画作。没传时照常文生图，传了就必须使用参考图。
 - 支持参考图时，在脚本顶层加 `export const supportsImage = true`，并把 `image` 接到服务的图生图接口（模板用 SD WebUI 的 `img2img` / `init_images`）。已有脚本不会自动覆盖，需要自行适配。
 - 没声明支持，或服务本身不支持时，应报「这个生图服务不支持参考图」，不能忽略 `image` 继续文生图。
 - 返回：图片 `Buffer`，或 `{ buffer }` / `{ file }` / `{ base64 }` / `{ url }`
+
+多图脚本声明 `export const supportsImages = true`，可选 `export const maxReferenceImages = 4`（1–8，未声明取 8）。多图请求通过 `images: string[]` 接收纯 base64 数组；单图时也会补充单元素 `images`。旧 `supportsImage` 脚本仍只收 `image`。外貌文字及实际传入图片的备注已加入 `prompt`。脚本应使用所有传入图片，不静默丢弃。
 
 ### song-convert.mjs
 - 参数：`{ input, output, pitch, voice, voiceFile, indexFile, log }`
@@ -40,6 +42,14 @@
 - 返回：换好声音的 wav 路径（一般就是 `output`）
 - 开了这个之后，翻唱不再需要内置的 Applio 和音色模型（人声分离环境还是要装）
 
+#### Windows Applio 的可选 CPU 配置
+
+已使用 Applio、且 CPU 推理在 `ConvTranspose1d` 崩溃时，可把插件安装目录 `src/local/templates/song-cpu-infer.py` 复制到翻唱根目录的 `setup/`（同级应有 `Applio/`）。让现有 `song-convert.mjs` 用翻唱环境的 Python 调用这个文件，替代 `core.py`；后面的 `infer --input-path ... --output-path ...` 等参数保持不变。
+
+这个入口关闭 MKLDNN、保留短分段并限定 PyTorch 线程数；默认单线程。在现有 `spawn` 的子进程 `env` 中加入 `AURABOT_RVC_CPU_THREADS: '4'`，可试用四线程，删掉该字段便恢复默认。不用修改系统环境变量或人格，也不改变普通 TTS。只在这条本地换声路径启用，不会自动改变其他用户的内置推理。
+
+先用同一段已分离的人声比较 1、2、4 线程，再用完整长片段验证：线程越多不一定越快，短片段通过也不代表长输入不会崩溃。i5-12450H / 16 GB / PyTorch 2.11 CPU 的一次10秒同源测试，含启动和加载耗时约68、50、41秒；这是换声阶段，不是点歌到发送的总耗时。音色模型、RMVPE、检索比例和采样率保持不变。未通过稳定性检查时回到原线程数，不要为速度撤掉已有防崩溃措施。
+
 ### asr.mjs
 - 参数：`{ file, log }`（`file` 是 16kHz 单声道 wav）
 - 返回：识别出的文字，或 `{ text }`；听不清返回空字符串
@@ -47,10 +57,3 @@
 ## 让 DSH 帮你改
 
 在面板「本地接口」页点「复制给 DSH 的话」，粘给 DSH，再补一句你用的是什么服务、地址和关键参数，它会读这份说明、帮你把脚本改好。
-
-## 生视频 video.mjs
-
-输入 `{ prompt, seconds, outDir, log }`，返回视频文件的完整路径或 `{ file }`。出错就 throw。
-
-生视频很慢，插件默认等 20 分钟，可以在面板「本地接口」页改。她会先回复，做好后自动发到聊天，一次只跑一段，只有主人能让她生成。
-

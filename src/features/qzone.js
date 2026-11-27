@@ -2,6 +2,7 @@
 
 import { dataDir, readJson, writeJson } from '../core/store.js'
 import { fetchImage } from '../core/net.js'
+import { windowMinutes } from '../core/time-window.js'
 import { resolveAudience } from './qzone-audience.js'
 import { cleanOutboundText } from '../chat/reply.js'
 
@@ -16,15 +17,20 @@ export function planDiaryTimes({ timesPerDay, windowStart, windowEnd, minGapMinu
   const a = toMin(windowStart)
   const b = toMin(windowEnd)
   const n = Math.max(0, Math.round(timesPerDay))
-  if (n === 0 || b <= a) return []
-  const span = b - a
+  // 跨天窗口（如 22:00–02:00）按绕回后的跨度排；from === to 与 proactive-policy 口径一致，视为全天。
+  const span = windowMinutes(a, b)
+  if (n === 0 || span <= 0) return []
   const gap = Math.min(minGapMinutes, Math.floor(span / Math.max(n, 1)))
   for (let attempt = 0; attempt < 200; attempt++) {
-    const pts = Array.from({ length: n }, () => a + Math.floor(rand() * span)).sort((x, y) => x - y)
-    if (pts.every((p, i) => i === 0 || p - pts[i - 1] >= gap)) return pts
+    // 先在「窗口内偏移」上排，保证跨天时两两间隔仍按真实先后算
+    const offsets = Array.from({ length: n }, () => Math.floor(rand() * span)).sort((x, y) => x - y)
+    if (offsets.every((p, i) => i === 0 || p - offsets[i - 1] >= gap)) {
+      return offsets.map((off) => ((a + off) % 1440 + 1440) % 1440).sort((x, y) => x - y)
+    }
   }
   // 实在排不开就均分
-  return Array.from({ length: n }, (_, i) => a + Math.floor((span / n) * (i + 0.5)))
+  return Array.from({ length: n }, (_, i) => Math.floor((span / n) * (i + 0.5)))
+    .map((off) => ((a + off) % 1440 + 1440) % 1440).sort((x, y) => x - y)
 }
 
 export function createQzone({ getConfig, onebot, hub, log, onDiary, pickImage, composeDiary }) {
@@ -61,6 +67,10 @@ export function createQzone({ getConfig, onebot, hub, log, onDiary, pickImage, c
       audience = resolveAudience(latest, visibility)
       if (!latest.enabled || latest.dryRun) return { ok: false, message: '发布前开关已变化，本次未发布。' }
       beforeSend?.()
+      // 说说走 QQ 空间（公开 / 部分好友可见），**不是私聊主人**，所以不进出站门闸：
+      // 主动发言策略治理的是「主动私聊当前 owner」这个场景（设计稿 §2 范围），
+      // 空间动态不影响主人的私聊体验，也没有「打扰主人几次」的额度概念。
+      // 它有自己的开关（qzone.enabled / visibility）和 dryRun，不走 proactive 账本。
       const r = await onebot.call('send_qzone_msg', { content: text, ugc_right: audience.ugc_right, ...(audience.target_uins ? { target_uins: audience.target_uins } : {}), ...(imgs.length ? { images: imgs } : {}) }, { timeoutMs: 60000 })
       const tid = String(r?.tid ?? r?.id ?? r ?? '')
       log.info(`发了一条说说（${audience.label}，tid ${tid || '?'}）`)
@@ -221,6 +231,9 @@ export function createQzone({ getConfig, onebot, hub, log, onDiary, pickImage, c
     }
   }
 
+  // 日记没写成（网络抖动 / 模型报错）不能把这一档直接吞掉：2/5/15 分钟后各重试一次，连续 3 次才放弃
+  const RETRY_DELAY_MIN = [2, 5, 15]
+
   /** 每分钟调一次。 */
   async function tick() {
     const cfg = getConfig()
@@ -228,7 +241,7 @@ export function createQzone({ getConfig, onebot, hub, log, onDiary, pickImage, c
     const s = state()
     const today = dayKey()
     if (s.plan.day !== today) {
-      s.plan = { day: today, times: planDiaryTimes(cfg.diary), done: [] }
+      s.plan = { day: today, times: planDiaryTimes(cfg.diary), done: [], retry: {} }
       save(s)
       log.info(`今天的日记时间：${s.plan.times.map((m) => `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`).join('、') || '（不写）'}`)
     }
@@ -236,10 +249,29 @@ export function createQzone({ getConfig, onebot, hub, log, onDiary, pickImage, c
     const nowMin = now.getHours() * 60 + now.getMinutes()
     const due = s.plan.times.find((m) => m <= nowMin && !s.plan.done.includes(m))
     if (due === undefined) return
-    s.plan.done.push(due)
+    const retry = s.plan.retry && s.plan.retry[due]
+    if (retry && retry.at > Date.now()) return
+    log.info(retry ? `写日记没成功，再试一次（第 ${retry.count + 1} 次）` : '到点了，写一篇空间日记')
+    const r = await writeDiary()
+    if (r && (r.ok || r.preview)) {
+      s.plan.done.push(due)
+      if (s.plan.retry) delete s.plan.retry[due]
+      save(s)
+      return
+    }
+    // writeDiary 内部已经记过 warn；这里只负责重试节奏
+    const count = (retry && retry.count || 0) + 1
+    const delayMin = RETRY_DELAY_MIN[count - 1]
+    if (!delayMin) {
+      s.plan.done.push(due)
+      if (s.plan.retry) delete s.plan.retry[due]
+      save(s)
+      log.warn(`写日记连续失败 ${count} 次，今天这一篇先跳过`)
+      return
+    }
+    s.plan.retry = { ...(s.plan.retry || {}), [due]: { at: Date.now() + delayMin * 60_000, count } }
     save(s)
-    log.info('到点了，写一篇空间日记')
-    await writeDiary()
+    log.warn(`写日记失败，${delayMin} 分钟后再试（${r && r.message ? r.message : '未知错误'}）`)
   }
 
   function nextTime() {

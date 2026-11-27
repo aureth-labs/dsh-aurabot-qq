@@ -4,7 +4,8 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { normalize, publicConfig, mergeFromPanel } from '../src/core/config.js'
+import { normalize, publicConfig, mergeFromPanel, saveConfig, loadConfig } from '../src/core/config.js'
+import { initUsage, closeUsage, usageReport } from '../src/core/usage.js'
 import { createVectorIndex } from '../src/features/memory-vector.js'
 import { buildIndex, createMemoryStore, memoryLine, search } from '../src/features/memory.js'
 import memoryModule from '../src/modules/memory/index.js'
@@ -17,7 +18,7 @@ function setup(t, fetchImpl) {
   const dir = mkdtempSync(join(tmpdir(), 'aurabot-vector-'))
   const old = process.env.AURABOT_DATA_DIR
   process.env.AURABOT_DATA_DIR = dir
-  const cfg = normalize({ ownerQQ: OWNER, memory: { dailyConsolidate: false, vector: { enabled: true, baseUrl: 'http://localhost:1234/v1/', model: 'fake', apiKey: '秘密密钥' } } })
+  const cfg = normalize({ ownerQQ: OWNER, memory: { dailyConsolidate: false, vector: { enabled: true, baseUrl: 'http://localhost:1234/v1/', model: 'fake', apiKey: '秘密密钥', batchSize: 32, queryTimeoutMs: 2000 } } })
   const hub = { chatLogDays: () => [], chatLogOf: () => [], speakersOf: () => [FRIEND] }
   const calls = []
   const fake = fetchImpl || (async (url, options) => {
@@ -41,9 +42,26 @@ const items = () => [
   { id: 'nurse', text: '阿花在杭州当护士', about: FRIEND, importance: 0.6, at: Date.now() },
 ]
 
-test('默认关闭，配置不全时不请求；密钥遮罩并在面板保存时保留', async (t) => {
+test('默认关闭向量、默认模式为本地模型，配置不全时不请求；密钥遮罩并在面板保存时保留', async (t) => {
   const s = setup(t)
-  assert.deepEqual(normalize({}).memory.vector, { enabled: false, baseUrl: '', model: '', apiKey: '' })
+  // beta 1.3 起向量默认关、provider 可配
+  // mode 是派生值（不可枚举，见 config.js 的 defineProperty）：它不进这份形状比对，
+  // 免得升级兼容要求把它写进配置文件后变成「用户显式选择」（#520）。下一行单独断言它的值。
+  assert.deepEqual(normalize({}).memory.vector, {
+    enabled: false,
+    provider: 'siliconflow',
+    baseUrl: '',
+    model: '',
+    apiKey: '',
+    dimensions: 0,
+    batchSize: 10,
+    queryTimeoutMs: 3000,
+    headers: '',
+  })
+  assert.equal(normalize({}).memory.vector.mode, 'local', '默认用本地小模型')
+  // 老配置填了地址没写 mode 时，要按在线服务跑，不然升级后向量检索会悄悄失效
+  assert.equal(normalize({ memory: { vector: { baseUrl: 'http://localhost:1/v1' } } }).memory.vector.mode, 'remote')
+  assert.equal(normalize({ memory: { vector: { enabled: false } } }).memory.vector.enabled, false, '显式关掉要尊重用户选择')
   const index = s.index()
   s.cfg.memory.vector.enabled = false
   await index.sync(items())
@@ -66,6 +84,17 @@ test('默认关闭，配置不全时不请求；密钥遮罩并在面板保存�
   await mem.tick()
   assert.deepEqual(await mem.vectorHits('宠物'), [])
   assert.equal(s.calls.length, 0)
+})
+
+test('面板回传旧配置的在线模式，显式切换本地后保留地址并能重启重读', (t) => {
+  const { cfg } = setup(t)
+  const draft = JSON.parse(JSON.stringify(publicConfig(cfg)))
+  assert.equal(draft.memory.vector.mode, 'remote')
+  draft.memory.vector.mode = 'local'
+  saveConfig(mergeFromPanel(cfg, draft), cfg)
+  assert.equal(loadConfig().memory.vector.mode, 'local')
+  assert.equal(loadConfig().memory.vector.baseUrl, cfg.memory.vector.baseUrl)
+  assert.equal(mergeFromPanel(loadConfig(), {}).memory.vector.mode, 'local')
 })
 
 test('假向量补充宠物→猫、医院→护士，关键词仍可命中', async (t) => {
@@ -323,12 +352,12 @@ test('切换模型后旧请求返回不会污染新模型的冷却状态', async
   assert.equal(calls, 4)
 })
 
-test('查询超时最多两秒，连续三次失败冷却十分钟，只写不含密钥的 debug', async (t) => {
+test('查询超时最多两秒，连续三次失败冷却十分钟，warn 带超时原因及时间', async (t) => {
   t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() })
   let calls = 0
   const messages = []
   const s = setup(t, () => { calls++; return new Promise(() => {}) })
-  const vector = createVectorIndex({ getConfig: () => s.cfg, log: { debug: (...a) => messages.push(a.join(' ')) }, fetchImpl: s.fake })
+  const vector = createVectorIndex({ getConfig: () => s.cfg, log: { warn: (...a) => messages.push(a.join(' ')) }, fetchImpl: s.fake })
   for (let i = 0; i < 3; i++) {
     const pending = vector.queryVector('问题' + i)
     t.mock.timers.tick(2000)
@@ -337,7 +366,10 @@ test('查询超时最多两秒，连续三次失败冷却十分钟，只写不�
   assert.equal(calls, 3)
   assert.equal(await vector.queryVector('冷却中'), null)
   assert.equal(calls, 3)
-  assert.ok(messages.length === 3 && messages.every((m) => !m.includes('秘密密钥')))
+  assert.equal(messages.length, 3)
+  assert.match(messages[0], /请求超时/)
+  assert.equal(vector.status().lastError, '请求超时')
+  assert.equal(vector.status().lastErrorAt, Date.now())
   t.mock.timers.tick(10 * 60_000)
   const retry = vector.queryVector('恢复后')
   t.mock.timers.tick(2000)
@@ -372,15 +404,53 @@ test('自动回忆和 recall_memory 工具都使用向量，失败时保留关�
   assert.match((await tool.execute({ query: '杭州' })).message, /护士/)
 })
 
-test('错误响应只记 debug，接口失败时自动回忆仍能按关键词找到记忆', async (t) => {
+test('服务地址误填完整 /embeddings 时自动去掉，不拼成双路径', async (t) => {
+  const s = setup(t)
+  s.cfg.memory.vector.baseUrl = 'http://localhost:1234/v1/embeddings'
+  await s.index().embed(['x'])
+  assert.equal(s.calls.at(-1).url, 'http://localhost:1234/v1/embeddings')
+})
+
+test('自定义请求头、维度、批量、base64 向量；状态/测试/重建', async (t) => {
+  const s = setup(t)
+  const v = s.cfg.memory.vector
+  v.headers = 'X-Api-Key: header-key\nAuthorization: Custom token'
+  v.dimensions = 3
+  v.batchSize = 2
+  const calls = []
+  const fake = async (url, options) => {
+    const body = JSON.parse(options.body)
+    calls.push({ url, options, body })
+    const vec = Buffer.from(new Float32Array([1, 0, 0]).buffer).toString('base64')
+    return { ok: true, json: async () => ({ data: body.input.map((_, index) => ({ index, embedding: vec })) }) }
+  }
+  const vector = createVectorIndex({ getConfig: () => s.cfg, log, fetchImpl: fake })
+  const facts = [1, 2, 3].map((i) => ({ id: String(i), text: '小猫' + i }))
+  await vector.sync(facts)
+  assert.equal(calls[0].body.input.length, 2, '按 batchSize 分批')
+  assert.equal(calls[0].body.dimensions, 3)
+  assert.equal(calls[0].options.headers['X-Api-Key'], 'header-key')
+  assert.equal(calls[0].options.headers.Authorization, 'Custom token', '自定义 Authorization 优先')
+  assert.equal(vector.validIds(facts).length, 2)
+  await vector.sync(facts)
+  assert.equal(vector.validIds(facts).length, 3)
+  assert.equal(vector.status(facts).indexed, 3)
+  assert.equal(vector.status(facts).dims, 3)
+  const tested = await vector.test('测试')
+  assert.equal(tested.dims, 3)
+  assert.equal(vector.reset(), true)
+  assert.equal(vector.validIds(facts).length, 0)
+})
+
+test('HTTP 失败写 warn 和面板统计，按关键词回退，成功清除失败状态', async (t) => {
   const messages = []
   let fail = false
   const s = setup(t)
-  const fetchImpl = (...args) => fail ? Promise.resolve({ ok: false }) : s.fake(...args)
+  const fetchImpl = (...args) => fail ? Promise.resolve({ ok: false, status: 401, json: async () => { assert.fail('不能读取错误正文') } }) : s.fake(...args)
   let prompt
   const api = {
     config: () => s.cfg, core: { hub: s.hub, http: {} },
-    log: { debug: (...a) => messages.push(a.join(' ')), info() {}, warn: () => assert.fail('不应写警告日志') },
+    log: { debug() {}, info() {}, warn: (...a) => messages.push(a.join(' ')) },
     context() {}, on: (name, fn) => { if (name === 'prompt') prompt = fn }, every() {}, tool() {}, route() {},
   }
   const mem = memoryModule.setup(api, { fetchImpl })
@@ -391,5 +461,37 @@ test('错误响应只记 debug，接口失败时自动回忆仍能按关键词�
   const injected = await prompt([{ type: 'text', text: '杭州' }], { chat, queryText: '杭州' })
   assert.match(injected[0].text, /护士/)
   assert.equal(messages.length, 1)
-  assert.ok(!messages[0].includes('秘密密钥'))
+  assert.match(messages[0], /HTTP 401 Unauthorized/)
+  assert.equal(mem.stats().vectorLastError, 'HTTP 401 Unauthorized')
+  assert.ok(mem.stats().vectorLastErrorAt > 0)
+  fail = false
+  await prompt([{ type: 'text', text: '杭州' }], { chat, queryText: '杭州' })
+  assert.equal(messages.length, 1)
+  assert.equal(mem.stats().vectorLastError, '')
+  assert.equal(mem.stats().vectorLastErrorAt, null)
+})
+
+test('网络失败保留原始 message 及 cause.code，隐藏请求中的凭证和文字', async (t) => {
+  const messages = []
+  const s = setup(t, async () => {
+    throw new Error('fetch failed 秘密密钥 custom-token 私密问题 https://user:pass@host/?key=query-token', { cause: { code: 'ECONNREFUSED' } })
+  })
+  s.cfg.memory.vector.headers = 'Authorization: Bearer custom-token'
+  const index = createVectorIndex({ getConfig: () => s.cfg, log: { warn: (message) => messages.push(message) }, fetchImpl: s.fake })
+  assert.equal(await index.queryVector('私密问题'), null)
+  assert.match(index.status().lastError, /fetch failed.*ECONNREFUSED/)
+  assert.match(messages[0], /fetch failed.*ECONNREFUSED/)
+  assert.doesNotMatch(messages[0], /秘密密钥|custom-token|私密问题|user:pass|query-token/)
+  s.cfg.memory.vector.model = 'new-model'
+  assert.equal(index.status().lastErrorAt, null)
+})
+
+test('一次远程请求只计一笔；两条输入不重复计数，缓存命中不收费', async t => {
+  const s = setup(t, async (_, opt) => ({ok:true, json: async () => ({usage:{prompt_tokens:15,total_tokens:15},data:JSON.parse(opt.body).input.map((_,index)=>({index,embedding:[1,0]}))})}))
+  initUsage()
+  try {
+    const index=s.index(); await index.sync(items()); await index.queryVector('猫'); await index.queryVector('猫')
+    const [r]=usageReport({range:'all'}).current.byMemoryTask
+    assert.equal(r.key,'生成记忆向量'); assert.equal(r.runs,2); assert.equal(r.totalTokens,30)
+  } finally { closeUsage() }
 })

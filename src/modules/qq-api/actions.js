@@ -60,6 +60,7 @@ export const QQ_API = {
   get_group_tags: ['owner', 'group_class!', '获取指定群分类下的资料标签'],
   get_group_todo_list: ['open', 'group_id!', '获取指定群的待办列表并缓存对应消息元信息'],
   get_mini_app_ark: ['owner', 'type,title,desc,picUrl,pic_url,jumpUrl,jump_url', '根据输入生成或获取小程序 Ark 卡片'],
+  get_msg: ['owner', 'message_id!', '取一条消息的完整内容（含图片/语音等段的下载地址，rkey 现取）'],
   get_msg_emoji_likes: ['owner', 'message_id!', '获取指定消息的全部表情回应汇总'],
   get_online_clients: ['owner', 'no_cache', '获取当前会话最近观察到的在线客户端快照'],
   get_profile_like: ['owner', 'user_id,start,count', '获取用户资料点赞及收藏统计'],

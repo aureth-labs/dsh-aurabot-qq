@@ -16,11 +16,101 @@ window.__ModuleLoader__.load({
 
     // ---------------- 小工具 ----------------
     const get = (p) => fetch(API + p, { cache: 'no-store' }).then((r) => r.json()).catch((e) => ({ ok: false, message: '连不上插件：' + e.message }))
+    // 面板 tab 缓存：GET 结果 30 秒内复用，切 tab 不重复拉；任何 POST 成功或上传后清空。
+    const getCache = new Map()
+    const CACHE_TTL = 30000
+    const bustCache = () => getCache.clear()
+    const getCached = (p, force = false) => {
+      const hit = getCache.get(p)
+      if (!force && hit && Date.now() - hit.at < CACHE_TTL) return Promise.resolve(hit.data)
+      return get(p).then((data) => {
+        if (!data || data.ok !== false) getCache.set(p, { at: Date.now(), data })
+        return data
+      })
+    }
     const post = (p, body) =>
       fetch(API + p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) })
         .then((r) => r.json())
+        .then((data) => { if (!data || data.ok !== false) bustCache(); return data })
         .catch((e) => ({ ok: false, message: '连不上插件：' + e.message }))
     const clone = (o) => JSON.parse(JSON.stringify(o))
+    // 把 publicConfig 的 *Set 标志对应的 secret 字段清空（保留「已设置」状态）。
+    // 保存回执的基线只能带脱敏后的 secret 值，否则会把明文长期留在草稿里，
+    // 下次改同段其它字段时又整段回传，覆盖别的客户端刚轮换的新密钥（#520 复审）。
+    const maskSecretFields = (value, source = null) => {
+      const walk = (node, src) => {
+        if (!node || typeof node !== 'object') return
+        for (const [k, v] of Object.entries(node)) {
+          if (v && typeof v === 'object') walk(v, src && typeof src === 'object' ? src[k] : null)
+          if (k.endsWith('Set') && typeof v === 'boolean') {
+            const base = k.slice(0, -3)
+            // 只清「本来就是这次提交的旧值」；用户在保存期间新敲的 secret 不动。
+            if (base && Object.hasOwn(node, base) && (!source || !src || node[base] === src[base])) node[base] = ''
+          }
+        }
+      }
+      walk(value, source)
+      return value
+    }
+    // 把服务端 publicConfig 的 *Set / *Hint 标志同步到本地草稿（保留「已设置」提示）。
+    const copySecretFlags = (target, source) => {
+      const walk = (node, src) => {
+        if (!node || typeof node !== 'object' || !src || typeof src !== 'object') return
+        for (const [k, v] of Object.entries(src)) {
+          if (v && typeof v === 'object') walk(node[k], v)
+          else if ((k.endsWith('Set') || k.endsWith('Hint')) && Object.hasOwn(node, k)) node[k] = v
+        }
+      }
+      walk(target, source)
+      return target
+    }
+    // ---------------- 面板轻量读取层（首屏提速，2026-11-16） ----------------
+    // 同 URL 在途合并：相同地址只放行一个在途请求，周期轮询重叠时复用同一个 Promise，防止连环打。
+    const inflight = new Map()
+    const sharedGet = (p) => {
+      if (inflight.has(p)) return inflight.get(p)
+      const pr = get(p).finally(() => inflight.delete(p))
+      inflight.set(p, pr)
+      return pr
+    }
+    // 轻量 GET（/panel/bootstrap、/panel/pulse、/panel/config）：3 秒截止（AbortController），
+    // 失败按可识别原因归类（超时/启动中/连不上/权限受限），退避节奏由调用方（根组件）控制。
+    // 旧 /state 与各诊断接口不经过这里，保持原有行为。
+    const PANEL_READ_TIMEOUT = 3000
+    const panelGet = (p, opts) => {
+      const timeout = (opts && opts.timeout) || PANEL_READ_TIMEOUT
+      const registry = opts && opts.registry
+      const ctl = new AbortController()
+      if (registry) registry.add(ctl)
+      const done = (v) => { clearTimeout(timer); if (registry) registry.delete(ctl); return v }
+      const timer = setTimeout(() => ctl.abort(), timeout)
+      return fetch(API + p, { cache: 'no-store', signal: ctl.signal })
+        .then(async (r) => {
+          const data = await r.json().catch(() => null)
+          if (!data) return done({ ok: false, code: 'CONNECT', message: '暂时连不上插件：响应不是合法 JSON' })
+          if (r.status === 503 && data.code === 'BOOTSTRAPPING') return done({ ok: false, code: 'BOOTSTRAPPING', bootId: data.bootId, message: '插件正在启动' })
+          if (r.status === 401 || r.status === 403) return done({ ok: false, code: 'AUTH', message: '权限受限：当前身份没有打开面板的权限' })
+          if (!r.ok) return done({ ok: false, code: 'CONNECT', message: '暂时连不上插件（HTTP ' + r.status + '）' })
+          return done(data)
+        })
+        .catch((e) => {
+          if (e && e.name === 'AbortError') return done({ ok: false, code: 'TIMEOUT', message: '读取超时（' + Math.round(timeout / 1000) + ' 秒），插件还没有应答' })
+          return done({ ok: false, code: 'CONNECT', message: '暂时连不上插件：' + (e && e.message ? e.message : e) })
+        })
+    }
+    // 轻量 GET 也走在途合并（同一地址同时只有一个在途请求）
+    const sharedPanelGet = (p, opts) => {
+      const key = 'panel:' + p
+      if (inflight.has(key)) return inflight.get(key)
+      const pr = panelGet(p, opts).finally(() => inflight.delete(key))
+      inflight.set(key, pr)
+      return pr
+    }
+    const bustPanelGet = (p) => { inflight.delete('panel:' + p) }
+    // /save 回执的 committedPaths / unchangedPaths 是 JSON Pointer（如 /voice/enabled）；
+    // 草稿内部用点路径（voice.enabled），这里换算（~0/~1 转义按 RFC 6901 还原）。
+    const ptrToDots = (ptr) => String(ptr || '').split('/').filter(Boolean)
+      .map((k) => k.replace(/~1/g, '/').replace(/~0/g, '~')).join('.')
     const setPath = (obj, path, value) => {
       const next = clone(obj)
       let cur = next
@@ -28,6 +118,37 @@ window.__ModuleLoader__.load({
       for (let i = 0; i < ks.length - 1; i++) cur = cur[ks[i]] = cur[ks[i]] || {}
       cur[ks[ks.length - 1]] = value
       return next
+    }
+    // ---------------- token 用量显示 ----------------
+    // Compact display only; accounting always retains the original integers.
+    const fmtTokens = (n) => {
+      const v = Math.max(0, Math.round(Number(n) || 0))
+      const units = ['', 'K', 'M', 'B']
+      let unit = 0
+      while (unit < units.length - 1 && v >= 1000 ** (unit + 1)) unit++
+      let scaled = Number((v / 1000 ** unit).toFixed(2))
+      // Rounding at a boundary should read 1M, not 1000K.
+      if (scaled >= 1000 && unit < units.length - 1) { scaled = Number((scaled / 1000).toFixed(2)); unit++ }
+      return String(scaled) + units[unit]
+    }
+    /**
+     * 花费：「0.05 元」——「元」放后面（中文习惯），货币符号（¥ / $）才放前面。
+     * 小于 1 分保留 4 位并去掉多余的 0（0.008 元），别显示成 0.00。
+     */
+    const fmtCost = (n, currency = '元') => {
+      const v = Number(n) || 0
+      if (v > 0 && v < 0.0001) return '< ' + fmtCost(0.0001, currency)
+      const text = v === 0 ? '0' : v < 0.01 ? v.toFixed(4).replace(/0+$/, '').replace(/\.$/, '') : v.toFixed(2)
+      return /[\u3400-\u9fff]/.test(String(currency)) ? text + ' ' + currency : String(currency) + text
+    }
+    /** chatId → 好认的名字：group:602656027 → 「群 602656027」，system:bili → 「后台 · bili」 */
+    const chatLabel = (k) => {
+      if (!k || k === '（未知）') return '其他后台任务'
+      const [kind, id] = String(k).split(':')
+      if (kind === 'group') return '群 ' + id
+      if (kind === 'private') return '私聊 ' + id
+      if (kind === 'system') return '后台 · ' + String(id || '').replace(/^ext-/, '')
+      return String(k)
     }
     // ---------------- DeepSeek 峰谷（前端只读展示，逻辑与 src/core/offpeak.js 保持一致） ----------------
     const BJ_OFFSET = 8 * 3600_000 // 北京时间 = UTC+8（中国无夏令时）
@@ -68,6 +189,8 @@ window.__ModuleLoader__.load({
     const getPath = (obj, path) => path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj)
     // 自动记忆原本按来源分别限额；调整总数时按当前比例分配整数名额。
     const MEMORY_CAPACITY_DEFAULT = { auto: 2000, event: 600, diary: 400 }
+    // 「翻一翻」首屏一页 60 条，后面的点「加载更多」再取；不要一次拉 300 条。
+    const MEMORY_PAGE_SIZE = 60
     const memoryCapacity = (value) => Object.fromEntries(Object.entries(MEMORY_CAPACITY_DEFAULT).map(([key, fallback]) => {
       const n = Number(value?.[key])
       return [key, value?.[key] != null && Number.isFinite(n) ? Math.max(0, Math.floor(n)) : fallback]
@@ -87,6 +210,8 @@ window.__ModuleLoader__.load({
       return Object.fromEntries(Object.keys(MEMORY_CAPACITY_DEFAULT).map((key, i) => [key, limits[i]]))
     }
     const pct = (v) => Math.round((Number(v) || 0) * 100)
+    // 和 src/features/companion.js 的 moodEffects 严丝合缝：心情区间 → 贴表情系数
+    const REACT_MOOD_BANDS = [['85 以上', 1.6], ['70–84', 1.25], ['50–69', 1], ['35–49', 0.5], ['35 以下', 0.3]]
     const cx = (...a) => a.filter(Boolean).join(' ')
     // 音调存的是 '+20Hz' 这种字符串，滑条要数字；合法范围 ±80Hz（再往上 edge-tts 服务端会夹）
     const pitchNum = (s) => {
@@ -124,6 +249,11 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-deep:#9cc4f5;--ab-sea:#6
 .ab-hero .ab-sub{color:var(--ab-sub);margin-top:2px}
 .ab-hero-main{flex:1;min-width:0;position:relative;z-index:1}
 .ab-hero-side{display:flex;flex-direction:column;gap:8px;align-items:flex-end;position:relative;z-index:1}
+/* 首屏外壳骨架：bootstrap 返回前内容区只画中性占位（不闪、不做视觉改版） */
+.ab-skel{border-radius:10px;background:linear-gradient(90deg,var(--ab-card-2),var(--ab-foam),var(--ab-card-2));background-size:200% 100%;animation:ab-skel 1.4s ease-in-out infinite;min-height:14px}
+@keyframes ab-skel{0%{background-position:200% 0}100%{background-position:-200% 0}}
+.ab-boot-note{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:14px 18px;border:1px solid var(--ab-line);border-radius:14px;background:var(--ab-card)}
+.ab-boot-note.err{border-color:var(--ab-line-2)}
 .ab-pills{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
 .ab-pill{display:inline-flex;align-items:center;gap:6px;padding:2px 10px;border-radius:999px;font-size:12px;background:var(--ab-card-2);border:1px solid var(--ab-line);color:var(--ab-sub)}
 .ab-dot{width:7px;height:7px;border-radius:50%;background:var(--ab-dim)}
@@ -157,6 +287,31 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-deep:#9cc4f5;--ab-sea:#6
 .ab-finder-empty{padding:12px 10px;color:var(--ab-dim);font-size:12px}
 @media (max-width:640px){.ab-grp{padding:0 10px;gap:5px}.ab-find-btn .t,.ab-find-btn .ab-kbd{display:none}.ab-finder{left:6px;right:6px;width:auto;max-width:none}}
 .ab-grid{display:grid;gap:12px}
+.ab-pool>summary{cursor:pointer;font-weight:600}.ab-pool[open]>summary{margin-bottom:10px}
+@media (max-width:640px){.ab-voice-services .ab-row .ab-ctl{width:100%}}
+.ab-voice-options>summary{padding:8px 0;cursor:pointer;font-weight:560}
+.ab-market-grid{grid-template-columns:repeat(auto-fill,minmax(min(100%,280px),1fr))}
+.ab-market-grid>.ab-card{content-visibility:auto;contain-intrinsic-block-size:auto 180px}
+.ab-permission-grid{display:grid;grid-template-columns:minmax(220px,1fr) minmax(0,2fr);gap:12px;align-items:start}
+.ab-permission-grid>.ab-card{padding:14px 16px}
+.ab-permission-grid>.ab-card h3{margin-bottom:2px}
+.ab-permission-grid>.ab-card .ab-desc{margin:3px 0 8px;line-height:1.45}
+.ab-permission-people{display:grid;gap:3px;margin:8px 0 0;max-height:370px;overflow:auto}
+.ab-permission-person-row{display:flex;align-items:center;gap:6px;min-width:0}
+.ab-permission-person{display:flex;align-items:center;justify-content:space-between;gap:8px;text-align:left;padding:6px 8px;border:1px solid transparent;border-radius:8px;background:transparent;color:var(--ab-text);font:inherit;cursor:pointer}
+.ab-permission-person-row>.ab-permission-person{flex:1;min-width:0;width:100%}
+.ab-permission-person:hover,.ab-permission-person.on{border-color:var(--ab-line);background:var(--ab-foam)}
+.ab-permission-person small{display:block;color:var(--ab-sub)}
+.ab-permission-bulk{margin-top:8px;padding:10px 12px;border:1px solid var(--ab-line);border-radius:10px;background:var(--ab-foam)}
+.ab-permission-bulk>p{margin:4px 0 8px}
+.ab-permission-options{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}
+.ab-permission-options .ab-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px 10px;padding:10px 12px;border:1px solid var(--ab-line);border-radius:10px}
+.ab-permission-options .ab-row .ab-label{flex:none;min-width:0;padding-top:0}
+.ab-permission-options .ab-row .ab-label small{max-width:none}
+.ab-permission-options .ab-row .ab-ctl{flex:none;grid-column:2;grid-row:1;justify-content:flex-end}
+.ab-permission-group-row .ab-ctl{justify-content:flex-end}
+.ab-permission-section h4{margin:10px 0 4px}
+@media(max-width:800px){.ab-permission-grid{grid-template-columns:1fr}.ab-permission-people{max-height:190px}}
 .ab-g2{grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
 .ab-g4{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
 .ab-card{background:var(--ab-card);border:1px solid var(--ab-line);border-radius:14px;padding:16px 18px}
@@ -252,7 +407,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-deep:#9cc4f5;--ab-sea:#6
 .ab-sticker .x{position:absolute;top:4px;right:4px;opacity:0;transition:opacity .15s}
 .ab-sticker:hover .x{opacity:1}
 .ab-list{display:flex;flex-direction:column}
-.ab-li{display:flex;gap:12px;align-items:flex-start;padding:10px 0;border-top:1px solid var(--ab-line)}
+.ab-li{display:flex;gap:12px;align-items:flex-start;padding:10px 0;border-top:1px solid var(--ab-line);content-visibility:auto;contain-intrinsic-size:56px}
 .ab-li:first-child{border-top:0}
 .ab-li .meta{color:var(--ab-dim);font-size:11.5px;white-space:nowrap}
 .ab-li .body{flex:1;min-width:0;white-space:pre-wrap;word-break:break-word}
@@ -272,6 +427,17 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-deep:#9cc4f5;--ab-sea:#6
 .ab-pm-face img{width:100%;height:100%;object-fit:cover;display:block}
 .ab-pm-face.big{width:64px;height:64px;font-size:24px}
 .ab-pm-split{display:grid;grid-template-columns:272px minmax(0,1fr);gap:12px;align-items:start}
+.ab-pm-graph{grid-template-columns:minmax(0,1fr)}
+.ab-pm-graph.open{grid-template-columns:minmax(320px,1fr) minmax(0,1fr)}
+.ab-pm-graph .ab-pm-list{position:static;max-height:none;min-width:0}
+.ab-pm-stars{max-height:650px;overflow:auto;overscroll-behavior:contain}
+.ab-pm-stars svg{display:block;width:100%;max-width:560px;margin:auto;touch-action:pan-y}
+.ab-pm-stars g[role=button]{cursor:pointer;outline:none}
+.ab-pm-stars g[role=button]:focus-visible circle{stroke:var(--ab-text);stroke-width:3}
+.ab-pm-related{margin-top:6px;font-size:12px;line-height:1.6}
+.ab-pm-related article{padding:7px 9px;margin-top:5px;background:var(--ab-foam);border-radius:8px;white-space:pre-wrap;overflow-wrap:anywhere}
+.ab-pm-related .text{text-decoration:none!important}
+.ab-pm-platforms{overflow-x:auto}
 .ab-pm-list{display:flex;flex-direction:column;border:1px solid var(--ab-line);border-radius:14px;background:var(--ab-card);overflow:visible;position:sticky;top:64px;z-index:1;max-height:calc(100vh - 96px)}
 .ab-pm-search{position:relative;z-index:2;padding:10px;border-bottom:1px solid var(--ab-line)}
 .ab-pm-search input{width:100%;box-sizing:border-box}
@@ -344,7 +510,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-deep:#9cc4f5;--ab-sea:#6
 .ab-pm-tl-item.feel:before{left:-20px;top:14px;width:11px;height:11px;background:var(--ab-deep);box-shadow:0 0 0 3px var(--ab-foam-2)}
 .ab-pm-tl-item.feel .text{font-size:16px;font-weight:600;color:var(--ab-deep)}
 @media (max-width:760px){
-.ab-pm-split{grid-template-columns:minmax(0,1fr)}
+.ab-pm-split,.ab-pm-graph.open{grid-template-columns:minmax(0,1fr)}
 .ab-pm-list{position:static;max-height:none}
 .ab-pm-split.open .ab-pm-list{display:none}
 .ab-pm-acts{opacity:1}
@@ -411,6 +577,27 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-deep:#9cc4f5;--ab-sea:#6
 .ab-muted{color:var(--ab-sub)}
 .ab-small{font-size:12px}
 .ab-section-title{font-size:12px;font-weight:600;color:var(--ab-dim);letter-spacing:.06em;margin:18px 2px 8px}
+.ab-fold{display:flex;align-items:center;gap:6px;width:100%;background:none;border:0;padding:0;font:inherit;text-align:left;cursor:pointer}
+.ab-fold:hover{color:var(--ab-text)}
+.ab-fold-arrow{width:12px;display:inline-block;flex:0 0 12px}
+/* token 用量面板：指标卡 + 小标签 + 数字右对齐，别糊成一坨 */
+/* Usage is read-only: one entry card, detailed tables scroll inside the card on phones. */
+.ab-usage{min-width:0}
+.ab-usage>.ab-card{min-width:0;max-width:100%;box-sizing:border-box}
+.ab-usage-summary{display:flex;flex-direction:column;align-items:flex-start;gap:8px;text-align:left;color:var(--ab-text);font:inherit;cursor:pointer;width:100%}
+.ab-usage-summary:hover{border-color:var(--ab-sea)}
+.ab-usage-summary:focus-visible{outline:2px solid var(--ab-sea);outline-offset:2px}
+.ab-usage-number{font-size:30px;line-height:1.2;color:var(--ab-deep);font-variant-numeric:tabular-nums}
+.ab-usage-table{max-width:100%;overflow-x:auto;margin-top:12px}
+.ab-usage-table table{min-width:680px}
+.ab-usage-table th,.ab-usage-table td{white-space:nowrap}
+.ab-usage-table td:first-child{white-space:normal;min-width:150px;max-width:280px;overflow-wrap:anywhere}
+.ab-usage summary{cursor:pointer}
+
+.ab-table.num th:not(:first-child),.ab-table.num td:not(:first-child){text-align:right}
+.ab-table.num td:not(:first-child){font-variant-numeric:tabular-nums}
+.ab-table.num .money{font-weight:600;color:var(--ab-deep)}
+.ab-table.num tbody tr:last-child td{border-bottom:0}
 .ab-sel{position:relative;display:inline-block;min-width:200px;max-width:100%}
 .ab-sel-btn{width:100%;display:flex;align-items:center;gap:8px;border:1px solid var(--ab-line-2);border-radius:9px;padding:6px 10px;background:var(--ab-card);color:var(--ab-text);font:inherit;cursor:pointer;text-align:left}
 .ab-sel-btn:hover{border-color:var(--ab-sky)}
@@ -433,6 +620,12 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-deep:#9cc4f5;--ab-sea:#6
 .ab-choice.on{border-color:var(--ab-sea);box-shadow:0 0 0 3px var(--ab-foam);background:linear-gradient(var(--ab-foam),var(--ab-foam)),var(--ab-card)}
 .ab-choice b{display:flex;align-items:center;gap:6px;font-weight:600}
 .ab-choice small{display:block;color:var(--ab-dim);font-size:11.5px;margin-top:3px;line-height:1.45}
+.ab-choice-pin{position:absolute;right:8px;top:8px;display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:7px;color:var(--ab-dim);opacity:.55;cursor:pointer;transition:opacity .12s,color .12s,background .12s}
+.ab-choice-pin:hover{opacity:1;background:var(--ab-hover)}
+.ab-choice-pin.on{opacity:1;color:var(--ab-sea);background:var(--ab-foam)}
+.ab-choice-more{display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;min-height:78px}
+.ab-choice-more b{justify-content:center}
+.ab-choice-more small{text-align:center}
 .ab-tab .dirty{width:6px;height:6px;border-radius:50%;background:var(--ab-warn)}
 .ab-toast.ok{background:var(--ab-ok);color:#fff}.ab-toast.err{background:var(--ab-err);color:#fff}
 .ab-kbd{font-family:var(--dsh-font-family-code,monospace);font-size:11px;padding:0 5px;border:1px solid var(--ab-line-2);border-radius:5px;color:var(--ab-dim)}
@@ -544,6 +737,30 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
 .ab-mod .what{color:var(--ab-dim);font-size:11.5px;margin-top:4px;word-break:break-word}
 .ab-mod .acts{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
 .ab-mod .side{display:flex;flex-direction:column;align-items:flex-end;gap:6px}
+/* 管理功能页：模块项卡片网格（替代原行式布局，提高横向空间利用率）。
+   列宽取 180px：DSH 面板内容区偏窄（约 380~450px，还要扣掉所在 Card 的内边距），
+   180px 能稳定排出 2 列；容器更窄时由 auto-fill 自动降为单列，无需媒体查询。 */
+.ab-manage-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px;align-items:stretch}
+.ab-manage-card{display:flex;flex-direction:column;gap:8px;padding:14px 16px;border:1px solid var(--ab-line);border-radius:12px;background:var(--ab-card);min-width:0}
+/* 受限/失败：告警色边框 + 卡底，提示需要处理（色值沿用 .ab-badge.warn 的告警色，不引入新颜色） */
+.ab-manage-card.is-blocked{border-color:rgba(191,135,0,.35);background:var(--ab-card-2)}
+.ab-manage-card.is-off,.ab-manage-card.is-absent{background:var(--ab-card-2)}
+/* 卡片头部：名称+徽标左对齐，启用开关右对齐（两端对齐）。
+   width:100% / align-self:stretch 显式撑满卡宽——space-between 只有在头部占满可用宽时
+   才会把开关顶到右缘；名称是 auto 宽度的 flex item，靠它撑不满整行。 */
+.ab-manage-head{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;align-self:stretch;box-sizing:border-box}
+/* 模块名字号：比面板正文(12.5px)/卡片标题(15px)之间取 15.5px，作为卡片内的主标题更醒目 */
+.ab-manage-name{font-weight:620;font-size:15.5px;min-width:0;overflow-wrap:anywhere}
+.ab-manage-desc{color:var(--ab-sub);font-size:12.5px;line-height:1.55;flex:1 1 auto;min-width:0;overflow-wrap:anywhere}
+.ab-manage-reason{margin:0;font-size:12.5px}
+/* 操作区固定在卡片底部，保证同排卡片按钮对齐 */
+.ab-manage-acts{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:auto;padding-top:2px}
+/* 卡片内「更多设置（N 项）」子折叠卡：视觉上弱化一层，避免与父卡重复的实底边框 */
+.ab-fold-sub{background:transparent;border-style:dashed;box-shadow:none}
+/* 组行：一行放一组设置，行内项自由流式排版（按类型与宽度自然排，窄窗自动降列） */
+.ab-grp-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px 14px;align-items:start}
+.ab-grp-row>.ab-row{flex-direction:column;align-items:flex-start;gap:4px}
+.ab-grp-row>.ab-row>.ab-ctl{width:100%}
 .ab-code{font-family:ui-monospace,Consolas,monospace;font-size:11.5px;background:var(--ab-card-2);border:1px solid var(--ab-line);border-radius:8px;padding:8px 10px;white-space:pre-wrap;word-break:break-all;margin:6px 0 0}
 `
     function useStyle() {
@@ -567,17 +784,25 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     }
 
     // ---------------- 基础控件 ----------------
-    function Switch({ on, onChange, disabled, title }) {
-      return h('button', { type: 'button', className: cx('ab-switch', on && 'on'), onClick: () => !disabled && onChange(!on), disabled, title, role: 'switch', 'aria-checked': !!on })
+    // 两种写法都认：内置表单用 on，自己写的模块（panel.js）习惯按受控 input 写 checked。
+    // 只认 on 的时候，模块面板里的开关会永远显示「关」：on 是 undefined，点了也不变色，
+    // 看着就像点了没反应（dsh-image 的「用 DSH 已接入的模型生图」就是踩这个坑）。
+    // label 同理：模块面板习惯写 label，这里当 title 兜住，不至于丢失提示。
+    function Switch({ on, checked, onChange, disabled, title, label }) {
+      const value = on === undefined ? checked : on
+      return h('button', { type: 'button', className: cx('ab-switch', value && 'on'), onClick: () => !disabled && onChange(!value), disabled, title: title || label, role: 'switch', 'aria-checked': !!value })
     }
     function Row({ label, hint, children }) {
       return h('div', { className: 'ab-row' }, h('div', { className: 'ab-label' }, h('b', null, label), hint ? h('small', null, hint) : null), h('div', { className: 'ab-ctl' }, children))
     }
-    function Card({ title, desc, icon, right, children, className }) {
-      return h('div', { className: cx('ab-card', className) },
-        title ? h('div', { className: 'ab-flex', style: { marginBottom: desc ? 0 : 10 } }, h('h3', null, icon || null, title), h('div', { className: 'ab-spacer' }), right || null) : null,
-        desc ? h('p', { className: 'ab-desc' }, desc) : null,
-        children)
+    function Card({ title, desc, icon, right, children, className, collapsible, defaultOpen = true }) {
+      const [open, setOpen] = useState(!collapsible || defaultOpen)
+      const head = title ? h('div', { className: 'ab-flex', style: { marginBottom: (desc && open) ? 0 : 10 } },
+        h('h3', { onClick: collapsible ? () => setOpen((v) => !v) : undefined, style: collapsible ? { cursor: 'pointer', userSelect: 'none' } : undefined },
+          icon || null, title,
+          collapsible ? h('span', { className: 'ab-muted', style: { marginLeft: 6, fontSize: 11 } }, open ? '▾ 收起' : '▸ 展开') : null),
+        h('div', { className: 'ab-spacer' }), right || null) : null
+      return h('div', { className: cx('ab-card', className) }, head, desc && open ? h('p', { className: 'ab-desc' }, desc) : null, open ? children : null)
     }
     function Btn({ kind, small, onClick, disabled, children, title }) {
       const [busy, setBusy] = useState(false)
@@ -639,6 +864,83 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         h('b', null, o.icon || null, o.label), o.desc ? h('small', null, o.desc) : null)))
     }
 
+    /** 贴表情的映射表：QQ 系统表情（自己的编号）＋ emoji（Unicode 码点），两种都能直接填给 set_msg_emoji_like。 */
+    /** QQ 系统表情的预览图：社区维护的 QFace 图库按 id 取 png；取不到就把图藏起来，只留名字。 */
+    const QFACE_IMG = (id) => 'https://koishi.js.org/QFace/assets/qq_emoji/' + id + '/png/' + id + '.png'
+
+    function FaceMapCard() {
+      const [data, setData] = useState(null)
+      const [q, setQ] = useState('')
+      const [kind, setKind] = useState('all')
+      const [copied, setCopied] = useState('')
+      useEffect(() => {
+        let alive = true
+        get('/panel/faces')
+          .then((r) => { if (alive && r && r.ok !== false) setData(r) })
+          .catch(() => {})
+        return () => { alive = false }
+      }, [])
+      const faces = data ? data.faces || [] : []
+      const emojis = data ? data.emojis || [] : []
+      const all = [
+        ...faces.map((x) => ({ kind: 'face', name: String(x.name), id: String(x.id), label: String(x.name) })),
+        ...emojis.map((x) => ({ kind: 'emoji', name: String(x.name), id: String(x.id), label: x.char + ' ' + x.name })),
+      ]
+      const key = String(q || '').trim().toLowerCase()
+      const rows = all.filter((x) => (kind === 'all' || x.kind === kind) &&
+        (!key || x.name.toLowerCase().includes(key) || x.id.includes(key) || x.label.toLowerCase().includes(key)))
+      const copy = (x) => {
+        try { navigator.clipboard.writeText(x.id) } catch (e) {}
+        setCopied(x.id)
+        setTimeout(() => setCopied(''), 1200)
+      }
+      return h(Card, {
+        title: '可用映射' + (all.length ? '（' + all.length + ' 条）' : ''),
+        desc: '两种编号混着用都行。点一行复制编号，填进贴表情或让她自己挑。',
+      },
+        h('div', { style: { display: 'flex', gap: 8, alignItems: 'center', marginBottom: 8, flexWrap: 'wrap' } },
+          h(Seg, {
+            value: kind,
+            options: [
+              { value: 'all', label: '全部' },
+              { value: 'face', label: 'QQ 表情 ' + faces.length },
+              { value: 'emoji', label: 'emoji ' + emojis.length },
+            ],
+            onChange: setKind,
+          }),
+          h('input', {
+            className: 'ab-input sm',
+            placeholder: '搜名字或编号',
+            value: q,
+            onChange: (e) => setQ(e.target.value),
+            style: { width: 180 },
+          }),
+          copied ? h('span', { className: 'ab-small', style: { color: 'var(--ab-ok)' } }, '已复制 ' + copied) : null),
+        data === null
+          ? h('div', { className: 'ab-muted ab-small' }, '正在读表情目录…')
+          : rows.length === 0
+            ? h('div', { className: 'ab-muted ab-small' }, '没有匹配的')
+            : h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(148px, 1fr))', gap: 6, maxHeight: 260, overflow: 'auto', paddingRight: 4 } },
+                rows.map((x) => h('button', {
+                  key: x.kind + x.id,
+                  type: 'button',
+                  title: '复制 ' + x.id,
+                  onClick: () => copy(x),
+                  style: { display: 'flex', justifyContent: 'space-between', gap: 8, alignItems: 'center', font: 'inherit', fontSize: 12, padding: '4px 8px', borderRadius: 6, border: '1px solid rgba(127,127,127,.22)', background: 'rgba(127,127,127,.06)', color: 'inherit', cursor: 'pointer', textAlign: 'left' },
+                },
+                  h('span', { style: { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 } },
+                    x.kind === 'face'
+                      ? h('img', {
+                          src: QFACE_IMG(x.id), alt: '', width: 18, height: 18, loading: 'lazy',
+                          style: { flex: '0 0 auto', width: 18, height: 18, objectFit: 'contain' },
+                          onError: (e) => { e.currentTarget.style.visibility = 'hidden' },
+                        })
+                      : null,
+                    h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, x.kind === 'emoji' ? x.label : x.name)),
+                  h('span', { style: { fontFamily: 'ui-monospace, Consolas, monospace', opacity: 0.75 } }, x.id)))),
+      )
+    }
+
     /** 滑块 + 数值，比纯数字框直观。 */
     function Range({ value, min, max, step, onChange, fmt }) {
       return h('div', { className: 'ab-range' },
@@ -686,6 +988,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     // ---------------- 标签页 ----------------
     const TABS = [
       { id: 'overview', label: '概览' },
+      { id: 'manage', label: '管理功能' },
       { id: 'connect', label: '连接' },
       { id: 'character', label: '人格' },
       { id: 'access', label: '权限' },
@@ -694,16 +997,17 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       { id: 'voice', label: '语音', flag: 'voice.enabled' },
       { id: 'stickers', label: '表情包', flag: 'stickers.enabled' },
       { id: 'imagegen', label: '生图', flag: 'imageGen.enabled' },
+      { id: 'video', label: '视频', flagFn: (cfg) => { const v = cfg.video || {}; const p = v.provider || 'local'; return p === 'local' ? Boolean(cfg.local && cfg.local.video) : p === 'minimax' ? Boolean(v.minimax && v.minimax.apiKeySet) : Boolean(v.custom && v.custom.createUrl && v.custom.queryUrl) } },
       { id: 'diary', label: '空间日记', flag: 'diary.enabled' },
-      { id: 'speakup', label: '主动搭话', flag: 'speakUp.enabled' },
+      { id: 'speakup', label: '目的引擎', flag: 'ext.purpose.enabled' },
+      { id: 'autotelic', label: '自驱引擎（实验）', flag: 'ext.autotelic.enabled' },
       { id: 'pet', label: '桌宠' },
-      { id: 'mood', label: '心情与记忆', flag: 'mood.enabled' },
-      { id: 'persona', label: '人物记忆', flag: 'memory.enabled' },
+      { id: 'mood', label: '心情', flag: 'mood.enabled' },
+      { id: 'memory', label: '记忆', flag: 'memory.enabled' },
       { id: 'song', label: '翻唱', flag: 'song.enabled' },
-      { id: 'bili', label: 'B站', flag: 'bili.enabled' },
-      { id: 'douyin', label: '抖音', flag: 'douyin.enabled' },
-      { id: 'heybox', label: '小黑盒', flag: 'heybox.enabled' },
+      { id: 'content', label: '内容平台' },
       { id: 'local', label: '本地接口' },
+      { id: 'browser', label: '浏览器' },
       { id: 'security', label: '安全防护' },
       { id: 'market', label: '模块市场' },
       { id: 'modules', label: '已安装' },
@@ -711,31 +1015,42 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       { id: 'about', label: '关于' },
       { id: 'logs', label: '日志' },
     ]
-    // 内置标签页属于哪个模块：模块都没在跑就不显示这一页
-    const TAB_MODS = { voice: ['voice'], stickers: ['stickers'], imagegen: ['imagegen'], diary: ['diary', 'qzone-social'], speakup: ['speakup', 'purpose'], pet: ['pet'], mood: ['mood', 'memory'], persona: ['memory'], song: ['song'], bili: ['bili'], douyin: ['douyin'], heybox: ['heybox'] }
+    // 内置标签页属于哪个模块：模块都没在跑就不显示这一页（语音识别 asr 已并入「语音」页）
+    const TAB_MODS = { voice: ['voice'], stickers: ['stickers'], imagegen: ['imagegen'], video: ['video'], diary: ['diary', 'qzone-social'], speakup: ['speakup', 'purpose'], pet: ['pet'], mood: ['mood', 'memory'], memory: ['memory', 'persona'], song: ['song'], content: ['bili', 'douyin', 'heybox'], autotelic: ['autotelic'] }
     const modOn = (st, id) => (st.modules || []).some((m) => m.id === id && m.running)
 
     // 两层导航：上面一排是分组，下面一排是这组里的页面；每组记住上次看的那页，Alt+K 查找功能
     // （分组导航的思路来自社区贡献的「导航布局」扩展，这里改成面板自己实现）
     const NAV_GROUPS = [
-      { id: 'home', label: '概览', icon: 'M3 10.5 12 3l9 7.5M5.5 9v11.5h13V9M10 20.5v-6h4v6', tabs: ['overview'] },
-      { id: 'self', label: '人设', icon: 'M12 12.5a4.25 4.25 0 1 0 0-8.5 4.25 4.25 0 0 0 0 8.5zM4.5 20.5c.9-3.6 3.9-5.5 7.5-5.5s6.6 1.9 7.5 5.5', tabs: ['character', 'group', 'speakup', 'mood', 'persona'] },
-      { id: 'express', label: '表达', icon: 'M20.5 11.5a8 8 0 0 1-11.7 7.1L4 20l1.4-4.4A8 8 0 1 1 20.5 11.5zM9 13.2s1.1 1.5 3 1.5 3-1.5 3-1.5M9.5 9.6h.01M14.5 9.6h.01', tabs: ['voice', 'stickers', 'imagegen', 'song', 'pet'] },
-      { id: 'platform', label: '平台', icon: 'M3.5 6.5h17v11h-17zM10.5 9.8v4.4l3.8-2.2z', tabs: ['diary', 'bili', 'douyin', 'heybox'] },
-      { id: 'system', label: '系统', icon: 'M4 7h9M17 7h3M4 12h3M11 12h9M4 17h11M19 17h1M15 5v4M9 10v4M17 15v4', tabs: ['connect', 'model', 'access', 'security', 'backup', 'about', 'logs'] },
+      { id: 'home', label: '概览', icon: 'M3 10.5 12 3l9 7.5M5.5 9v11.5h13V9M10 20.5v-6h4v6', tabs: ['overview', 'manage'] },
+      { id: 'self', label: '人设', icon: 'M12 12.5a4.25 4.25 0 1 0 0-8.5 4.25 4.25 0 0 0 0 8.5zM4.5 20.5c.9-3.6 3.9-5.5 7.5-5.5s6.6 1.9 7.5 5.5', tabs: ['character', 'group', 'speakup', 'autotelic', 'mood', 'memory'] },
+      { id: 'express', label: '表达', icon: 'M20.5 11.5a8 8 0 0 1-11.7 7.1L4 20l1.4-4.4A8 8 0 1 1 20.5 11.5zM9 13.2s1.1 1.5 3 1.5 3-1.5 3-1.5M9.5 9.6h.01M14.5 9.6h.01', tabs: ['voice', 'stickers', 'imagegen', 'video', 'song', 'pet'] },
+      { id: 'platform', label: '平台', icon: 'M3.5 6.5h17v11h-17zM10.5 9.8v4.4l3.8-2.2z', tabs: ['diary', 'content'] },
+      { id: 'system', label: '系统', icon: 'M4 7h9M17 7h3M4 12h3M11 12h9M4 17h11M19 17h1M15 5v4M9 10v4M17 15v4', tabs: ['connect', 'model', 'access', 'browser', 'security', 'backup', 'about', 'logs'] },
       { id: 'market', label: '模块', icon: 'M4 9.5 5.5 4h13L20 9.5M4 9.5a2.7 2.7 0 0 0 5.3 0 2.7 2.7 0 0 0 5.4 0 2.7 2.7 0 0 0 5.3 0M5.5 12.5V20h13v-7.5M10 20v-4.5h4V20', tabs: ['market', 'modules', 'local'] },
     ]
     // 自己写的模块：名字像逛平台的放「平台」，其余放「系统」（排在「日志」前面）
     const PLATFORM_EXT = /逛|刷|B站|抖音|小红书|闲鱼|淘宝|微博|知乎|贴吧|快手|触站|小黑盒/
-    const navGroupOf = (t) => NAV_GROUPS.find((g) => g.tabs.includes(t.id)) || (t.ext && PLATFORM_EXT.test(t.label) ? NAV_GROUPS[3] : NAV_GROUPS[4])
+    const navGroupById = (id) => NAV_GROUPS.find((group) => group.id === id)
+    const navGroupOf = (t) => NAV_GROUPS.find((g) => g.tabs.includes(t.id)) || navGroupById(t.navGroup) ||
+      (t.ext && PLATFORM_EXT.test(t.label) ? NAV_GROUPS[3] : NAV_GROUPS[4])
     const navOrder = (g, t) => { const i = g.tabs.indexOf(t.id); return i >= 0 ? i : g.tabs.length - (g.tabs.includes('logs') ? 1.5 : 0) }
     const NAV_ALIAS = {
-      overview: '首页 状态', connect: 'qq 网关 snowluma onebot 登录 工作区', character: '人设 性格 设定 头像', persona: '人物 画像 小档案 群印象 梗概 时间轴 相处经验 说话方式', access: '主人 白名单 权限 群管 改资料',
-      group: '群聊 插话 合并', model: 'ai 大模型 视觉 思考强度', voice: '语音 tts 说话 音色 edge', stickers: '表情 小黄脸 gif 商城表情',
-      imagegen: '画图 图片', diary: '空间 说说 日记', speakup: '搭话 主动', mood: '心情 记忆', song: '唱歌 翻唱 rvc 点歌',
-      bili: 'b站 bilibili 视频', douyin: '抖音 短视频 私信', pet: '桌宠 宠物 悬浮窗 气泡 electron', local: '本地 接口 sd sovits', security: '安全 防护 ssrf 内网 图片 下载', modules: '扩展 自己写 模板 安全模式', market: '模块 市场 插件 社区 下载 安装 桌宠 抖音 小黑盒 群管', logs: '日志 报错', about: '关于 关于我们 版本 许可 鸣谢 开源', backup: '备份 恢复 换电脑 迁移 导入 导出',
+      overview: '首页 状态', manage: '管理功能 开关 启用 停用 可选功能', connect: 'qq 网关 snowluma onebot 登录 工作区', character: '人设 性格 设定 头像', access: '主人 白名单 权限 群管 改资料',
+      group: '群聊 发言 白名单 仅模块 主动 窗口 插话 旁听 静默 合并 不回应 不理 屏蔽 黑名单 通用设置 继续回应 回复方式 权限与限制', model: 'ai 大模型 视觉 思考强度', voice: '语音 tts 说话 音色 edge 语音识别 听语音 转文字 asr 语音转文本', stickers: '表情 小黄脸 gif 商城表情',
+      imagegen: '画图 图片', video: '视频 生视频 拍视频', diary: '空间 说说 日记', speakup: '搭话 主动 目的引擎 目的 素材 立目标 小闹钟 追问', autotelic: '自驱 自主 后台 账本 审计 做梦 立项', mood: '心情', memory: '记忆 星图 联想 翻一翻 向量 重排 人物 画像 小档案 群印象 梗概 时间轴 相处经验 说话方式', song: '唱歌 翻唱 rvc 点歌',
+      content: '内容平台 抖音 b站 bilibili 小黑盒 短视频 私信 刷视频', pet: '桌宠 宠物 悬浮窗 气泡 electron', local: '本地 接口 sd sovits', browser: '浏览器 侧边 侧边栏 ego 共享 独立窗口', security: '安全 防护 ssrf 内网 图片 下载', modules: '扩展 自己写 模板 安全模式', market: '模块 市场 插件 社区 下载 安装 桌宠 抖音 小黑盒 群管', logs: '日志 报错', about: '关于 关于我们 版本 许可 鸣谢 开源', backup: '备份 恢复 换电脑 迁移 导入 导出',
     }
     const navIcon = (d) => h('svg', { viewBox: '0 0 24 24', 'aria-hidden': true }, h('path', { d }))
+    // connections 是平台连接快照数组（平台/实例/连接阶段）；推不出 QQ 网关状态时返回 null、保留旧值不动。
+    // 字段按契约语义取 platform/stage；契约未细化的字段形状不猜，推不出来就不改界面状态。
+    const connectionsToOnebot = (connections, fallback) => {
+      if (!Array.isArray(connections)) return null
+      const qq = connections.find((c) => c && (c.platform === 'qq' || c.platform === 'onebot' || c.id === 'onebot' || c.instanceId === 'onebot'))
+      if (!qq || qq.stage == null) return null
+      const state = { connected: 'connected', connecting: 'connecting', disconnected: 'disconnected', stopped: 'stopped', unconfigured: 'unconfigured' }[qq.stage]
+      return state ? { ...fallback, state } : null
+    }
 
     function NavBar({ tabs, cur, go, mark, dirtyOf, subRef }) {
       const [last, setLast] = useState(() => { try { return JSON.parse(localStorage.getItem('aurabot.navlast') || '{}') || {} } catch (e) { return {} } })
@@ -818,10 +1133,30 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     }
     const copy = (text, toast, msg) => { try { navigator.clipboard.writeText(text); if (msg) toast(msg, 'ok') } catch (e) { toast('复制失败，手动选中复制吧', 'err') } }
 
-    /** 更新提示：GitHub 上有新版本时给更新命令；刚更新完显示一次这次更新了什么。 */
+    // SnowLuma 版本提醒：只针对「低于最低支持版本」弹一次；升级到 >= 2.3.4 或点过「不再提示」就不再出现
+    const SNOWLUMA_WARN_KEY = 'aurabot.snowlumaCompatDismissed'
+    function SnowLumaCompatBanner({ st, go }) {
+      const compat = st && st.snowluma && st.snowluma.compat
+      const [dismissed, setDismissed] = useState(() => { try { return localStorage.getItem(SNOWLUMA_WARN_KEY) === '1' } catch (e) { return false } })
+      if (!compat || compat.status !== 'outdated' || dismissed) return null
+      const dismiss = () => { try { localStorage.setItem(SNOWLUMA_WARN_KEY, '1') } catch (e) {} setDismissed(true) }
+      return h('div', { className: 'ab-note warn', style: { marginTop: 12 } },
+        h('div', { className: 'ab-flex', style: { alignItems: 'center', gap: 8, flexWrap: 'wrap' } },
+          h('b', null, '建议升级 SnowLuma'),
+          h('div', { className: 'ab-spacer' }),
+          h(Btn, { small: true, kind: 'ghost', onClick: dismiss }, '不再提示')),
+        h('div', { style: { marginTop: 6 } }, compat.message),
+        h('div', { className: 'ab-flex', style: { marginTop: 8, gap: 8, flexWrap: 'wrap' } },
+          h(Btn, { small: true, kind: 'primary', onClick: () => window.open(st.snowluma.downloadPage, '_blank') }, '打开下载页 ↗'),
+          h(Btn, { small: true, onClick: () => go('connect') }, '去连接页看看')))
+    }
+
+    /** 更新提示：GitHub 上有新版本时给「跟当前系统/形态对应」的命令、链接和更新按钮；刚更新完显示一次这次更新了什么。 */
     function UpdateNotes({ st, toast }) {
       const [upd, setUpd] = useState(null)
       const [notes, setNotes] = useState(null)
+      const [busy, setBusy] = useState(false)
+      const [result, setResult] = useState(null)
       useEffect(() => {
         get('/update/check').then(setUpd).catch(() => {})
         let seen = null
@@ -831,15 +1166,151 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         else if (!seen) { try { localStorage.setItem('aurabot.seenVersion', st.version) } catch (e) {} }
       }, [st.version])
       const dismiss = () => { try { localStorage.setItem('aurabot.seenVersion', st.version) } catch (e) {} setNotes(null) }
+      const copy = (text) => { try { navigator.clipboard.writeText(text); toast('复制好了', 'ok') } catch (e) { toast('复制失败，手动选中复制吧', 'err') } }
+      const apply = async () => {
+        if (!upd || busy) return
+        if (!confirm('现在更新到 v' + upd.latest + '？更新完需要重启 DSH 才会生效，设置、人格、记忆都会保留。')) return
+        setBusy(true)
+        setResult(null)
+        const r = await post('/update/apply')
+        setBusy(false)
+        setResult(r)
+        toast(r.message || (r.ok ? '更新好了，重启 DSH 生效' : '更新没成功'), r.ok ? 'ok' : 'err')
+      }
+      const envText = upd && upd.platform ? (upd.platformLabel || upd.platform) + ' · ' + (upd.modeLabel || upd.mode) + '（profile: ' + upd.profile + '）' : ''
       return h(Fragment, null,
         notes ? h('div', { className: 'ab-note' },
           h('div', { className: 'ab-flex' }, h('b', null, '已更新到 v' + st.version), h('div', { className: 'ab-spacer' }), h(Btn, { small: true, kind: 'ghost', onClick: dismiss }, '知道了')),
           h('div', { style: { whiteSpace: 'pre-wrap', marginTop: 6 } }, notes)) : null,
         upd && upd.newer ? h('div', { className: 'ab-note warn' },
-          h('div', null, h('b', null, '有新版本 v' + upd.latest), '（现在是 v' + upd.current + '）。在 PowerShell 里运行下面这行，然后重启 DSH；设置、人格、记忆都会保留。'),
+          h('div', null, h('b', null, '有新版本 v' + upd.latest), '（现在是 v' + upd.current + '）。', envText ? '当前环境：' + envText + '。' : '', '更新后重启 DSH，设置、人格、记忆都会保留。'),
           h('div', { className: 'ab-flex', style: { marginTop: 6 } },
-            h('code', { style: { flex: '1 1 300px', fontSize: 11.5, wordBreak: 'break-all' } }, upd.command),
-            h(Btn, { small: true, onClick: () => { try { navigator.clipboard.writeText(upd.command); toast('复制好了', 'ok') } catch (e) { toast('复制失败，手动选中复制吧', 'err') } } }, '复制'))) : null)
+            h('code', { style: { flex: '1 1 240px', fontSize: 11.5, wordBreak: 'break-all' } }, upd.command),
+            h(Btn, { small: true, onClick: () => copy(upd.command) }, '复制'),
+            h(Btn, { small: true, kind: 'primary', disabled: busy, onClick: apply }, busy ? '更新中…' : '立即更新'),
+            h('a', { key: 'release', className: 'ab-btn sm', href: upd.tagUrl || upd.releaseUrl, target: '_blank', rel: 'noreferrer' }, '打开发布页')),
+          result ? h('div', { className: 'ab-small', style: { marginTop: 6, whiteSpace: 'pre-wrap', wordBreak: 'break-all', color: result.ok ? 'var(--dsw-alias-text-success, #2e7d32)' : 'var(--dsw-alias-text-danger, #c62828)' } },
+            result.message, result.output ? '\n' + String(result.output).slice(-1200) : '') : null) : null)
+    }
+
+    // 老用户升级后：根目录里攒下的记忆和会话还没认领给哪个人格。认领前所有人格照旧共用这一份
+    function ClaimBanner({ st, toast }) {
+      const [id, setId] = useState(() => ((st.personas || []).some((p) => p.id === 'dafeiyu') ? 'dafeiyu' : (st.personas || [])[0]?.id || ''))
+      const [done, setDone] = useState(false)
+      if (done || !st.persona?.claimPending) return null
+      const claim = async () => {
+        const name = ((st.personas || []).find((p) => p.id === id) || {}).name || id
+        if (!confirm('把升级前的记忆和会话认领给「' + name + '」？之后其他人格从下一轮起用自己的记忆和会话（一开始是空的）。只能认领一次。')) return
+        const r = await post('/persona/data-owner', { id })
+        toast(r.message || (r.ok ? '认领好了' : '没认领成功'), r.ok ? 'ok' : 'err')
+        if (r.ok) setDone(true)
+      }
+      return h('div', { className: 'ab-note warn' },
+        '现在每个人格可以有自己的记忆和会话了。升级前攒下的记忆和会话属于哪个人格？认领之前，所有人格照旧共用这一份。',
+        h('div', { className: 'ab-flex', style: { marginTop: 6, alignItems: 'center' } },
+          h('select', { className: 'ab-select', 'aria-label': '认领给哪个人格', value: id, onChange: (e) => setId(e.target.value) },
+            (st.personas || []).map((p) => h('option', { key: p.id, value: p.id }, p.name))),
+          h(Btn, { small: true, kind: 'primary', onClick: claim }, '认领')))
+    }
+
+    const usageCurrencies = { CNY: '人民币', USD: '美元', EUR: '欧元', HKD: '港元', JPY: '日元', GBP: '英镑', SGD: '新加坡元', CAD: '加元', AUD: '澳元', CHF: '瑞士法郎' }
+    const usageCodes = Object.fromEntries(Object.entries(usageCurrencies).map(([code, label]) => [label, code]))
+    // Preserve custom tariff units when their ISO currency is unknown (e.g. credits or an ambiguous $).
+    const usageMoney = (amount, from, to, fx) => {
+      const unit = String(from).trim().toUpperCase()
+      const code = unit === '元' || unit === 'RMB' ? 'CNY' : usageCodes[unit] || unit
+      if (!Object.hasOwn(usageCurrencies, code)) return fmtCost(amount, from) + '（原单位）'
+      const origin = fx?.rates?.[code], target = fx?.rates?.[to]
+      if (code === to || !(origin > 0 && target > 0)) return fmtCost(amount, code === 'CNY' ? '元' : usageCurrencies[code])
+      return fmtCost(amount * (target / origin), to === 'CNY' ? '元' : usageCurrencies[to])
+    }
+
+    function UsageSummary({ sessions = {} }) {
+      const [report, setReport] = useState(null)
+      const [open, setOpen] = useState(false)
+      const [precise, setPrecise] = useState(false)
+      const [currency, setCurrency] = useState(() => {
+        try { const c = localStorage.getItem('aurabot.usage.currency'); if (Object.hasOwn(usageCurrencies, c)) return c } catch {}
+        return 'CNY'
+      })
+      const [range, setRange] = useState('all')
+      const [busy, setBusy] = useState(false)
+      const [failed, setFailed] = useState(false)
+      const request = useRef(null)
+      const load = useCallback((selected, refreshFx = false) => {
+        request.current?.abort()
+        const controller = new AbortController()
+        request.current = controller
+        setBusy(true); setFailed(false)
+        fetch(API + '/usage?range=' + selected + (refreshFx ? '&fx=refresh' : ''), { signal: controller.signal, cache: 'no-store' })
+          .then(r => { if (!r.ok) throw new Error(); return r.json() })
+          .then(r => { if (!r || r.ok === false || !r.current || !r.ranges) throw new Error(); if (!controller.signal.aborted) setReport(r) })
+          .catch(() => { if (!controller.signal.aborted) setFailed(true) })
+          .finally(() => { if (!controller.signal.aborted) setBusy(false) })
+      }, [])
+      useEffect(() => { load(range); return () => request.current?.abort() }, [range, load])
+      const exact = n => Number(n || 0).toLocaleString('zh-CN')
+      const tokens = n => precise ? exact(n) : fmtTokens(n)
+      const tokenTitle = n => exact(n) + ' Tokens'
+      const hit = r => r?.promptTokens ? (r.cacheHitRate * 100).toFixed(2) + '%' : '—'
+      const price = r => {
+        if (typeof r?.cost === 'number') return usageMoney(r.cost, report.currency, currency, report.fx)
+        if (typeof r?.pricedCost === 'number') return usageMoney(r.pricedCost, report.currency, currency, report.fx) + '（另有 ' + exact(r.unpricedCalls) + ' 次未定价）'
+        return '未定价'
+      }
+      const official = r => typeof r?.officialUSD === 'number' ? usageMoney(r.officialUSD, 'USD', currency, report.fx) + (r.officialMissing ? '（另有 ' + exact(r.officialMissing) + ' 次无报价）' : '') : '暂无报价'
+      const money = r => r?.runs ? ' · 官方参考费用：' + official(r) + (typeof r.pricedCost === 'number' ? ' · 渠道估算：' + price(r) : '') : ''
+      const total = report?.ranges.all
+      const label = k => {
+        const title = sessions[k]?.title
+        return title ? title + ' · ' + chatLabel(k) : chatLabel(k)
+      }
+      const table = (rows, nameOf) => {
+        if (!rows?.length) return h('p', { className: 'ab-muted' }, '这段时间没有已记录的用量。')
+        const priced = rows.some(r => typeof (r.pricedCost ?? r.cost) === 'number')
+        return h('div', { className: 'ab-usage-table', tabIndex: 0, 'aria-label': '用量明细，可横向滚动' },
+          h('table', { className: 'ab-table num' },
+            h('thead', null, h('tr', null, ['对话 / 来源', '已上报调用', '输入 Tokens', '输出 Tokens', '合计 Tokens', '缓存命中率', '官方参考费用', ...(priced ? ['渠道估算'] : [])].map(x => h('th', { key: x }, x)))),
+            h('tbody', null, rows.map(r => h('tr', { key: r.key },
+              h('td', null, nameOf(r.key)), h('td', null, exact(r.runs)),
+              h('td', { title: tokenTitle(r.promptTokens) }, tokens(r.promptTokens)), h('td', { title: tokenTitle(r.completionTokens) }, tokens(r.completionTokens)),
+              h('td', { title: tokenTitle(r.totalTokens) }, tokens(r.totalTokens)), h('td', null, hit(r)), h('td', null, official(r)),
+              priced ? h('td', null, price(r)) : null)))))
+      }
+      const cur = report?.current
+      return h('div', { className: 'ab-grid ab-usage' },
+        h('button', { type: 'button', className: 'ab-card ab-usage-summary', 'aria-expanded': open, onClick: () => { setOpen(!open); if (!open) load(range, true) } },
+          h('span', { className: 'ab-section-title' }, 'Tokens 用量'),
+          h('strong', { className: 'ab-usage-number', title: total ? tokenTitle(total.totalTokens) : undefined }, total ? tokens(total.totalTokens) : busy ? '读取中…' : '暂时无法读取'),
+          h('span', null, '近 90 天 · 缓存命中率 ' + hit(total) + money(total)),
+          h('span', { className: 'ab-muted' }, open ? '收起明细 ↑' : '查看明细 →')),
+        open ? h(Card, { title: '用量明细', right: h(Btn, { small: true, onClick: () => load(range, true), disabled: busy }, busy ? '读取中…' : '刷新'),
+          desc: '只统计服务已上报的 Tokens。' },
+          h('div', { className: 'ab-flex', style: { flexWrap: 'wrap', gap: 6 } },
+            [['all','近 90 天'],['today','今天'],['yesterday','昨天'],['7','近 7 天'],['30','近 30 天']].map(([value,name]) =>
+              h('button', { key: value, type: 'button', className: cx('ab-btn',range === value && 'primary'), 'aria-pressed': range === value, onClick: () => setRange(value) }, name))),
+          h('div', { className: 'ab-flex', style: { flexWrap: 'wrap', gap: 8, alignItems: 'center', marginTop: 8 } },
+            h('label', { className: 'ab-flex', style: { alignItems: 'center', gap: 6 } }, '显示币种',
+              h('select', { className: 'ab-select', value: currency, onChange: e => {
+                const c = e.target.value; setCurrency(c); try { localStorage.setItem('aurabot.usage.currency', c) } catch {}
+              } }, Object.entries(usageCurrencies).map(([c, label]) => h('option', { key: c, value: c }, label + ' · ' + c)))),
+            h('button', { type: 'button', className: 'ab-btn', 'aria-pressed': precise, onClick: () => setPrecise(!precise) }, precise ? '使用简写' : '显示精确数字')),
+          failed ? h('div', { className: 'ab-note warn', role: 'alert' }, '暂时没能读取最新用量，请点刷新重试。' + (report ? '当前仍显示上次结果。' : '')) : null,
+          report?.writeFailed ? h('div', { className: 'ab-note warn', role: 'alert' }, '用量暂未保存成功；重启可能丢失最近的记录。') : null,
+          busy || report?.range !== range ? h('p', { className: 'ab-muted', role: 'status' }, busy ? '正在读取所选时段…' : '请刷新以读取所选时段。') : cur ? h(Fragment, null,
+            h('div', { className: 'ab-note', title: tokenTitle(cur.totalTokens) }, '合计 ' + tokens(cur.totalTokens) + ' Tokens · 命中率 ' + hit(cur) + money(cur)),
+            h('details', { style: { marginTop: 12 } }, h('summary', null, '群和私聊'), table(cur.byChat, label)),
+            h('details', { style: { marginTop: 12 } }, h('summary', null, '记忆用量'),
+              cur.byMemoryTask?.length ? table(cur.byMemoryTask, k => k) : h('p', { className: 'ab-muted' }, '这段时间没有单列的记忆用量。旧版未区分的记录仍在原分类里。')),
+            h('details', { style: { marginTop: 12 } }, h('summary', null, '按来源查看'),
+              cur.background?.runs ? h('p', { className: 'ab-muted' }, '后台任务：' + tokens(cur.background.totalTokens) + ' Tokens（已计入合计）') : null,
+              table(cur.byModule, k => k)),
+            h('details', { style: { marginTop: 12 } }, h('summary', null, '按模型查看'), table(cur.byModel, k => k))) : null,
+          h('details', { className: 'ab-muted ab-small', style: { marginTop: 12 } }, h('summary', null, '统计口径与价目'),
+            h('p', null, '官方参考费用按原厂标准 API 价（美元）折算，中转按同价。价目核对：' + (report?.referenceDate || '—') + '。外部搜索、生图等单独计费。'),
+            report?.fx?.date ? h('p', null, '换算汇率：欧洲央行 · ' + report.fx.date) : null,
+            h('p', null, '按北京时间分日。输入含缓存读写，命中率按输入 Tokens 计算。',
+              report?.startedAt ? ' 后台用量自 ' + new Date(report.startedAt).toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai' }) + ' 起记录。' : ''))) : null)
     }
 
     function Overview({ st, toast, go }) {
@@ -849,12 +1320,22 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const quick = (p, body) => async () => { const r = await post(p, body); toast(r.message || (r.ok ? '好了' : '没成功')) }
       return h('div', { className: 'ab-grid' },
         h(UpdateNotes, { st, toast }),
+        h(ClaimBanner, { st, toast }),
         !cfg.enabled ? h('div', { className: 'ab-note warn' }, '总开关是关着的：大肥鱼现在不会收也不会发任何 QQ 消息。准备好了就在右上角打开。') : null,
-        cfg.enabled && cfg.dryRun ? h('div', { className: 'ab-note' }, '现在是试运行：ta会照常思考回复，但只写进日志，不会真的发到 QQ。确认没问题后在右上角关掉「试运行」。') : null,
+        cfg.enabled && cfg.debug ? h('div', { className: 'ab-note warn' },
+          '现在是调试：她会照常思考回复，但既不发到 QQ，也不写任何记忆和聊天流水 —— 只出现在日志里。调试期间的对话不会被明天的记忆整理吸收，也不会影响正式上线后的她。',
+          h('div', { className: 'ab-flex', style: { marginTop: 6, alignItems: 'center' } },
+            h(Btn, { small: true, kind: 'primary', onClick: async () => { const r = await post('/debug/session'); toast(r.message || (r.ok ? '好了' : '没建好'), r.ok ? 'ok' : 'err') } }, '新建 / 打开调试会话'),
+            h('span', { className: 'ab-muted ab-small' }, '去左侧栏「Aurabot · QQ」工作区打开它，直接在输入框里跟她说话'))) : null,
+        cfg.enabled && cfg.debug ? h(Card, { title: '调试对话', desc: '在这里直接跟她说话：走她的人格和工具，但不经过 QQ、不写记忆。和左侧栏那个调试会话是同一个会话。' }, h(DebugChat, { toast })) : null,
+        cfg.enabled && !cfg.debug && cfg.dryRun ? h('div', { className: 'ab-note' }, '现在是试运行：她会照常思考回复，但只写进日志，不会真的发到 QQ。注意试运行**会照常写记忆**；只想试人格、不想留痕迹请切到「调试」。') : null,
+        st.outbox && st.outbox.count ? h('div', { className: 'ab-note warn' }, `网关还没就绪：已有 ${st.outbox.count} 条消息排队，连接后会自动补发。`) : null,
         cfg.enabled && !conn ? h('div', { className: 'ab-note err' }, '还没连上 QQ 网关' + (st.onebot.problem ? '：' + st.onebot.problem + '。' : '。去「连接」标签看看 SnowLuma 有没有装好、启动没有。') + ' ', h('a', { href: '#', onClick: (e) => { e.preventDefault(); go('connect') } }, '去连接 →')) : null,
+        st.outbox && st.outbox.count ? h('div', { className: 'ab-note warn' }, `网关还没就绪：已有 ${st.outbox.count} 条消息排队，连接后会自动补发。`) : null,
         h('div', { className: 'ab-grid ab-g4' },
           [['今天收到', s.received, '📥'], ['今天发出', s.sent, '📤'], ['语音条', s.voice, '🎙️'], ['表情包', s.stickers, '😺']].map(([l, n, ic]) => h('div', { key: l, className: 'ab-card ab-stat' }, h('span', { className: 'ic', 'aria-hidden': true }, ic), h('div', { className: 'n' }, n || 0), h('div', { className: 'l' }, l))),
         ),
+        h(UsageSummary, { sessions: st.sessions }),
         h('div', { className: 'ab-grid ab-g2' },
           h(Card, { title: 'ta现在', desc: '心情会随聊天起伏，过一阵子慢慢回到平常。' },
             h('div', { className: 'ab-flex', style: { marginBottom: 8 } }, h('b', null, st.mood.label), h('span', { className: 'ab-muted' }, st.mood.value + ' / 100')),
@@ -869,7 +1350,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h(Card, { title: '快捷操作', desc: '试一试ta是不是活着。这些操作会真的发到 QQ（试运行时只写日志）。' },
             h('div', { className: 'ab-flex' },
               h(Btn, { kind: 'primary', onClick: quick('/test-send') }, '给主人发一条自测'),
-              h(Btn, { onClick: quick('/speakup/fire') }, '让ta现在来找你'),
+              h(Btn, { onClick: quick('/purpose/fire') }, '让ta现在来找你'),
               h(Btn, { onClick: quick('/diary/run', { visibility: 'self' }) }, '写一篇日记（仅自己可见）'),
             ),
             h('p', { className: 'ab-muted ab-small', style: { marginTop: 12, marginBottom: 0 } }, '想看ta和每个人聊了什么、调了什么工具：点 DSH 侧栏「Aurabot · QQ」工作区里对应的会话，也可以直接在会话里插话。'),
@@ -881,6 +1362,85 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       )
     }
 
+    /**
+     * 「管理功能」页：把散在各页的可选功能收在一处，按四类状态展示。
+     * 判定来源 = 阶段一 bootstrap 摘要（boot.modules：enabled/running/availability/error）+ 对应配置键。
+     * 四类：ready（正常可用）→ 去设置；blocked（启用但平台受限/启动失败）→ 原因 + 排障入口；
+     *       off（用户停用）→ 启用入口；absent（未安装）→ 安装入口。
+     */
+    const MANAGE_FEATURES = [
+      { key: 'voice', label: '语音', desc: '让她用语音条说话：<voice> 标出来的部分会变成语音。', tab: 'voice', flag: 'voice.enabled', cli: 'voice' },
+      { key: 'stickers', label: '表情包', desc: '会挑合适的表情一起发，也能认出你发的表情。', tab: 'stickers', flag: 'stickers.enabled', cli: 'stickers' },
+      { key: 'imagegen', label: '生图', desc: '按描述画图发给你。', tab: 'imagegen', flag: 'imageGen.enabled', cli: 'imagegen' },
+      { key: 'song', label: '翻唱', desc: '用 RVC 翻唱一段发给你。', tab: 'song', flag: 'song.enabled', cli: 'song' },
+      { key: 'pet', label: '桌宠', desc: '桌面上的悬浮窗形象，和 QQ 里是同一个她。', tab: 'pet', cli: 'pet' },
+      { key: 'diary', label: '空间日记', desc: '自己写日记、发到空间说说。', tab: 'diary', flag: 'diary.enabled', cli: 'diary' },
+      { key: 'platform', label: '内容平台', desc: '逛 B站 / 抖音 / 小黑盒，看内容也能互动。', tab: 'bili', cli: ['bili', 'douyin', 'heybox'] },
+      { key: 'purpose', label: '目的引擎', desc: '像人一样主动找你说话：攒素材 → 立目标 → 到点来找你。', tab: 'speakup', flag: 'ext.purpose.enabled', cli: 'purpose' },
+      { key: 'autotelic', label: '自驱引擎（实验）', desc: '观察→回味→决策→行动→沉淀，v5 重写，实验性功能。', tab: 'autotelic', flag: 'ext.autotelic.enabled', cli: 'autotelic' },
+    ]
+
+    function Manage({ st, boot, toast, go, reload, draft }) {
+      const mods = (boot && boot.modules) || st.modules || []
+      // 启用/停用沿用现有保存流程：成功才用回执里的模块表刷新导航，失败就地提示
+      const setEnabled = async (id, on) => {
+        const r = await post('/save', { modules: { [id]: { ...((draft.modules || {})[id] || {}), enabled: on } } })
+        if (r.ok === false) return toast(r.message || '没改成', 'err')
+        toast(on ? '已启用' : '已停用', 'ok')
+        reload()
+      }
+      const find = (id) => mods.find((m) => m && m.id === id)
+      const rows = MANAGE_FEATURES.map((f) => {
+        const ids = Array.isArray(f.cli) ? f.cli : [f.cli]
+        const ms = ids.map(find).filter(Boolean)
+        const cfgOn = f.flag ? getPath(st.config, f.flag) !== false && Boolean(getPath(st.config, f.flag)) : true
+        const anyRunning = ms.some((m) => m.running)
+        const anyError = ms.find((m) => m.availability === 'error')
+        const userOff = ms.length ? ms.every((m) => m.enabled === false) : false
+        const absent = !ms.length || ms.every((m) => m.availability === 'unloaded')
+        // 平台受限：模块声明了 platforms，但当前连接里没有它支持的平台
+        const plats = ms.flatMap((m) => m.platforms || [])
+        const conns = ((boot && boot.connections) || []).map((c) => String(c.platform || '').toLowerCase())
+        const limited = plats.length > 0 && conns.length > 0 && !plats.some((p) => conns.includes(String(p).toLowerCase()))
+        let kind = 'ok'
+        let reason = ''
+        if (absent) { kind = 'absent' }
+        else if (anyError) { kind = 'blocked'; reason = anyError.error || '启动时出错了' }
+        else if (ms.some((m) => m.enabled !== false) && !anyRunning) { kind = 'blocked'; reason = '已启用，但没在运行' }
+        else if (limited && anyRunning) { kind = 'blocked'; reason = '已启用，但当前连接的平台不支持（需要 ' + plats.join(' / ') + '）' }
+        else if (userOff || !cfgOn) { kind = 'off' }
+        const badge = { ok: ['ok', '可用'], blocked: ['warn', '受限'], off: ['', '已停用'], absent: ['', '未安装'] }[kind]
+        return { f, kind, reason, badge, ms, userOff }
+      })
+      // 卡片网格：每项一张卡（头部=名称+状态徽标 / 正文=说明与原因 / 底部=操作区）。
+      // 行为与行式布局时完全一致：kind 判定、按钮文案、/save 流程都没动，只换 DOM 结构与样式。
+      const section = (title, desc, list) => (list.length ? h(Card, { title, desc }, h('div', { className: 'ab-manage-grid' }, list.map(({ f, kind, reason, badge, ms }) => h('div', {
+        key: f.key,
+        className: cx('ab-manage-card', kind === 'blocked' && 'is-blocked', kind === 'off' && 'is-off', kind === 'absent' && 'is-absent'),
+      },
+      // 头部两端对齐：左=名称+徽标，右=启用开关（开关逻辑与之前完全一致，只是位置从操作区挪上来）
+      h('div', { className: 'ab-manage-head' },
+        h('span', { className: 'ab-manage-name' }, f.label, h('span', { className: cx('ab-badge', badge[0]) }, badge[1])),
+        ms.length ? h('span', { style: { flexShrink: 0 } }, h(Switch, {
+          on: ms.some((m) => m.enabled !== false),
+          onChange: (v) => setEnabled(ms[0].id, v),
+          title: '启用 / 停用这个功能',
+        })) : null),
+      h('div', { className: 'ab-manage-desc' }, f.desc),
+      reason ? h('div', { className: 'ab-note warn ab-manage-reason' }, reason) : null,
+      h('div', { className: 'ab-manage-acts' },
+        h(Btn, { small: true, kind: kind === 'ok' ? 'primary' : undefined, onClick: () => go(f.tab) }, kind === 'ok' ? '去设置' : '打开设置'),
+        kind === 'blocked' ? h(Btn, { small: true, onClick: () => go('logs') }, '看日志排障') : null,
+        kind === 'absent' ? h(Btn, { small: true, onClick: () => go('market') }, '去安装') : null))))) : null)
+      return h('div', { className: 'ab-grid' },
+        h('div', { className: 'ab-note' }, '这里汇总所有可选功能，按状态分组。想更细地调参数，点「去设置」进各自页面。'),
+        section('正常可用', '已启用并在运行的功能。', rows.filter((r) => r.kind === 'ok')),
+        section('需要处理', '已启用但没跑起来：可能是启动失败，或当前连接的平台不支持。', rows.filter((r) => r.kind === 'blocked')),
+        section('已停用', '你手动关掉的功能，点开关就能重新启用。', rows.filter((r) => r.kind === 'off')),
+        section('未安装', '还没装上的功能，去模块市场装，或在内置页里打开。', rows.filter((r) => r.kind === 'absent')),
+      )
+    }
+
     /** 「关于」页：三张通栏大卡（这是谁 / 加入我们 / 核心开发者），贡献者与许可默认折叠。
      *  只读展示，没有设置项。「核心开发者」写死三个人；「贡献者」里的头像墙走 contrib.rocks 自动更新，
      *  文字名单取自 GitHub contributors 与版本说明（含没有 commit 的反馈者）。
@@ -889,9 +1449,18 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const repo = 'https://github.com/aureth-labs/dsh-aurabot-qq'
       const mods = 'https://github.com/aureth-labs/dsh-aurabot-qq-mods'
       const gh = (name) => h('a', { key: 'gh-' + name, href: 'https://github.com/' + name, target: '_blank', rel: 'noreferrer' }, '@' + name)
-      // GitHub contributors API（按提交数排序）+ 版本说明里记录的 issue 报告 / 反馈者（没有 commit，单列）
-      const coders = ['accomplish07zrh-eng', 'baihengaead', 'RookieApe-tao', 'GitNekopedia', 'Chsw-CC', 'chsw', 'Emotionana', 'Nightc-c', 'Fallen-plum-blossom']
+      // 兜底名单：接口读不到时用这份；平时优先用 /about/contributors 动态拉取（GitHub contributors）
+      const fallbackCoders = ['accomplish07zrh-eng', 'baihengaead', 'RookieApe-tao', 'GitNekopedia', 'Chsw-CC', 'chsw', 'Emotionana', 'Nightc-c', 'Fallen-plum-blossom']
       const reporters = ['cxin21', 'zhuyi314', '38213063', 'HuaGyuu', 'CYyare', 'yunxirumo', 'XiongYachao']
+      const [remote, setRemote] = useState(null)
+      useEffect(() => {
+        let alive = true
+        get('/about/contributors').then((r) => { if (alive && r && r.ok && Array.isArray(r.list) && r.list.length) setRemote(r) })
+        return () => { alive = false }
+      }, [])
+      const coders = remote ? remote.list.map((x) => x.login) : fallbackCoders
+      // 头像墙每天换一个查询参数，避免浏览器/CDN 按 3 天缓存卡住不更新
+      const wallSrc = 'https://contrib.rocks/image?repo=aureth-labs/dsh-aurabot-qq&v=' + new Date().toISOString().slice(0, 10)
       const kv = (rows) => h('div', { className: 'ab-kv' }, rows.flatMap(([k, v]) => [h('span', { key: k }, k), h('span', { key: k + '-v' }, v)]))
       const copyGroup = (e) => { try { navigator.clipboard.writeText('1130575035'); e.target.textContent = '已复制'; setTimeout(() => { e.target.textContent = '复制' }, 1500) } catch (error) {} }
       // 核心开发者：仓库创建者 + 两位主要贡献者（只展示头像与名字，不标具体模块）
@@ -932,8 +1501,8 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h('div', null,
             // 头像墙由 contrib.rocks 按仓库提交记录自动生成，有新人提交就会自己更新，不用改代码
             h('a', { key: 'wall', className: 'ab-contrib', href: repo + '/graphs/contributors', target: '_blank', rel: 'noreferrer', title: '在 GitHub 上查看贡献者列表' },
-              h('img', { src: 'https://contrib.rocks/image?repo=aureth-labs/dsh-aurabot-qq', alt: '贡献者头像墙', loading: 'lazy', referrerPolicy: 'no-referrer', onError: (e) => { e.currentTarget.style.display = 'none' } })),
-            h('p', { className: 'ab-muted ab-small', style: { marginTop: 0, marginBottom: 12 } }, '上面这排头像由 contrib.rocks 按提交记录自动更新，有新人提交就会自己变（加载不出来就点它，跳 GitHub 看）。下面按「写代码的 / 报问题提建议的」分开列。'),
+              h('img', { src: wallSrc, alt: '贡献者头像墙', loading: 'lazy', referrerPolicy: 'no-referrer', onError: (e) => { e.currentTarget.style.display = 'none' } })),
+            h('p', { className: 'ab-muted ab-small', style: { marginTop: 0, marginBottom: 12 } }, '上面这排头像由 contrib.rocks 按提交记录自动更新（地址每天换一次，避免被浏览器缓存卡住）；下面「写代码的」名单从 GitHub contributors 实时拉取，读不到时用内置名单兜底。'),
             h('div', { style: { marginBottom: 8 } }, h('b', { style: { fontSize: 13 } }, '写代码的')),
             h('div', { className: 'ab-flex', style: { flexWrap: 'wrap', gap: 8 } },
               coders.map((n) => h('span', { key: n, className: 'ab-pill' }, gh(n)))),
@@ -1044,11 +1613,12 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const f = useField(draft, setDraft)
       const sl = st.snowluma
       const [procs, setProcs] = useState(null)
+      const [otherProcs, setOtherProcs] = useState([])
       const [moveTo, setMoveTo] = useState('')
       // 远端桌宠直连：对外地址的本地编辑态（null = 跟着服务端当前值显示）
       const [pubBase, setPubBase] = useState(null)
       const conn = st.onebot.state === 'connected'
-      const loadProcs = async () => { const r = await get('/snowluma/processes'); setProcs(r.list || []); if (!r.ok) toast(r.message) }
+      const loadProcs = async () => { const r = await get('/snowluma/processes'); setProcs(r.list || []); setOtherProcs(r.others || []); if (!r.ok) toast(r.message) }
       const act = (p) => async () => { const r = await post(p); toast(r.message || (r.ok ? '好了' : '没成功')); reload() }
       const login = st.onebot.login
       const external = draft.gateway === 'onebot'
@@ -1070,7 +1640,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             h('div', { className: cx('ab-step', sl.installed && 'done') }, h('div', null,
               h('b', null, '解压到一个纯英文的目录'), h('div', { className: 'ab-muted ab-small' }, '推荐 C:\\Aurabot\\snowluma。解压后这个目录里应该直接能看到 index.mjs 和 node.exe。'),
               h('div', { className: 'ab-flex', style: { marginTop: 6 } }, f.text('snowluma.dir', { size: 'wide', placeholder: 'C:\\Aurabot\\snowluma' })),
-              !sl.installed && sl.reason ? h('div', { className: 'ab-small', style: { color: 'var(--ab-warn)', marginTop: 4 } }, sl.reason) : sl.installed ? h('div', { className: 'ab-small', style: { color: 'var(--ab-ok)', marginTop: 4 } }, '找到了 SnowLuma v' + sl.version) : null)),
+              !sl.installed && sl.reason ? h('div', { className: 'ab-small', style: { color: 'var(--ab-warn)', marginTop: 4 } }, sl.reason) : sl.installed ? h('div', { className: 'ab-small', style: { color: sl.compat && sl.compat.status !== 'ok' ? 'var(--ab-warn)' : 'var(--ab-ok)', marginTop: 4 } }, '找到了 SnowLuma v' + sl.version + (sl.compat ? '（' + sl.compat.label + '）' : '')) : null)),
             h('div', { className: cx('ab-step', sl.running && 'done') }, h('div', null,
               h('b', null, '启动'), h('div', { className: 'ab-muted ab-small' }, '后台运行，不弹窗口；以后会跟着 DSH 自动启动。'),
               h('div', { className: 'ab-flex', style: { marginTop: 6 } },
@@ -1081,19 +1651,25 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
               h('b', null, '阅读并同意 SnowLuma 的用户协议'), h('div', { className: 'ab-muted ab-small', style: { marginBottom: 6 } }, '同意之前 SnowLuma 不会工作。'),
               h(Agreement, { running: sl.running, toast, onChange: reload }))),
             h('div', { className: cx('ab-step', conn && login && login.uin === draft.botQQ && 'done') }, h('div', null,
-              h('b', null, '登录机器人号并接入'), h('div', { className: 'ab-muted ab-small' }, '在电脑上另开一个 QQ 登录机器人号 ' + draft.botQQ + '（可以最小化），然后点「接入机器人号」。'),
+              h('b', null, '登录机器人号并接入'), h('div', { className: 'ab-muted ab-small' }, '在电脑上另开一个 QQ 登录机器人号 ' + draft.botQQ + '（可以最小化），然后点「接入机器人号」。QQ 必须是 NT 版 9.9.33 及以上（SnowLuma 2.4 的要求）；旧版 QQ 注入不了，先升级 QQ。'),
               h('div', { className: 'ab-flex', style: { marginTop: 6 } },
                 h(Btn, { small: true, kind: 'primary', disabled: !sl.running, onClick: act('/snowluma/attach') }, '接入机器人号'),
                 h(Btn, { small: true, disabled: !sl.running, onClick: loadProcs }, '看看有哪些 QQ 进程'),
                 h(Btn, { small: true, onClick: async () => { const r = await get('/onebot/test'); toast(r.message) } }, '测试连接')),
               sl.lastAttach && sl.lastAttach.at ? h('div', { className: 'ab-small', style: { marginTop: 4, color: sl.lastAttach.ok ? 'var(--ab-ok)' : 'var(--ab-warn)' } }, timeAgo(sl.lastAttach.at) + '：' + sl.lastAttach.message) : null)),
           ),
+          sl.installed && sl.compat && sl.compat.status !== 'ok' ? h('div', { className: 'ab-note warn', style: { marginTop: 10 } },
+            h('b', null, 'SnowLuma 版本提示：'), sl.compat.message, ' ',
+            h('a', { href: sl.downloadPage, target: '_blank', rel: 'noreferrer' }, '打开下载页 ↗')) : null,
           procs ? h('div', { style: { marginTop: 14 } }, procs.length === 0 ? h('div', { className: 'ab-muted' }, '没找到 QQ 进程。') :
-            h('table', { className: 'ab-table' }, h('thead', null, h('tr', null, ['进程', '登录的号', '昵称', '状态', ''].map((x) => h('th', { key: x }, x)))),
+            h('table', { className: 'ab-table' }, h('thead', null, h('tr', null, ['进程', '登录的号', '昵称', 'QQ 版本', '状态', ''].map((x) => h('th', { key: x }, x)))),
               h('tbody', null, procs.map((p) => h('tr', { key: p.pid },
                 h('td', null, p.pid), h('td', null, p.uin || '识别不出'), h('td', null, p.nickname || '—'),
+                h('td', { style: (p.nt === false || p.tooOld) ? { color: 'var(--ab-warn)' } : null }, (p.qqVersion || '—') + (p.nt === false ? '（非 NT）' : p.tooOld ? '（低于 9.9.33）' : '')),
                 h('td', null, p.injected ? (p.connected ? '已接入' : '已注入，连接中') : '未接入'),
-                h('td', null, p.isBot ? h('span', { className: 'ab-badge' }, '机器人号') : h('span', { className: 'ab-muted ab-small' }, '不会碰'))))))) : null,
+                h('td', null, p.isBot ? h('span', { className: 'ab-badge' }, '机器人号') : h('span', { className: 'ab-muted ab-small' }, '不会碰')))))),
+            h('div', { className: 'ab-muted ab-small', style: { marginTop: 6 } }, '注：SnowLuma 2.4 只能注入 QQ NT 9.9.33 及以上；低于这个版本的 NT 会卡在「等待登录」，老版 QQ 则根本不会出现在这里。'),
+            otherProcs.length ? h('div', { className: 'ab-note warn', style: { marginTop: 8 } }, '另外看到 ' + otherProcs.length + ' 个老版 QQ（' + otherProcs.map((p) => (p.qqVersion || '版本未知') + '，pid ' + p.pid).join('；') + '）：SnowLuma 接不了，别用它登录机器人号。') : null) : null,
         ),
         h(Card, { title: 'QQ 会话放在哪', desc: '每个 QQ 私聊 / 群都是 DSH 里「Aurabot · QQ」工作区下的一个会话，ta在会话里读写文件也在这个文件夹。改了以后新开的会话放到新位置；已有的会话还在原来的地方，想全部挪过去就在「概览」点「重新开始所有 QQ 会话」。' },
           h(Row, { label: '工作区文件夹', hint: '填完整路径（比如 D:\\Aurabot\\qq-chats）；留空 = 默认位置' }, f.text('workspaceDir', { size: 'wide', placeholder: st.workspaceDir || '' })),
@@ -1253,7 +1829,146 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     }
 
     const personaDraftKey = (id) => 'aurabot.persona.draft.' + id
-    function Persona({ st, toast, reload }) {
+    function PersonaImageSettings({ image, disabled, onSave }) {
+      const [note, setNote] = useState(image.note || '')
+      useEffect(() => { setNote(image.note || '') }, [image.id, image.note])
+      return h('div', { style: { marginTop: 12 } },
+        h('label', { className: 'ab-flex', style: { gap: 8, marginBottom: 10 } },
+          h('input', { type: 'checkbox', checked: image.reference !== false, disabled, onChange: (e) => onSave({ reference: e.target.checked }) }),
+          h('span', null, '用于生图参考')),
+        h('label', { className: 'ab-muted ab-small' }, '图片备注',
+          h('input', { className: 'ab-input', style: { width: '100%', marginTop: 6 }, value: note, maxLength: 120, disabled, placeholder: '如：工作服、常服、Q版形象', onChange: (e) => setNote(e.target.value) })),
+        h('div', { style: { marginTop: 8 } }, h(Btn, { small: true, disabled: disabled || note === (image.note || ''), onClick: async () => { const result = await onSave({ note }); if (result?.images) setNote(result.images.find((item) => item.id === image.id)?.note || '') } }, '保存备注')))
+    }
+
+    function PersonaLook({ edit, patch, look, setLook, saved, st, draft, setDraft, toast }) {
+      const [busy, setBusy] = useState('')
+      const [models, setModels] = useState(null)
+      const [modelError, setModelError] = useState('')
+      const modelRequest = useRef(0)
+      const userRevision = useRef(0)
+      const fileRef = useRef(null)
+      const replaceRef = useRef(null)
+      const replaceId = useRef(null)
+      const request = useRef(0)
+      const latest = useRef(null)
+      const model = draft.personaLook?.visionModel || { provider: '', model: '' }
+      const modelKey = model.provider && model.model ? model.provider + '::' + model.model : ''
+      const modelDirty = JSON.stringify(model) !== JSON.stringify(st.config.personaLook?.visionModel || { provider: '', model: '' })
+      latest.current = { id: edit.id, appearance: edit.appearance, modelKey, imageHash: look.imageHash }
+      const loadModels = async () => {
+        const token = ++modelRequest.current
+        setModels(null); setModelError('')
+        const r = await get('/models')
+        if (token !== modelRequest.current) return
+        setModels(r.list || [])
+        if (r.ok === false) setModelError(r.message || '模型列表读取失败')
+      }
+      useEffect(() => {
+        loadModels()
+        return () => { modelRequest.current++; request.current++ }
+      }, [])
+      const options = [{ value: '', label: '跟随聊天模型' }, ...(models || []).map((m) => ({ value: m.provider + '::' + m.model, label: m.name + (m.vision === true ? '（能看图）' : m.vision === false ? '（不看图）' : ''), group: m.provider }))]
+      if (modelKey && !options.some((m) => m.value === modelKey)) options.push({ value: modelKey, label: modelKey + '（当前配置）' })
+      const run = async (kind, action) => {
+        const token = ++request.current
+        setBusy(kind)
+        try { return await action(() => token === request.current) }
+        catch (e) { if (token === request.current) toast(e.message || '操作失败', 'err') }
+        finally { if (token === request.current) setBusy('') }
+      }
+      const images = look.images || (look.hasImage ? [{ id: 'legacy', hash: look.imageHash }] : [])
+      const maxImages = look.maxImages || 8
+      const upload = (files, imageId) => {
+        if (!files.length || busy || !saved) return
+        const replacing = imageId !== undefined
+        run('upload', async (valid) => {
+          if (!replacing && images.length + files.length > maxImages) throw new Error(`每个人格最多 ${maxImages} 张人设图，请减少选择数量`)
+          if (files.some((file) => file.size > 5 * 1024 * 1024)) throw new Error('每张人设图最多 5MB')
+          let completed = 0
+          for (const file of files) {
+            try {
+              const data = await new Promise((resolve, reject) => {
+                const reader = new FileReader()
+                reader.onload = () => resolve(reader.result)
+                reader.onerror = () => reject(new Error('图片读取失败'))
+                reader.onabort = () => reject(new Error('图片读取已取消'))
+                reader.readAsDataURL(file)
+              })
+              if (!valid()) return
+              const r = await post('/persona/look/upload', { id: edit.id, data, ...(replacing ? { imageId } : { append: true }) })
+              if (!valid()) return
+              if (!r.ok) throw new Error(r.message)
+              setLook(r.look)
+              completed++
+            } catch (error) {
+              throw new Error(`${completed ? `已保存 ${completed} 张；` : ''}${error.message}`)
+            }
+          }
+          toast(replacing ? '这张人设图已替换' : `已新增 ${completed} 张人设图`, 'ok')
+        })
+      }
+      const describe = () => run('describe', async (valid) => {
+        const snapshot = { ...latest.current }
+        const rev = userRevision.current
+        const r = await post('/persona/look/describe', { id: edit.id })
+        if (!valid()) return
+        if (!r.ok) throw new Error(r.message)
+        if (rev !== userRevision.current || JSON.stringify(snapshot) !== JSON.stringify(latest.current) || r.imageHash !== snapshot.imageHash) {
+          toast('图片、描述或模型已变化，本次解析结果未填入，请重新解析')
+          return
+        }
+        patch({ appearance: r.text, appearanceSource: 'vision', appearanceDirty: true })
+        toast('描述已填入，确认后点击「保存人格」', 'ok')
+      })
+      return h('div', { className: 'ab-persona-look', style: { marginTop: 16, padding: 20, border: '1px solid var(--ab-line)', borderRadius: 12 } },
+        h('strong', null, '人设图与外貌'),
+        h('p', { className: 'ab-muted ab-small' }, '人设图只供识图与画自己时参考，不直接进入聊天上下文；与左侧「面板头像」分别保存。上传和删图立即生效，外貌文字随「保存人格」保存。'),
+        !saved ? h('p', { className: 'ab-muted' }, '请先保存新人格，再上传人设图。') : null,
+        h('p', { className: 'ab-muted ab-small' }, `最多 ${maxImages} 张，每张 5MB。生成外貌描述时综合全部图片；生图仅使用已开启的参考图，并按服务支持的数量传入。`),
+        h('p', { className: 'ab-muted ab-small' }, '参考开关即时保存；备注点「保存备注」后生效，并随实际使用的图片加入生图提示。只支持单图时取已开启的第一张，不支持参考图时使用外貌文字，工具会说明实际使用情况。'),
+        h('div', { className: 'ab-look-grid', style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 190px), 1fr))', gap: 16, margin: '16px 0' } },
+          images.map((image, index) => h('div', { key: image.id || 'legacy', className: 'ab-look-image', style: { padding: 14, border: '1px solid var(--ab-line)', borderRadius: 10, minWidth: 0 } },
+            h('img', { src: API + '/persona/look/image?id=' + encodeURIComponent(edit.id) + (image.id ? '&imageId=' + encodeURIComponent(image.id) : '') + '&v=' + encodeURIComponent(image.hash || ''), alt: `人设图 ${index + 1}`, style: { display: 'block', width: '100%', height: 180, objectFit: 'contain' } }),
+            h('div', { className: 'ab-muted ab-small', style: { marginTop: 10 } }, `人设图 ${index + 1} · ${image.reference === false ? '未用于生图' : '已开启生图参考'}`),
+            h(PersonaImageSettings, { key: image.id, image, disabled: !!busy || !saved, onSave: (settings) => run('configure', async (valid) => {
+              const r = await post('/persona/look/configure', { id: edit.id, imageId: image.id, ...settings })
+              if (!valid()) return
+              if (!r.ok) throw new Error(r.message)
+              setLook(r.look)
+              toast(settings.note !== undefined ? '图片备注已保存' : '生图参考选择已保存', 'ok')
+              return r.look
+            }) }),
+            h('div', { className: 'ab-flex ab-look-actions', style: { gap: 10, paddingTop: 12, paddingBottom: 4, flexWrap: 'wrap' } },
+              h(Btn, { small: true, disabled: !!busy || !saved, onClick: () => { replaceId.current = image.id; replaceRef.current?.click() } }, '替换这张'),
+              h(Btn, { small: true, kind: 'danger', disabled: !!busy || !saved, onClick: () => run('delete', async (valid) => {
+                const r = await post('/persona/look/delete', { id: edit.id, imageId: image.id })
+                if (!valid()) return
+                if (!r.ok) throw new Error(r.message)
+                setLook(r.look)
+                toast('已删除这张人设图，其他图片和外貌文字保留', 'ok')
+              }) }, '删除这张'))))),
+        h('input', { ref: fileRef, type: 'file', multiple: true, accept: 'image/png,image/jpeg,image/gif,image/webp', style: { display: 'none' }, onChange: (e) => { const files = Array.from(e.target.files || []); e.target.value = ''; upload(files) } }),
+        h('input', { ref: replaceRef, type: 'file', accept: 'image/png,image/jpeg,image/gif,image/webp', style: { display: 'none' }, onChange: (e) => { const files = Array.from(e.target.files || []).slice(0, 1); e.target.value = ''; upload(files, replaceId.current) } }),
+        h('div', { className: 'ab-flex', style: { padding: '4px 0 18px', gap: 12, flexWrap: 'wrap' } },
+          h(Btn, { small: true, disabled: !saved || !!busy || images.length >= maxImages, onClick: () => fileRef.current?.click() }, busy === 'upload' ? '上传中…' : '添加人设图'),
+          h('span', { className: 'ab-muted ab-small' }, `${images.length} / ${maxImages} 张 · ${images.filter((image) => image.reference !== false).length} 张已开启生图参考`)),
+        h(Row, { label: '外貌解析模型', hint: '仅用于读取人设图，生成外貌描述。' }, h(Select, { value: modelKey, options, onChange: (value) => {
+          userRevision.current++
+          const [provider, ...rest] = String(value).split('::')
+          setDraft((previous) => setPath(previous, 'personaLook.visionModel', { provider: value ? provider : '', model: value ? rest.join('::') : '' }))
+        } })),
+        h('div', { className: 'ab-muted ab-small', style: { margin: '0 0 14px', lineHeight: 1.7 } },
+          h('div', null, '点击「从人设图生成描述」时，才会把全部人设图发送给这个模型。需要支持看图的模型。'),
+          h('div', null, '这项选择只影响外貌解析，不会更换聊天模型或生图模型。所有人格共用此设置；更换后先点页面底部「保存设置」。')),
+        models === null ? h('p', { className: 'ab-muted ab-small' }, '正在读取模型列表…') : null,
+        modelError ? h('div', { className: 'ab-flex' }, h('span', { className: 'ab-muted ab-small' }, modelError), h(Btn, { small: true, onClick: loadModels }, '重试模型列表')) : null,
+        h(Row, { label: '外貌描述', hint: '最多 2000 字，可直接手写或修改生成结果。点击「保存人格」后，她在聊天和画自己时会采用这段外貌设定。' }, h('textarea', { className: 'ab-textarea', value: edit.appearance || '', maxLength: 2000, onChange: (e) => { userRevision.current++; patch({ appearance: e.target.value, appearanceSource: 'manual', appearanceDirty: true }) } })),
+        h('div', { className: 'ab-flex', style: { padding: '14px 0 4px', gap: 12, flexWrap: 'wrap' } }, h(Btn, { small: true, disabled: !saved || !look.hasImage || !!busy || modelDirty, onClick: describe }, busy === 'describe' ? '正在生成描述…' : '从人设图生成描述'),
+          h('span', { className: 'ab-muted ab-small' }, modelDirty ? '外貌解析模型已更换，请先点页面底部「保存设置」。' : look.stale ? '图片已更新，可重新生成描述，也可手动修改后保存人格。' : edit.appearanceDirty ? '描述尚未保存，请确认后点「保存人格」。' : '生成结果先填入文本框，确认后点「保存人格」才生效。')))
+    }
+
+    function Persona({ st, toast, reload, draft, setDraft }) {
       const [list, setList] = useState(st.personas)
       const [current, setCurrent] = useState(st.config.persona.current)
       // 记住上次编辑的人格：切走标签页再回来还编辑同一个，而不是跳回正在用的那个
@@ -1264,30 +1979,41 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [whole, setWhole] = useState(() => { try { return localStorage.getItem('aurabot.persona.whole') === '1' } catch (e) { return false } })
       // 上次没保存的草稿：进来时只提示「要不要恢复」，不自动覆盖当前内容
       const [restore, setRestore] = useState(null)
+      const [look, setLook] = useState({})
+      const [saving, setSaving] = useState(false)
+      const [loadError, setLoadError] = useState('')
+      const loadSeq = useRef(0)
+      const revision = useRef(0)
+      const editRef = useRef(edit)
+      editRef.current = edit
+      useEffect(() => () => { loadSeq.current++; revision.current++ }, [])
       useEffect(() => { try { localStorage.setItem('aurabot.persona.sel', sel) } catch (e) {} }, [sel])
       const load = async (id) => {
+        const token = ++loadSeq.current
+        setLoadError('')
         const r = await get('/persona/get?id=' + encodeURIComponent(id))
-        if (!r.ok) return
-        const server = { id: r.persona.id, name: r.persona.name, tags: (r.persona.tags || []).join('，'), secs: splitPersona(r.persona.body) }
-        let draft = null
-        try { const raw = localStorage.getItem(personaDraftKey(id)); if (raw) { const d = JSON.parse(raw); if (d && d.id === id && typeof d.body === 'string' && d.body !== r.persona.body) draft = d } } catch (e) {}
+        if (token !== loadSeq.current) return
+        if (!r.ok) { setLoadError(r.message || '人格读取失败'); return }
+        const server = { id: r.persona.id, name: r.persona.name, tags: (r.persona.tags || []).join('，'), secs: splitPersona(r.persona.body), appearance: r.look?.appearance || '', appearanceSource: r.look?.source || 'manual', appearanceDirty: false }
+        let localDraft = null
+        try { const raw = localStorage.getItem(personaDraftKey(id)); if (raw) { const d = JSON.parse(raw); if (d && d.id === id && typeof d.body === 'string' && (d.body !== r.persona.body || d.name !== server.name || d.tags !== server.tags || (typeof d.appearance === 'string' && d.appearance !== server.appearance))) localDraft = d } } catch (e) {}
+        revision.current++
         setEdit(server)
+        setLook(r.look || {})
         setDirty(false)
-        setRestore(draft ? { body: draft.body, name: draft.name, tags: draft.tags, at: draft.at || 0 } : null)
+        setRestore(localDraft)
         setPending({})
       }
-      useEffect(() => { load(sel) }, [sel])
+      useEffect(() => { load(sel); return () => { loadSeq.current++ } }, [sel])
       // 编辑中的草稿只写 localStorage（不动磁盘）；切标签/刷新后在下次进来时提示是否恢复
       useEffect(() => {
         if (!edit || !dirty) return
-        const t = setTimeout(() => {
-          try { localStorage.setItem(personaDraftKey(edit.id), JSON.stringify({ id: edit.id, name: edit.name, tags: edit.tags, body: joinPersona(edit.secs), at: Date.now() })) } catch (e) {}
-        }, 200)
-        return () => clearTimeout(t)
+        try { localStorage.setItem(personaDraftKey(edit.id), JSON.stringify({ id: edit.id, name: edit.name, tags: edit.tags, body: joinPersona(edit.secs), appearance: edit.appearance, appearanceSource: edit.appearanceSource, at: Date.now() })) } catch (e) {}
       }, [edit, dirty])
       const restoreDraft = () => {
         if (!restore) return
-        setEdit({ ...edit, name: restore.name ?? edit.name, tags: restore.tags ?? edit.tags, secs: splitPersona(restore.body) })
+        revision.current++
+        setEdit({ ...edit, name: restore.name ?? edit.name, tags: restore.tags ?? edit.tags, secs: splitPersona(restore.body), appearance: restore.appearance ?? edit.appearance, appearanceSource: restore.appearanceSource || 'manual', appearanceDirty: typeof restore.appearance === 'string' })
         setDirty(true)
         setRestore(null)
         toast('已恢复上次的改动（还没保存，确认后点「保存人格」）', 'ok')
@@ -1301,11 +2027,24 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const body = edit ? joinPersona(edit.secs) : ''
       const waiting = Object.keys(pending).length
       const save = async () => {
-        const r = await post('/persona/save', { id: edit.id, name: edit.name, tags: edit.tags.split(/[,，\s]+/).filter(Boolean), body })
+        if (saving) return
+        const rev = revision.current
+        const id = edit.id
+        setSaving(true)
+        const r = await post('/persona/save', { id, name: edit.name, tags: edit.tags.split(/[,，\s]+/).filter(Boolean), body, ...(edit.appearanceDirty ? { appearance: edit.appearance || '', appearanceSource: edit.appearanceSource } : {}) })
+        setSaving(false)
         toast(r.message || (r.ok ? '保存好了' : '没保存成功'))
-        if (r.ok) { setDirty(false); setRestore(null); try { localStorage.removeItem(personaDraftKey(edit.id)) } catch (e) {} refresh() }
+        if (r.ok) {
+          if (editRef.current?.id === id && revision.current === rev) {
+            setDirty(false); setRestore(null)
+            setEdit((previous) => ({ ...previous, appearanceDirty: false }))
+            setLook((previous) => previous.imageHash === r.look?.imageHash ? { ...previous, stale: r.look.stale } : previous)
+            try { localStorage.removeItem(personaDraftKey(id)) } catch (e) {}
+          }
+          refresh()
+        }
       }
-      const patch = (p) => { setEdit({ ...edit, ...p }); setDirty(true) }
+      const patch = (p) => { revision.current++; setEdit((previous) => ({ ...previous, ...p })); setDirty(true) }
       const setSecs = (secs) => patch({ secs })
       const updSec = (k, p) => setSecs(edit.secs.map((s) => (s.k === k ? { ...s, ...p } : s)))
       const moveSec = (i, d) => { const n = edit.secs.slice(); const [x] = n.splice(i, 1); n.splice(i + d, 0, x); setSecs(n) }
@@ -1329,16 +2068,22 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const suggest = PSEC_SUGGEST.filter((t) => !titles.includes(t))
       return h('div', { className: 'ab-persona' },
         h('div', { className: 'ab-plist' },
-          list.map((p) => h('button', { key: p.id, type: 'button', className: cx('ab-pitem', sel === p.id && 'on'), onClick: () => setSel(p.id) },
+          list.map((p) => h('button', { key: p.id, type: 'button', className: cx('ab-pitem', sel === p.id && 'on'), onClick: () => { if (p.id === sel) return; loadSeq.current++; revision.current++; setEdit(null); setSel(p.id) } },
             h('div', { className: 'nm' }, p.name, p.id === current ? h('span', { className: 'ab-badge' }, '正在用') : null),
             h('div', { className: 'tg' }, (p.tags || []).join(' · ') || p.id + ' · ' + p.chars + ' 字'))),
-          h(Btn, { kind: 'ghost', onClick: () => { const id = 'persona-' + Date.now().toString(36); setEdit({ id, name: '新人格', tags: '', secs: splitPersona('你是……\n\n【打字习惯】\n- 短句、口语，一次只说一两句。') }); setSel(id); setDirty(true); setPending({}) } }, '＋ 新建人格'),
+          h(Btn, { kind: 'ghost', onClick: () => { const id = 'persona-' + Date.now().toString(36); loadSeq.current++; revision.current++; setEdit({ id, name: '新人格', tags: '', appearance: '', appearanceSource: 'manual', appearanceDirty: false, secs: splitPersona('你是……\n\n【打字习惯】\n- 短句、口语，一次只说一两句。') }); setLook({}); setRestore(null); setSel(id); setDirty(true); setPending({}) } }, '＋ 新建人格'),
           h(AvatarCard, { st, toast, reload }),
         ),
         edit ? h(Card, { title: '编辑人格', desc: '人格写在系统提示词的最前面，按节写更好改。离开不会自动保存；切标签/切页面会先记住草稿，下次进来会问你要不要恢复；输入框里 Ctrl+Z 可撤回。保存后大肥鱼下一轮回复起就按新的来。',
           right: h('div', { className: 'ab-flex' },
             edit.id !== current ? h(Btn, { small: true, onClick: async () => { const r = await post('/persona/use', { id: edit.id }); toast(r.message); refresh(); reload() } }, '设为当前') : null,
-            edit.id !== current ? h(Btn, { small: true, kind: 'danger', onClick: async () => { if (!confirm('删掉这个人格？')) return; const r = await post('/persona/delete', { id: edit.id }); if (r.ok) { try { localStorage.removeItem(personaDraftKey(edit.id)) } catch (e) {} setList(r.list); setSel(current) } else toast(r.message) } }, '删除') : null) },
+            edit.id !== current ? h(Btn, { small: true, kind: 'danger', onClick: async () => {
+              if (!confirm('删掉这个人格？')) return
+              // 有自己目录的人格（不是根目录那个，也不在待认领）才有单独的记忆和会话可删
+              const own = !st.persona?.claimPending && edit.id !== st.persona?.dataOwner
+              const withData = own && confirm('这个人格的记忆和会话记录也一起删掉吗？删了找不回来。\n选「取消」只删人格，记忆留着，以后用同一个 id 新建人格还能接上。')
+              const r = await post('/persona/delete', { id: edit.id, withData })
+              if (r.ok) { try { localStorage.removeItem(personaDraftKey(edit.id)) } catch (e) {} setList(r.list); setSel(current) } else toast(r.message) } }, '删除') : null) },
           restore ? h('div', { className: 'ab-flex', style: { marginTop: 12, padding: '8px 10px', border: '1px solid #4a4a55', borderRadius: 8, background: 'rgba(255,255,255,.04)' } },
             h('span', { className: 'ab-small' }, '发现上次没保存的人格改动（' + String(restore.body || '').length + ' 字' + (restore.at ? '，' + new Date(restore.at).toLocaleString() : '') + '）。要恢复吗？'),
             h('div', { className: 'ab-spacer' }),
@@ -1346,6 +2091,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             h(Btn, { small: true, kind: 'ghost', onClick: discardDraft }, '丢弃')) : null,
           h(Row, { label: '名字' }, h('input', { className: 'ab-input', value: edit.name, onChange: (e) => patch({ name: e.target.value }) })),
           h(Row, { label: '标签', hint: '用逗号隔开' }, h('input', { className: 'ab-input', value: edit.tags, onChange: (e) => patch({ tags: e.target.value }) })),
+          h(PersonaLook, { key: edit.id, edit, patch, look, setLook, saved: list.some((p) => p.id === edit.id), st, draft, setDraft, toast }),
           h('div', { className: 'ab-flex', style: { marginTop: 14 } },
             h(Seg, { value: whole ? 'whole' : 'secs', onChange: (v) => setMode(v === 'whole'), options: [{ value: 'secs', label: '分节' }, { value: 'whole', label: '整段' }] }),
             h('div', { className: 'ab-spacer' }),
@@ -1365,12 +2111,217 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h('div', { className: 'ab-flex', style: { marginTop: 14 } },
             waiting ? h('span', { className: 'ab-muted ab-small' }, '还有 ' + waiting + ' 节 AI 润色没选定，选好再保存') : null,
             h('div', { className: 'ab-spacer' }),
-            h(Btn, { kind: 'primary', disabled: !dirty || !!waiting, onClick: save }, dirty ? '保存人格' : '已保存')),
-        ) : h(Card, null, h(Empty, { icon: '⏳', text: '加载中…' })),
+            h(Btn, { kind: 'primary', disabled: !dirty || !!waiting || saving, onClick: save }, saving ? '保存中…' : dirty ? '保存人格' : '已保存')),
+        ) : h(Card, null, loadError ? h('div', null, h('p', { className: 'ab-muted' }, loadError), h(Btn, { onClick: () => load(sel) }, '重试加载人格')) : h(Empty, { icon: '⏳', text: '加载中…' })),
       )
     }
 
-    function Access({ st, draft, setDraft }) {
+    /**
+     * 按工作区控制「审批 / 提问」要不要上报到 QQ。
+     * 工作区是 DSH 动态登记的，所以单独拉接口，不走配置表单的 draft。
+     */
+    function NoticeWorkspaces({ toast }) {
+      const [info, setInfo] = useState(null)
+      const load = async () => {
+        try { setInfo(await get('/notice/state')) } catch (e) { setInfo({ ok: false, workspaces: [] }) }
+      }
+      useEffect(() => { load() }, [])
+      const toggle = async (kind, workspace, value) => {
+        try {
+          await post('/notice/toggle', { kind, workspace, value })
+          await load()
+        } catch (e) { toast(e.message, 'err') }
+      }
+      const list = info?.workspaces || []
+      const rows = list.map((w) => h(Row, { key: w.path, label: w.name, hint: w.path + (w.sessions ? ` · ${w.sessions} 个会话` : '') },
+        h('div', { style: { display: 'flex', gap: 10, alignItems: 'center' } },
+          h('span', { className: 'ab-small ab-muted' }, '审批'), h(Switch, { on: w.approval, onChange: (v) => toggle('approval', w.path, v) }),
+          h('span', { className: 'ab-small ab-muted' }, '提问'), h(Switch, { on: w.question, onChange: (v) => toggle('question', w.path, v) }))))
+      return h(Card, { title: '按工作区上报', desc: '哪个工作区的活卡在授权或提问上，就把那条消息发到 QQ。只通知，不代答；改动立即生效。' },
+        list.length === 0
+          ? h('div', { className: 'ab-muted ab-small' }, info ? '这个 DSH 里还没登记过工作区。' : '读取中…')
+          : rows)
+    }
+
+    function Access(props) {
+      const [tab, setTab] = useState('global')
+      return h('div', { className: 'ab-grid' },
+        h('div', null, h(Seg, { value: tab, onChange: setTab, options: [
+          { value: 'global', label: '全局设置' }, { value: 'people', label: '私聊用户' }, { value: 'groups', label: '群聊' },
+        ] })),
+        tab === 'people' ? h(PrivatePermissions, props)
+          : tab === 'groups' ? h(GroupPermissions, props) : h(GlobalAccess, props),
+      )
+    }
+
+    function usePermissionSave(toast, reload) {
+      const [busy, setBusy] = useState(false)
+      const pending = useRef(false)
+      const save = async (path, payload) => {
+        if (pending.current) return false
+        pending.current = true
+        setBusy(true)
+        try {
+          const result = await post(path, payload)
+          if (!result.ok) { toast(result.message || '保存权限失败', 'err'); return false }
+          if (path === '/permissions/subject' || result.changed) await reload()
+          toast(result.message || '权限已保存', 'ok')
+          return true
+        } finally {
+          pending.current = false
+          setBusy(false)
+        }
+      }
+      const apply = (id, kind, changes) => save('/permissions/subject', { id, kind, changes })
+      const applyMany = (ids) => save('/permissions/private-batch', { ids })
+      return { busy, apply, applyMany }
+    }
+
+    function PrivatePermissions({ st, toast, reload }) {
+      const [catalog, setCatalog] = useState(null)
+      const [friends, setFriends] = useState([])
+      const [query, setQuery] = useState('')
+      const [selected, setSelected] = useState('')
+      const [quickQQ, setQuickQQ] = useState('')
+      const [batchOpen, setBatchOpen] = useState(false)
+      const [batchText, setBatchText] = useState('')
+      const [permissionGroupsOpen, setPermissionGroupsOpen] = useState({ 功能: true })
+      const { busy, apply, applyMany } = usePermissionSave(toast, reload)
+      const modules = (st.modules || []).map(({ id, running, commands }) => [id, running, commands])
+      const catalogVersion = JSON.stringify(modules)
+      useEffect(() => {
+        let active = true
+        get('/permissions/catalog').then((r) => { if (active) setCatalog(r) })
+        return () => { active = false }
+      }, [catalogVersion])
+      const loadFriends = async () => {
+        try {
+          const r = await get('/permissions/friends')
+          if (r.ok) { setFriends(r.friends); return true }
+          toast(r.message || '读取好友失败', 'err')
+        } catch (error) { toast(error.message || '读取好友失败', 'err') }
+        return false
+      }
+      const cfg = st.config
+      const owner = String(cfg.ownerQQ)
+      const privateAllow = (cfg.allow.private || []).map(String)
+      const isOpen = (qq) => privateAllow.includes(String(qq))
+      const saved = [cfg.allow.private, ...Object.values(cfg.capabilityAllow || {}), ...Object.values(cfg.commandAllow || {})]
+      const ids = [...new Set(saved.flat().map(String))].filter((id) => id !== owner)
+      const names = new Map(friends.map(({ id, name }) => [id, name]))
+      const q = query.trim().toLowerCase()
+      const matching = [...new Set([...ids, ...names.keys()])].filter((id) => id !== owner && (!q ? ids.includes(id) || names.has(id) : id.includes(q) || names.get(id)?.toLowerCase().includes(q)))
+      const entries = matching.slice(0, 50)
+      const id = selected || (!q ? entries[0] : '')
+      const open = Boolean(id && isOpen(id))
+      const has = (key) => key === 'chat' ? open : (cfg.capabilityAllow?.[key] || cfg.commandAllow?.[key] || []).includes(id)
+      const canOpen = /^\d{5,12}$/.test(q) && q !== owner && !entries.includes(q)
+      const permissions = catalog?.list || []
+      const known = new Set(permissions.map(({ key }) => key))
+      const inactive = Object.keys(cfg.commandAllow || {}).filter((key) => has(key) && !known.has(key))
+      const quickId = quickQQ.trim()
+      const canQuickAdd = /^\d{5,12}$/.test(quickId) && quickId !== owner && !isOpen(quickId)
+      const addPrivate = async (qq) => {
+        if (!/^\d{5,12}$/.test(String(qq)) || String(qq) === owner) return
+        if (await apply(String(qq), 'private', { chat: true })) { setSelected(String(qq)); setQuickQQ('') }
+      }
+      const batchTokens = batchText.split(/[\s,，;；、]+/).filter(Boolean)
+      const batchValid = batchTokens.filter((value) => /^\d{5,12}$/.test(value))
+      const batchUnique = [...new Set(batchValid)]
+      const ownerCount = batchUnique.filter((value) => value === owner).length
+      const batchIds = batchUnique.filter((value) => value !== owner)
+      const batchAdd = batchIds.filter((value) => !isOpen(value))
+      const tooManyBatchAdd = batchAdd.length > 500
+      const batchDuplicates = batchValid.length - batchUnique.length
+      const batchInvalid = batchTokens.length - batchValid.length
+      const toggle = ({ key, label, description }) => {
+        const publicFeature = (key === 'image' && cfg.imageGen.ownerOnly === false) || (key === 'song' && cfg.song.ownerOnly === false)
+        const hint = publicFeature ? `${description}。当前功能对所有白名单会话开放。` : description
+        return h(Row, { key, label, hint },
+          h(Switch, { on: has(key), title: label, disabled: busy, onChange: (value) => apply(id, 'private', { [key]: value }) }))
+      }
+      return h('div', { className: 'ab-permission-grid' },
+        h(Card, { title: '私聊用户', className: 'ab-permission-card', desc: '按昵称选好友，或输入 QQ 号添加。', right: h('div', { className: 'ab-flex', style: { gap: 6, flexWrap: 'wrap' } },
+          h(Btn, { small: true, kind: 'ghost', onClick: loadFriends }, friends.length ? '刷新好友' : '读取 QQ 好友'),
+          h(Btn, { small: true, kind: 'primary', onClick: () => setBatchOpen(!batchOpen) }, batchOpen ? '收起' : '批量添加')) },
+          h('input', { className: 'ab-input wide', value: query, 'aria-label': '搜索已授权用户或好友昵称', placeholder: '搜索已授权用户或好友昵称', onChange: (e) => setQuery(e.target.value) }),
+          h('div', { className: 'ab-flex', style: { marginTop: 6, flexWrap: 'wrap' } },
+            h('input', { className: 'ab-input', style: { flex: 1, minWidth: 140 }, inputMode: 'numeric', value: quickQQ, 'aria-label': '直接输入 QQ 号添加私聊', placeholder: '输入 QQ 号（5～12 位）', onChange: (e) => setQuickQQ(e.target.value) }),
+            h(Btn, { kind: 'primary', disabled: busy || !canQuickAdd, onClick: () => addPrivate(quickId) }, '添加私聊'),
+          ),
+          batchOpen ? h('div', { className: 'ab-permission-bulk' },
+            h('div', { className: 'ab-flex', style: { marginBottom: 6 } },
+              h('b', null, '批量添加私聊白名单'), h('div', { className: 'ab-spacer' }),
+              h(Btn, { small: true, kind: 'ghost', onClick: () => setBatchOpen(false) }, '关闭')),
+            h('textarea', { className: 'ab-textarea', style: { width: '100%', minHeight: 76, boxSizing: 'border-box' }, value: batchText, 'aria-label': '批量 QQ 号列表', placeholder: '粘贴 QQ 号，支持换行、空格、逗号或顿号', onChange: (e) => setBatchText(e.target.value) }),
+            h('div', { className: 'ab-flex', style: { flexWrap: 'wrap', marginTop: 6 } },
+              h('span', { className: 'ab-muted ab-small' }, `可新增 ${batchAdd.length} 人 · 重复 ${batchDuplicates} 个 · 跳过主人 ${ownerCount} 个 · 格式不对 ${batchInvalid} 条`),
+              h('div', { className: 'ab-spacer' }),
+              h(Btn, { small: true, kind: 'primary', disabled: busy || !batchAdd.length || tooManyBatchAdd, onClick: async () => { if (await applyMany(batchAdd)) setBatchText('') } }, `批量添加 ${batchAdd.length} 人`))) : null,
+          h('div', { className: 'ab-permission-people' }, entries.map((qq) => h('div', { key: qq, className: 'ab-permission-person-row' },
+            h('button', {
+              type: 'button', className: cx('ab-permission-person', qq === id && 'on'), 'aria-pressed': qq === id,
+              disabled: busy, onClick: () => setSelected(qq),
+            }, h('span', null, names.get(qq) || qq, names.get(qq) ? h('small', null, qq) : null),
+            h('small', null, isOpen(qq) ? '允许私聊' : ids.includes(qq) ? '已暂停' : '未授权')),
+            !isOpen(qq) ? h(Btn, { small: true, kind: 'ghost', disabled: busy, onClick: () => addPrivate(qq) }, '添加') : null))),
+          canOpen ? h(Btn, { small: true, disabled: busy, onClick: () => setSelected(q) }, `查看 ${q} 的权限`) : null,
+          !entries.length && !canOpen ? h('p', { className: 'ab-muted ab-small' }, q ? '没有匹配的用户' : '读取好友后可以按昵称添加；也可以在上方直接输入 QQ 号。') : null,
+          matching.length > entries.length ? h('p', { className: 'ab-muted ab-small' }, '请继续输入，缩小搜索范围。') : null,
+        ),
+        !id ? h(Card, null, h(Empty, { text: '选择一位私聊用户来管理授权' }))
+          : h(Card, { title: names.get(id) || id, className: 'ab-permission-card', desc: names.get(id) ? `QQ ${id}` : undefined },
+            h('div', { className: 'ab-permission-options' }, toggle({ key: 'chat', label: '允许私聊', description: '关闭会暂停这个人的其他授权，重新开启即可恢复。' })),
+            !open ? h('p', { className: 'ab-muted ab-small' }, '这个人目前无法私聊。可以先选好功能，开启私聊后授权生效。') : null,
+            catalog?.ok === false ? h('p', { className: 'ab-note err' }, catalog.message || '读取可授权项失败') : null,
+            catalog?.ok ? h(Fragment, null,
+              h('div', { className: 'ab-flex', style: { margin: '10px 0', flexWrap: 'wrap' } },
+                h(Btn, { small: true, disabled: busy || (open && has('help') && has('reset')), onClick: () => apply(id, 'private', { chat: true, help: true, reset: true }) }, open ? '授予会话自助' : '开放私聊和会话自助'),
+                h('span', { className: 'ab-muted ab-small' }, '包含 /help、/reset')),
+              ['功能', '命令', '扩展命令'].map((group) => {
+                const items = permissions.filter((item) => item.group === group)
+                if (!items.length) return null
+                const collapsible = group !== '功能'
+                const open = !collapsible || permissionGroupsOpen[group] === true
+                const optionsId = `private-permissions-${group}`
+                return h('section', { key: group, className: 'ab-permission-section' },
+                  collapsible
+                    ? h('div', { className: 'ab-row ab-permission-group-row' },
+                      h('div', { className: 'ab-label' }, h('b', null, group)),
+                      h('div', { className: 'ab-ctl' }, h('button', { type: 'button', className: 'ab-btn sm primary', 'aria-expanded': open, 'aria-controls': optionsId, onClick: () => setPermissionGroupsOpen((old) => ({ ...old, [group]: !open })) }, open ? '收起' : '展开')))
+                    : h('h4', null, group),
+                  open ? h('div', { id: optionsId, className: 'ab-permission-options' }, items.map(toggle)) : null,
+                )
+              }),
+              inactive.length ? h('section', { className: 'ab-permission-section' }, h('h4', null, '当前不可用的授权'),
+                inactive.map((key) => toggle({ key, label: key, description: '此模块命令未启用或已停止开放，可以撤销原授权。' }))) : null,
+            ) : null,
+            modOn(st, 'memory') ? h(Row, { label: '用户记忆' }, h(PersonMemoryReset, { key: id, qq: id, toast })) : null,
+          ),
+      )
+    }
+
+    function GroupPermissions({ st, toast, reload, go }) {
+      const [input, setInput] = useState('')
+      const { busy, apply } = usePermissionSave(toast, reload)
+      const id = input.trim()
+      const groups = st.config.allow.groups
+      return h('div', { className: 'ab-grid' },
+        h(Card, { title: '群消息设置', desc: '选一个群，设置是否聊天、仅用模块，以及旁听。无需另外添加白名单。' },
+          h(Btn, { kind: 'primary', onClick: () => go('group') }, '打开群聊设置'),
+          h('details', { style: { marginTop: 16 } },
+            h('summary', { style: { cursor: 'pointer' } }, '直接编辑群白名单'),
+            h('p', { className: 'ab-muted ab-small' }, '这里仅改名单，操作立即生效。新群默认允许 AI 聊天；已有的「仅模块」限制保留。'),
+            h('div', { className: 'ab-flex', style: { flexWrap: 'wrap' } },
+              h('input', { className: 'ab-input', 'aria-label': '群号', placeholder: '输入群号', inputMode: 'numeric', value: input, onChange: (e) => setInput(e.target.value) }),
+              h(Btn, { disabled: busy || !/^\d{5,}$/.test(id) || groups.includes(id), onClick: async () => { if (await apply(id, 'group', { chat: true })) setInput('') } }, '添加群聊')),
+            groups.map((qq) => h(Row, { key: qq, label: qq, hint: (st.config.group.moduleOnlyGroups || []).includes(qq) ? '仅模块' : '允许 AI 聊天' }, h(Btn, { small: true, disabled: busy, onClick: () => apply(qq, 'group', { chat: false }) }, '移除')))),
+        ),
+        modOn(st, 'group-admin') ? h(GroupRoles, null) : null,
+      )
+    }
+
+    function GlobalAccess({ st, draft, setDraft, toast }) {
       const f = useField(draft, setDraft)
       return h('div', { className: 'ab-grid' },
         h(Card, { title: '主人', desc: '主人的 QQ 号。群管、点歌、电脑上的操作只听主人的。' },
@@ -1384,9 +2335,23 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
                 { value: 'chat', label: '纯聊天', desc: '什么工具都没有，只聊天' },
               ] }),
               h('div', { className: 'ab-muted ab-small', style: { marginTop: 8 } }, '切换后会给主人私聊换一个新的 DSH 会话（旧的还在侧栏里）。'))),
-          h(Row, { label: 'DSH 要授权时发到 QQ', hint: '人不在电脑前也知道ta卡住了。' }, f.sw('approvalNotify')),
+          h(Row, { label: '上报到 QQ', hint: '有会话在等授权、等你选东西时，ta 会用自己的话提醒你一句。' }, f.sw('notice.enabled')),
+          h(Row, { label: '要授权时提醒', hint: '工具卡住、等你点批准的时候。' }, f.sw('notice.approval')),
+          h(Row, { label: '要选选项时提醒', hint: '需要你选东西的时候。' }, f.sw('notice.question')),
+          h(Row, { label: '合并等待（秒）', hint: '连着来几件事时先攒一会儿再提醒，免得刷屏。默认 8。' },
+            // 非受控 + onChange：输入时不重渲染（不会弹回），但值实时写进 draft，不用失焦也不会丢
+            h('input', {
+              className: cx('ab-input', 'sm'),
+              defaultValue: getPath(draft, 'notice.windowSec') ?? '',
+              placeholder: '8',
+              inputMode: 'numeric',
+              onChange: (e) => setDraft(setPath(draft, 'notice.windowSec', e.target.value)),
+            }),
+            h('span', { className: 'ab-muted' }, ' 秒')),
+          h(NoticeWorkspaces, { toast }),
           h(Row, { label: 'QQ 接口', hint: '让她用 QQ 的其他能力：别人只能查当前群的公告、精华这些；撤回、设精华、改群名片等只听你的。取 Cookie、发原始包、删好友、退群这些不开放。' }, f.sw('qqApi.enabled')),
-          h(Row, { label: '在 QQ 里批准', hint: '和你私聊时要授权，回复「确认」批准这一次、回复「取消」拒绝，5 分钟没回就不批。只认你本人的私聊回复，DSH 里也能同时点。QQ 号被盗的话，对方也能批，介意就关掉' }, f.sw('approvalViaQQ')),
+          h(Row, { label: '在 QQ 里批准', hint: '回复「确认」批准这一次、回复「取消」拒绝；超时按不批。只认你的私聊回复，DSH 也能同时点。' }, f.sw('approvalViaQQ')),
+          h(Row, { label: '等多久算超时（秒）', hint: '在 QQ 里等你回复的时长，默认 300（5 分钟）。' }, f.num('approvalTimeoutSec', { min: 30, max: 1800 }), h('span', { className: 'ab-muted' }, ' 秒')),
           h(Row, { label: '长任务模式', hint: '只在「完整」权限下生效。打开后ta能把命令放到后台跑、跑完自动回来告诉你，也能设定时任务；工具多一点，回话会稍慢。切换后同样换新会话。' },
             h(Choices, { value: draft.longTasks ? 'on' : 'off', onChange: (v) => setDraft(setPath(draft, 'longTasks', v === 'on')), options: [
               { value: 'off', label: '关', desc: '工具少一点，回话快一点' },
@@ -1399,11 +2364,6 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             ] })),
         ),
         h(ProfilePerms, { st, draft, setDraft }),
-        h(Card, { title: '白名单', desc: '只有名单里的人和群，ta才会理。一行一个号码。' },
-          h(Row, { label: '私聊白名单', hint: '主人默认就在里面。' }, f.list('allow.private', { placeholder: '每行一个 QQ 号', numbers: true })),
-          h(Row, { label: '群白名单', hint: '把机器人拉进群后，把群号加到这里。' }, f.list('allow.groups', { placeholder: '每行一个群号', numbers: true })),
-        ),
-        modOn(st, 'group-admin') ? h(GroupRoles, null) : null,
         h(CommandList, null),
       )
     }
@@ -1428,7 +2388,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         row('biliAvatar', 'B 站头像', '要先在 B 站页登录并打开 B 站。图片网址或刚才发的图，最大 2MB。'),
         row('biliComment', 'B 站评论', '有人让ta去某个视频下发评论（bili_comment）。「仅主人」也包括你在群里开口。ta自己刷视频时发不发评论，看 B 站页的开关。'),
         row('qqFriendRequest', '处理好友申请', '让ta通过 / 拒绝别人加ta为好友的申请。ta自己主动加别人暂不支持（SnowLuma 没有这个接口）。'),
-        row('whitelist', '改白名单', '让ta把 QQ 号 / 群号加进或移出下面的白名单。主人不会被移出。开成「所有人」前请想清楚。'),
+        row('whitelist', '改白名单', '允许改聊天白名单，主人不能被移出。关闭后，也不能在私聊里管理群接话和旁听；这两项始终只听主人私聊。「所有人」会允许其他人改聊天白名单。'),
         douyinOn && row('douyinBrowse', '刷抖音 / 看视频', '让ta去刷推荐（douyin_browse）、点开别人发来的抖音链接（douyin_watch）。定时自己刷不受这项限制。'),
         douyinOn && row('douyinLike', '抖音点赞', '有人让ta给某个视频点赞；关掉后ta自己刷的时候也不点赞。'),
         douyinOn && row('douyinComment', '抖音评论', '有人让ta去某个视频下评论；关掉后ta自己刷的时候也不评论。'),
@@ -1445,7 +2405,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     function CommandList() {
       const [list, setList] = useState([])
       useEffect(() => { get('/commands').then((r) => setList(r.list || [])) }, [])
-      return h(Card, { title: 'QQ 命令', desc: '主人在 QQ 里（私聊或白名单群）直接发这些命令就能管ta，别人发了不算。总开关关着时也能用。' },
+      return h(Card, { title: 'QQ 命令', desc: '主人可以在 QQ 私聊或白名单群使用命令。其他人获授权后可在自己的私聊使用对应命令。' },
         h('table', { className: 'ab-table' }, h('tbody', null, list.map((c) => h('tr', { key: c.name },
           h('td', { style: { whiteSpace: 'nowrap' } }, h('code', null, '/' + c.name), c.aliases.length ? h('div', { className: 'ab-muted ab-small' }, c.aliases.map((a) => '/' + a).join(' ')) : null),
           h('td', null, c.desc))))))
@@ -1496,7 +2456,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             info && info.titles ? h('div', { className: 'ab-psec-add', style: { marginTop: 10 } },
               info.titles.length
                 ? info.titles.slice(0, 30).map((t) => h('button', { key: t.title, type: 'button', className: cx('ab-chip', t.title === tf.title.trim() && 'on'), title: t.members.map((m) => m.name).join('、'), onClick: () => set({ title: t.title }) }, t.title, h('span', { className: 'n' }, t.count + ' 人')))
-                : h('span', { className: 'ab-muted ab-small' }, groups.length ? '这些群里还没有人挂专属头衔。' : '群白名单是空的，先在「权限」页加群。')) : null,
+                : h('span', { className: 'ab-muted ab-small' }, groups.length ? '这些群里还没有人挂专属头衔。' : '先到「聊天 → 群聊」添加群，选择「仅模块」或「允许 AI 聊天」。')) : null,
             hit ? h('div', { className: 'ab-tf-who' }, '挂着「' + hit.title + '」的：' + hit.members.map((m) => m.name + '（' + m.id + '）').join('、') + (hit.count > hit.members.length ? ' 等 ' + hit.count + ' 人' : '')) : null,
             info && info.message ? h('div', { className: 'ab-muted ab-small', style: { marginTop: 6 } }, info.message) : null)),
         h(Row, { label: '在哪些群生效', hint: '没勾的群照常回。只列白名单里的群。' },
@@ -1521,71 +2481,286 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const on = (gid) => (ob.groups || []).includes(gid)
       const toggle = (gid) => setDraft(setPath(draft, 'group.ownerBrief.groups', on(gid) ? (ob.groups || []).filter((x) => x !== gid) : [...(ob.groups || []), gid]))
       return h(Card, { title: '主人私聊：群聊摘要', right: f.sw('group.ownerBrief.enabled'),
-        desc: '主人在私聊里问起群里的事时，把最近 24 小时的群聊流水当成「ta自己的见闻」补进这一轮上下文。只在「主人私聊 + 这句话提到群相关」时触发，不常驻、不写进记忆；默认关。开启前先在「权限」页把群加进白名单。' },
+        desc: '主人在私聊里问起群里的事时，把最近 24 小时的群聊流水当成「ta自己的见闻」补进这一轮上下文。只在「主人私聊 + 这句话提到群相关」时触发，不常驻、不写进记忆；默认关。先在「聊天 → 群聊」选择「仅模块」或「允许 AI 聊天」。' },
         h(Row, { label: '每个群给几条', hint: '越少越省上下文；最多 30 条' }, f.range('group.ownerBrief.lines', 1, 30, 1, (v) => v + ' 条')),
         h(Row, { label: '只取哪些群', hint: '没勾 = 所有白名单群；只列白名单里的群' },
           groups.length
             ? h('div', { className: 'ab-flex' }, groups.map((gid) => h('button', { key: gid, type: 'button', className: cx('ab-chip', on(gid) && 'on'), onClick: () => toggle(gid) },
               (on(gid) ? '✓ ' : '') + (nameOf(gid) || '群'), h('span', { className: 'n' }, gid))))
-            : h('span', { className: 'ab-muted ab-small' }, '群白名单是空的，先在「权限」页加群。')),
+            : h('span', { className: 'ab-muted ab-small' }, '先到「聊天 → 群聊」添加群，选择「仅模块」或「允许 AI 聊天」。')),
         h('div', { className: 'ab-muted ab-small', style: { marginTop: 6 } }, 'ta只会当成自己最近在群里看到的，不会把群聊原文说成是主人发的。'))
     }
 
-    function Group({ draft, setDraft }) {
-      const f = useField(draft, setDraft)
+    function MemberFilter({ draft, setDraft }) {
+      const value = draft.memberFilter || { enabled: true, rules: [] }
+      const rules = value.rules
+      const [input, setInput] = useState('')
+      const [selected, setSelected] = useState('')
+      const qq = input.trim()
+      const current = rules.find(r => r.userId === selected) || rules[0]
+      const saveRules = next => setDraft(setPath(draft, 'memberFilter', { ...value, rules: next }))
+      const change = patch => saveRules(rules.map(r => r.userId === current.userId ? { ...r, ...patch } : r))
+      const valid = /^[1-9]\d{4,11}$/.test(qq) && qq !== String(draft.ownerQQ)
+      return h(Card, { title: '不回应的人', right: h(Switch, { title: '启用不回应名单', on: value.enabled, onChange: enabled => setDraft(setPath(draft, 'memberFilter', { ...value, enabled })) }),
+        desc: '在所选群里不回应这些人，包括 @、引用、戳一戳和模块指令。私聊和主人不受影响。' },
+        !value.enabled ? h('p', { className: 'ab-note warn' }, '名单已暂停，下面的规则暂不生效。') : null,
+        h('div', { className: 'ab-flex', style: { marginBottom: 12 } },
+          h('input', { className: 'ab-input', 'aria-label': '添加不回应的 QQ 号', inputMode: 'numeric', placeholder: '输入一个 QQ 号', value: input, onChange: e => setInput(e.target.value) }),
+          h(Btn, { small: true, disabled: !valid || (rules.length >= 100 && !rules.some(r => r.userId === qq)), onClick: () => {
+            if (!rules.some(r => r.userId === qq)) saveRules([...rules, { userId: qq, scope: 'groups', groups: [] }])
+            setSelected(qq); setInput('')
+          } }, rules.some(r => r.userId === qq) ? '查看' : '添加')),
+        qq && !valid ? h('p', { className: 'ab-note warn' }, qq === String(draft.ownerQQ) ? '主人不会被屏蔽，无需添加。' : '请填一个 5～12 位数字 QQ 号。') : null,
+        h('div', { className: 'ab-flex', style: { flexWrap: 'wrap', maxHeight: 160, overflowY: 'auto' } }, rules.map(r =>
+          h('button', { type: 'button', key: r.userId, className: cx('ab-chip', current?.userId === r.userId && 'on'), 'aria-pressed': current?.userId === r.userId, onClick: () => setSelected(r.userId) },
+            r.userId, h('span', { className: 'n' }, r.scope === 'all' ? '所有群' : r.groups.length ? r.groups.length + ' 个群' : '待选群')))),
+        !current ? h('p', { className: 'ab-muted' }, '名单为空，没有按 QQ 号屏蔽任何人。') : h('div', { key: current.userId, style: { marginTop: 16 } },
+          h('div', { className: 'ab-flex' }, h('b', null, 'QQ ' + current.userId), h('div', { className: 'ab-spacer' }),
+            h(Btn, { small: true, kind: 'ghost', onClick: () => saveRules(rules.filter(r => r.userId !== current.userId)) }, '移出不回应名单')),
+          current.userId === String(draft.ownerQQ) ? h('p', { className: 'ab-note' }, '这是当前主人，规则不会拦截此人。') : null,
+          h(Row, { label: '在哪些群不回应' }, h(Select, { ariaLabel: 'QQ ' + current.userId + ' 不回应范围', value: current.scope,
+            options: [{ value: 'groups', label: '仅指定群' }, { value: 'all', label: '所有群（含以后加入的群）' }], onChange: scope => change({ scope }) })),
+          current.scope === 'groups' ? h(Row, { label: '指定群号', hint: '一行一个，也可用逗号分隔。留空不生效，不会自动变成所有群。' },
+            h(ListArea, { value: current.groups, numbers: true, placeholder: '填写要生效的群号', onChange: groups => change({ groups }) })) : null,
+          current.scope === 'groups' && !current.groups.length ? h('p', { className: 'ab-note' }, '还没选群，这个人暂时不会被屏蔽。') : null,
+          h('p', { className: 'ab-muted ab-small' }, '点底部「保存设置」后对新消息生效；已开始的回复和旧记忆保留。')))
+    }
+
+    function GroupOverrides({ draft, setDraft, setSection }) {
       const overrides = draft.group.overrides || {}
+      const groupIds = [...new Set([...draft.allow.groups, ...(draft.group.moduleOnlyGroups || []), ...Object.keys(overrides), ...Object.keys(draft.memory.groupExtraction || {}), ...(draft.memory.passiveGroups || [])])]
       const [newGid, setNewGid] = useState('')
+      const [selected, setSelected] = useState('')
+      const selectedId = groupIds.includes(selected) ? selected : groupIds[0]
+      const groupId = newGid.trim()
+      const validGroupId = /^[1-9]\d{4,11}$/.test(groupId)
+      const modeLabel = id => !draft.allow.groups.includes(id) ? '不响应' : (draft.group.moduleOnlyGroups || []).includes(id) ? '仅模块' : 'AI 聊天'
       return h('div', { className: 'ab-grid' },
-        h(Card, { title: '连发合并', right: f.sw('merge.enabled'), desc: '人常常一口气发好几句。打开后ta会等对方说完再一起回，而不是一句一回。' },
-          h(Row, { label: '对方停顿多久算说完' }, f.range('merge.waitSec', 0.5, 10, 0.5, (v) => v + ' 秒')),
-          h(Row, { label: '最多等多久', hint: '对方一直在发也最多等这么久' }, f.range('merge.maxSec', 2, 30, 1, (v) => v + ' 秒')),
-          h(Row, { label: '群里停顿多久算一段', hint: '群里大家你一句我一句，多等一会儿把一段话攒齐再回；ta回上一段的时候，新消息也会先攒着' }, f.range('merge.groupWaitSec', 1, 20, 1, (v) => v + ' 秒')),
-          h(Row, { label: '群里最多等多久' }, f.range('merge.groupMaxSec', 3, 60, 1, (v) => v + ' 秒')),
-        ),
-        h(TitleFilter, { draft, setDraft }),
-        h(OwnerBrief, { draft, setDraft }),
-        h(Card, { title: '发文件', right: f.sw('files.enabled'), desc: '打开后，你可以让ta把本机文件发到 QQ：图片会直接显示成图，其它当文件发。私聊里随时能发，群里只在你自己开口那一轮能发；也能按你说的发给白名单里的人或群。ta只能发 QQ 工作区和下面目录里的文件；单个文件有大小上限；发过什么会记在日志里。' },
-          h(Row, { label: '单个文件最大' }, f.num('files.maxMB', { min: 1, max: 2048 }), h('span', { className: 'ab-muted' }, ' MB')),
-          h(Row, { label: '额外允许的目录', hint: '一行一个完整路径。QQ 工作区里的文件一直允许，不用写；留空 = 只能发工作区里的' }, f.list('files.dirs', { placeholder: 'D:\\Aurabot\\要发的文件' })),
-          h(Row, { label: '图片按路径直发', hint: '网关和 NapCat 在同一台机器或共享挂载时，直接把路径交给网关，省掉读盘和 base64 膨胀；网关读不到会自动改用 base64。默认开。' }, f.sw('files.imageByPath')),
-        ),
-        h(Card, { title: '群里什么时候必回', desc: '被 @、有人引用回复ta的消息、或者提到下面这些名字时，ta一定会回。' },
-          h(Row, { label: '能不能看别的群', hint: '只读白名单里的群，一次最多 50 条，主人随时能看。开到「群里也行」后，ta在 A 群的回答全群都看得到，里面可能有不在 B 群的人；读到的内容也会留在这个会话里。' }, f.choices('group.crossRead', [{ value: 'off', label: '关', desc: '只看当前聊天' }, { value: 'private', label: '私聊可以', desc: '主人，以及私聊里问的人本身在那个群（默认）' }, { value: 'group', label: '群里也行', desc: '再加上群里问的人都在那个群' }])),
-          h(Row, { label: '@ 了别人不算叫ta', hint: '有人 @ 别人时顺口提到ta的名字，不算在叫ta；ta还是可以按平时的频率插话。默认关' }, f.sw('group.ignoreAtOthers')),
-          h(Row, { label: '新会话先补看聊天记录', hint: '会话第一次开口时先读最近几条，接得上话。默认关' }, f.sw('chat.seedHistory')),
-          h(Row, { label: '唤醒词', hint: '一行一个' },f.list('group.wakeWords', { placeholder: '大肥鱼\n肥鱼' })),
-        ),
-        h(Card, { title: '安全刹车', desc: '只防失控（比如和别的机器人聊停不下来）：ta在一个群里短时间说太多就歇一会儿；别人 @ ta、引用 ta、喊 ta 名字或追问 ta 不算主动接话，不会被刹车拦。平时碰不到。' },
-          h(Row, { label: '连着接话几次', hint: '她会自己判断该不该停，这里只是兜底：没人叫她时最多连着接几次。0 = 不接话' }, f.range('group.engagedMax', 0, 10, 1, (v) => v + ' 次')),
-          h(Row, { label: '最多说几次' }, f.range('group.burstMax', 1, 20, 1, (v) => v + ' 次'), h('span', { className: 'ab-muted' }, '/'), f.range('group.burstWindowSec', 30, 600, 30, (v) => Math.round(v / 6) / 10 + ' 分钟')),
-        ),
-        h(Card, { title: '群里插话', desc: '没人叫ta的时候，ta也可能自然地插一句；ta看完群里在聊什么，也可以决定不说话。' },
-          h(Row, { label: '插话概率', hint: '每条普通消息触发插话的机会' }, f.percent('group.interjectChance')),
-          h(Row, { label: '冷却', hint: '两次插话至少隔多久' }, f.range('group.cooldownSec', 0, 600, 10, (v) => v + ' 秒')),
-          h(Row, { label: '每小时最多插话' }, f.range('group.maxPerHour', 0, 30, 1, (v) => v + ' 次')),
-          h(Row, { label: 'ta感兴趣的话题', hint: '群里在聊这些（或ta记得相关的事）时更容易插话；一行一个' }, f.list('group.interests', { placeholder: '白米饭\n游戏\n追剧' })),
-          h(Row, { label: '话题相关度门槛', hint: '和ta关系不大的话题就不插话；拉到 0 = 不看话题、纯随机' }, f.range('group.minRelevance', 0, 1, 0.05, (v) => (v === 0 ? '不看话题' : Math.round(v * 100) + '%'))),
-          h('div', { className: 'ab-note', style: { marginTop: 8 } }, 'ta被叫到或插上话以后算「加入了话题」：话题还和ta相关、ta 3 分钟内说过话，就会接着聊下去（每次看完群里新说的一段再回），不受冷却和每小时上限限制；话题跑偏或者ta选择不说话就退出。'),
-          h(Row, { label: '群冷清时不插话', hint: '最近几分钟内消息少于这个数就不插' }, f.num('group.minRecentMessages', { min: 0 }), h('span', { className: 'ab-muted' }, '条 / '), f.num('group.activeWindowSec', { min: 30 }), h('span', { className: 'ab-muted' }, '秒')),
-          h(Row, { label: '静默时段', hint: '这段时间不插话（被叫到还是会回）' },
-            h('input', { className: 'ab-input sm', type: 'number', min: 0, max: 23, value: draft.group.quietHours[0], onChange: (e) => setDraft(setPath(draft, 'group.quietHours', [Number(e.target.value), draft.group.quietHours[1]])) }),
-            h('span', { className: 'ab-muted' }, '点 到'),
-            h('input', { className: 'ab-input sm', type: 'number', min: 0, max: 23, value: draft.group.quietHours[1], onChange: (e) => setDraft(setPath(draft, 'group.quietHours', [draft.group.quietHours[0], Number(e.target.value)])) }),
-            h('span', { className: 'ab-muted' }, '点')),
-        ),
-        h(Card, { title: '按群单独设置', desc: '某个群想让ta更安静或更活跃，在这里单独设插话概率。' },
-          Object.keys(overrides).length === 0 ? h('div', { className: 'ab-muted', style: { marginBottom: 10 } }, '还没有单独设置的群。') :
-            Object.entries(overrides).map(([gid, o]) => h(Row, { key: gid, label: '群 ' + gid },
-              h('input', { className: 'ab-input sm', type: 'number', min: 0, max: 100, value: pct(o.interjectChance ?? draft.group.interjectChance), onChange: (e) => setDraft(setPath(draft, 'group.overrides', { ...overrides, [gid]: { ...o, interjectChance: Number(e.target.value) / 100 } })) }),
-              h('span', { className: 'ab-muted' }, '% 插话'),
-              h(Btn, { small: true, kind: 'ghost', onClick: () => { const n = { ...overrides }; delete n[gid]; setDraft(setPath(draft, 'group.overrides', n)) } }, '移除'))),
-          h('div', { className: 'ab-flex' }, h('input', { className: 'ab-input', placeholder: '群号', value: newGid, onChange: (e) => setNewGid(e.target.value.replace(/\D/g, '')) }),
-            h(Btn, { small: true, disabled: !newGid, onClick: () => { setDraft(setPath(draft, 'group.overrides', { ...overrides, [newGid]: { interjectChance: draft.group.interjectChance } })); setNewGid('') } }, '添加')),
+        h(Card, { title: '选择群', desc: '选一个群，设置它能做什么；改好后点「保存设置」。' },
+          h('div', { className: 'ab-flex', style: { marginBottom: 12 } },
+            h('input', { className: 'ab-input', 'aria-label': '查找或添加群号', placeholder: '查找或添加群号', inputMode: 'numeric', value: newGid, onChange: e => setNewGid(e.target.value) }),
+            h(Btn, { small: true, disabled: !validGroupId, onClick: () => {
+              if (!groupIds.includes(groupId)) setDraft(setPath(draft, 'group.overrides', { ...overrides, [groupId]: {} }))
+              setSelected(groupId); setNewGid('')
+            } }, groupIds.includes(groupId) ? '查看此群' : '添加群')),
+          newGid && !/^\d*$/.test(newGid.trim()) ? h('p', { className: 'ab-note warn' }, '请填数字群号，不要混入文字。') : null,
+          h('div', { className: 'ab-flex', style: { flexWrap: 'wrap', marginBottom: 12, maxHeight: 160, overflowY: 'auto' } },
+            groupIds.filter(id => id.includes(groupId)).map(id => h('button', { key: id, type: 'button', className: cx('ab-chip', selectedId === id && 'on'), 'aria-pressed': selectedId === id,
+              onClick: () => { setSelected(id); setNewGid('') } }, id, h('span', { className: 'n' }, modeLabel(id))))),
+          groupId && !groupIds.some(id => id.includes(groupId)) ? h('p', { className: 'ab-muted ab-small' }, validGroupId ? '尚未设置这个群；添加后不会自动开放聊天。' : '没有匹配的群；添加时需填完整的 5～12 位群号。') : null,
+          groupIds.length === 0 ? h('div', { className: 'ab-muted', style: { marginBottom: 10 } }, '输入群号后选择模式；添加一行不会自动开放聊天。') :
+            [selectedId].map((gid) => {
+              const raw = overrides[gid]
+              const mode = !draft.allow.groups.includes(gid) ? 'off' : (draft.group.moduleOnlyGroups || []).includes(gid) ? 'modules' : 'chat'
+              const changeMode = value => {
+                setSelected(gid)
+                const n = clone(draft)
+                n.allow.groups = value === 'off' ? n.allow.groups.filter(x => x !== gid) : [...new Set([...n.allow.groups, gid])]
+                const restricted = n.group.moduleOnlyGroups || []
+                n.group.moduleOnlyGroups = value === 'chat' ? restricted.filter(x => x !== gid) : value === 'modules' ? [...new Set([...restricted, gid])] : restricted
+                n.group.overrides[gid] = { ...o }
+                setDraft(n)
+              }
+              const o = raw && typeof raw === 'object' ? raw : {}
+              const chance = o.interjectChance ?? draft.group.interjectChance
+              const proactive = (o.proactiveEnabled ?? draft.group.proactiveEnabled) !== false && chance > 0
+              const engagedFlag = o.engagedEnabled ?? draft.group.engagedEnabled
+              const engaged = typeof engagedFlag === 'boolean' ? engagedFlag : chance > 0
+              const change = (key, value) => {
+                const next = { ...o }
+                if (value === '') delete next[key]
+                else next[key] = value === 'on'
+                setDraft(setPath(draft, 'group.overrides', { ...overrides, [gid]: next }))
+              }
+              return h('div', { key: gid, style: { borderTop: '1px solid var(--ab-line)', paddingTop: 10, marginTop: 10 } },
+                h('h3', null, '群 ' + gid),
+                h(Row, { label: '群响应模式' }, h(Select, { ariaLabel: '群 ' + gid + ' 响应模式', value: mode,
+                  options: [{ value: 'off', label: '不响应群消息' }, { value: 'modules', label: '仅模块' }, { value: 'chat', label: '允许 AI 聊天' }], onChange: changeMode }),
+                  mode === 'off' ? h('label', { className: 'ab-flex' }, '不响应时仍旁听',
+                    h(Switch, { title: '群 ' + gid + ' 不响应时仍旁听', on: (draft.memory.passiveGroups || []).includes(gid), onChange: on => {
+                      const ids = draft.memory.passiveGroups || []
+                      setDraft(setPath(draft, 'memory.passiveGroups', on ? [...new Set([...ids, gid])] : ids.filter(x => x !== gid)))
+                    } })) : null),
+                mode !== 'chat' ? h('div', { className: 'ab-note' }, mode === 'modules' ? '群消息只交给模块；是否回应仍看各模块的开关、权限和时段。AI 聊天设置暂不生效。' : '群消息不触发模块或 AI。' + (!draft.enabled ? '总开关已关闭，旁听暂不记录。' : draft.debug ? '调试模式不记录记忆。' : !draft.memory.enabled ? '记忆已关闭，旁听暂不记录。' : '开启旁听只记新文字，不回复；记忆整理可能产生费用。')) : h('p', { className: 'ab-muted ab-small' }, '被 @、引用或叫名字时按规则回复，仍受总开关、暂停和次数限制。'),
+                h(Row, { label: '长期记忆整理', hint: '相关对话包括主人发言、与她的互动和紧邻前文。群聊上下文不变。' }, h(Select, { ariaLabel: '群 ' + gid + ' 长期记忆整理', value: draft.memory.groupExtraction?.[gid] || 'related',
+                  options: [{ value: 'related', label: '只整理相关对话（默认）' }, { value: 'all', label: '整理全部对话' }, { value: 'auto', label: '按群消息量自动切换' }], onChange: value => {
+                    const modes = { ...draft.memory.groupExtraction }; if (value === 'related') delete modes[gid]; else modes[gid] = value
+                    setDraft(setPath(draft, 'memory.groupExtraction', modes))
+                  } })),
+                draft.memory.groupExtraction?.[gid] === 'auto' && h('p', { className: 'ab-muted ab-small' }, '当日近一小时超过 80 行，只整理相关对话；降至 40 行及以下恢复全部。'),
+                h('details', { key: gid + ':' + mode, open: mode === 'chat' ? true : undefined },
+                  h('summary', { style: { cursor: 'pointer', margin: '12px 0' } }, mode === 'chat' ? 'AI 聊天设置' : 'AI 聊天设置（开启 AI 聊天后生效）'),
+                ...[['proactiveEnabled', '没人叫时主动插话'], ['engagedEnabled', '聊起来后继续回应']].map(([key, label]) =>
+                  h(Row, { key, label, hint: key === 'proactiveEnabled' ? '没人叫它时，是否偶尔加入话题。' : '最近 3 分钟聊过，可以继续接话，不必每次 @。' }, h(Select, { ariaLabel: '群 ' + gid + ' ' + label, value: typeof o[key] === 'boolean' ? (o[key] ? 'on' : 'off') : '',
+                    options: [{ value: '', label: '使用群聊通用设置' }, { value: 'on', label: '开' }, { value: 'off', label: '关' }], onChange: (v) => change(key, v) }))),
+                h('div', { className: 'ab-muted ab-small' }, `接话规则：主动插话${proactive ? '开' : '关'}（基础 ${pct(chance)}%），继续回应${engaged ? '开' : '关'}。`),
+                chance === 0 ? h('div', { className: 'ab-note warn' }, '概率为 0，不会主动插话；想继续接话，可以单独打开「聊起来后继续回应」。') : null,
+                h('details', null, h('summary', { style: { cursor: 'pointer', margin: '12px 0' } }, '插话频率与次数'),
+                h(Row, { label: '主动插话概率', hint: '留空使用通用概率；0 表示不主动插话。' },
+                  h('input', { className: 'ab-input sm', 'aria-label': '群 ' + gid + ' 插话概率', type: 'number', min: 0, max: 100,
+                    placeholder: String(pct(draft.group.interjectChance)), value: o.interjectChance == null ? '' : pct(o.interjectChance),
+                    onChange: (e) => { const next = { ...o }; if (e.target.value === '') delete next.interjectChance; else next.interjectChance = Math.max(0, Math.min(100, Number(e.target.value))) / 100; setDraft(setPath(draft, 'group.overrides', { ...overrides, [gid]: next })) } }),
+                  h('span', { className: 'ab-muted' }, '%')),
+                h('p', { className: 'ab-muted ab-small' }, '继续回应不使用主动插话概率，也不受主动插话间隔和每小时上限影响。'),
+                h('p', { className: 'ab-muted ab-small' }, (() => {
+                  const q = o.quietHours || draft.group.quietHours
+                  return `不主动说话：${q[0] === q[1] ? '未设置' : q.map(v => String(v).padStart(2, '0') + ':00').join('–')}；主动插话每小时最多 ${o.maxPerHour ?? draft.group.maxPerHour} 次；最多连续接话 ${o.engagedMax ?? draft.group.engagedMax} 次。`
+                })()),
+                h(Btn, { small: true, kind: 'ghost', title: '清除本群单独设置的接话规则；不改响应模式和旁听。', disabled: !Object.keys(o).length, onClick: () => { const n = { ...overrides }; delete n[gid]; setDraft(setPath(draft, 'group.overrides', n)) } }, '本群接话改用通用设置'))),
+                h('div', { style: { marginTop: 12 } }, h(Btn, { small: true, kind: 'ghost', onClick: () => setSection('manage') },
+                  '管理不回应名单（本群 ' + (draft.memberFilter?.enabled ? (draft.memberFilter.rules || []).filter(r => r.userId !== String(draft.ownerQQ) && (r.scope === 'all' || r.groups.includes(gid))).length : 0) + ' 人）')))
+            }),
         ),
       )
     }
 
-    /** 按聊天选模型：私聊默认 / 群聊默认两个下拉，单个 QQ / 群的例外放在默认收起的小列表里。 */
+    function Group({ draft, setDraft, st, go }) {
+      const f = useField(draft, setDraft)
+      // 两段：single = 单个群（沿用 GroupOverrides），all = 所有群默认
+      const [section, setSection] = useState('single')
+      // 「更多设置（N 项）」子折叠卡：只直显少量高频项，其余收进来（复用 Card 的折叠不渲染 children）
+      const more = (title, items) => (items.length ? h(Card, { title: (title || '更多设置') + '（' + items.length + ' 项）', collapsible: true, defaultOpen: false, className: 'ab-fold-sub' }, items) : null)
+      return h('div', { className: 'ab-grid' },
+        h('div', { className: 'ab-flex', style: { marginBottom: 2 } },
+          h(Seg, { value: section, onChange: setSection, options: [{ value: 'single', label: '单个群' }, { value: 'all', label: '所有群默认' }] })),
+        h(Card, { title: '群聊通用设置', desc: '允许 AI 聊天的群默认按这些规则接话；单个群另有设置的项目优先。' },
+          h('div', { className: 'ab-grp-row' },
+            h(Row, { label: '没人叫时主动插话', hint: '没人叫它、也没在聊天时，偶尔加入话题。' }, f.sw('group.proactiveEnabled', { on: draft.group.proactiveEnabled !== false, title: '没人叫时主动插话' })),
+            h(Row, { label: '聊起来后继续回应', hint: '最近 3 分钟聊过，可以继续接相关话题，不必每次 @。' }, f.sw('group.engagedEnabled', { on: typeof draft.group.engagedEnabled === 'boolean' ? draft.group.engagedEnabled : draft.group.interjectChance > 0, title: '聊起来后继续回应' })),
+            h(Row, { label: '主动插话概率', hint: '话题越相关，实际概率可能越高；0 表示不主动插话。' }, f.percent('group.interjectChance')),
+            h(Row, { label: '最多连续接话几次', hint: '聊起来后，没有人再次叫它时，最多继续回应几次。0 表示不继续接话。' }, f.range('group.engagedMax', 0, 10, 1, (v) => v + ' 次')),
+          ),
+          draft.group.interjectChance === 0 ? h('div', { className: 'ab-note warn' }, '概率为 0，不会主动插话；想继续接话，可以单独打开「聊起来后继续回应」。') : null),
+
+        section === 'single' ? h(Fragment, null,
+          h(GroupOverrides, { draft, setDraft, setSection: () => setSection('all') }),
+          h(Card, { title: '相关设置' },
+            h('p', { className: 'ab-desc' }, '群模式控制收到消息后是否回应。定时推送、表情制作等模块仍按各自开关和时段运行。'),
+            h('div', { className: 'ab-flex', style: { flexWrap: 'wrap' } },
+              h(Btn, { small: true, onClick: () => go('memory') }, '记忆总开关与清理'),
+              h(Btn, { small: true, onClick: () => go('modules') }, '管理模块'),
+              (st.modules || []).some(m => m.id === 'meme' && m.running && m.panel) ? h(Btn, { small: true, onClick: () => go('ext:meme') }, '表情制作与休息时段') : null)),
+        ) : null,
+        section === 'all' ? h(Fragment, null,
+
+        // 其余通用设置按用途分组。
+
+        // 组行 ① 被叫到时怎么回：6 项流式排一行
+        h(Card, { title: '被叫到时怎么回', desc: '群模式为「允许 AI 聊天」时，被 @、引用回复或叫名字会触发回复，仍受总开关、暂停和次数限制。' },
+          h('div', { className: 'ab-grp-row' },
+            h(Row, { label: '用哪些称呼叫它', hint: '一行一个；群里提到这些称呼时，按被叫到的规则回应。' }, f.list('group.wakeWords', { placeholder: '大肥鱼\n肥鱼' })),
+            h(Row, { label: '@ 了别人不算叫ta', hint: '有人 @ 别人时顺口提到ta的名字，不算在叫ta；ta还是可以按平时的频率插话。默认关' }, f.sw('group.ignoreAtOthers')),
+            h(Row, { label: '每小时必回上限', hint: '一个群里一小时内因被 @、引用、叫名字而必回的次数最多这么多，超过就不回（主人说话不受限，也不计入）；小时一过自动恢复。0 = 不限' }, f.range('group.mustMaxPerHour', 0, 100, 5, (v) => (v === 0 ? '不限' : v + ' 次'))),
+            h(Row, { label: '免打扰', hint: '这段时间内只有主人的消息能进；群里其他人 @、引用、唤醒词、追问都不起轮次。清空 = 不启用' },
+              h('div', { className: 'ab-flex', style: { alignItems: 'center', gap: 8 } },
+                h('input', { className: 'ab-input', type: 'time', style: { width: '118px' }, 'aria-label': '免打扰开始时间', value: String(draft.group.guestQuietFrom || ''), onChange: (e) => setDraft(setPath(draft, 'group.guestQuietFrom', e.target.value)) }),
+                h('span', { className: 'ab-muted ab-small' }, '到'),
+                h('input', { className: 'ab-input', type: 'time', style: { width: '118px' }, 'aria-label': '免打扰结束时间', value: String(draft.group.guestQuietTo || ''), onChange: (e) => setDraft(setPath(draft, 'group.guestQuietTo', e.target.value)) }),
+                h(Btn, { small: true, onClick: () => { setDraft(setPath(setPath(draft, 'group.guestQuietFrom', ''), 'group.guestQuietTo', '')) } }, '清空=关'),
+                draft.group.guestQuietFrom && draft.group.guestQuietTo
+                  ? h('span', { className: 'ab-muted ab-small' }, '这段时间只有主人叫得醒她')
+                  : h('span', { className: 'ab-muted ab-small' }, '未启用')))
+          )),
+
+        // 组行 ② 一条消息怎么变成回复：3 个总开关排一行
+        h(Card, { title: '一条消息怎么变成回复', desc: '连发合并、合并转发、发送节奏与超时。' },
+          h('div', { className: 'ab-grp-row' },
+            h(Row, { label: '连发合并', hint: '人常常一口气发好几句。打开后ta会等对方说完再一起回，而不是一句一回。' }, f.sw('merge.enabled')),
+            h(Row, { label: '合并转发', hint: '群里有人发合并转发时，她手上只有一个占位符，内容看不见。打开后消息一进来就展开存进上下文，代价是每条转发多调一次接口。' }, f.sw('forward.expandEarly')),
+            h(Row, { label: '每段都发', hint: '一轮里她分几段说，就发几条。自动 = 纯对话轮分条，这一轮调过工具（干活）就并成一条发' },
+              f.select('chat.everyStep', [
+                { value: false, label: '只发最后一段' },
+                { value: 'auto', label: '自动（推荐）' },
+                { value: true, label: '每段都发' },
+              ])),
+            h(Row, { label: '近似去重阈值', hint: '分条时，若这一段和上一段字面重合超过这个比例，就按「同一件事说两遍」处理：后一段顶掉前一段，只发一条。0.45 是实测的中间线（真重复 0.49 / 真补充 0.03）；设 1 等于关掉' },
+              f.num('chat.dupSimilarity', { min: 0, max: 1, step: 0.05 })),
+          )),
+
+        // ===== 折叠区：其余所有组/设置项 =====
+
+        // 折叠 A：接话节奏与时段（7 项）
+        more('接话节奏与时段', [
+          h(Row, { key: 'cd', label: '两次主动插话的间隔' }, f.range('group.cooldownSec', 0, 600, 10, (v) => v + ' 秒')),
+          h(Row, { key: 'mph', label: '每小时最多主动插话' }, f.range('group.maxPerHour', 0, 30, 1, (v) => v + ' 次')),
+          h(Row, { key: 'qh', label: '不主动说话的时段', hint: '暂停主动插话和继续接话；被 @ 等仍按规则回复，模块不受影响。起止相同表示不限制。' },
+            h('input', { className: 'ab-input sm', 'aria-label': '不主动说话的开始小时', type: 'number', min: 0, max: 23, value: draft.group.quietHours[0], onChange: (e) => setDraft(setPath(draft, 'group.quietHours', [Number(e.target.value), draft.group.quietHours[1]])) }),
+            h('span', { className: 'ab-muted' }, '点 到'),
+            h('input', { className: 'ab-input sm', 'aria-label': '恢复主动说话的小时', type: 'number', min: 0, max: 23, value: draft.group.quietHours[1], onChange: (e) => setDraft(setPath(draft, 'group.quietHours', [draft.group.quietHours[0], Number(e.target.value)])) }),
+            h('span', { className: 'ab-muted' }, '点')),
+          h(Row, { key: 'bm', label: '短时间内最多回复' }, f.range('group.burstMax', 1, 20, 1, (v) => v + ' 次'), h('span', { className: 'ab-muted' }, '/'), f.range('group.burstWindowSec', 30, 600, 30, (v) => Math.round(v / 6) / 10 + ' 分钟')),
+        ]),
+
+        // 折叠 B：话题与群活跃度（3 项）
+        more('话题与群活跃度', [
+          h(Row, { key: 'i', label: 'ta感兴趣的话题', hint: '群里在聊这些（或ta记得相关的事）时更容易插话；一行一个' }, f.list('group.interests', { placeholder: '白米饭\n游戏\n追剧' })),
+          h(Row, { key: 'r', label: '话题相关度门槛', hint: '和ta关系不大的话题就不插话；拉到 0 = 不看话题、纯随机' }, f.range('group.minRelevance', 0, 1, 0.05, (v) => (v === 0 ? '不看话题' : Math.round(v * 100) + '%'))),
+          h(Row, { key: 'a', label: '群冷清时不插话', hint: '最近几分钟内消息少于这个数就不插' }, f.num('group.minRecentMessages', { min: 0 }), h('span', { className: 'ab-muted' }, '条 / '), f.num('group.activeWindowSec', { min: 30 }), h('span', { className: 'ab-muted' }, '秒')),
+        ]),
+
+        // 折叠 C：合并与发送明细（7 项）
+        more('合并与发送明细', [
+          h(Row, { key: 'w', label: '对方停顿多久算说完' }, f.range('merge.waitSec', 0.5, 10, 0.5, (v) => v + ' 秒')),
+          h(Row, { key: 'mx', label: '最多等多久', hint: '对方一直在发也最多等这么久' }, f.range('merge.maxSec', 2, 30, 1, (v) => v + ' 秒')),
+          h(Row, { key: 'gw', label: '群里停顿多久算一段', hint: '群里大家你一句我一句，多等一会儿把一段话攒齐再回；ta回上一段的时候，新消息也会先攒着' }, f.range('merge.groupWaitSec', 1, 20, 1, (v) => v + ' 秒')),
+          h(Row, { key: 'gm', label: '群里最多等多久' }, f.range('merge.groupMaxSec', 3, 60, 1, (v) => v + ' 秒')),
+          h(Row, { key: 'fh', label: '早先的也补展开', hint: '开着「合并转发」后，这条再打开：轮到她要回话时，把这一段里还没展开过的转发（最多 3 条）补上。每条只拉一次' }, f.sw('forward.expandHistory')),
+          h(Row, { key: 'sh', label: '新会话先补看聊天记录', hint: '会话第一次开口时先读最近几条，接得上话。默认关' }, f.sw('chat.seedHistory')),
+          h(Row, { key: 'rt', label: '话写在思考里也捞出来', hint: '她偶尔把要说的话全写在思考里，正文是空的，这一轮就什么都发不出去。打开后从思考里找她自己定稿的那段，找不到就不发。默认关' }, f.sw('chat.rescueFromThinking')),
+          h(Row, { key: 'tt', label: '一轮最多等多久（分钟）', hint: '模型或工具卡住时，超过这么多分钟就强制放开，后面的消息正常开新一轮；不然会一直哑着。填 0 不兜底。默认 30' }, f.num('chat.turnTimeoutMinutes', { min: 0, max: 180 })),
+        ]),
+
+        // 折叠 D：主人跨群与特权（6 项，含条件显隐）
+        more('主人跨群与特权', [
+          h(Row, { key: 'pc', label: '私聊里的 /群设置 指令', hint: '私聊发 /群设置 查看用法。直接执行，不经过模型；批量修改先预览，再确认。只控制 /群设置，不影响自然语言管理、/权限 或群内的 /quiet。' }, f.sw('group.privateCommandsEnabled', { title: '群设置指令总开关' })),
+          h(Row, { key: 'ob', label: '群聊摘要（主人私聊）', hint: '主人在私聊里问起群里的事时，把最近 24 小时的群聊流水当成「ta自己的见闻」补进这一轮上下文。只在主人私聊且提到群相关时触发，不常驻、不写进记忆；默认关。' }, f.sw('group.ownerBrief.enabled')),
+          h(Row, { key: 'ot', label: '群里的本机工具', hint: '默认关：群里ta只能聊天，没有任何电脑操作能力。「只有主人」＝主人在群里说话的那一轮ta才拿得到命令和文件工具。' },
+            f.choices('group.ownerTools', [{ value: 'off', label: '谁都不行' }, { value: 'owner', label: '只有主人' }])),
+          // 条件显隐：ownerTools 非 off 才出现群列表（保持原有依赖语义）
+          draft.group.ownerTools && draft.group.ownerTools !== 'off'
+            ? h(Row, { key: 'og2', label: '工具只在这些群生效', hint: '一行一个群号；留空 = 白名单里所有群都生效' }, f.list('group.ownerToolsGroups', { placeholder: '100200300' }))
+            : null,
+          h(Row, { key: 'cr', label: '能不能看别的群', hint: '只读白名单里的群，一次最多 50 条，主人随时能看。开到「群里也行」后，ta在 A 群的回答全群都看得到；读到的内容也会留在这个会话里。' }, f.choices('group.crossRead', [{ value: 'off', label: '关', desc: '只看当前聊天' }, { value: 'private', label: '私聊可以', desc: '主人，以及私聊里问的人本身在那个群（默认）' }, { value: 'group', label: '群里也行', desc: '再加上群里问的人都在那个群' }])),
+          h(Row, { key: 'ol', label: '每个群给几条摘要', hint: '越少越省上下文；最多 30 条' }, f.range('group.ownerBrief.lines', 1, 30, 1, (v) => v + ' 条')),
+          h(Row, { key: 'og', label: '摘要只取哪些群', hint: '没勾 = 所有白名单群；只列白名单里的群' }, h(OwnerBriefGroups, { draft, setDraft })),
+        ]),
+
+        // 折叠 E：发文件明细（3 项）
+        more('发文件', [
+          h(Row, { key: 'fe', label: '允许发文件', hint: '关了之后ta不能发任何本机文件。' }, f.sw('files.enabled')),
+          h(Row, { key: 'd', label: '单个文件最大' }, f.num('files.maxMB', { min: 1, max: 2048 }), h('span', { className: 'ab-muted' }, ' MB')),
+          h(Row, { key: 'dir', label: '额外允许的目录', hint: '一行一个完整路径。QQ 工作区里的文件一直允许，不用写；留空 = 只能发工作区里的' }, f.list('files.dirs', { placeholder: 'D:\\Aurabot\\要发的文件' })),
+          h(Row, { key: 'p', label: '图片按路径直发', hint: '网关和 NapCat 在同一台机器或共享挂载时，直接把路径交给网关，省掉读盘和 base64 膨胀；网关读不到会自动改用 base64。默认开。' }, f.sw('files.imageByPath')),
+        ]),
+
+        // 折叠 F：不想理的人与头衔（整卡默认折叠，内容自成一卡）
+        h(Card, { title: '不想理的人与头衔', desc: '按 QQ 号或群头衔屏蔽：说了也不回（包括 @、引用、戳一戳和模块指令）。私聊和主人不受影响。', collapsible: true, defaultOpen: false },
+          h(MemberFilter, { draft, setDraft }),
+          h(TitleFilter, { draft, setDraft }),
+        ),
+
+        ) : null,
+      )
+    }
+
+    /** 群聊摘要的群多选（原 OwnerBrief 内联逻辑抽出，供「更多设置」复用） */
+    function OwnerBriefGroups({ draft, setDraft }) {
+      const ob = draft.group.ownerBrief || { enabled: false, lines: 12, groups: [] }
+      const groups = (draft.allow.groups || []).map(String)
+      const [info, setInfo] = useState(null)
+      useEffect(() => { get('/groups/titles').then((r) => { if (r.ok) setInfo(r) }).catch(() => {}) }, [])
+      const nameOf = (gid) => {
+        const g = ((info && info.groups) || []).find((x) => x.groupId === gid)
+        return g && g.name && g.name !== gid ? g.name : ''
+      }
+      const on = (gid) => (ob.groups || []).includes(gid)
+      const toggle = (gid) => setDraft(setPath(draft, 'group.ownerBrief.groups', on(gid) ? (ob.groups || []).filter((x) => x !== gid) : [...(ob.groups || []), gid]))
+      return h('div', { className: 'ab-flex', style: { flexWrap: 'wrap' } }, groups.length
+        ? groups.map((gid) => h('button', { key: gid, type: 'button', className: cx('ab-chip', on(gid) && 'on'), onClick: () => toggle(gid) },
+          (on(gid) ? '✓ ' : '') + (nameOf(gid) || '群'), h('span', { className: 'n' }, gid)))
+        : h('span', { className: 'ab-muted ab-small' }, '先到「聊天 → 单个群」添加群，选择「仅模块」或「允许 AI 聊天」。'))
+    }
+
     function ChatModels({ draft, setDraft, list }) {
       const cm = draft.chatModels || { privateDefault: {}, groupDefault: {}, privates: {}, groups: {} }
       const [open, setOpen] = useState(false)
@@ -1605,13 +2780,43 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         setAdd({ ...add, id: '' })
       }
       const remove = (kind, id) => { const field = kind === 'private' ? 'privates' : 'groups'; const n = { ...(cm[field] || {}) }; delete n[id]; setCm({ [field]: n }) }
-      return h(Card, { title: '按聊天选模型', desc: '顺序：这个私聊 > 这个群 > 所有私聊 / 所有群的默认 > 上面的全局模型。没选的一级就用下一级；选的模型在 DSH 里找不到时也自动退回。只有你能在这里改，聊天里的人换不了。换了之后从那个聊天的下一条消息起生效。' },
+      // 思考强度：beta 的 chatEfforts 按「聊天 + 当前模型」各存一份，键是 JSON.stringify([provider, model])。
+      const globalModel = draft.model || {}
+      const EFFORTS = [
+        { value: '', label: '跟随默认' },
+        { value: 'low', label: '低（快）' },
+        { value: 'high', label: '高' },
+        { value: 'max', label: '最高' },
+      ]
+      const modelOf = (sel) => ({ provider: (sel && sel.provider) || globalModel.provider || '', model: (sel && sel.model) || globalModel.model || '' })
+      const effortOf = (kind, id, sel) => {
+        const m = modelOf(sel)
+        if (!m.provider || !m.model) return ''
+        return ((draft.chatEfforts || {})[`${kind}:${id}`] || {})[JSON.stringify([m.provider, m.model])] || ''
+      }
+      const setEffort = (kind, id, sel, eff) => {
+        const m = modelOf(sel)
+        if (!m.provider || !m.model) return
+        const cid = `${kind}:${id}`
+        const key = JSON.stringify([m.provider, m.model])
+        const cur = { ...(draft.chatEfforts || {}) }
+        const row = { ...(cur[cid] || {}) }
+        if (eff) row[key] = eff
+        else delete row[key]
+        if (Object.keys(row).length) cur[cid] = row
+        else delete cur[cid]
+        setDraft(setPath(draft, 'chatEfforts', cur))
+      }
+      return h(Card, { title: '按聊天选模型 / 思考强度', desc: '顺序：这个私聊 > 这个群 > 所有私聊 / 所有群的默认 > 上面的全局模型。没选的一级就用下一级；选的模型在 DSH 里找不到时也自动退回。单个聊天的「思考强度」按「聊天 + 当前模型」各存一份（和 /effort 命令是同一份配置）。只有你能在这里改，聊天里的人换不了。换了之后从那个聊天的下一条消息起生效。' },
         h(Row, { label: '私聊默认模型' }, h(Select, { value: val(cm.privateDefault), width: 280, options: optsFor(val(cm.privateDefault)), onChange: (v) => setCm({ privateDefault: toSel(v) }) })),
         h(Row, { label: '群聊默认模型' }, h(Select, { value: val(cm.groupDefault), width: 280, options: optsFor(val(cm.groupDefault)), onChange: (v) => setCm({ groupDefault: toSel(v) }) })),
         h('div', { style: { marginTop: 8 } }, h(Btn, { small: true, kind: 'ghost', onClick: () => setOpen(!open) }, (open ? '收起' : '展开') + '单个 QQ / 群的例外（' + rows.length + '）')),
         open ? h('div', { style: { marginTop: 8 } },
           rows.length === 0 ? h('div', { className: 'ab-muted', style: { marginBottom: 10 } }, '还没有单独设置的 QQ 或群。') :
-            rows.map((r) => h(Row, { key: r.kind + r.id, label: (r.kind === 'private' ? '私聊 ' : '群 ') + r.id }, h('span', { className: 'ab-muted' }, label(r.sel)), h(Btn, { small: true, kind: 'ghost', onClick: () => remove(r.kind, r.id) }, '移除'))),
+            rows.map((r) => h(Row, { key: r.kind + r.id, label: (r.kind === 'private' ? '私聊 ' : '群 ') + r.id },
+              h('span', { className: 'ab-muted' }, label(r.sel)),
+              h(Select, { value: effortOf(r.kind, r.id, r.sel), width: 140, options: EFFORTS, onChange: (v) => setEffort(r.kind, r.id, r.sel, v) }),
+              h(Btn, { small: true, kind: 'ghost', onClick: () => remove(r.kind, r.id) }, '移除'))),
           h('div', { className: 'ab-flex' },
             h(Seg, { value: add.kind, onChange: (v) => setAdd({ ...add, kind: v }), options: [{ value: 'private', label: '私聊' }, { value: 'group', label: '群' }] }),
             h('input', { className: 'ab-input', placeholder: add.kind === 'private' ? 'QQ 号' : '群号', value: add.id, onChange: (e) => setAdd({ ...add, id: e.target.value.replace(/\D/g, '') }) }),
@@ -1649,7 +2854,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     function Model({ draft, setDraft, toast }) {
       const [list, setList] = useState(null)
       const [ping, setPing] = useState({})
-      useEffect(() => { get('/models').then((r) => setList(r.list || [])) }, [])
+      useEffect(() => { getCached('/models').then((r) => setList(r.list || [])) }, [])
       const key = (m) => m.provider + '::' + m.model
       const cur = draft.model.provider && draft.model.model ? draft.model.provider + '::' + draft.model.model : ''
       const curModel = cur && list ? list.find((m) => key(m) === cur) : null
@@ -1657,15 +2862,32 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const noReasoning = Boolean(curModel && curModel.reasoning === null)
       // 视觉能力：自动时把 DSH 的声明显示出来，主人一眼能看出会不会降级
       const autoVision = curModel ? curModel.vision : undefined
-      const visionHint = draft.model.vision === 'on'
-        ? '强制当「能看图」；模型其实看不了的话，带图的那一轮会报错'
-        : draft.model.vision === 'off'
-          ? '强制当「看不懂」：收到图片只给一行文字提示，不会把图塞给模型'
-          : autoVision === true
-            ? '自动：DSH 说这个模型支持看图'
-            : autoVision === false
-              ? '自动：DSH 说这个模型看不了图，会自动降级成文字提示'
-              : '自动：DSH 没声明，默认照发；真看不了就手动选「不支持」'
+      // 识图模型：配了它以后，收到的图片先交给它看，聊天模型只收文字描述
+      const vm = draft.model.visionModel || { provider: '', model: '' }
+      const vmVal = vm.provider && vm.model ? vm.provider + '::' + vm.model : ''
+      const vmOptions = [{ value: '', label: '跟随聊天模型', desc: '聊天模型自己能看图就直接收图' }]
+        .concat((list || []).filter((m) => m.vision !== false).map((m) => ({ value: key(m), label: m.name + (m.vision === true ? '（能看图）' : ''), desc: m.provider, group: m.provider })))
+      if (vmVal && !vmOptions.some((o) => o.value === vmVal)) {
+        const hit = (list || []).find((m) => key(m) === vmVal)
+        vmOptions.push({ value: vmVal, label: vm.model, desc: hit ? hit.provider + '（DSH 说它看不了图）' : '（DSH 里没找到这个模型）' })
+      }
+      const visionHint = vmVal
+        ? '设了识图模型：图片先交给它看，再把描述当文字交给她；和聊天模型选同一个时仍然直接看图'
+        : draft.model.vision === 'on'
+          ? '强制当「能看图」；模型其实看不了的话，带图的那一轮会报错'
+          : draft.model.vision === 'off'
+            ? '强制当「看不懂」：收到图片只给一行文字提示，不会把图塞给模型'
+            : autoVision === true
+              ? '自动：DSH 说这个模型支持看图'
+              : autoVision === false
+                ? '自动：DSH 说这个模型看不了图，会自动降级成文字提示'
+                : '自动：DSH 没声明，默认照发；真看不了就手动选「不支持」'
+      // 识图模型有自己的思考强度：和上面聊天的「思考强度」分开设，互不影响
+      const vmCur = vmVal && list ? list.find((m) => key(m) === vmVal) : null
+      const vmNoReasoning = Boolean(vmCur && vmCur.reasoning === null)
+      const vmHint = vmVal
+        ? '图片先交给它看，描述再交给聊天模型（聊天模型本身看不了图也没关系）；识图用下面的「识图思考强度」，和聊天的互不影响'
+        : '默认跟着聊天模型；也可以单独选一个识图模型，让她用便宜的快模型聊天、图片交给会看图的模型'
       const test = async (m) => {
         setPing({ ...ping, [key(m)]: '测速中…' })
         const r = await post('/model/ping', { provider: m.provider, model: m.model })
@@ -1674,6 +2896,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       return h('div', { className: 'ab-grid' },
         h(Card, { title: '聊天用的模型', desc: '新建的 QQ 会话按这里的设置来；已有会话也可以在 DSH 里点开单独切换。聊天对速度很敏感，可以先点「测速」挑个快的。' },
           h(Row, { label: '思考强度', hint: noReasoning ? '这个模型不支持思考强度，会自动忽略' : '聊天建议「低」，回得快' }, h(Seg, { value: draft.model.reasoningEffort || 'low', disabled: noReasoning, onChange: (v) => setDraft(setPath(draft, 'model.reasoningEffort', v)), options: [{ value: 'low', label: '低' }, { value: 'high', label: '高' }, { value: 'max', label: '最高' }] })),
+          vmVal ? h(Row, { label: '识图思考强度', hint: vmNoReasoning ? '这个模型不支持思考强度，会自动忽略' : '只影响识图，和上面聊天的「思考强度」互不影响；模型不支持会自动省略' }, h(Seg, { value: draft.model.visionReasoningEffort || 'low', disabled: vmNoReasoning, onChange: (v) => setDraft(setPath(draft, 'model.visionReasoningEffort', v)), options: [{ value: 'low', label: '低' }, { value: 'high', label: '高' }, { value: 'max', label: '最高' }] })) : null,
           h(Row, { label: '视觉能力', hint: visionHint }, h(Seg, {
             value: draft.model.vision || 'auto',
             onChange: (v) => setDraft(setPath(draft, 'model.vision', v)),
@@ -1687,95 +2910,529 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             }),
             cur ? h(Btn, { small: true, onClick: () => test({ provider: draft.model.provider, model: draft.model.model }) }, '测速') : null,
             cur && ping[cur] ? h('span', { className: 'ab-muted ab-small' }, ping[cur]) : null),
+          h(Row, { label: '识图模型', hint: vmHint }, h(Select, {
+            value: vmVal, width: 280,
+            options: vmOptions,
+            onChange: (v) => {
+              const [p, ...m] = v.split('::')
+              setDraft(setPath(setPath(draft, 'model.visionModel.provider', v ? p : ''), 'model.visionModel.model', v ? m.join('::') : ''))
+            },
+          })),
         ),
         h(ChatModels, { draft, setDraft, list }),
         h(CostCard, { draft, setDraft }),
         h(Card, { title: '可用的模型', desc: '点「测速」会真的问一次模型（花一点点额度），看它回一句话要多久。' },
           list === null ? h(Empty, { icon: '⏳', text: '加载中…' }) : list.length === 0 ? h(Empty, { text: 'DSH 没有列出模型' }) :
             h('table', { className: 'ab-table' }, h('tbody', null, list.map((m) => h('tr', { key: key(m) },
-              h('td', null, m.name), h('td', { className: 'ab-muted' }, m.provider),
+              h('td', null, m.name, m.vision === true ? h('span', { className: 'ab-muted ab-small' }, ' · 能看图') : m.vision === false ? h('span', { className: 'ab-muted ab-small' }, ' · 纯文本') : null), h('td', { className: 'ab-muted' }, m.provider),
               h('td', null, ping[key(m)] || ''),
               h('td', { style: { textAlign: 'right' } }, h(Btn, { small: true, kind: 'ghost', onClick: () => test(m) }, '测速'), h(Btn, { small: true, kind: 'ghost', onClick: () => { setDraft(setPath(setPath(draft, 'model.provider', m.provider), 'model.model', m.model)); toast('选好了，记得保存') } }, '用这个')))))),
         ),
       )
     }
 
-    /** 语音条变声：用「翻唱」页导入的 RVC 音色模型（TTS 后接一层 RVC）。 */
-    function VoiceSongModel({ draft, setDraft }) {
+    /** 语音条变声：用「翻唱」页导入的 RVC 音色模型（TTS 后接一层 RVC）。
+     *  flat=true 时不再自带卡片外框（由外层的折叠卡提供），避免卡片套卡片。
+     *  get('/voice/song-voices') 只在本组件挂载时发一次，所以外层折叠卡收起时不挂载 = 不发请求。 */
+    function VoiceSongModel({ draft, setDraft, flat }) {
       const [s, setS] = useState(null)
       const f = useField(draft, setDraft)
       useEffect(() => { get('/voice/song-voices').then(setS).catch(() => setS({ ok: false, voices: [], message: '没查到翻唱音色' })) }, [])
       const voices = (s && s.voices) || []
-      return h(Card, { title: '语音条变声（用翻唱音色）', desc: '把ta说话的声音也换成「翻唱」页导入的 RVC 音色模型：先 TTS 念出来，再用同一个音色变声。默认不变声，直接用 TTS 原声；变声失败会自动回退原声，不影响发送。' },
-        h(Row, { label: '翻唱音色', hint: s && s.available === false ? (s.message || '翻唱环境还没装好，装好并导入音色后才能选') : '只列「翻唱」页导入过的 .pth 音色（带 index 的会标出来）' },
+      const rows = [
+        h(Row, { key: 'v', label: '翻唱音色', hint: s && s.available === false ? (s.message || '翻唱环境还没装好，装好并导入音色后才能选') : '只列「翻唱」页导入过的 .pth 音色（带 index 的会标出来）' },
           f.select('voice.songVoice', [{ value: '', label: '不变声（TTS 原声）' }, ...voices.map((v) => ({ value: v.id, label: v.id + (v.hasIndex ? '（有 index）' : '') }))], { width: 280 })),
-        h(Row, { label: '变调', hint: '模型是男声训练的、想变成女声一般 +12；不确定就 0' },
+        h(Row, { key: 'p', label: '变调', hint: '模型是男声训练的、想变成女声一般 +12；不确定就 0' },
           f.num('voice.songPitch', { min: -24, max: 24 }), h('span', { className: 'ab-muted' }, ' 半音')),
-        h('div', { className: 'ab-muted ab-small' }, !s ? '正在查翻唱音色…' : (s.available ? '变声要跑一次 RVC，会比普通语音慢几秒；单次变声失败会自动用原声。' : (s.message || '翻唱环境还没装好（面板「翻唱」页一键安装、导入音色后才能给语音条变声）')))) 
+        h('div', { key: 'n', className: 'ab-muted ab-small' }, !s ? '正在查翻唱音色…' : (s.available ? '变声要跑一次 RVC，会比普通语音慢几秒；单次变声失败会自动用原声。' : (s.message || '翻唱环境还没装好（面板「翻唱」页一键安装、导入音色后才能给语音条变声）'))),
+      ]
+      if (flat) return h('div', null, rows)
+      return h(Card, { title: '语音条变声（用翻唱音色）', desc: '把ta说话的声音也换成「翻唱」页导入的 RVC 音色模型：先 TTS 念出来，再用同一个音色变声。默认不变声，直接用 TTS 原声；变声失败会自动回退原声，不影响发送。' }, rows)
     }
 
-    function Voice({ st, draft, setDraft, toast, reload }) {
+    /** 豆包语音（火山）：地址 / 请求头 / 请求体都内置好了，这里只挑音色、填 Key。 */
+    /** Breeze 云端音色：点一下拉列表，选中即填 voice id（不用去官网抄）。 */
+    function BreezeVoices({ b, draft, setDraft }) {
+      const [list, setList] = useState(null)
+      const [err, setErr] = useState('')
+      const [busy, setBusy] = useState(false)
+      const load = async () => {
+        setBusy(true); setErr('')
+        try {
+          const r = await get('/voice/breeze-voices')
+          if (r && r.ok) setList(r.voices || [])
+          else setErr(r?.message || '拉不到音色列表')
+        } catch (e) { setErr(e.message) } finally { setBusy(false) }
+      }
+      const cur = String(b?.voiceId || '')
+      const opts = (list || []).map((v) => ({ value: v.id, label: v.name || v.id, desc: [v.origin === 'cloned' ? '克隆' : v.origin, v.desc].filter(Boolean).join(' · ') || undefined }))
+      if (list && cur && !opts.some((o) => o.value === cur)) opts.unshift({ value: cur, label: cur, desc: '当前配置里的音色（不在列表里）' })
+      return h('div', null,
+        h(Row, { label: 'Breeze 音色', hint: list ? '共 ' + list.length + ' 个，选一个就填进上面的音色 id' : '点「列出音色」从 Breeze 拉列表，选中自动填 id，不用去官网抄' },
+          h('div', { className: 'ab-flex' },
+            list ? h(Select, { width: 340, value: cur, options: opts, onChange: (v) => setDraft(setPath(draft, 'voice.breeze.voiceId', v)) }) : null,
+            h(Btn, { small: true, kind: 'ghost', disabled: busy, onClick: load }, busy ? '拉取中…' : (list ? '刷新' : '列出音色')))),
+        err ? h('div', { className: 'ab-note warn', style: { marginTop: 6 } }, err) : null,
+      )
+    }
+    /** Breeze 云端额度：查余额、显示上次领取、手动领一次。 */
+    function BreezeQuota({ b }) {
+      const [st, setSt] = useState(null)
+      const [busy, setBusy] = useState('')
+      const load = () => get('/voice/breeze-status').then((r) => setSt(r && r.ok !== false ? r : null)).catch(() => setSt(null))
+      useEffect(() => { load() }, [b?.mode, b?.keySet, b?.emailSet, b?.autoClaim])
+      const claim = async () => {
+        setBusy('claim')
+        try {
+          const r = await post('/voice/breeze-claim', {})
+          toast(r.message || (r.ok ? '领完了' : '没领到'), r.ok ? 'ok' : 'err')
+          load()
+        } catch (e) { toast(e.message, 'err') } finally { setBusy('') }
+      }
+      if (b?.mode === 'local') return h('div', { className: 'ab-muted ab-small' }, '本地自建模式：不查额度，也不用登录。')
+      const when = st?.lastClaimAt ? new Date(st.lastClaimAt).toLocaleString() : ''
+      return h('div', { className: 'ab-note', style: { marginTop: 8 } },
+        st
+          ? [
+            h('div', { key: 'a' }, st.online
+              ? '云端在线' + (st.balance == null ? '' : '（额度 ' + st.balance + '）')
+              : '云端离线' + (st.note ? '：' + st.note : '')),
+            when ? h('div', { key: 'b', className: 'ab-muted ab-small' }, '上次领取：' + when + (st.lastTier ? '（' + st.lastTier + '）' : '')) : null,
+            !st.emailSet ? h('div', { key: 'c', className: 'ab-muted ab-small' }, '填了邮箱密码才能自动领每日额度。') : null,
+          ]
+          : h('div', { className: 'ab-muted ab-small' }, '正在查额度…'),
+        h('div', { key: 'btn', style: { marginTop: 8 } },
+          h(Btn, { small: true, disabled: busy === 'claim' || !st?.emailSet, onClick: claim }, busy === 'claim' ? '领取中…' : '领取今日额度')),
+      )
+    }
+    function VolcanoVoice({ draft, setDraft }) {
       const f = useField(draft, setDraft)
+      const [list, setList] = useState(null)
+      const [pv, setPv] = useState({ src: '', busy: false, err: '' })
+      useEffect(() => {
+        get('/voice/volcano-voices').then((r) => setList(r && r.voices ? r.voices : [])).catch(() => setList([]))
+      }, [])
+      const cv = draft.voice.volcano || {}
+      const voices = list || []
+      // 1.0 和 2.0 是两个产品：只开通了 2.0 的账号选 1.0 音色会报「模型没开通」，所以在选项里先标出来
+      const opts = voices.map((v) => ({ value: v.id, label: v.name, desc: [v.ver, v.scene || '通用场景', v.ver === '1.0' ? '要另开通 1.0' : ''].filter(Boolean).join(' · '), group: v.group }))
+      // 面板里存着清单外的 id（自己从控制台复制的）时，也得能正常显示，别变成一个空格子
+      if (list && cv.voiceType && !voices.some((v) => v.id === cv.voiceType)) {
+        opts.unshift({ value: cv.voiceType, label: cv.voiceType, desc: '自定义音色 id（不在预置清单里）', group: '自定义' })
+      }
+      const cur = voices.find((v) => v.id === cv.voiceType)
+      // 选音色时把模型版本一起写掉：1.0 的音色配 2.0 的模型会直接报 speaker permission denied
+      const pick = (id) => {
+        const hit = voices.find((v) => v.id === id)
+        setDraft(setPath(setPath(draft, 'voice.volcano.voiceType', id), 'voice.volcano.resourceId', hit ? hit.resourceId : ''))
+        setPv({ src: '', busy: false, err: '' })
+      }
+      // 试听用面板上现在这一份（Key 没保存也能听），不用先存配置
+      const preview = async () => {
+        setPv({ src: '', busy: true, err: '' })
+        const r = await post('/voice/volcano-preview', { keyPool: draft.voice.keyPools?.volcano, apiKey: cv.apiKey || '', voiceType: cv.voiceType || '', resourceId: cv.resourceId || '', speedRatio: cv.speedRatio })
+        if (r && r.ok) setPv({ src: 'data:' + r.mime + ';base64,' + r.data, busy: false, err: '' })
+        // 后端还是老进程时，这个接口根本不存在，插件框架会统一回「模块没开」——别让人去翻「已安装」
+        else if (r && r.moduleOff) setPv({ src: '', busy: false, err: '试听接口还没生效：把 DeepSeek Harness 关掉重开一次，再回来点这个' })
+        else setPv({ src: '', busy: false, err: (r && r.message) || '试听失败' })
+      }
+      return [
+        h(Row, { key: 'k', label: 'API Key', hint: '火山控制台左侧「API Key」里那一串；只存在这台电脑上，存过就不再显示' },
+          f.text('voice.volcano.apiKey', { type: 'password', size: 'wide', placeholder: cv.apiKeySet ? '已保存（不改就留空）' : '粘进来就行，别的都不用填' }),
+          h('a', { key: 'open', className: 'ab-btn sm', href: 'https://console.volcengine.com/speech/new/setting/apikeys?projectName=default', target: '_blank', rel: 'noreferrer', style: { marginLeft: 8 } }, '打开控制台拿 Key')),
+        h(Row, { key: 'v', label: '音色', hint: cur ? cur.ver + ' 音色，自动配 ' + cur.resourceId : '清单里没有的 id，直接填在配置里也能用' },
+          list === null
+            ? h('span', { className: 'ab-muted' }, '正在读音色清单…')
+            : voices.length
+              ? [
+                h(Select, { key: 's', value: cv.voiceType || '', options: opts, width: 320, onChange: pick }),
+                h(Btn, { key: 'b', small: true, disabled: pv.busy, onClick: preview }, pv.busy ? '念着呢…' : '试听这个'),
+              ]
+              : h('span', { className: 'ab-muted' }, '没读到音色清单：把 DeepSeek Harness 关掉重开一次，再打开面板')),
+        h(Row, { key: 's', label: '语速', hint: '1.0 是原速；拖动调整，范围 0.5～2.0' },
+          h(Range, {
+            min: 0.5,
+            max: 2,
+            step: 0.05,
+            value: Number(cv.speedRatio) || 1,
+            fmt: (v) => Number(v).toFixed(2) + ' 倍',
+            onChange: (v) => setDraft(setPath(draft, 'voice.volcano.speedRatio', Number(v))),
+          })),
+        pv.err ? h('div', { key: 'e', className: 'ab-small', style: { color: 'var(--ab-err, #d9534f)' } }, pv.err) : null,
+        pv.src ? h('div', { key: 'a' }, h('audio', { src: pv.src, controls: true, autoPlay: true, style: { height: 32 } })) : null,
+        h('div', { key: 'n', className: 'ab-muted ab-small' },
+          voices.length ? '共 ' + voices.length + ' 个官方预置音色（2.0 ' + voices.filter((v) => v.ver === '2.0').length + ' 个，1.0 ' + voices.filter((v) => v.ver === '1.0').length + ' 个），版本跟着音色自动配。' : '',
+          '还出不了声就看这两处：',
+          h('a', { key: 'k2', href: 'https://console.volcengine.com/speech/new/setting/apikeys?projectName=default', target: '_blank', rel: 'noreferrer' }, 'API Key'),
+          '（别的服务的 Key 不通用）、',
+          h('a', { key: 'o2', href: 'https://console.volcengine.com/speech/app', target: '_blank', rel: 'noreferrer' }, '开通管理'),
+          '（新账号要在「语音合成大模型」那一项点开通，开通后等几分钟生效）。音色也要账号里开通过才能念，报「speaker permission denied」就换一个。'),
+      ]
+    }
+
+    function PinIcon({ filled }) {
+      return h('svg', {
+        width: 13, height: 13, viewBox: '0 0 24 24', fill: filled ? 'currentColor' : 'none',
+        stroke: 'currentColor', strokeWidth: 2, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': 'true',
+      },
+        h('path', { d: 'M12 17v5' }),
+        h('path', { d: 'M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z' }))
+    }
+
+    /**
+     * 语音接口选择：默认只露前 4 个；常用接口可置顶（最多 4 个），
+     * 其余接口点「更多」再显示。置顶状态存本地，不跟设置草稿走。
+     */
+    function VoiceEngineChoices({ options, value, active, onChange, toast }) {
+      const [pinned, setPinned] = usePersisted('voice.pinnedEngines', [])
+      const [more, setMore] = useState(false)
+      const raw = Array.isArray(pinned) ? pinned : []
+      // 自动置顶看「已保存」的接口，不跟当前草稿选择走。
+      const current = String(active || '')
+      const validRaw = raw.filter((id) => options.some((o) => o.value === id))
+      // 保存后，正在使用的接口永远排第一；它也算一个置顶。超过 4 个时从末尾淘汰。
+      const activePins = (current && options.some((o) => o.value === current)
+        ? [current, ...validRaw.filter((id) => id !== current)]
+        : validRaw).slice(0, 4)
+      const activeKey = activePins.join('|')
+      const rawKey = validRaw.join('|')
+      useEffect(() => {
+        if (activeKey !== rawKey) setPinned(activePins)
+      }, [activeKey, rawKey])
+      const ordered = [...activePins.map((id) => options.find((o) => o.value === id)).filter(Boolean), ...options.filter((o) => !activePins.includes(o.value))]
+      // 当前接口已经由 activePins 保证在第一张；折叠时固定显示前 4 张 + 更多卡片。
+      const visible = more ? ordered : ordered.slice(0, 4)
+      const togglePin = (id) => {
+        if (id === current) {
+          if (toast) toast('正在使用的接口默认置顶')
+          return
+        }
+        if (activePins.includes(id)) {
+          setPinned(activePins.filter((x) => x !== id))
+          return
+        }
+        // 新置顶插到当前接口之后；超过 4 个就淘汰原来的末尾。
+        const next = (current ? [current, id, ...activePins.filter((x) => x !== current)] : [id, ...activePins]).slice(0, 4)
+        setPinned(next)
+      }
+      return h('div', null,
+        h('div', { className: 'ab-choices', role: 'radiogroup' }, [
+          ...visible.map((o) => {
+            const on = o.value === value
+            const pinnedNow = activePins.includes(o.value)
+            return h('div', {
+              key: o.value,
+              role: 'radio',
+              'aria-checked': on,
+              tabIndex: 0,
+              className: cx('ab-choice', on && 'on'),
+              style: { position: 'relative', paddingRight: 36 },
+              onClick: () => onChange(o.value),
+              onKeyDown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onChange(o.value) } },
+            },
+              h('b', null, o.icon || null, o.label), o.desc ? h('small', null, o.desc) : null,
+              h('span', {
+                className: cx('ab-choice-pin', pinnedNow && 'on'),
+                role: 'button',
+                tabIndex: 0,
+                title: pinnedNow ? '取消置顶' : '置顶这个接口',
+                'aria-label': (pinnedNow ? '取消置顶 ' : '置顶 ') + o.label,
+                'aria-pressed': pinnedNow,
+                style: { position: 'absolute', right: 8, top: 8, zIndex: 2 },
+                onClick: (e) => { e.stopPropagation(); togglePin(o.value) },
+                onKeyDown: (e) => {
+                  if (e.key !== 'Enter' && e.key !== ' ') return
+                  e.preventDefault(); e.stopPropagation(); togglePin(o.value)
+                },
+              }, h(PinIcon, { filled: pinnedNow })))
+          }),
+          h('div', {
+            key: '__more',
+            className: 'ab-choice ab-choice-more',
+            role: 'button',
+            tabIndex: 0,
+            onClick: () => setMore((v) => !v),
+            onKeyDown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setMore((v) => !v) } },
+          },
+            h('b', null, more ? '收起' : '更多'),
+            h('small', null, more ? '只看常用接口' : '还有 ' + Math.max(0, options.length - visible.length) + ' 个接口')),
+        ]),
+        h('div', { className: 'ab-muted ab-small', style: { marginTop: 8 } }, '常用的声音来源可以置顶，最多四个。'))
+    }
+
+    const VOICE_SERVICES = { 'fish-free': 'Fish Audio', breeze: 'Breeze', edge: '微软在线语音', volcano: '豆包语音', minimax: 'MiniMax', cosyvoice: 'CosyVoice', gptsovits: 'GPT-SoVITS', http: '自定义 HTTP' }
+
+    function FishBalance() {
+      const [busy, setBusy] = useState(false), [result, setResult] = useState(null)
+      const check = async () => {
+        setBusy(true)
+        try { setResult(await get('/voice/fish-balances')) }
+        finally { setBusy(false) }
+      }
+      return h(Row, { label: '账号余额' }, h('div', null,
+        h(Btn, { small: true, disabled: busy, onClick: check }, busy ? '查询中…' : '查询已保存账号'),
+        result && h('div', { role: 'status', style: { marginTop: 8 } }, result.ok && Array.isArray(result.rows) && result.rows.length ? [
+          ...result.rows.map(({ name, wallet, pack }, i) => h('div', { key: i }, h('b', null, name), ' · API 余额：', wallet.error || ('$' + wallet.usd), ' · 套餐点数：', pack.error || (pack.remaining.toLocaleString() + ' / ' + pack.total.toLocaleString() + (pack.extra ? '，额外 ' + pack.extra.toLocaleString() : '')))),
+          h('small', { className: 'ab-muted', key: 'note' }, '免费语音不扣 API 余额。Fish 未提供免费语音的剩余字数。'),
+        ] : result.ok ? '还没有已保存的 Fish 密钥。' : '查询失败，请稍后重试。')))
+    }
+
+    function VoiceKeyPool({ id, draft, setDraft }) {
+      const path = 'voice.keyPools.' + id
+      const pool = getPath(draft, path) || {}, rows = pool.accounts || []
+      let origin = ''
+      if (id === 'http') { try { const u = new URL(draft.voice.http.urlTemplate); if (u.protocol === 'https:') origin = u.origin } catch {} }
+      const update = (field, value) => setDraft(setPath(draft, path + '.' + field, value))
+      const edit = (row, patch) => update('accounts', rows.map(a => a.id === row.id ? { ...a, ...patch } : a))
+      return h('details', { className: 'ab-card ab-pool' }, h('summary', null, '多账号设置' + (rows.length ? ' · ' + rows.length + ' 个附加账号' : '')),
+        h(Row, { label: '分配方式' }, h(Select, { ariaLabel: '分配方式', width: 230, value: pool.strategy || 'balanced', onChange: v => update('strategy', v), options: [
+          { value: 'balanced', label: '均衡使用（推荐）', desc: '优先空闲账号，同样空闲就轮流用' },
+          { value: 'ordered', label: id === 'http' ? '按添加顺序' : '优先主账号', desc: id === 'http' ? '先用排在前面的账号' : '主账号不可用时，按添加顺序使用' },
+        ] })),
+        ...rows.map((row, i) => h(Row, { key: row.id, label: '附加账号 ' + (i + 1), hint: id === 'http' && row.origin !== origin ? '服务地址已更换，请重新填写密钥。' : '' },
+          h('input', { className: 'ab-input', 'aria-label': '账号备注 ' + (i + 1), placeholder: '账号备注（可选）', value: row.name || '', maxLength: 80, onChange: e => edit(row, { name: e.target.value }) }),
+          h('input', { className: 'ab-input', type: 'password', autoComplete: 'new-password', 'aria-label': '附加密钥 ' + (i + 1), placeholder: row.apiKeySet ? '密钥已保存，留空不改' : '粘贴 API Key', value: row.apiKey || '', onChange: e => edit(row, { apiKey: e.target.value, ...(id === 'http' && { origin }) }) }),
+          h(Btn, { small: true, onClick: () => update('accounts', rows.filter(a => a.id !== row.id)) }, '移除'))),
+        id === 'http' && !origin ? h('span', { className: 'ab-muted' }, '先填写 HTTPS 服务地址。') : h(Btn, { small: true, onClick: () => update('accounts', [...rows, { id: globalThis.crypto?.randomUUID?.() || 'k-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2), name: '', apiKey: '', ...(id === 'http' && { origin }) }]) }, '添加账号'))
+    }
+
+    function VoiceServices({ selected, onSelect, extensions = [], st, draft, setDraft, toast, reload }) {
+      const options = [...Object.entries(VOICE_SERVICES).map(([value, label]) => ({ value, label })), ...extensions.map(m => ({ value: 'ext:' + m.id, label: m.name || m.id }))]
+      const active = options.find(o => o.value === selected) || options[0]
+      const httpPool = active.value === 'http' && String(draft.voice.http?.headers || '').includes('{apiKey}')
+      const poolId = httpPool ? 'http' : ['fish-free', 'minimax', 'volcano'].includes(active.value) || (active.value === 'breeze' && draft.voice.breeze?.mode !== 'local') ? active.value : null
+      return h('div', { className: 'ab-grid ab-voice-services' },
+        h('div', { className: 'ab-flex' }, h('b', null, '配置服务'), h(Select, { ariaLabel: '配置服务', options, value: active.value, onChange: onSelect, width: 220 })),
+        active.value.startsWith('ext:')
+          ? h(ExtPage, { key: active.value, mod: active.value.slice(4), st, draft, setDraft, toast, reload, embedded: true })
+          : h(Card, { key: active.value, title: active.label }, h(VoiceServiceFields, { id: active.value, st, draft, setDraft, toast, reload })),
+        poolId ? h(VoiceKeyPool, { key: 'pool:' + poolId, id: poolId, draft, setDraft }) : null)
+    }
+
+    function VoiceServiceFields({ id, st, draft, setDraft, toast, reload }) {
+      const f = useField(draft, setDraft)
+      if (id === 'edge') return [
+        !st.voice.edgeInstalled ? h(Row, { key: 'i', label: 'edge-tts', hint: '装在插件自己的 Python 环境里，不影响系统' }, h(Btn, { small: true, onClick: async () => { toast('正在安装，可能要一两分钟…'); const r = await post('/voice/install'); toast(r.message); reload() } }, '安装 edge-tts')) : null,
+        h(Row, { key: 'v', label: '音色' }, f.select('voice.voice', [
+          { value: 'zh-CN-XiaoyiNeural', label: '晓伊', desc: '活泼女声', group: '普通话' }, { value: 'zh-CN-XiaoxiaoNeural', label: '晓晓', desc: '温柔女声', group: '普通话' },
+          { value: 'zh-CN-YunxiNeural', label: '云希', desc: '少年男声', group: '普通话' },
+          { value: 'zh-CN-liaoning-XiaobeiNeural', label: '晓北', desc: '东北女声', group: '方言' }, { value: 'zh-CN-shaanxi-XiaoniNeural', label: '晓妮', desc: '陕西女声', group: '方言' },
+          { value: 'zh-TW-HsiaoChenNeural', label: '曉臻', desc: '台湾女声', group: '方言' }], { width: 220 })),
+        h(Row, { key: 'r', label: '语速' }, f.select('voice.rate', [{ value: '-20%', label: '慢一点' }, { value: '-10%', label: '稍慢' }, { value: '+0%', label: '正常' }, { value: '+10%', label: '稍快' }, { value: '+20%', label: '快一点' }], { width: 140 })),
+        h(Row, { key: 'p', label: '音调', hint: '只调整微软在线声音的高低。' },
+          h(Range, {
+            min: -80,
+            max: 80,
+            step: 10,
+            value: pitchNum(draft.voice.pitch),
+            fmt: pitchLabel,
+            onChange: (v) => setDraft(setPath(draft, 'voice.pitch', pitchText(v))),
+          })),
+      ]
+      if (id === 'cosyvoice') return [
+        h(Row, { key: 'u', label: '服务地址', hint: '填写已启动的 CosyVoice 服务地址。' }, f.text('voice.cosyvoice.url', { size: 'wide', placeholder: 'http://127.0.0.1:50000' })),
+        h(Row, { key: 'm', label: '模式' }, f.select('voice.cosyvoice.mode', [{ value: 'sft', label: '预置音色（sft）' }, { value: 'instruct', label: '带语气指令（instruct）' }], { width: 220 })),
+        h(Row, { key: 's', label: '音色 ID', hint: '例如 中文女、中文男' }, f.text('voice.cosyvoice.spkId')),
+        draft.voice.cosyvoice.mode === 'instruct' ? h(Row, { key: 'i', label: '语气指令', hint: '例如：用甜美撒娇的语气说' }, f.text('voice.cosyvoice.instruct', { size: 'wide' })) : null,
+        h(Row, { key: 'r', label: '采样率', hint: 'CosyVoice 1 是 22050，CosyVoice 2 是 24000' }, f.select('voice.cosyvoice.sampleRate', [{ value: 22050, label: '22050 Hz' }, { value: 24000, label: '24000 Hz' }], { width: 160 })),
+      ]
+      if (id === 'gptsovits') return [
+        h(Row, { key: 'u', label: '服务地址', hint: '填写已启动的 GPT-SoVITS v2 服务地址。' }, f.text('voice.gptsovits.url', { size: 'wide', placeholder: 'http://127.0.0.1:9880' })),
+        h(Row, { key: 'a', label: '参考音频路径', hint: '服务那台电脑上的路径' }, f.text('voice.gptsovits.refAudio', { size: 'wide' })),
+        h(Row, { key: 'p', label: '参考音频的文字' }, f.text('voice.gptsovits.promptText', { size: 'wide' })),
+      ]
+      if (id === 'fish-free') return h(Fragment, null,
+        h(Row, { label: 'API 密钥', hint: draft.voice.fishApiKeySet ? '' : '已在 DSH 配过密钥可留空。' },
+          h('input', { className: 'ab-input wide', type: 'password', autoComplete: 'new-password', 'aria-label': 'Fish API Key', value: draft.voice.fishApiKey || '', placeholder: draft.voice.fishApiKey === null ? '保存后移除' : draft.voice.fishApiKeySet ? '已保存，留空不改' : '粘贴 Fish API Key', onChange: e => setDraft(setPath(draft, 'voice.fishApiKey', e.target.value)) }),
+          h('a', { href: 'https://fish.audio/app/developers/get-started/', target: '_blank', rel: 'noreferrer', className: 'ab-btn sm' }, '获取密钥 ↗'),
+          draft.voice.fishApiKeySet ? h(Btn, { small: true, onClick: () => setDraft(setPath(draft, 'voice.fishApiKey', draft.voice.fishApiKey === null ? '' : null)) }, draft.voice.fishApiKey === null ? '撤销移除' : '移除已存密钥') : null),
+        h(Row, { label: '音色 ID', hint: '留空使用默认声音。' }, f.text('voice.fishReferenceId', { size: 'wide', placeholder: '音色 ID（32 位）' })), h(FishBalance))
+      if (id === 'volcano') return h(VolcanoVoice, { key: 'volcano', draft, setDraft })
+      if (id === 'breeze') return [
+        (() => {
+          // 缺东西时先提示（不拦保存）：不然只有点「试听」才报错，还看不懂缺哪个
+          const b = draft.voice.breeze || {}
+          const miss = b.mode === 'local'
+            ? (!String(b.url || '').trim() ? ['服务地址'] : [])
+            : [
+              !String(b.key || '').trim() && !b.keySet && !draft.voice.keyPools?.breeze?.accounts?.some(a => a.apiKeySet || a.apiKey) ? 'API Key' : '',
+              !String(b.voiceId || '').trim() ? '音色 id' : '',
+            ].filter(Boolean)
+          const localDown = b.mode === 'local' && !String(b.url || '').trim()
+          return miss.length
+            ? h('div', { className: 'ab-note warn', style: { marginBottom: 8 } },
+              '还差：' + miss.join('、') + '。不填的话说话会退回 系统语音（照常发声，只是不是 Breeze 的音色）。',
+              localDown ? '本地模式要先把 breeze_infer 跑起来，地址填它的 /v1 前缀（例如 http://127.0.0.1:7860）。' : '')
+            : null
+        })(),
+        h(Row, { key: 'mode', label: '模式', hint: '云端走 BreezeBlue 官方接口；本地走自己跑的 breeze_infer' }, h(Select, {
+          width: 240,
+          value: draft.voice.breeze?.mode || 'cloud',
+          options: [{ value: 'cloud', label: '云端（BreezeBlue）' }, { value: 'local', label: '本地自建（breeze_infer）' }],
+          // 切模式时顺手把服务地址换成对应的默认值（自己填过的自定义地址不动）
+          onChange: (v) => {
+            const cur = String(draft.voice.breeze?.url || '').trim()
+            const defaults = ['', 'https://api.breeze.blue', 'http://127.0.0.1:7860']
+            const url = defaults.includes(cur) ? (v === 'local' ? 'http://127.0.0.1:7860' : 'https://api.breeze.blue') : cur
+            setDraft(setPath(setPath(draft, 'voice.breeze.mode', v), 'voice.breeze.url', url))
+          },
+        })),
+        h(Row, { key: 'u', label: '服务地址', hint: '云端填 https://api.breeze.blue；自建就填自己的地址' }, f.text('voice.breeze.url', { size: 'wide', placeholder: 'https://api.breeze.blue' })),
+        draft.voice.breeze?.mode === 'local' ? null : h(Row, { key: 'k', label: 'API Key', hint: 'Breeze 控制台 → API Keys 生成，brz_ 开头；已保存就不回显' }, f.text('voice.breeze.key', { type: 'password', placeholder: draft.voice.breeze?.keySet ? '已保存' : 'brz_…', size: 'wide' })),
+        draft.voice.breeze?.mode === 'local' ? null : h(Row, { key: 'v', label: '音色 id', hint: '从音色库复制，或点下方「列出音色」选择。' }, f.text('voice.breeze.voiceId', { size: 'wide', placeholder: 'voc_…' })),
+        draft.voice.breeze?.mode === 'local' ? null : h(BreezeVoices, { key: 'voices', b: draft.voice.breeze, draft, setDraft }),
+        h('details', { key: 'tuning', className: 'ab-voice-options' }, h('summary', null, 'Breeze 声音微调'),
+          h(Row, { key: 'm', label: '模型', hint: '默认 breeze-tts-2' }, f.text('voice.breeze.model', { placeholder: 'breeze-tts-2' })),
+          h(Row, { key: 'l', label: '语种' }, f.text('voice.breeze.languageCode', { placeholder: 'zh' })),
+          draft.voice.breeze?.mode === 'local' ? h(Row, { key: 'i', label: '语气说明', hint: '本地模式用：这段描述就是音色设计（voice design），不填就用模型默认声音' }, f.text('voice.breeze.instructions', { size: 'wide', placeholder: '清亮柔软、略带奶气的普通话少女音' })) : null,
+          draft.voice.breeze?.mode === 'local' ? h(Row, { key: 'g', label: '指令遵循强度', hint: '数值越高，声音越接近你的描述。' }, f.range('voice.breeze.guidanceScale', 0, 10, 0.5, (v) => (String(v || '4')))) : null,
+        ),
+        draft.voice.breeze?.mode === 'local' ? null : h('details', { key: 'quota-settings', className: 'ab-voice-options' }, h('summary', null, '每日额度与签到'),
+          h(Row, { key: 'em', label: '账号邮箱', hint: '填了才能自动领每日额度（免费额度约 250 句短话）' }, f.text('voice.breeze.email', { size: 'wide', placeholder: 'you@example.com' })),
+          h(Row, { key: 'pw', label: '账号密码', hint: '存在本机 config.json（和别的密钥一样，面板里不回显）；留空 = 用已保存的' }, f.text('voice.breeze.password', { type: 'password', placeholder: draft.voice.breeze?.passwordSet ? '已保存' : '不填就不自动领额度' })),
+          h(Row, { key: 'ac', label: '自动领每日额度', hint: '每小时醒一次，一天最多领一次；失败只记日志' }, f.sw('voice.breeze.autoClaim')),
+          h(BreezeQuota, { key: 'quota', b: draft.voice.breeze }),
+        ),
+      ]
+      if (id === 'minimax') return [
+        (() => {
+          // 缺东西时先提示（不拦保存）：不然只有点「试听」才报错，还看不懂缺哪个
+          const m = draft.voice.minimax || {}
+          const miss = [
+            !String(m.apiKey || '').trim() && !m.apiKeySet && !draft.voice.keyPools?.minimax?.accounts?.some(a => a.apiKeySet || a.apiKey) ? 'API Key' : '',
+            !String(m.voiceId || '').trim() ? 'Voice ID' : '',
+          ].filter(Boolean)
+          return miss.length
+            ? h('div', { className: 'ab-note warn', style: { marginBottom: 8 } },
+              '还差：' + miss.join('、') + '。不填的话说话会退回 系统语音（照常发声，只是不是 MiniMax 的音色）。')
+            : null
+        })(),
+        h(Row, { key: 'k', label: 'API Key', hint: 'MiniMax 开放平台「接口密钥」里创建；只存在本机' }, f.text('voice.minimax.apiKey', { size: 'wide', type: 'password', placeholder: draft.voice.minimax?.apiKeySet ? '已保存（不改就留空）' : 'sk-api-…' })),
+        h(Row, { key: 'l', label: '开放平台', hint: '还没注册就先注册；拿 Key 在「接口密钥」页' },
+          h('div', { className: 'ab-flex' },
+            h('a', { href: 'https://platform.minimax.cn/console/home', target: '_blank', rel: 'noreferrer' }, '注册 / 登录开放平台 ↗'),
+            h('span', { className: 'ab-muted' }, '·'),
+            h('a', { href: 'https://platform.minimax.cn/audio/voices', target: '_blank', rel: 'noreferrer' }, '音色库（试听后复制 Voice ID）↗'))),
+        h(Row, { key: 'v', label: 'Voice ID', hint: '音色库右侧「复制 Voice ID」；声音设计 / 复刻拿到的自定义 id 也填这里' }, f.text('voice.minimax.voiceId', { size: 'wide', placeholder: 'Chinese (Mandarin)_Soft_Girl' })),
+        h('details', { key: 'tuning', className: 'ab-voice-options' }, h('summary', null, 'MiniMax 声音与服务设置'),
+          h(Row, { key: 'm', label: '模型' }, f.select('voice.minimax.model', [{ value: 'speech-2.8-turbo', label: '2.8 Turbo（快、便宜）' }, { value: 'speech-2.8-hd', label: '2.8 HD（更细腻）' }, { value: 'speech-2.6-turbo', label: '2.6 Turbo（没有语气词）' }, { value: 'speech-2.6-hd', label: '2.6 HD（没有语气词）' }], { width: 220 })),
+          h(Row, { key: 'e', label: '情绪', hint: '选「自动」会按文字判断。' }, f.select('voice.minimax.emotion', [{ value: 'auto', label: '自动' }, { value: 'happy', label: '高兴' }, { value: 'sad', label: '难过' }, { value: 'angry', label: '生气' }, { value: 'fearful', label: '害怕' }, { value: 'disgusted', label: '嫌弃' }, { value: 'surprised', label: '惊讶' }, { value: 'calm', label: '平静' }], { width: 160 })),
+          h(Row, { key: 's', label: '语速' }, f.range('voice.minimax.speed', 0.5, 2, 0.05, (v) => (Number(v) || 1).toFixed(2) + '×')),
+          h(Row, { key: 'p', label: '语调' }, f.range('voice.minimax.pitch', -12, 12, 1, (v) => (Number(v) > 0 ? '+' : '') + (Number(v) || 0))),
+          h(Row, { key: 'b', label: '服务地址', hint: '国内用 api.minimax.cn；海外账号改 api.minimax.io' }, f.text('voice.minimax.baseUrl', { size: 'wide', placeholder: 'https://api.minimax.cn' })),
+        ),
+      ]
+      if (id === 'http') return [
+        h(Row, { key: 'u', label: '接口地址', hint: 'GET：地址里带 {text}；POST：填接口地址就行' }, f.text('voice.http.urlTemplate', { size: 'wide', placeholder: 'https://openspeech.bytedance.com/api/v1/tts' })),
+        h(Row, { key: 'm', label: '请求方式' }, f.select('voice.http.method', [{ value: 'GET', label: 'GET' }, { value: 'POST', label: 'POST' }], { width: 140 })),
+        h(Row, { key: 'h', label: '请求头', hint: '每行一项。多账号可填 Authorization: Bearer {apiKey}。' }, f.area('voice.http.headers', { size: 'wide', rows: 2, placeholder: 'Authorization: Bearer;你的token' })),
+        String((draft.voice.http || {}).method || 'GET').toUpperCase() !== 'GET'
+          ? h(Row, { key: 'b', label: '请求体', hint: '{text} 换成要念的话（自动转义），{reqid} 换成每次不同的随机串' }, f.area('voice.http.body', { size: 'wide', rows: 6, placeholder: '{"app":{"appid":"你的appid","token":"随便填","cluster":"volcano_tts"},"user":{"uid":"aurabot"},"audio":{"voice_type":"zh_female_wanwanxiaohe_moon_bigtts","encoding":"mp3"},"request":{"reqid":"{reqid}","text":"{text}"}}' }))
+          : null,
+      ]
+      return null
+    }
+
+    function Voice({ st, draft, setDraft, toast, reload, configure }) {
+      const f = useField(draft, setDraft)
+      const voiceDirty = Boolean(st && st.config) && JSON.stringify(draft.voice) !== JSON.stringify(st.config.voice)
       const [txt, setTxt] = useState('晚安啦，今天也辛苦了，明天见～')
       const [src, setSrc] = useState('')
+      const source = draft.voice.engine === 'auto' ? 'edge' : draft.voice.engine
+      const engineOptions = [
+        { value: 'auto', label: '自动', desc: '先用微软在线语音，不可用时用 Windows 声音' },
+        { value: 'edge', label: '微软 edge-tts', desc: st.voice.edgeInstalled ? '在线，音色自然（已装好）' : '在线，音色自然（还没装）' },
+        { value: 'cosyvoice', label: '本地 CosyVoice', desc: '自己部署的 CosyVoice 服务，可克隆音色' },
+        { value: 'gptsovits', label: '本地 GPT-SoVITS', desc: '用自己准备的录音定音色' },
+        { value: 'volcano', label: '豆包语音（火山）', desc: '只填 API Key，选个音色就行' },
+        { value: 'fish-free', label: 'Fish Audio', desc: 'S2.1 Pro Free，可选音色' },
+        { value: 'breeze', label: 'Breeze 语音', desc: 'BreezeBlue 云端或自建，填 Key + 音色 id' },
+        { value: 'minimax', label: 'MiniMax 语音', desc: '在线，音色多，支持自定义音色和情绪' },
+        { value: 'http', label: '其他 HTTP 接口', desc: '任意返回音频的地址' },
+        { value: 'windows', label: 'Windows 自带', desc: '离线可用，机械感重一些' },
+      ]
       return h('div', { className: 'ab-grid' },
-        h(Card, { title: '说话（文字转语音）', right: f.sw('voice.enabled'), desc: '回复里写了 <voice>…</voice> 的部分会变成 QQ 语音条；对方明确要语音时一定发语音；短回复也有一定概率整条变语音。' },
-          h('div', { style: { margin: '4px 0 12px' } }, f.choices('voice.engine', [
-            { value: 'auto', label: '自动', desc: 'edge-tts 优先，不行用 Windows 语音' },
-            { value: 'edge', label: '微软 edge-tts', desc: st.voice.edgeInstalled ? '在线，音色自然（已装好）' : '在线，音色自然（还没装）' },
-            { value: 'cosyvoice', label: '本地 CosyVoice', desc: '自己部署的 CosyVoice 服务，可克隆音色' },
-            { value: 'gptsovits', label: '本地 GPT-SoVITS', desc: 'GPT-SoVITS api_v2，用参考音频定音色' },
-            { value: 'http', label: '其他 HTTP 接口', desc: '任意返回音频的地址' },
-            { value: 'windows', label: 'Windows 自带', desc: '离线可用，机械感重一些' },
-          ])),
-          ['auto', 'edge'].includes(draft.voice.engine) ? [
-            !st.voice.edgeInstalled ? h(Row, { key: 'i', label: 'edge-tts', hint: '装在插件自己的 Python 环境里，不影响系统' }, h(Btn, { small: true, onClick: async () => { toast('正在安装，可能要一两分钟…'); const r = await post('/voice/install'); toast(r.message); reload() } }, '安装 edge-tts')) : null,
-            h(Row, { key: 'v', label: '音色' }, f.select('voice.voice', [
-              { value: 'zh-CN-XiaoyiNeural', label: '晓伊', desc: '活泼女声', group: '普通话' }, { value: 'zh-CN-XiaoxiaoNeural', label: '晓晓', desc: '温柔女声', group: '普通话' },
-              { value: 'zh-CN-YunxiNeural', label: '云希', desc: '少年男声', group: '普通话' },
-              { value: 'zh-CN-liaoning-XiaobeiNeural', label: '晓北', desc: '东北女声', group: '方言' }, { value: 'zh-CN-shaanxi-XiaoniNeural', label: '晓妮', desc: '陕西女声', group: '方言' },
-              { value: 'zh-TW-HsiaoChenNeural', label: '曉臻', desc: '台湾女声', group: '方言' }], { width: 220 })),
-            h(Row, { key: 'r', label: '语速' }, f.select('voice.rate', [{ value: '-20%', label: '慢一点' }, { value: '-10%', label: '稍慢' }, { value: '+0%', label: '正常' }, { value: '+10%', label: '稍快' }, { value: '+20%', label: '快一点' }], { width: 140 })),
-            h(Row, { key: 'p', label: '音调', hint: '拖动调整，±80Hz 为上限（实测再往上 edge-tts 会静默夹住）；只对 edge-tts 有效' },
-              h(Range, {
-                min: -80,
-                max: 80,
-                step: 10,
-                value: pitchNum(draft.voice.pitch),
-                fmt: pitchLabel,
-                onChange: (v) => setDraft(setPath(draft, 'voice.pitch', pitchText(v))),
-              })),
-          ] : null,
-          draft.voice.engine === 'cosyvoice' ? [
-            h(Row, { key: 'u', label: '服务地址', hint: 'CosyVoice 自带 runtime/python/fastapi/server.py' }, f.text('voice.cosyvoice.url', { size: 'wide', placeholder: 'http://127.0.0.1:50000' })),
-            h(Row, { key: 'm', label: '模式' }, f.select('voice.cosyvoice.mode', [{ value: 'sft', label: '预置音色（sft）' }, { value: 'instruct', label: '带语气指令（instruct）' }], { width: 220 })),
-            h(Row, { key: 's', label: '音色 ID', hint: '例如 中文女、中文男' }, f.text('voice.cosyvoice.spkId')),
-            draft.voice.cosyvoice.mode === 'instruct' ? h(Row, { key: 'i', label: '语气指令', hint: '例如：用甜美撒娇的语气说' }, f.text('voice.cosyvoice.instruct', { size: 'wide' })) : null,
-            h(Row, { key: 'r', label: '采样率', hint: 'CosyVoice 1 是 22050，CosyVoice 2 是 24000' }, f.select('voice.cosyvoice.sampleRate', [{ value: 22050, label: '22050 Hz' }, { value: 24000, label: '24000 Hz' }], { width: 160 })),
-          ] : null,
-          draft.voice.engine === 'gptsovits' ? [
-            h(Row, { key: 'u', label: '服务地址', hint: 'GPT-SoVITS 的 api_v2.py' }, f.text('voice.gptsovits.url', { size: 'wide', placeholder: 'http://127.0.0.1:9880' })),
-            h(Row, { key: 'a', label: '参考音频路径', hint: '服务那台电脑上的路径' }, f.text('voice.gptsovits.refAudio', { size: 'wide' })),
-            h(Row, { key: 'p', label: '参考音频的文字' }, f.text('voice.gptsovits.promptText', { size: 'wide' })),
-          ] : null,
-          draft.voice.engine === 'http' ? [
-            h(Row, { key: 'u', label: '接口地址', hint: 'GET：地址里带 {text}；POST：填接口地址就行' }, f.text('voice.http.urlTemplate', { size: 'wide', placeholder: 'https://openspeech.bytedance.com/api/v1/tts' })),
-            h(Row, { key: 'm', label: '请求方式' }, f.select('voice.http.method', [{ value: 'GET', label: 'GET' }, { value: 'POST', label: 'POST' }], { width: 140 })),
-            h(Row, { key: 'h', label: '请求头', hint: '一行一个。多个头就多写几行' }, f.area('voice.http.headers', { size: 'wide', rows: 2, placeholder: 'Authorization: Bearer;你的token' })),
-            String((draft.voice.http || {}).method || 'GET').toUpperCase() !== 'GET'
-              ? h(Row, { key: 'b', label: '请求体', hint: '{text} 换成要念的话（自动转义），{reqid} 换成每次不同的随机串' }, f.area('voice.http.body', { size: 'wide', rows: 6, placeholder: '{"app":{"appid":"你的appid","token":"随便填","cluster":"volcano_tts"},"user":{"uid":"aurabot"},"audio":{"voice_type":"zh_female_wanwanxiaohe_moon_bigtts","encoding":"mp3"},"request":{"reqid":"{reqid}","text":"{text}"}}' }))
-              : null,
-          ] : null,
+        h(Card, { title: '说话（文字转语音）', right: f.sw('voice.enabled', { title: '允许发送语音' }), desc: '选好声音可以先试听，保存后用于聊天。' },
+          voiceDirty ? h('div', { className: 'ab-note' }, '有未保存的改动，聊天仍使用之前的声音。') : null,
+          h('div', { style: { margin: '4px 0 12px' } }, h(VoiceEngineChoices, {
+            options: engineOptions,
+            value: draft.voice.engine,
+            active: st && st.config && st.config.voice ? st.config.voice.engine : '',
+            onChange: (v) => setDraft(setPath(draft, 'voice.engine', v)),
+            toast,
+          })),
+          VOICE_SERVICES[source] ? h(Btn, { small: true, onClick: () => configure(source) }, '配置 ' + VOICE_SERVICES[source]) : null,
+          h(Row, { label: '试听', hint: '试听当前选择，不用先保存。' },
+            h('input', { className: 'ab-input', 'aria-label': '试听文字', value: txt, onChange: (e) => setTxt(e.target.value) }),
+            h(Btn, { small: true, onClick: async () => {
+              setSrc('')
+              const r = await post('/voice/test', { text: txt, voice: draft.voice })
+              if (r.ok) setSrc('data:' + r.mime + ';base64,' + r.data)
+              else toast(r.message)
+            } }, '播放试听'),
+            src ? h('audio', { key: src, src, controls: true, autoPlay: true, style: { height: 32 } }) : null),
+        ),
+        // 低频参数收进折叠卡：默认不展开，展开区才挂载（不展开就不渲染、不注册控件）
+        h(Card, { title: '什么时候发语音', collapsible: true, defaultOpen: false },
           h(Row, { label: '短回复变语音的概率' }, f.percent('voice.autoChance')),
           h(Row, { label: '多短算短回复' }, f.range('voice.autoMaxChars', 10, 200, 5, (v) => v + ' 字')),
-          h(Row, { label: '表情和语音分开发', hint: '语音条里的表情 / emoji 不念出来，语音发完再单独补一条文字发出去（没有表情就不补）；关掉 = 表情直接丢掉，不补发' }, f.sw('voice.emojiSeparate')),
-          h(Row, { label: '试听', hint: '先保存设置再试听' },
-            h('input', { className: 'ab-input', value: txt, onChange: (e) => setTxt(e.target.value) }),
-            h(Btn, { small: true, onClick: async () => { const r = await post('/voice/test', { text: txt }); if (r.ok) setSrc('data:' + r.mime + ';base64,' + r.data); else toast(r.message) } }, '生成'),
-            src ? h('audio', { src, controls: true, autoPlay: true, style: { height: 32 } }) : null),
-        ),
-        h(VoiceSongModel, { draft, setDraft }),
-        h(Card, { title: '听语音（语音转文字）', right: f.sw('voice.asr'), desc: '别人发来的语音会先转成文字再交给ta：优先用 QQ 自带的转文字，不行再用 DSH 自带的语音识别（要在 DSH「插件」里开启「语音输入」）。' },
+          h(Row, { label: '表情和语音分开发', hint: '开启后，表情会作为文字另发；关闭后跳过表情。' }, f.sw('voice.emojiSeparate'))),
+        // 语音条变声（翻唱音色）属于低频功能：收进默认收起的折叠卡，
+        // 展开才挂载 VoiceSongModel，从而延迟 GET /voice/song-voices —— 不进语音页首屏。
+        h(Card, { title: '语音条变声（用翻唱音色）', desc: '选用已导入的翻唱音色。不选就保留原声。', collapsible: true, defaultOpen: false },
+          h(VoiceSongModel, { draft, setDraft, flat: true })),
+      )
+    }
+
+    /**
+     * 语音页外壳：发语音 / 听语音 / 扩展服务三个子视图共用一个页签。
+     * 关键约束：听语音（Asr）只在 view==='listen' 时挂载——不挂载即不发请求、不跑轮询。
+     */
+    function VoiceTab({ voiceView, setVoiceView, st, draft, setDraft, toast, reload, extensions = [] }) {
+      const [service, setService] = useState('fish-free')
+      const configure = id => { setService(id); setVoiceView('services') }
+      const seg = h('div', { className: 'ab-seg', role: 'tablist', 'aria-label': '语音子视图' },
+        h('button', { type: 'button', role: 'tab', 'aria-selected': voiceView === 'send', className: cx(voiceView === 'send' && 'on'), onClick: () => setVoiceView('send') }, '发语音'),
+        h('button', { type: 'button', role: 'tab', 'aria-selected': voiceView === 'listen', className: cx(voiceView === 'listen' && 'on'), onClick: () => setVoiceView('listen') }, '听语音'),
+        h('button', { type: 'button', role: 'tab', 'aria-selected': voiceView === 'services', className: cx(voiceView === 'services' && 'on'), onClick: () => setVoiceView('services') }, '扩展服务'))
+      return h('div', null,
+        h('div', { className: 'ab-flex', style: { margin: '0 0 12px' } }, seg),
+        voiceView === 'listen'
+          ? h(Asr, { draft, setDraft, toast })
+          : voiceView === 'services' ? h(VoiceServices, { selected: service, onSelect: setService, extensions, st, draft, setDraft, toast, reload })
+          : h(Voice, { st, draft, setDraft, toast, reload, configure }))
+    }
+
+    /** 语音识别：作为「语音」页的「听语音」子视图渲染（不再单独占页签）。 */
+    function Asr({ draft, setDraft, toast }) {
+      const f = useField(draft, setDraft)
+      return h('div', { className: 'ab-grid' },
+        h(Card, { title: '听语音（语音转文字）', right: f.sw('voice.asr'), desc: '别人发来的语音会先转成文字再交给ta：本地接口 → QQ 自带转文字 → 云端识别（可选）→ DSH 自带识别。任何一层失败都会继续试下一层。' },
+          h(Row, { label: '云端识别', hint: '可选；不选就维持原来的顺序（本地 → QQ → DSH）' },
+            f.select('voice.asrApi.provider', [
+              { value: '', label: '不用云端识别' },
+              { value: 'siliconflow', label: '硅基流动' },
+              { value: 'openai', label: 'OpenAI' },
+              { value: 'custom', label: '自定义 OpenAI 兼容' },
+            ], { width: 220 })),
+          draft.voice.asrApi?.provider ? [
+            h(Row, { key: 'u', label: '服务地址', hint: '只填到 /v1，不要带 /audio/transcriptions；留空用预置：硅基 https://api.siliconflow.cn/v1；OpenAI https://api.openai.com/v1' },
+              f.text('voice.asrApi.baseUrl', { size: 'wide', placeholder: draft.voice.asrApi.provider === 'siliconflow' ? 'https://api.siliconflow.cn/v1' : draft.voice.asrApi.provider === 'openai' ? 'https://api.openai.com/v1' : 'http://127.0.0.1:8000/v1' })),
+            h(Row, { key: 'm', label: '模型', hint: '留空用预置：硅基 FunAudioLLM/SenseVoiceSmall；OpenAI whisper-1。换 XingChenASR 要带完整 ID：XingChenAGI/XingChenASR-V3.2-Ultra' },
+              f.text('voice.asrApi.model', { size: 'wide', placeholder: draft.voice.asrApi.provider === 'siliconflow' ? 'FunAudioLLM/SenseVoiceSmall' : draft.voice.asrApi.provider === 'openai' ? 'whisper-1' : 'whisper-1' })),
+            h(Row, { key: 'k', label: 'API Key', hint: '只存在本机，面板不回显；本地服务可留空' },
+              f.text('voice.asrApi.apiKey', { type: 'password', placeholder: draft.voice.asrApi?.apiKeySet ? '已保存（不改就留空）' : '没有就留空' })),
+            h(Row, { key: 'l', label: '语言', hint: '可留空；只对支持 language 的模型有效' },
+              f.text('voice.asrApi.language', { placeholder: 'zh' })),
+            h(Row, { key: 'p', label: '先用谁', hint: 'QQ 通常 1~2 秒；硅基 SenseVoice 实测约 14 秒，建议先 QQ' },
+              f.select('voice.asrApi.prefer', [{ value: 'qq', label: '先 QQ 自带（推荐）' }, { value: 'cloud', label: '先云端识别' }], { width: 220 })),
+            h(Row, { key: 't', label: '测试', hint: '先用内置语音念一句，再交给云端识别；用当前页面设置，没保存也生效' },
+              h(Btn, { small: true, onClick: async () => {
+                toast('正在合成并识别，可能要十几秒…')
+                const r = await post('/voice/asr-provider-test', { text: '今天想吃白米饭', voice: draft.voice })
+                toast(r.ok ? '念的是「' + r.said + '」，听成了「' + r.heard + '」' : r.message)
+              } }, '测试云端识别')),
+          ] : null,
           h(AsrStatus, { toast })),
       )
     }
@@ -1794,13 +3451,41 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     function Stickers({ draft, setDraft, toast }) {
       const f = useField(draft, setDraft)
       const [items, setItems] = useState(null)
+      const [hasMore, setHasMore] = useState(false)
+      const [stickerTotal, setStickerTotal] = useState(0)
+      const [moreBusy, setMoreBusy] = useState(false)
       const fileRef = useRef(null)
-      const load = () => get('/stickers').then((r) => setItems(r.items || []))
+      const load = () => getCached('/stickers?limit=40&offset=0').then((r) => {
+        setItems(r.items || []); setHasMore(Boolean(r.hasMore)); setStickerTotal(Number(r.total) || 0)
+      })
+      const loadMore = async () => {
+        if (moreBusy || !hasMore) return
+        setMoreBusy(true)
+        try {
+          const r = await getCached('/stickers?limit=40&offset=' + ((items || []).length))
+          if (r.ok === false) return toast(r.message || '加载失败', 'err')
+          setItems((prev) => [...(prev || []), ...(r.items || [])])
+          setHasMore(Boolean(r.hasMore)); setStickerTotal(Number(r.total) || 0)
+        } finally { setMoreBusy(false) }
+      }
+      const removeStickers = (md5s) => {
+        const gone = new Set(md5s)
+        const removed = (items || []).filter((i) => gone.has(i.md5)).length
+        if (!removed) return
+        const nextLoaded = Math.max(0, (items || []).length - removed)
+        const nextTotal = Math.max(0, stickerTotal - removed)
+        setItems((prev) => (prev || []).filter((i) => !gone.has(i.md5)))
+        setStickerTotal(nextTotal)
+        setHasMore(nextTotal > nextLoaded)
+      }
+      const editSticker = (md5, patch) => {
+        setItems((prev) => (prev || []).map((i) => i.md5 === md5 ? { ...i, ...patch } : i))
+      }
       useEffect(() => { load() }, [])
       const [newName, setNewName] = useState('')
       // 起名用哪个模型：列 DSH 里已经接好的模型，能看图的标出来（AI 补全必须看图）
       const [models, setModels] = useState(null)
-      useEffect(() => { get('/models').then((r) => setModels(r.list || [])).catch(() => setModels([])) }, [])
+      useEffect(() => { getCached('/models').then((r) => setModels(r.list || [])).catch(() => setModels([])) }, [])
       const cm = (draft.stickers && draft.stickers.captionModel) || {}
       const cmKey = cm.provider && cm.model ? cm.provider + '::' + cm.model : ''
       const cmHit = cmKey && models ? models.find((m) => m.provider + '::' + m.model === cmKey) : null
@@ -1830,10 +3515,12 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           setJob(r)
           if (!r.running) {
             clearInterval(timer)
+            bustCache()
             load()
             toast(r.message || '整理完了', r.failed ? 'err' : 'ok')
           } else if ((r.done || 0) - shown.current >= 5) {
             shown.current = r.done || 0 // 每跑五张刷一下，新起的名字能早点看到
+            bustCache()
             load()
           }
         }, 2000)
@@ -1856,8 +3543,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         if (!confirm(ask)) return
         const r = await post('/sticker/delete-batch', { md5s: picked, fromQQ: dropQQ })
         toast(r.message || (r.ok ? '删掉了 ' + n + ' 张' : '没删成'), r.ok ? 'ok' : 'err')
-        setPicked([])
-        load()
+        if (r.ok) { removeStickers(picked); setPicked([]) }
       }
       // DSH 是 Electron，不支持 prompt() 弹框：名字在页面上填（不填就自动看图起名）
       const upload = async (files) => {
@@ -1866,7 +3552,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         let ok = 0
         const errs = []
         for (const file of list) {
-          if (file.size > 5 * 1024 * 1024) { errs.push(file.name + ' 超过 5MB'); continue }
+          // 跟宿主侧 src/features/stickers.js 的 PANEL_UPLOAD_MAX_BYTES 对齐：
+          // 那条路是 JSON + base64（体积 ×1.33），所以比 QQ 侧收表情的那一档小。
+          if (file.size > 20 * 1024 * 1024) { errs.push(file.name + ' 超过 20MB'); continue }
           try {
             const data = await new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.onerror = () => rej(new Error('读不了这个文件')); fr.readAsDataURL(file) })
             const r = await post('/sticker/upload', { data, name: list.length === 1 ? newName.trim().slice(0, 12) : '' })
@@ -1900,11 +3588,14 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h('label', { key: 'redo', className: 'ab-small ab-muted', title: '勾上以后连已经有名字的也重新起一遍（会重新花模型调用）' },
             h('input', { type: 'checkbox', checked: redoAll, onChange: (e) => setRedoAll(e.target.checked) }), ' 全部重做'),
           h(Btn, { key: 'pick', small: true, kind: 'ghost', onClick: () => { setPicking(true); setPicked([]) } }, '多选'),
-          h(Btn, { key: 'reload', small: true, kind: 'ghost', onClick: load }, '刷新'),
+          h(Btn, { key: 'reload', small: true, kind: 'ghost', onClick: () => { bustCache(); load() } }, '刷新'),
         ]
       return h('div', { className: 'ab-grid' },
-        h(Card, { title: '表情包', right: f.sw('stickers.enabled'), desc: '回复里写 <sticker:名字> 就会发对应的表情；也会按概率自动配一张。' },
-          h(Row, { label: '自动配表情的概率' }, f.percent('stickers.autoChance')),
+        h(Card, { title: '表情包', right: f.sw('stickers.enabled'), desc: '聊天时从表情库配图；关闭后不发表情包。' },
+          h(Row, { label: '自动补一张表情包', hint: '纯文字回复也按概率配图。关闭后只发送明确选出的表情，不影响主动索要表情；回复标签仍受下方概率开关控制。' }, f.sw('stickers.autoAppend', { title: '自动补一张表情包' })),
+          h(Row, { label: draft.stickers.limitTagged ? '回复配表情的概率' : '自动配表情的概率', hint: draft.stickers.limitTagged ? (draft.stickers.keywordExemption ? '有正文且未命中关键词时按此概率；纯表情或命中关键词时保留。' : '每段回复按此概率决定是否配表情；0% 不配，100% 不限。') : '只控制自动补图，会随心情变化；模型自己选的表情仍会发送。' }, f.percent('stickers.autoChance')),
+          h(Row, { label: '回复里的表情也受概率限制', hint: draft.stickers.keywordExemption && draft.stickers.limitTagged ? '纯表情直接保留；带文字的回复按下方关键词判断，可能误放或漏判。' : '会删掉没抽中的表情，但不改正文，可能“说要发图却没发”。更在意聊天连贯时请关闭；表情制作不受影响。' }, f.sw('stickers.limitTagged', { title: '回复里的表情也受概率限制' })),
+          draft.stickers.limitTagged ? h(Row, { label: '纯表情或提到图片时保留（实验性）', hint: '只发表情，或正文命中“图、表情、一张、看看”等词时保留；其余按概率。关键词匹配可能误判。' }, f.sw('stickers.keywordExemption', { title: '纯表情或提到图片时保留（实验性）' })) : null,
           h(Row, { label: '夹 QQ 小黄脸', hint: '回复里能夹 QQ 自带的系统表情（/捂脸 /斜眼笑 这种），和文字在同一条消息里' }, f.sw('stickers.faces')),
           h(Row, { label: '偷表情', hint: '别人发的表情包会被收藏（普通照片不收）。' }, f.sw('stickers.collect'), h('span', { className: 'ab-muted' }, '从群里'), f.sw('stickers.fromGroups'), h('span', { className: 'ab-muted' }, '从私聊'), f.sw('stickers.fromPrivate')),
           draft.stickers.collect ? h(Row, { label: '怎么偷', hint: '「ta挑」只递给ta看，喜欢才收；「只听主人的」只在主人私聊 / 这一轮只有主人时ta才可自己收，有别人在场要主人发话' },
@@ -1930,7 +3621,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             models === null ? h('span', { className: 'ab-muted ab-small' }, ' 正在查模型…') : null,
             cmHit && cmHit.vision === false ? h('span', { className: 'ab-small', style: { color: 'var(--ab-warn)' } }, ' 这个模型看不了图，起名会被跳过') : null),
         ),
-        h(Card, { title: '表情库' + (items ? '（' + items.length + ' 张）' : ''), right: h('div', { className: 'ab-flex' }, bar) },
+        h(Card, { title: '表情库' + (items ? '（' + items.length + (stickerTotal > items.length ? '/' + stickerTotal : '') + ' 张）' : ''), right: h('div', { className: 'ab-flex' }, bar) },
           job ? h('div', { className: 'ab-flex', style: { margin: '0 0 10px' } },
             job.running ? h('i', { key: 's', className: 'ab-spin' }) : h('span', { key: 'k', style: { color: job.failed ? 'var(--ab-warn)' : 'var(--ab-ok)' } }, '✓'),
             h('span', { key: 't', className: 'ab-small' }, job.running
@@ -1943,8 +3634,43 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           ) : null,
           items === null ? h(Empty, { icon: '⏳', text: '加载中…' }) : items.length === 0 ? h(Empty, { icon: '🐳', text: '表情库还是空的。别人在群里发表情包，ta会自己收；也可以点右上角上传，或者「从 QQ 收藏导入」机器人号已经收藏的表情。' }) :
             h('div', { className: cx('ab-stickers', picking && 'picking') },
-              items.map((it) => h(StickerCell, { key: it.md5, it, onChanged: load, toast, picking, selected: picked.includes(it.md5), onToggle: toggle }))),
+              items.map((it) => h(StickerCell, { key: it.md5, it, onChanged: load, onDeleted: (md5) => removeStickers([md5]), onEdited: editSticker, toast, picking, selected: picked.includes(it.md5), onToggle: toggle }))),
+          hasMore ? h('div', { className: 'ab-flex', style: { marginTop: 8 } },
+            h(Btn, { small: true, kind: 'ghost', disabled: moreBusy, onClick: loadMore }, moreBusy ? '加载中…' : `加载更多（已显示 ${items ? items.length : 0}/${stickerTotal}）`)) : null,
         ),
+        h(Card, {
+          title: '贴表情',
+          right: f.sw('stickers.react'),
+          desc: '默认关。打开后看到谁的消息，就可能贴个表情——不一定回话，只在旁边看着也行。emoji 直接给 Unicode 码点（🍬 127852、👍 128077），QQ 老表情是另一套编号（❓ 10068），两种混着用都行。',
+        },
+          h(Row, { label: '主动贴表情的概率', hint: '默认 15%，和「表情包」那张卡里的自动配表情各算各的，互不影响；心情好会更频繁' },
+            h(Range, {
+              min: 0,
+              max: 100,
+              value: pct(draft.stickers.reactChance ?? 0.15),
+              onChange: (v) => setDraft(setPath(draft, 'stickers.reactChance', v / 100)),
+              fmt: (v) => v + '%',
+            })),
+          h(Row, { label: '概率表', hint: '实际概率 = 拖拽条的值 × 心情系数（心情越高越爱贴；超过 100% 就是必贴）' },
+            (() => {
+              const base = Number(draft.stickers.reactChance ?? 0.15) || 0
+              const cell = (key, text, extra) => h('td', { key, style: Object.assign({ padding: '3px 16px 3px 0' }, extra) }, text)
+              return h('table', { style: { borderCollapse: 'collapse', fontSize: 12, marginTop: 2 } },
+                h('thead', null, h('tr', null,
+                  cell('h0', '心情', { opacity: 0.55, fontWeight: 500 }),
+                  cell('h1', '系数', { opacity: 0.55, fontWeight: 500, textAlign: 'right' }),
+                  cell('h2', '实际概率', { opacity: 0.55, fontWeight: 500, textAlign: 'right', paddingRight: 0 }),
+                )),
+                h('tbody', null, REACT_MOOD_BANDS.map(([label, mult]) => h('tr', { key: label },
+                  cell('m', label, { opacity: 0.8 }),
+                  cell('k', mult + '×', { opacity: 0.55, textAlign: 'right' }),
+                  cell('p', Math.min(100, Math.round(base * mult * 1000) / 10) + '%', { textAlign: 'right', paddingRight: 0, fontVariantNumeric: 'tabular-nums' }),
+                ))),
+              )
+            })()),
+          h(Row, { label: '每小时上限', hint: '每个会话单独算，免得在热闹的群里刷屏' }, f.range('stickers.reactMaxPerHour', 0, 60, 1, (v) => v + ' 次')),
+        ),
+        h(FaceMapCard, null),
       )
     }
 
@@ -1952,7 +3678,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
      * 一张表情：名字（备注）和标签都能直接改，改完离开输入框就保存（#31：模型起的名字 / 标签不对时手动纠正）。
      * 多选模式下整张卡片就是勾选框，点一下就选中。
      */
-    function StickerCell({ it, onChanged, toast, picking, selected, onToggle }) {
+    function StickerCell({ it, onChanged, onDeleted, onEdited, toast, picking, selected, onToggle }) {
       const [name, setName] = useState(it.name || '')
       const tagText = (it.tags || []).join(' ')
       const [tags, setTags] = useState(tagText)
@@ -1962,7 +3688,10 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const save = async (body, label) => {
         const r = await post('/sticker/rename', { md5: it.md5, ...body })
         toast(r.ok ? label + '改好了' : '没改成：' + (r.message || '找不到这张表情'), r.ok ? 'ok' : 'err')
-        if (r.ok) onChanged()
+        if (r.ok) {
+          if (onEdited) onEdited(it.md5, body)
+          else onChanged()
+        }
       }
       return h('div', {
         className: cx('ab-sticker', picking && 'pick', selected && 'on'),
@@ -1975,7 +3704,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           onBlur: () => { if (!picking && name !== (it.name || '')) save({ name }, '名字') } }),
         h('input', { className: 'tg', value: tags, placeholder: '加标签，空格隔开', title: '标签，空格或逗号隔开，最多 5 个', readOnly: Boolean(picking), tabIndex: picking ? -1 : undefined, onChange: (e) => setTags(e.target.value),
           onBlur: () => { if (!picking && tags.trim() !== tagText) save({ tags: tags.split(/[\s,，、#]+/).map((x) => x.trim()).filter(Boolean).slice(0, 5) }, '标签') } }),
-        picking ? null : h('button', { type: 'button', className: 'ab-btn sm danger x', title: '删除', onClick: async () => { if (!confirm('删掉这张表情？（QQ 收藏里也会删）')) return; await post('/sticker/delete', { md5: it.md5 }); onChanged() } }, '✕'),
+        picking ? null : h('button', { type: 'button', className: 'ab-btn sm danger x', title: '删除', onClick: async () => { if (!confirm('删掉这张表情？（QQ 收藏里也会删）')) return; const r = await post('/sticker/delete', { md5: it.md5 }); if (r.ok) { if (onDeleted) onDeleted(it.md5); else onChanged() } } }, '✕'),
       )
     }
 
@@ -2145,7 +3874,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         h(Row, { label: '好友说说互动概率', hint: '每条说说只判断一次' }, f.percent('qzoneSocial.friendChance')),
         h(Row, { label: '你的说说互动概率' }, f.percent('qzoneSocial.ownerChance')),
         h(Row, { label: '每天最多评论', hint: '点赞不算' }, f.range('qzoneSocial.maxPerDay', 0, 30, 1, (v) => v + ' 条')),
-        h(Row, { label: '多久逛一次', hint: '只在「主动搭话」里设的醒着时间内' }, f.range('qzoneSocial.intervalMin', 10, 240, 10, (v) => v + ' 分钟')),
+        h(Row, { label: '多久逛一次', hint: '只在「目的引擎」里设的醒着时间内' }, f.range('qzoneSocial.intervalMin', 10, 240, 10, (v) => v + ' 分钟')),
         h('div', { className: 'ab-flex', style: { marginTop: 10 } },
           h('span', { className: 'ab-muted ab-small' }, s ? '今天评论了 ' + s.count + ' 条' + (s.lastRun ? '，上次逛是 ' + timeAgo(s.lastRun) : '') : ''),
           h('div', { className: 'ab-spacer' }),
@@ -2156,27 +3885,311 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       )
     }
 
+    /**
+     * 目的引擎页（tab 'speakup'）。2026-11-17 按面板统一口径重构：
+     *  - 可见区 2~3 个高频组（一律纯行式：Row 直接纵向排列，label 左、控件右；
+     *    曾包在 ab-grp-row 网格里，但那套样式会把 Row 改写成竖排窄卡，已废弃）
+     *  - 其余收进「更多设置（N 项）」折叠卡（collapsible + defaultOpen=false + ab-fold-sub）
+     *  - 冻结键（speakUp.awakeFrom、awakeTo、allow、reminder 系列、idleMinutes、间隔、maxPerDay、nudge）一个不丢，仅调整呈现位置
+     */
     function SpeakUp({ st, draft, setDraft, toast }) {
       const f = useField(draft, setDraft)
+      // 「更多设置（N 项）」折叠子卡：与聊天页/记忆页同口径
+      const more = (title, items) => (items.length ? h(Card, { title: (title || '更多设置') + '（' + items.length + ' 项）', collapsible: true, defaultOpen: false, className: 'ab-fold-sub' }, items) : null)
+      const [closedReminders, setClosedReminders] = useState(() => new Set())
+      const reminders = (st.speakUp?.reminders || []).filter((r) => !closedReminders.has(r.id))
+      const closeReminder = async (id) => {
+        const r = await post('/purpose/reminder/close', { id }).catch(() => ({ ok: false, message: '关闭失败' }))
+        toast(r.message, r.ok === false ? 'err' : 'ok')
+        if (r.ok) setClosedReminders((prev) => new Set(prev).add(id))
+      }
       return h('div', { className: 'ab-grid' },
-        h(Card, { title: '主动搭话', right: f.sw('speakUp.enabled'), desc: '只在和你的私聊里：你一阵子没理ta，ta会主动来找你说一句——每次由头不一样（分享小事、接着上次的话题、想起你的事、按时间问候……），内容是ta现想的，不是模板。群里不会这样。' },
-          h(Row, { label: '追问', hint: 'ta问了你一句、你 15~40 分钟没回，偶尔轻轻追一句（「人呢」之类），每句最多追一次' }, f.sw('speakUp.nudge')),
+        // ===== 可见区 ① 什么时候来找你（4 项核心节奏，纯行式：label 左、控件右）=====
+        h(Card, { title: '什么时候来找你',
+          desc: '只在和你的私聊里：闲的时候主动来找你说一句——每次由头不一样（分享小事、接着上次的话题、想起你的事、按时间问候……），内容是ta现想的，不是模板。群里不会这样。' },
           h(Row, { label: '多久没聊才找你' }, f.num('speakUp.idleMinutes', { min: 5 }), h('span', { className: 'ab-muted' }, '分钟')),
           h(Row, { label: '两次之间隔', hint: '在这个范围里随机' }, f.num('speakUp.minIntervalMinutes', { min: 5 }), h('span', { className: 'ab-muted' }, '到'), f.num('speakUp.maxIntervalMinutes', { min: 5 }), h('span', { className: 'ab-muted' }, '分钟')),
-          h(Row, { label: '主动搭话白名单', hint: '除了你，还会主动找这些人，每人单独算次数。目的引擎开着时也按这份名单找人，只用和对方的私聊和关于对方的记忆。也可以在 QQ 里发 /speak add QQ 号。名单里的人要在私聊白名单里，才能回ta' }, f.list('speakUp.allow', { placeholder: '每行一个 QQ 号', numbers: true })),
           h(Row, { label: '每天最多', hint: '每个人单独算；留空就是 20，不封顶' }, f.num('speakUp.maxPerDay', { min: 0 }), h('span', { className: 'ab-muted' }, '次')),
-          h(Row, { label: 'ta醒着的时间', hint: '这段时间外不打扰你' }, f.num('speakUp.awakeFrom', { min: 0, max: 23 }), h('span', { className: 'ab-muted' }, '点到'), f.num('speakUp.awakeTo', { min: 1, max: 24 }), h('span', { className: 'ab-muted' }, '点')),
+          h(Row, { label: 'ta醒着的时间', hint: '这段时间外不打扰你；终点填 24 表示醒到午夜（比如 7 到 24 = 早上 7 点到当天结束，0 点到 7 点不打扰）；起止相同 = 全天不打扰关闭；小闹钟按她定的时间触发，不受这里限制' }, f.num('speakUp.awakeFrom', { min: 0, max: 23 }), h('span', { className: 'ab-muted' }, '点到'), f.num('speakUp.awakeTo', { min: 1, max: 24 }), h('span', { className: 'ab-muted' }, '点')),
           h('div', { className: 'ab-flex', style: { marginTop: 10 } },
             h('span', { className: 'ab-muted ab-small' }, '今天已经找过你 ' + (st.speakUp.count || 0) + ' 次'),
             h('div', { className: 'ab-spacer' }),
-            h(Btn, { small: true, onClick: async () => { const r = await post('/speakup/fire'); toast(r.message) } }, '现在就让ta来找我')),
+            h(Btn, { small: true, onClick: async () => { const r = await post('/panel/purpose/run'); toast(r.message) } }, '现在就让ta来找我')),
         ),
+
+        // ===== 可见区 ② 找谁（白名单，单项但高频且重要）=====
+        h(Card, { title: '找谁',
+          desc: '除了你，还会主动找这些人，每人单独算次数。目的引擎开着时也按这份名单找人，只用和对方的私聊和关于对方的记忆。' },
+          h(Row, { label: '白名单', hint: '每行一个 QQ 号；也可以在 QQ 里发 /speak add QQ 号。名单里的人要在私聊白名单里，才能回ta' }, f.list('speakUp.allow', { placeholder: '每行一个 QQ 号', numbers: true })),
+        ),
+
+        // ===== 可见区 ③ 小闹钟与追问（3 项）=====
+        h(Card, { title: '小闹钟与追问',
+          desc: '她自己在对话里定的一次性提醒；到点会触发主动搭话，让她按当时说好的内容来找你。过期或触发成功后会自动消失。' },
+          h(Row, { label: '她的小闹钟', hint: '开着她可以在和你的私聊里自己定时间，到点由目的引擎的系统提醒叫醒她' }, f.sw('speakUp.reminderEnabled')),
+          h(Row, { label: '追问', hint: 'ta问了你一句、你 15~40 分钟没回，偶尔轻轻追一句（「人呢」之类），每句最多追一次' }, f.sw('speakUp.nudge')),
+          h(Row, { label: '最多保留', hint: '未过期、未关闭的提醒；最多 10 条' }, f.num('speakUp.reminderLimit', { min: 1, max: 10 }), h('span', { className: 'ab-muted' }, '条')),
+          more('更多设置', [
+            h(Row, { key: 'rr', label: '触发失败时保留提醒', hint: '网络波动或模型调用失败时保留 15 分钟，每 5 分钟重试一次；关掉则失败即丢弃' }, f.sw('speakUp.reminderRetry')),
+          ]),
+          // 待触发列表
+          reminders.length
+            ? h('div', { style: { marginTop: 10 } }, reminders.map((r) => h('div', { key: r.id, className: 'ab-flex', style: { alignItems: 'flex-start', gap: 12, padding: '9px 0', borderTop: '1px solid var(--ab-line)' } },
+              h('div', { style: { flex: 1, minWidth: 0 } },
+                h('b', null, r.atText),
+                h('div', { className: 'ab-small', style: { marginTop: 3, whiteSpace: 'pre-wrap', wordBreak: 'break-word' } }, r.note)),
+              h(Btn, { small: true, kind: 'ghost', onClick: () => closeReminder(r.id) }, '关闭'))))
+            : h('div', { className: 'ab-muted ab-small', style: { marginTop: 10 } }, '还没有待触发的小闹钟。'),
+        ),
+
         h(PurposeStatus, { st, toast }),
+        h(OutboundPolicy, { toast }),
       )
     }
 
+    // 「自驱引擎」独立页（少爷定的：不属于主动搭话，单独一页）。
+    // P0 只有地基（审计哈希链 + 状态），引擎闭环（立项/做事/做梦）在 P1 之后逐期点亮；
+    // 数据走 /autotelic/status，参数就是 ext.autotelic.*（模块 defaults 里全有）。
+    // 自驱引擎的出厂默认（跟 src/modules/autotelic 的 defaults 对齐；滑块控件在草稿没值时兜底显示用）。
+    const AUTOTELIC_DEFAULTS = { enabled: false, presetIdOverride: false, minCuriosity: 0.55, evalModel: '', maxCandidates: 3, allowAct: true, actTimeoutMs: 180000, maxSteps: 8, maxTasksActive: 8, budgetActionsPerHour: 12, quietFrom: '23:30', quietTo: '07:30', dailyReviewHour: 23, minBatchForReview: 3, dreamFrom: '03:00', dreamTo: '05:00', allowUserModules: true, allowPython: true, pythonBin: '', scriptTimeoutMs: 120000 }
+    function Autotelic({ st, draft, setDraft, toast }) {
+      const f = useField(draft, setDraft)
+      const [s, setS] = useState(null)
+      const [pv, setPv] = useState(null)
+      const [showPv, setShowPv] = useState(false)
+      const [busy, setBusy] = useState('')
+      const [jr, setJr] = useState(null)
+      const [openDay, setOpenDay] = useState(null)
+      const load = () => get('/autotelic/status').then((r) => { if (r.ok) setS(r); else setS(null) }).catch(() => setS(null))
+      const loadJournal = () => get('/autotelic/journal').then((r) => { if (r.ok) setJr(r) }).catch(() => {})
+      useEffect(() => { load(); loadJournal(); const t = setInterval(load, 15000); return () => { clearInterval(t) } }, [])
+      const doPreview = async () => { setBusy('preview'); try { const r = await get('/autotelic/preview'); setPv(r); setShowPv(true) } catch (e) { toast(e.message, 'err') } finally { setBusy('') } }
+      const act = async (key, path) => {
+        setBusy(key)
+        try { const r = await post(path, {}); toast(r.message || '这轮结束了', r.ok === false ? 'err' : 'ok') }
+        catch (e) { toast(e.message, 'err') } finally { setBusy(''); load() }
+      }
+      const tasks = (s && s.tasks) || []
+      const sm = (s && s.summary) || {}
+      const TASK_BADGE = { active: '在办', done: '办成', failed: '失败', blocked: '卡住', abandoned: '放弃' }
+      // 点任务行 → 打开「这一天的记录」弹窗（当天审计流水 + 任务 + 复盘刊物）
+      const [dayM, setDayM] = useState(null) // { date, data }
+      const dkey = (ts) => { const d = new Date(ts); const p = (n) => String(n).padStart(2, '0'); return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) }
+      const openTaskDay = (t) => {
+        const date = dkey(t.updatedAt || t.createdAt)
+        setDayM({ date, taskId: t.id, data: null })
+        get('/autotelic/day?date=' + date + '&taskId=' + encodeURIComponent(t.id)).then((r) => { if (r.ok) setDayM({ date, taskId: t.id, data: r }); else { toast(r.message || '没读到', 'err'); setDayM(null) } }).catch((e) => { toast(e.message, 'err'); setDayM(null) })
+      }
+      const clipText = (v, n) => { const t = String(v || ''); return t.length > n ? t.slice(0, n) + '…' : t }
+      // 审计行用纯文本堆叠（不玩 flex 固定宽），样式全部沿用页面既有类
+      const auditLine = (a, i) => h('div', { key: i, className: 'ab-small', style: { padding: '3px 0', borderBottom: '1px dashed var(--ab-line, #dbe5ea)', wordBreak: 'break-all' } },
+        a.kind === 'tool/denied'
+          ? h('span', { style: { color: '#c62828' } }, '⛔ ' + clipText((a.at || '').slice(11, 19) + '　' + (a.kind || '') + (a.tool ? ' · ' + a.tool : '') + '　' + clipText(a.outcome || a.args || '', 160), 220))
+          : clipText((a.at || '').slice(11, 19) + '　' + (a.kind || '') + (a.tool ? ' · ' + a.tool : '') + '　' + clipText(a.outcome || (typeof a.args === 'string' ? a.args : JSON.stringify(a.args) || ''), 160), 260))
+      const dayModal = dayM ? h('div', { style: { position: 'fixed', top: '0px', left: '0px', right: '0px', bottom: '0px', background: 'rgba(12,28,38,.45)', zIndex: '80', overflowY: 'auto', padding: '24px' }, onClick: () => setDayM(null) },
+        h('div', { className: 'ab-card', style: { maxWidth: '760px', margin: '0px auto' }, onClick: (e) => e.stopPropagation() },
+          h('div', { className: 'ab-flex', style: { alignItems: 'center', marginBottom: '8px' } },
+            h('b', null, '这条任务的流水账'),
+            h('span', { style: { flex: '1 1 auto', display: 'inline-block' } }),
+            h(Btn, { small: true, onClick: () => setDayM(null) }, '关闭')),
+          !dayM.data ? h(Empty, { icon: '⏳', text: '读账本中…' }) : h(TaskDayBody, { data: dayM.data, clipText, TASK_BADGE, auditLine }),
+        )) : null
+      const chain = s && s.audit && s.audit.chain
+      const lastBeat = s && s.heartbeats && s.heartbeats.length ? s.heartbeats[s.heartbeats.length - 1] : null
+      // 状态 pill：一眼看清「她在不在动 + 账本干不干净」
+      const pill = (cls, text) => h('span', { className: 'ab-pill' }, h('i', { className: cx('ab-dot', cls) }), text)
+      const pills = !s ? [pill('', '加载中…')] : [
+        pill(s.enabled ? (s.running ? '' : 'ok') : '', s.enabled ? (s.running ? '正在想' : '开着 · 待心跳') : '已关闭'),
+        pill(chain ? (chain.ok ? 'ok' : 'err') : '', chain ? (chain.ok ? '账本完整 · 今日 ' + (s.audit.today || 0) + ' 条' : '⚠ 账本断了') : '账本…'),
+        pill(s.audit && s.audit.wired ? 'ok' : '', s.audit && s.audit.wired ? '审计已接线' : '审计未接线'),
+        s.enabled ? pill('', lastBeat ? '上次心跳 ' + timeAgo(lastBeat.at) : '还没心跳') : null,
+      ].filter(Boolean)
+      // 「她在想的事」分页 + 状态筛选（点行还是打开这条任务的流水账）
+      const [tFilter, setTFilter] = useState('all')
+      const [tPage, setTPage] = useState(0)
+      const PER_PAGE = 6
+      const tFiltered = tasks.filter((t) => tFilter === 'all' || t.status === tFilter)
+      const tPages = Math.max(1, Math.ceil(tFiltered.length / PER_PAGE))
+      const tPageSafe = Math.min(tPage, tPages - 1)
+      const tShown = tFiltered.slice(tPageSafe * PER_PAGE, tPageSafe * PER_PAGE + PER_PAGE)
+      const STATUS_OPTS = [['all', '全部'], ['active', '在办'], ['done', '办成'], ['failed', '失败'], ['blocked', '卡住'], ['abandoned', '放弃']]
+      const taskLine = (t) => h('div', { key: t.id, className: 'ab-li', style: { cursor: 'pointer' }, title: '点开看这条任务的流水账', onClick: () => openTaskDay(t) },
+        h('div', { className: 'meta' },
+          h('b', null, t.title), ' ',
+          h('span', { className: 'ab-badge' }, TASK_BADGE[t.status] || t.status),
+          h('div', null, '好奇 ' + (t.score != null ? t.score.toFixed(2) : '?')),
+          h('div', null, timeAgo(t.updatedAt || t.createdAt))),
+        // 注意：.ab-li 是横排 flex，meta 之外的所有内容必须包进单个 .body（flex:1），
+        // 多塞一个直接子项就会被挤成零宽、文字一字一行竖排（少爷真机抓到的就是这个）
+        h('div', { className: 'body ab-small' },
+          h('div', null, t.reason),
+          t.why ? h('div', { style: { color: '#c62828' } }, '→ ' + t.why) : null))
+      // 复盘刊物：默认只露标题，点开才看全文（页面不都被长文淹没）
+      const jLine = (kind, d) => {
+        const open = openDay === kind + d.day
+        const head = h('div', { className: 'meta', style: { cursor: 'pointer' }, onClick: () => setOpenDay(open ? null : kind + d.day) },
+          h('b', null, (kind === 'daily' ? '每日一页' : '做梦') + ' · ' + d.day), ' ', h('span', { className: 'ab-muted ab-small' }, open ? '▲ 收起' : '▼ 展开'))
+        return h('div', { key: kind + d.day, className: 'ab-li' }, head,
+          open ? h('div', { className: 'body ab-small', style: { whiteSpace: 'pre-wrap' } }, d.text) : null)
+      }
+      const jAll = jr ? [...(jr.daily || []).map((d) => jLine('daily', d)), ...(jr.dreams || []).map((d) => jLine('dream', d))] : null
+      // ---------- 控件：数值 = 滑块 + 文本框；时间 = 原生 time 控件 + 一键清空 ----------
+      const A = 'ext.autotelic'
+      // 兼容旧版本面板 bug：设置被写进 ext.autotelic[""]，读取时把空键里的值并回父级。
+      const mergeLegacy = (v) => {
+        if (!v || typeof v !== 'object' || !v[''] || typeof v[''] !== 'object') return v || {}
+        const rest = { ...v }
+        delete rest['']
+        return { ...v[''], ...rest }
+      }
+      const aut = mergeLegacy(getPath(draft, A, {}))
+      const ap = (patch) => setDraft((previous) => {
+        const cur = mergeLegacy(getPath(previous, A, {}))
+        return setPath(previous, A, { ...cur, ...patch })
+      })
+      const dv = (k) => { const v = aut[k]; return v == null ? AUTOTELIC_DEFAULTS[k] : v }
+      // 数值双联：滑杆拖个大概，框里填精确值（照「桌宠·人物大小」那行的样式）
+      const NumRow = ({ label, hint, k, min, max, step = 1, suffix = '' }) => h(Row, { label, hint },
+        h('div', { className: 'ab-flex', style: { alignItems: 'center', gap: 8 } },
+          h('input', { type: 'range', min, max, step, style: { flex: 1, minWidth: 110, accentColor: 'var(--ab-sea, #2a86c6)' }, value: Number(dv(k)), onChange: (e) => ap({ [k]: Number(e.target.value) }) }),
+          h('input', { className: 'ab-input', type: 'number', min, max, step, style: { width: '84px' }, value: Number(dv(k)), onChange: (e) => { const v = Number(e.target.value); if (Number.isFinite(v)) ap({ [k]: v }) } }),
+          suffix ? h('span', { className: 'ab-muted ab-small', style: { whiteSpace: 'nowrap' } }, suffix) : null))
+      // 时间对（起~止）：原生 time 控件；两格都空 = 该功能关闭
+      const TimeRow = ({ label, hint, kf, kt, clearHint }) => h(Row, { label, hint },
+        h('div', { className: 'ab-flex', style: { alignItems: 'center', gap: 8 } },
+          h('input', { className: 'ab-input', type: 'time', style: { width: '118px' }, value: String(aut[kf] || ''), onChange: (e) => ap({ [kf]: e.target.value }) }),
+          h('span', { className: 'ab-muted ab-small' }, '到'),
+          h('input', { className: 'ab-input', type: 'time', style: { width: '118px' }, value: String(aut[kt] || ''), onChange: (e) => ap({ [kt]: e.target.value }) }),
+          h(Btn, { small: true, onClick: () => ap({ [kf]: '', [kt]: '' }) }, '清空=关'),
+          aut[kf] && aut[kt] ? h('span', { className: 'ab-muted ab-small' }, clearHint || '') : h('span', { className: 'ab-muted ab-small' }, '未启用')))
+      // 节奏预设：一键铺一整套作息；「恢复默认」回到出厂值
+      const PRESETS = {
+        default: { name: '恢复默认（出厂作息）', v: { quietFrom: '23:30', quietTo: '07:30', dailyReviewHour: 23, minBatchForReview: 3, dreamFrom: '03:00', dreamTo: '05:00', minCuriosity: 0.55, maxSteps: 8, maxTasksActive: 8, budgetActionsPerHour: 12, maxCandidates: 3 } },
+        standard: { name: '标准（23:30 睡，03 点做梦）', v: { quietFrom: '23:30', quietTo: '07:30', dailyReviewHour: 23, minBatchForReview: 3, dreamFrom: '03:00', dreamTo: '05:00' } },
+        night: { name: '夜猫子（02:00 睡，10:00 起）', v: { quietFrom: '02:00', quietTo: '10:00', dailyReviewHour: 1, minBatchForReview: 3, dreamFrom: '05:00', dreamTo: '07:00' } },
+        early: { name: '早起鸟（21:00 睡，05:00 起）', v: { quietFrom: '21:00', quietTo: '05:00', dailyReviewHour: 20, minBatchForReview: 3, dreamFrom: '23:00', dreamTo: '01:00' } },
+        always: { name: '全天候（不设安静时段）', v: { quietFrom: '', quietTo: '', dreamFrom: '', dreamTo: '', dailyReviewHour: 22, minBatchForReview: 3 } },
+      }
+      const [preset, setPreset] = useState('')
+      const applyPreset = (name) => {
+        setPreset(name)
+        if (name && PRESETS[name]) { ap(PRESETS[name].v); toast('已套用：' + PRESETS[name].name + '（记得点右下角「保存设置」）', 'ok') }
+      }
+      return h('div', { className: 'ab-grid' },
+        // ---------- 卡 1：总控 + 状态 + 动作 ----------
+        h(Card, { title: '自驱引擎（实验）', right: f.sw('ext.autotelic.enabled'), desc: 'v5：观察积累 → 定时回味/心念点火 → 三段决策环 → 行动单执行 → 技能沉淀 → 反馈回路。默认关闭；实验性功能，行为与配置面可能随版本调整。' },
+          h('div', { className: 'ab-flex', style: { flexWrap: 'wrap', gap: 6, marginBottom: 10 } }, pills),
+          h(Row, { label: '允许后台会话指定 preset', hint: '开着她做事才带工具（fs 只读；无 shell、无 QQ 工具）；关着只「想」不动' }, f.sw('ext.autotelic.presetIdOverride')),
+          chain && !chain.ok ? h('div', { className: 'ab-note err', style: { marginTop: 8 } }, '⚠ 账本断链 @ ' + chain.brokenAt.file + ' 第 ' + chain.brokenAt.line + ' 条：' + chain.brokenAt.reason) : null,
+          h('div', { style: { marginTop: 10, paddingTop: 10, borderTop: '1px dashed var(--ab-line, #dbe5ea)' } },
+            h('div', { className: 'ab-small ab-muted', style: { marginBottom: 6 } }, '手动推一把（开着总开关才有反应）：'),
+            h('div', { className: 'ab-flex' },
+              h(Btn, { small: true, kind: 'primary', onClick: () => act('run', '/autotelic/run'), disabled: busy === 'run' }, busy === 'run' ? h(Fragment, null, h('i', { className: 'ab-spin' }), ' 正在想…') : '现在想一轮'),
+              h(Btn, { small: true, onClick: () => act('step', '/autotelic/step'), disabled: busy === 'step' }, busy === 'step' ? h(Fragment, null, h('i', { className: 'ab-spin' }), ' 正在做…') : '推进一步'),
+              h(Btn, { small: true, onClick: doPreview, disabled: busy === 'preview' }, busy === 'preview' ? '预览中…' : '预览'),
+              h('span', { className: 'ab-muted ab-small' }, s && s.running ? '上一轮还没结束' : '')),
+            showPv && pv ? h('div', { className: 'ab-note', style: { marginTop: 8 } },
+              h('div', { className: 'ab-small' }, '素材 ' + pv.materialCount + ' 条 · 候选 ' + pv.candidates.length + ' 个（阈值 ' + pv.thresholds.minCuriosity + '）'),
+              pv.candidates.map((c) => h('div', { key: c.title, className: 'ab-small', style: { marginTop: 4 } }, '✓ 「' + c.title + '」 ' + c.score.toFixed(2) + ' — ' + c.reason)),
+              pv.rejected.slice(0, 3).map((x, i) => h('div', { key: i, className: 'ab-small ab-muted', style: { marginTop: 2 } }, '✗ 「' + x.title + '」 ' + x.score.toFixed(2) + ' — ' + x.why)),
+              // 预审否决（账本里记着的，2026-11-05 少爷定）：让她「想办但被拦下」的东西看得见
+              (s && s.screenVetoes && s.screenVetoes.length)
+                ? h('div', { style: { marginTop: 8, paddingTop: 8, borderTop: '1px dashed var(--ab-line, #dbe5ea)' } },
+                  h('div', { className: 'ab-small ab-muted' }, '立项前预审拦下的（6 小时内不再送审）：'),
+                  s.screenVetoes.slice(-5).reverse().map((v, i) => h('div', { key: i, className: 'ab-small ab-muted', style: { marginTop: 2 } }, '⊘ 「' + v.title + '」 — ' + v.why)))
+                : null) : null),
+        ),
+        // ---------- 卡 2：她在想的事 ----------
+        h(Card, { title: '她在想的事', desc: '进行中 ' + (sm.active || 0) + ' · 办成 ' + (sm.done || 0) + ' · 卡住 ' + (sm.blocked || 0) + ' · 放弃 ' + (sm.abandoned || 0) },
+          h(Row, { label: '筛选', hint: '只看某一类任务；点行看这条的流水账' },
+            h(Select, { value: tFilter, width: 130, onChange: (v) => { setTFilter(v); setTPage(0) }, options: STATUS_OPTS.map(([value, label]) => ({ value, label })) }),
+            h('span', { className: 'ab-muted ab-small' }, '共 ' + tFiltered.length + ' 条 · 第 ' + (tPageSafe + 1) + ' / ' + tPages + ' 页'),
+            h(Btn, { small: true, disabled: tPageSafe <= 0, onClick: () => setTPage(tPageSafe - 1) }, '‹ 上一页'),
+            h(Btn, { small: true, disabled: tPageSafe >= tPages - 1, onClick: () => setTPage(tPageSafe + 1) }, '下一页 ›')),
+          !s ? h(Empty, { icon: '⏳', text: '加载中…' })
+            : tShown.length === 0 ? h(Empty, { icon: '💭', text: tFiltered.length ? '这一页没有内容' : '账本还空着（或这个筛选下没有任务）。开着总开关等她心跳，或点上面的「现在想一轮」。' })
+              : h('div', { className: 'ab-list' }, tShown.map(taskLine))),
+        // ---------- 卡 3：节奏与预算（预设 + 滑块/时间控件） ----------
+        h(Card, { title: '节奏与预算', desc: '上限是你定的；她能往下调，永远调不上来。' },
+          h(Row, { label: '作息预设', hint: '一键铺一整套作息（安静时段 / 做梦 / 每日一页）；套用后点右下角「保存设置」才生效' },
+            h(Select, { value: preset, width: 220, onChange: applyPreset, options: [{ value: '', label: '选一套预设…' }, ...Object.entries(PRESETS).map(([k, p]) => ({ value: k, label: p.name }))] })),
+          NumRow({ label: '好奇分阈值', hint: '低于不立项；落选原因在「预览」里看', k: 'minCuriosity', min: 0, max: 1, step: 0.05 }),
+          NumRow({ label: '一轮最多立项', hint: '同样的方向不重复开坑', k: 'maxCandidates', min: 1, max: 5 }),
+          NumRow({ label: '同时进行的任务', hint: '到顶就不开新坑，在办的不受影响', k: 'maxTasksActive', min: 1, max: 16 }),
+          NumRow({ label: '单任务步数上限', hint: '失败 2 次也会卡住，不无限重试', k: 'maxSteps', min: 1, max: 32 }),
+          NumRow({ label: '动作数 / 小时', hint: '她动手的次数上限；超了这小时只想想', k: 'budgetActionsPerHour', min: 1, max: 120 }),
+          TimeRow({ label: '安静时段', kf: 'quietFrom', kt: 'quietTo', hint: '只禁打扰你，不禁她做事；清空 = 不启用', clearHint: '这段时间她不吵你' }),
+          NumRow({ label: '每日一页（几点）', hint: '她的自我总结时间', k: 'dailyReviewHour', min: 0, max: 23, suffix: '点' }),
+          NumRow({ label: '攒几件才评', hint: '攒够件数或到点，先到者为准', k: 'minBatchForReview', min: 1, max: 20, suffix: '件' }),
+          TimeRow({ label: '做梦窗口', kf: 'dreamFrom', kt: 'dreamTo', hint: '安静时段最深处做离线整理；清空 = 关闭做梦', clearHint: '到点她会做一次离线整理' }),
+        ),
+        // ---------- 卡 4：她的手 ----------
+        h(Card, { title: '她的手', desc: '框架代码（src/）对她锁死；Python 和用户模块是她攒本事的两条路。' },
+          h(Row, { label: 'Python', hint: '留空自动探测（滤商店假货）；探测不到时手填全路径（会先验真再存）' },
+            s && s.env && (s.env.pythonBin || s.env.bin) ? h('span', { className: 'ab-small', style: { color: 'var(--ab-ok)' } }, '✓ ' + (s.env.pythonBin || s.env.bin) + '（' + s.env.version + '）' + (s.env.source === 'configured' ? ' · 手填' : ' · 自动探测，已持久化')) : h('span', { className: 'ab-muted ab-small' }, '没探测到'),
+            f.text('ext.autotelic.pythonBin', { placeholder: '留空自动探测' }),
+            h(Btn, { small: true, disabled: busy === 'env', onClick: async () => {
+              setBusy('env')
+              try { const r = await post('/autotelic/env', { probe: true }); toast(r.hint || (r.ok ? '检测完了' : '没检测到'), r.ok && r.env && r.env.pythonBin ? 'ok' : 'err'); load() }
+              catch (e) { toast(e.message, 'err') } finally { setBusy('') }
+            } }, busy === 'env' ? '检测中…' : '重新检测')),
+          h(Row, { label: '允许跑 Python' }, f.sw('ext.autotelic.allowPython')),
+          NumRow({ label: '脚本超时', hint: '到点强杀，不悬挂', k: 'scriptTimeoutMs', min: 5000, max: 600000, step: 5000, suffix: '毫秒' }),
+          h(Row, { label: '允许写用户模块', hint: '只能写她自己的 modules/<id>/，写不到框架' }, f.sw('ext.autotelic.allowUserModules')),
+          h('div', { className: 'ab-small ab-muted', style: { margin: '6px 0 2px 2px' } },
+            '提案 ' + (s && s.proposals || 0) + ' 篇 · 攒着没说 ' + (s && s.sayPending || 0) + ' 句' + (s && s.sayPending ? '（安静时段她先把话攒下了）' : '')),
+          s && (s.skills || []).length ? h('div', { className: 'ab-list', style: { marginTop: 6 } }, s.skills.map((k) => h('div', { key: k.id, className: 'ab-li' },
+            h('div', { className: 'meta' }, h('b', null, k.id), ' ', h('span', { className: 'ab-badge' }, k.status === 'learned' ? '已学会' : k.status === 'retired' ? '已退役' : '候选'),
+              ' · 连胜 ' + (k.streak && k.streak.ok || 0) + ' / 连败 ' + (k.streak && k.streak.fail || 0)),
+            h('div', { className: 'body ab-small ab-muted' }, k.title)))) : null,
+        ),
+        // ---------- 卡 5：复盘与做梦 ----------
+        h(Card, { title: '复盘与做梦', desc: '每日一页必有一段「今天没敢说的」（段落在，内容不约束）；真实性靠账本对账。点条目展开全文。' },
+          !jr ? h(Empty, { icon: '⏳', text: '加载中…' })
+            : jAll && jAll.length ? h('div', { className: 'ab-list' }, jAll)
+              : h(Empty, { icon: '🌙', text: '还没有复盘。攒够几件完结、或到了每日一页的点儿，她会自己写。' })),
+        dayModal,
+      )
+    }
+
+    // 「这条任务的流水账」弹窗正文：单任务详情 + 它生命周期内的审计流水。
+    // 拆成独立组件，避免在 Autotelic 里写深嵌套的三元 + IIFE（括号数容易错，少爷真机抓过两次）。
+    function TaskDayBody({ data, clipText, TASK_BADGE, auditLine }) {
+      const t = data.task
+      if (!t) return h(Empty, { icon: '🕳️', text: data.message || '账本里没有这条任务了（可能被修剪掉）' })
+      const from = t.createdAt ? new Date(t.createdAt).toLocaleString() : '?'
+      const to = t.updatedAt ? new Date(t.updatedAt).toLocaleString() : '?'
+      const n = (v) => (v == null ? '?' : Number(v).toFixed(2))
+      const stepLine = (st2, i) => h('div', { key: i, className: 'ab-muted' },
+        '· 步 ' + (i + 1) + ' ' + st2.desc + ' → ' + st2.status
+        + (st2.attempts ? '（试 ' + st2.attempts + ' 次）' : '')
+        + (st2.observation ? '：' + clipText(st2.observation, 80) : '')
+        + (st2.why ? '：' + st2.why : ''))
+      return h('div', null,
+        h('div', { className: 'ab-small ab-muted', style: { marginBottom: '8px' } },
+          '立项于 ' + from + ' · 最近活动 ' + to + ' · 流水 ' + (data.audit || []).length + ' 条 · 笔记 ' + (data.notes || []).length + ' 篇'),
+        (data.notes || []).length ? h('div', { style: { marginBottom: '10px' } },
+          h('div', { className: 'ab-small ab-muted', style: { marginBottom: '4px' } }, '她写的笔记（notes/）：'),
+          (data.notes || []).map((nt) => h('div', { key: nt.file, style: { marginBottom: '8px' } },
+            h('div', { className: 'ab-small ab-muted' }, '📄 ' + nt.file + ' · ' + new Date(nt.at).toLocaleTimeString()),
+            h('div', { className: 'ab-small', style: { whiteSpace: 'pre-wrap', background: 'var(--ab-bg, #f6fafb)', padding: '10px', borderRadius: '8px', marginTop: '2px' } }, nt.text)))) : null,
+        h('div', { className: 'ab-li' },
+          h('div', { className: 'meta' },
+            h('b', null, t.title), ' ', h('span', { className: 'ab-badge' }, TASK_BADGE[t.status] || t.status),
+            h('div', null, '好奇 ' + n(t.score))),
+          h('div', { className: 'body ab-small' },
+            h('div', null, t.reason),
+            (t.steps || []).map(stepLine),
+            t.why ? h('div', { style: { color: '#c62828' } }, '→ ' + t.why) : null)),
+        h('div', { className: 'ab-small ab-muted', style: { margin: '10px 0px 4px 2px' } }, '这条任务的流水账（机械记录，从立项到最近一次活动）：'),
+        (data.audit || []).length ? h('div', null, (data.audit || []).map(auditLine))
+          : h('div', { className: 'ab-small ab-muted' }, '这条任务期间账本上没有工具调用（她只是想了想，或做事回合还没落账）。'))
+    }
     // 「目的机制」状态卡：链路计数、驱力条、目标假设、载体与节奏。数据走 /panel/purpose/* 代理（模块缺新接口时降级提示）。
-    const DRIVE_LABELS = { play: '玩', learn: '学', install: '装', connect: '连', care: '陪', share: '分', identity: '我', create: '创', consume: '收' }
+    const DRIVE_LABELS = { play: '玩闹', learn: '学习', install: '安装', connect: '陪伴', care: '关心', share: '分享', identity: '自我', create: '创作', consume: '体验' }
+    // 情绪图标：只为「上一轮的情绪」这一行做展示兜底。真正的图标/名字来自用户配的心情项
+    // （st.mood.emotionsItems 与 status.lastEmotionLabel），这里只是没配图标时的形状提示。
+    const EMOTION_ICONS = { curious: '🤔', excited: '🤩', lonely: '😔', envious: '😒', worried: '😟', proud: '😌', affectionate: '🥰', bored: '😐', amused: '😄', content: '😊' }
     const GOAL_OWNER_LABELS = { self: '自己', owner: '主人', member: '群友', media: '媒体' }
     const PACING_PRESETS = [{ value: 'conservative', label: '保守' }, { value: 'default', label: '默认' }, { value: 'active', label: '活跃' }]
     function PurposeStatus({ toast }) {
@@ -2216,9 +4229,16 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             h('div', { className: 'ab-muted ab-small' }, l), h('b', null, n == null ? '—' : n)))) : null,
         p.enabled && drives.length ? h(Row, { label: '驱力', hint: '越高越想说这类话题' },
           h('div', { style: { flex: 1, minWidth: 180 } }, drives.map(([k, v]) => h('div', { key: k, className: 'ab-flex', style: { marginBottom: 3 } },
-            h('span', { className: 'ab-small', style: { width: 28 } }, DRIVE_LABELS[k] || k),
+            h('span', { className: 'ab-small', style: { width: 42, flexShrink: 0 } }, DRIVE_LABELS[k] || k),
             h('div', { className: 'ab-mood', style: { flex: 1 } }, h('i', { style: { width: Math.round((v || 0) * 100) + '%' } })),
             h('span', { className: 'ab-muted ab-small', style: { width: 34, textAlign: 'right' } }, Math.round((v || 0) * 100) + '%'))))) : null,
+        // 心情进度条 2026-11-17 搬到「心情」页（数据源也换成了心情模块的 emotionsItems）：
+        // 它是她此刻的心情，不是这一轮的目的；目的引擎关掉时心情照常要显示。
+        // 这里只留「上一轮的情绪」这一个本回合的瞬时结果。
+        p.enabled ? h(Row, { label: '上一轮的情绪', hint: '这轮主动搭话时她的情绪（强弱措辞、桌宠气泡辉光用它）；跨轮的心情在「心情」页' },
+          h('span', { className: 'ab-muted ab-small' },
+            s.lastEmotionLabel ? (EMOTION_ICONS[s.lastEmotion] || '💭') + ' ' + s.lastEmotionLabel + (s.lastEmotionText ? ' · ' + s.lastEmotionText : '') : '还没有记录')) : null,
+        p.enabled && s.lastText ? h('div', { className: 'ab-note', style: { marginTop: -6 } }, '上次说：「' + s.lastText + '」') : null,
         p.enabled && goals.length ? h('div', { className: 'ab-list', style: { margin: '8px 0' } }, goals.map((g, i) => h('div', { key: g.id || i, className: 'ab-li' },
           h('div', { className: 'meta' }, (g.ownerLabel || GOAL_OWNER_LABELS[g.owner] || g.owner || '?') + ' · 置信 ' + Math.round((g.confidence || 0) * 100) + '% · 风险 ' + Math.round((g.risk || 0) * 100) + '%' + (g.status ? ' · ' + g.status : '')),
           h('div', { className: 'body' }, g.intent || g.object || '（没写意图）')))) : null,
@@ -2253,6 +4273,65 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
               cand ? '\n候选：\n' + cand : '',
               r.stats ? '\n素材 ' + (r.stats.selected ?? r.stats.total ?? '?') + ' 条，驱力 top：' + Object.entries(r.drives || {}).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k]) => DRIVE_LABELS[k] || k).join('、') : '')
           })()) : null,
+      )
+    }
+
+    // 「主动发言出站策略」卡片：档位、引擎状态、拦截统计。数据走 /panel/outbound-policy，
+    // 后端已把机器值翻成中文（view 字段），前端只管排版，不另维护翻译表。
+    function OutboundPolicy({ toast }) {
+      const [d, setD] = useState(null)
+      const [busy, setBusy] = useState('')
+      const load = () => get('/panel/outbound-policy').then((r) => { if (r.ok) setD(r.view) })
+      useEffect(() => { load(); const t = setInterval(load, 10000); return () => { clearInterval(t) } }, [])
+      if (!d) return null
+      const save = (patch, key) => async () => {
+        setBusy(key)
+        try {
+          const r = await post('/panel/outbound-policy', patch)
+          if (!r.ok) toast(r.message || '没保存上', 'err')
+          else { setD(r.view); toast('保存好了', 'ok') }
+        } catch (e) { toast(e.message) } finally { setBusy('') }
+      }
+      const toneColor = d.tone === 'ok' ? '#2e7d32' : d.tone === 'bad' ? '#c62828' : '#ef6c00'
+      return h(Card, {
+        title: '主动发言出站策略',
+        desc: '决定刷抖音、逛小黑盒、热榜巡游这类模块「刷完之后能不能直接私聊你」。关掉纳管时它们照旧直接发；开成门闸后，要先问主动搭话/目的引擎的意见。',
+      },
+        // 总体状态条：一句话说清现在到底管没管
+        h('div', { className: 'ab-card', style: { padding: '10px 12px', marginBottom: 10, borderLeft: '3px solid ' + toneColor } },
+          h('b', { style: { color: toneColor } }, d.headline),
+          h('div', { className: 'ab-muted ab-small', style: { marginTop: 4, lineHeight: 1.6 } }, d.summary)),
+        // 档位
+        h(Row, { label: '纳管档位', hint: d.tierHint },
+          h(Select, {
+            value: d.tier,
+            options: (d.tiers || []).map((t) => ({ value: t.value, label: t.label })),
+            onChange: (v) => save({ tier: v }, 'tier')(),
+          })),
+        h('div', { className: 'ab-muted ab-small', style: { margin: '-4px 0 8px 2px' } }, d.tierLabel),
+        // 策略源（谁在做决定）
+        h(Row, { label: '谁来判该不该说', hint: '自动 = 用当前就绪的那个引擎' },
+          h(Select, {
+            value: d.activeMode,
+            options: (d.activeOptions || []).map((o) => ({ value: o.value, label: o.label })),
+            onChange: (v) => save({ activePolicy: v }, 'active')(),
+          })),
+        d.sources && d.sources.length
+          ? h('div', { className: 'ab-list', style: { margin: '6px 0' } }, d.sources.map((s) => h('div', { key: s.name, className: 'ab-li' },
+            h('div', { className: 'meta' },
+              s.title + ' · ' + s.stateLabel + (s.reason ? ' · ' + s.reason : '')))))
+          : h('div', { className: 'ab-note' }, '还没有可用的引擎：请先打开「主动搭话」或「目的引擎」，否则没人来决定该不该说。'),
+        // 统计
+        d.stats && d.stats.length
+          ? h('div', { className: 'ab-flex', style: { gap: 8, flexWrap: 'wrap', margin: '8px 0' } },
+            d.stats.map((s) => h('div', { key: s.label, className: 'ab-card', style: { flex: '1 1 88px', padding: '8px 10px' }, title: s.hint },
+              h('div', { className: 'ab-muted ab-small' }, s.label),
+              h('b', null, s.value))))
+          : null,
+        d.ledger && d.ledger.length
+          ? h(Row, { label: '投递账本', hint: '由宿主代发的条目当前分布' },
+            h('span', { className: 'ab-muted ab-small' }, d.ledger.map((x) => x.label + ' ' + x.count).join(' · ')))
+          : null,
       )
     }
 
@@ -2302,6 +4381,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [bcfg, setBcfg] = useState(null)
       // 人物大小倍率的本地编辑态（0.5~2，点「保存」才下发）
       const [scVal, setScVal] = useState(null)
+      // 物理三参数（重力/弹力/动作频率）的本地编辑态：null = 还没动过，直接用服务端下发值；
+      // 改过就用本地值（改了一半别被 8 秒轮询冲掉），点各自的「保存」才下发
+      const [ph, setPh] = useState(null)
       const [bhErr, setBhErr] = useState('')
       const [quar, setQuar] = useState(null)
       const [quarErr, setQuarErr] = useState('')
@@ -2312,6 +4394,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [emUrl, setEmUrl] = useState(null)
       // 对话框（pet 1.0.5）配置草稿：快捷键/关键字/数字/城市要「保存」才下发，开关即点即存
       const [cc, setCc] = useState(null)
+      // 语音对讲（pet 1.2.0）配置草稿：热键/地址/音色/数字要「保存」才下发，开关与下拉即点即存。
+      // 独立草稿，不跟对话框的 cc 抢状态；null = 跟着服务端下发的 pet.voiceTalk 走。
+      const [cac, setCac] = useState(null)
       const load = async () => {
         const [pr, pu] = await Promise.all([get('/panel/pet/status'), get('/panel/purpose/status')])
         if (pr.ok) { setPet(pr.pet); setWs((old) => old || (pr.pet && pr.pet.whisper ? { ...pr.pet.whisper } : null)) }
@@ -2438,6 +4523,45 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       // 行为与安全：c = 本地草稿（改了一半别被 8 秒轮询冲掉）|| 服务端真值
       const c = bcfg || bh || {}
       const saveBehCfg = async (patch, msg) => { await savePet(patch, msg); setBcfg(null); loadBehavior() }
+      // ---------- 物理三参数（重力/弹力/动作频率）的草稿读写：null = 跟着服务端值走 ----------
+      const pv = (k, fallback) => (ph && ph[k] != null ? ph[k] : fallback)
+      const setPv = (k, v) => setPh((old) => ({ ...(old || {}), [k]: v }))
+      // 只清掉刚保存的那一项的草稿，别把另外两项改了一半的输入一起冲掉
+      const clearPv = (k) => setPh((old) => {
+        if (!old) return null
+        const next = { ...old }
+        delete next[k]
+        return Object.keys(next).length ? next : null
+      })
+      // 桌宠设置的写入通道：**优先走 /panel/pet/config**（宿主里专门给桌宠卡片开的那条白名单通道）。
+      // 白名单里已登记这六项（见 src/host.js /panel/pet/config 的 petGravity/petRestitution/
+      // petAnimRate/petShowBalance/petClickChase/petTeaseChase），正常情况走的就是这条正规路。
+      // 下面保留的 /save 回退**不是**主路径，而是「宿主白名单未同步」时的兼容退路：
+      // 用户装的模块比面板新时，会撞上「模块已有新设置键、宿主白名单还没补」的窗口期，
+      // 那会儿 /panel/pet/config 会以「没有可保存的字段」失败；有这条退路，控件不会在窗口期变成假控件。
+      // /save 是面板给扩展模块写设定的既有通用通道（{ ext: { 模块id: {...} } }），
+      // mergeFromPanel 深合并、normalize 只保留 ext 下的对象、不会丢未知键；
+      // 两条路最终都落到 ext.pet 这同一个地方，模块 api.settings() 读的就是它。
+      // 【教训 · 三处必须同步】模块 settings 新增键 → 本文件控件 + 宿主白名单 + 模块 defaults，缺一即假控件。
+      const savePetSetting = async (patch, okMsg) => {
+        let r = await post('/panel/pet/config', patch)
+        if (!r || r.ok === false) r = await post('/save', { ext: { pet: patch } })
+        if (r && r.ok !== false) { toast(okMsg || '保存好了', 'ok'); return true }
+        toast((r && r.message) || '没成功', 'err')
+        return false
+      }
+      // ---------- 语音对讲（pet 1.2.0）独立配置：从 pet.voiceTalk 读，写入仍走 savePetSetting ----------
+      // 服务端 status() 下发 pet.voiceTalk（hotkey/engine/rvc/rvcVoice/maxChars/asrUrl/sovitsUrl/
+      // micDeviceId/speakerDeviceId/asrReady/asrReason）。老模块只下发 pet.call 时兼容读取，
+      // 两者都没有时用安全默认值兜底照常渲染，这样模块升级顺序不同也不会白屏；
+      // 保存即写 ext.pet.call*（引擎等沿用 call* 键）+ ext.pet.voiceHotkey，宿主白名单见 host.js /panel/pet/config。
+      const CALL_DEFAULTS = { hotkey: 'Alt+Space', engine: 'native', rvc: false, rvcVoice: '', maxChars: 120, asrUrl: 'http://127.0.0.1:8000', sovitsUrl: 'http://127.0.0.1:9880', micDeviceId: '', speakerDeviceId: '', asrReady: null, asrReason: '' }
+      // 优先读新快照 pet.voiceTalk，老模块只有 pet.call 时兼容读取；状态字段（asrReady/asrReason）只在新快照里
+      const voiceTalk = pet?.voiceTalk || pet?.call || {}
+      const callCfg = { ...CALL_DEFAULTS, ...voiceTalk }
+      const cacVal = (k) => (cac && cac[k] != null ? cac[k] : callCfg[k])
+      const setCacVal = (k, v) => setCac((old) => ({ ...(old || {}), [k]: v }))
+      const saveCall = async (patch, msg) => { const ok = await savePetSetting(patch, msg); if (ok) setCac(null); return ok }
       return h('div', { className: 'ab-grid' },
         h(Card, { title: '桌宠', desc: '把「大肥鱼」请到桌面上：一个小小的ta待在屏幕角落，主动搭话走气泡；你也可以点ta聊天。' },
         h('div', { className: 'ab-flex', style: { marginBottom: 8 } },
@@ -2459,6 +4583,44 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         // 只有 1.0.4 以上的桌宠模块才支持松手落地开关（老模块不显示，免得拨了没反应）
         pet?.releaseLand != null ? h(Row, { label: '松手后落地', hint: '开：拖动松手后按甩出速度抛出去、落回屏幕底部（带 Q 弹挤压）。关：松手停在哪就在哪，不抛也不落' },
           h(Switch, { on: pet.releaseLand !== false, onChange: async (v) => { setBusy('land'); try { await savePet({ petReleaseLand: v }, v ? '松手落地已开启' : '松手落地已关闭：松手停在哪就在哪') } catch (e) { toast(e.message) } finally { setBusy(''); load() } } })) : null,
+        // ============================================================
+        // 【教训 · 面板是硬编码的，不是按模块 settings 自动渲染的】
+        // 桌宠是**内置模块**，它的 settings 数组（模块侧 declarative 声明）在面板里根本不会生成表单——
+        // 面板只给「用户自己从模块市场装的扩展模块」按 settings 渲染卡片。所以模块那边加了
+        // 设置项、defaults 也齐、/config 也下发，用户在面板上照样一个字都看不到：
+        //   **模块 settings 里新增一个键，必须同时在宿主这里补一个写入白名单（/panel/pet/config）
+        //     和一个本文件里的控件，否则就是「后端有、面板看不见」的半截功能。**
+        //   三处必须同步：模块 defaults/settings 声明 + 宿主 /panel/pet/config 白名单 + 本文件控件；
+        //   缺任何一处都是「假控件」（看得见、点了存不进去，轮询还会把值弹回去）。
+        // 下面这六项（重力/弹力/动作频率/查看余额/点击追鼠标/晃鼠标勾引追）就是 1.0.14 新加的，
+        // 全部用 pet 顶层实际下发的字段做守卫（老模块 1.0.13 及以前不会有这些字段）：
+        //   pet.physics?.gravity、pet.physics?.restitution、pet.animRate、
+        //   pet.balanceEnabled、pet.clickChase、pet.teaseChase
+        // 老模块下这一整段都不渲染，免得给用户看一堆拨了没反应的假控件。
+        // ============================================================
+        pet?.physics?.gravity != null ? h(Row, { label: '重力', hint: '下落加速度，越小飘得越久、越大落得越快（默认 1400）' },
+          h('div', { className: 'ab-flex', style: { alignItems: 'center', gap: 8 } },
+            h('input', { type: 'range', min: 200, max: 4000, step: 50, style: { flex: 1, minWidth: 120, accentColor: 'var(--ab-sea, #2a86c6)' }, value: Number(pv('gravity', pet.physics.gravity)), onChange: (e) => setPv('gravity', e.target.value) }),
+            h('input', { className: 'ab-input', type: 'number', min: 200, max: 4000, step: 50, style: { width: '84px' }, value: pv('gravity', pet.physics.gravity), onChange: (e) => setPv('gravity', e.target.value) }),
+            h(Btn, { small: true, disabled: busy === 'grav', onClick: async () => { const v = Number(pv('gravity', pet.physics.gravity)); if (!(v >= 200 && v <= 4000)) { toast('重力要填 200 ~ 4000 之间的数', 'err'); return } setBusy('grav'); try { const ok = await savePetSetting({ petGravity: Math.round(v) }, '重力已保存'); if (ok) clearPv('gravity') } finally { setBusy(''); load() } } }, busy === 'grav' ? '保存中…' : '保存'))) : null,
+        pet?.physics?.restitution != null ? h(Row, { label: '弹力', hint: '落地反弹保留速度比例，越大越 Q 弹（默认 0.78）' },
+          h('div', { className: 'ab-flex', style: { alignItems: 'center', gap: 8 } },
+            h('input', { type: 'range', min: 0.3, max: 0.95, step: 0.01, style: { flex: 1, minWidth: 120, accentColor: 'var(--ab-sea, #2a86c6)' }, value: Number(pv('restitution', pet.physics.restitution)), onChange: (e) => setPv('restitution', e.target.value) }),
+            h('input', { className: 'ab-input', type: 'number', min: 0.3, max: 0.95, step: 0.01, style: { width: '84px' }, value: pv('restitution', pet.physics.restitution), onChange: (e) => setPv('restitution', e.target.value) }),
+            h(Btn, { small: true, disabled: busy === 'rest', onClick: async () => { const v = Number(pv('restitution', pet.physics.restitution)); if (!(v >= 0.3 && v <= 0.95)) { toast('弹力要填 0.3 ~ 0.95 之间的数', 'err'); return } setBusy('rest'); try { const ok = await savePetSetting({ petRestitution: Math.round(v * 100) / 100 }, '弹力已保存'); if (ok) clearPv('restitution') } finally { setBusy(''); load() } } }, busy === 'rest' ? '保存中…' : '保存'))) : null,
+        pet?.animRate != null ? h(Row, { label: '动作频率', hint: '动画节奏倍率，>1 更活泼（默认 1）' },
+          h('div', { className: 'ab-flex', style: { alignItems: 'center', gap: 8 } },
+            h('input', { type: 'range', min: 0.5, max: 2, step: 0.1, style: { flex: 1, minWidth: 120, accentColor: 'var(--ab-sea, #2a86c6)' }, value: Number(pv('animRate', pet.animRate)), onChange: (e) => setPv('animRate', e.target.value) }),
+            h('input', { className: 'ab-input', type: 'number', min: 0.5, max: 2, step: 0.1, style: { width: '84px' }, value: pv('animRate', pet.animRate), onChange: (e) => setPv('animRate', e.target.value) }),
+            h('span', { className: 'ab-muted ab-small', style: { whiteSpace: 'nowrap' } }, '倍'),
+            h(Btn, { small: true, disabled: busy === 'anim', onClick: async () => { const v = Number(pv('animRate', pet.animRate)); if (!(v >= 0.5 && v <= 2)) { toast('动作频率要填 0.5 ~ 2 之间的数', 'err'); return } setBusy('anim'); try { const ok = await savePetSetting({ petAnimRate: Math.round(v * 10) / 10 }, '动作频率已保存'); if (ok) clearPv('animRate') } finally { setBusy(''); load() } } }, busy === 'anim' ? '保存中…' : '保存'))) : null,
+        // 查看余额 / 点击追鼠标 / 晃鼠标勾引追：三个开关，即点即存（跟「松手后落地」同一个范式）
+        pet?.balanceEnabled != null ? h(Row, { label: '查看余额', hint: '开 = 右键菜单显示「查看余额」（读当前 DeepSeek 账户余额）；默认开' },
+          h(Switch, { on: pet.balanceEnabled !== false, onChange: async (v) => { setBusy('bal'); try { await savePetSetting({ petShowBalance: v }, v ? '右键菜单会显示「查看余额」' : '右键菜单不再显示「查看余额」') } catch (e) { toast(e.message) } finally { setBusy(''); load() } } })) : null,
+        pet?.clickChase != null ? h(Row, { label: '点击追鼠标', hint: '开 = 点她会扑上来抓鼠标；默认关（不抓鼠标）' },
+          h(Switch, { on: pet.clickChase === true, onChange: async (v) => { setBusy('click'); try { await savePetSetting({ petClickChase: v }, v ? '点击会追鼠标了' : '点击不再抓鼠标') } catch (e) { toast(e.message) } finally { setBusy(''); load() } } })) : null,
+        pet?.teaseChase != null ? h(Row, { label: '晃鼠标勾引追', hint: '开 = 在她跟前晃鼠标她会扑上来；默认关（不抓鼠标）' },
+          h(Switch, { on: pet.teaseChase === true, onChange: async (v) => { setBusy('tease'); try { await savePetSetting({ petTeaseChase: v }, v ? '晃鼠标会勾引她追了' : '晃鼠标不再勾引她') } catch (e) { toast(e.message) } finally { setBusy(''); load() } } })) : null,
         // 只有 pet 1.0.5 以上的模块才有对话框（老模块不显示这些行，免得拨了没反应）
         chatCfg ? h('div', { style: { marginTop: 10, paddingTop: 10, borderTop: '1px dashed var(--ab-line, #dbe5ea)' } },
           h('div', { className: 'ab-small ab-muted', style: { marginBottom: 2 } },
@@ -2535,6 +4697,54 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         h(Row, { label: '表情预览', hint: '气泡与心情事件会用到这些表情' },
           h('div', { style: { flex: 1, display: 'flex', flexWrap: 'wrap', gap: 6 } },
             moods.map((m, i) => h('span', { key: (m.key || m) + i, className: 'ab-pill' }, moodLabel(m))))),
+        ),
+        // ---------- 语音对讲（1.2.0）：桌宠页里**独立的一张卡**，不是对话框卡的一部分 ----------
+        // 值从 pet.voiceTalk（兼容 pet.call）读，写入仍走 savePetSetting → /panel/pet/config。
+        // 下拉与开关即点即存；文本/数字用独立草稿 cac（改一半别被 8 秒轮询冲掉），点各自的「保存」才下发。
+        // toggle 模式：热键按一下开始听、再按一下发送；不设独立界面状态概念，只做收听与外放。
+        h(Card, { title: '语音对讲', desc: '按一下热键开始听、再按一下发送——大肥鱼「听到」（识别）→ 想（人格+记忆）→ 直接用系统音箱说出来，像智能音箱一样对讲。不弹窗、不发 QQ，设备由桌宠客户端上报。' },
+          h('div', { className: 'ab-small ab-muted', style: { marginBottom: 6 } },
+            '当前：' + (callCfg.engine === 'sovits' ? '本地 GPT-SoVITS' : callCfg.engine === 'voice' ? '「语音」页接管' : '系统原生')
+            + '｜触发热键：' + (callCfg.hotkey || '（未启用）')
+            + (callCfg.rvc ? '｜RVC 变声：' + (callCfg.rvcVoice || '未设音色') : '')),
+          // ASR 前置状态：未连通时红字显示人话原因，别等说完才报错（设计权威 §3）
+          callCfg.asrReady === false
+            ? h('div', { className: 'ab-small', style: { color: '#d9534f', marginBottom: 6 } }, '⚠ 识别未就绪：' + (callCfg.asrReason || '本地识别未连通，请配 faster-whisper 或开 DSH 语音输入'))
+            : callCfg.asrReady === true
+              ? h('div', { className: 'ab-small ab-muted', style: { marginBottom: 6 } }, '✓ 识别已就绪，可以开始对讲')
+              : null,
+          h(Row, { label: '触发热键', hint: '全局热键：按一下开始听、再按一下发送。留空 = 不启用' },
+            h('div', { className: 'ab-flex', style: { alignItems: 'center', gap: 8 } },
+              h('input', { className: 'ab-input', style: { width: 'min(200px, 100%)' }, placeholder: 'Alt+Space', value: cacVal('hotkey'), onChange: (e) => setCacVal('hotkey', e.target.value) }),
+              h(Btn, { small: true, disabled: busy === 'cfg', onClick: async () => { await saveCall({ voiceHotkey: String(cacVal('hotkey')).trim() }, '触发热键已保存') } }, '保存'))),
+          h(Row, { label: '麦克风设备 ID', hint: '桌宠客户端上报；空 = 系统默认。面板只显示当前值，要换设备请到桌宠客户端里选' },
+            h('span', { className: 'ab-muted ab-small' }, callCfg.micDeviceId || '系统默认')),
+          h(Row, { label: '扬声器设备 ID', hint: '桌宠客户端上报；空 = 系统默认外放' },
+            h('span', { className: 'ab-muted ab-small' }, callCfg.speakerDeviceId || '系统默认')),
+          h(Row, { label: '识别地址（callAsrUrl）', hint: '本地 faster-whisper 地址；DSH「语音输入」没开或音频不是 WAV 时退回这里。留空 = 回落内置默认 http://127.0.0.1:8000。识别未就绪看上面的提示' },
+            h('div', { className: 'ab-flex', style: { alignItems: 'center', gap: 8 } },
+              h('input', { className: 'ab-input', style: { width: 'min(320px, 100%)' }, placeholder: 'http://127.0.0.1:8000', value: cacVal('asrUrl'), onChange: (e) => setCacVal('asrUrl', e.target.value) }),
+              h(Btn, { small: true, disabled: busy === 'cfg', onClick: async () => { await saveCall({ callAsrUrl: String(cacVal('asrUrl')).trim() }, '识别地址已保存') } }, '保存'))),
+          h(Row, { label: '回答引擎（嘴）', hint: '只影响对讲里回答的声音，不改全局语音设置。系统原生 = edge 合成失败退 系统语音；本地 GPT-SoVITS = 用参考音频音色；语音页接管 = 豆包，你自选接管时才碰' },
+            h(Select, { value: cacVal('engine'), width: 320, options: [
+              { value: 'native', label: 'native 系统原生（默认，edge 合成，失败退 系统语音）' },
+              { value: 'sovits', label: 'sovits 本地 GPT-SoVITS（参考音频音色）' },
+              { value: 'voice', label: 'voice 语音页接管（豆包，自选才碰）' },
+            ], onChange: (v) => saveCall({ callEngine: v }, '回答引擎已保存') })),
+          h(Row, { label: 'GPT-SoVITS 地址', hint: '引擎选「本地 GPT-SoVITS」才用；参考音频沿用「语音」页的 gptsovits 配置。留空 = 回落内置默认 http://127.0.0.1:9880' },
+            h('div', { className: 'ab-flex', style: { alignItems: 'center', gap: 8 } },
+              h('input', { className: 'ab-input', style: { width: 'min(320px, 100%)' }, placeholder: 'http://127.0.0.1:9880', value: cacVal('sovitsUrl'), onChange: (e) => setCacVal('sovitsUrl', e.target.value) }),
+              h(Btn, { small: true, disabled: busy === 'cfg', onClick: async () => { await saveCall({ sovitsUrl: String(cacVal('sovitsUrl')).trim() }, 'GPT-SoVITS 地址已保存') } }, '保存'))),
+          h(Row, { label: 'RVC 变声', hint: 'TTS 出稿后用「翻唱」模块导入的音色再变一次声；翻唱没就绪时自动不变声并在状态里说明' },
+            h(Switch, { on: Boolean(cacVal('rvc')), onChange: (v) => saveCall({ callRvc: v }, v ? 'RVC 变声已开启' : 'RVC 变声已关闭') })),
+          h(Row, { label: '音色名', hint: '翻唱模块里导入的音色名（翻唱页能看到清单）；RVC 变声打开才生效' },
+            h('div', { className: 'ab-flex', style: { alignItems: 'center', gap: 8 } },
+              h('input', { className: 'ab-input', style: { width: 'min(200px, 100%)' }, placeholder: '如 小鱼', value: cacVal('rvcVoice'), onChange: (e) => setCacVal('rvcVoice', e.target.value) }),
+              h(Btn, { small: true, disabled: busy === 'cfg', onClick: async () => { await saveCall({ callRvcVoice: String(cacVal('rvcVoice')).trim() }, '音色名已保存') } }, '保存'))),
+          h(Row, { label: '一次最多字数', hint: '回答别太长，长了反而不像人（20~300 字，默认 120）' },
+            h('div', { className: 'ab-flex', style: { alignItems: 'center', gap: 8 } },
+              h('input', { className: 'ab-input', type: 'number', min: 20, max: 300, step: 1, style: { width: 96 }, value: cacVal('maxChars'), onChange: (e) => setCacVal('maxChars', e.target.value) }),
+              h(Btn, { small: true, disabled: busy === 'cfg', onClick: async () => { const v = Number(cacVal('maxChars')); if (!(v >= 20 && v <= 300)) { toast('一次最多字数要填 20 ~ 300 之间的数', 'err'); return } await saveCall({ callMaxChars: Math.round(v) }, '字数上限已保存') } }, '保存'))),
         ),
         // ---------- 素材包：默认形象包（大肥鱼）自动下载落位，也可在这里换镜像地址重下 ----------
         h(Card, { title: '素材包', desc: '桌宠的形象与动画（「大肥鱼」那 106 段）。插件发现缺包会自动从素材仓库下载落位，通常不用你动手；下载不动时可以在这里换镜像地址再重下。没有素材时桌宠会显示内置的静态形象（蓝色小鲸鱼）。' },
@@ -2769,7 +4979,214 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     }
 
     const SOURCE = { tool: 'ta自己记的', auto: '每日整理', diary: '空间日记', panel: '你加的', event: 'ta的经历', import: '导入的', abstract: '长期印象' }
+    // 心情项默认十项（与 src/features/mood-emotions.js 的 DEFAULT_EMOTIONS 对齐）：
+    // 只在草稿里还没有这个键时用来画「出厂长什么样」，真正的默认值由后端 normalize 补。
+    const EMOTION_DEFAULTS = [
+      { key: 'curious', label: '好奇', icon: '🤔', valence: 0.3, arousal: 0.6 },
+      { key: 'excited', label: '兴奋', icon: '🤩', valence: 0.8, arousal: 0.9 },
+      { key: 'lonely', label: '寂寞', icon: '😔', valence: -0.6, arousal: 0.3 },
+      { key: 'envious', label: '羡慕', icon: '😒', valence: -0.4, arousal: 0.5 },
+      { key: 'worried', label: '担心', icon: '😟', valence: -0.5, arousal: 0.6 },
+      { key: 'proud', label: '得意', icon: '😌', valence: 0.6, arousal: 0.5 },
+      { key: 'affectionate', label: '亲近', icon: '🥰', valence: 0.7, arousal: 0.4 },
+      { key: 'bored', label: '无聊', icon: '😐', valence: -0.2, arousal: 0.2 },
+      { key: 'amused', label: '好笑', icon: '😄', valence: 0.6, arousal: 0.7 },
+      { key: 'content', label: '平静', icon: '😊', valence: 0.2, arousal: 0.3 },
+    ]
+    // 心情项的键名规则与后端 EMOTION_KEY_RE 一致：小写字母开头，1~24 位
+    const EMOTION_KEY_RE = /^[a-z][a-z0-9_-]{0,23}$/
+
+    /**
+     * 心情项编辑器：增删项、改名字/图标、调正负倾向与强弱。
+     *
+     * 为什么不用 ListArea：心情项是「对象数组」，不是一行一个字符串——
+     * 名字、图标、正负、强弱都要能改，用 textarea 表达不出来（用户也分不清哪个字段是什么）。
+     * 交互照「生图备用接口」那套对象数组编辑（imageGen.fallbacks）：卡片 + 上下移 + 删除 + 添加。
+     */
+    function EmotionEditor({ value, onChange, disabled }) {
+      const list = Array.isArray(value) && value.length ? value : EMOTION_DEFAULTS
+      const setItem = (i, patch) => onChange(list.map((item, j) => (j === i ? { ...item, ...patch } : item)))
+      const remove = (i) => onChange(list.filter((_, j) => j !== i))
+      const move = (i, step) => {
+        const j = i + step
+        if (j < 0 || j >= list.length) return
+        const next = list.slice()
+        ;[next[i], next[j]] = [next[j], next[i]]
+        onChange(next)
+      }
+      // 新项的键必须唯一且合规：给个确定不会撞的默认键，用户想改再改（键是模型对齐用的，一般不用动）
+      const add = () => {
+        const used = new Set(list.map((item) => item.key))
+        let n = list.length + 1
+        while (used.has('emotion' + n)) n += 1
+        onChange([...list, { key: 'emotion' + n, label: '新心情', icon: '💭', valence: 0.2, arousal: 0.5 }])
+      }
+      return h('div', null,
+        h('div', { className: 'ab-small ab-muted', style: { marginBottom: 8 } },
+          '这些就是她「能有的情绪」。删掉某项后她不会再出现这种心情；改名字只影响显示与措辞，不影响已经记下的数据。正负（-1 难过 ~ +1 开心）和强弱（0 平淡 ~ 1 强烈）决定怎么说这句话。'),
+        list.map((item, i) => h('div', { key: item.key || ('e' + i), className: 'ab-note', style: { marginBottom: 8 } },
+          h('div', { className: 'ab-flex', style: { gap: 6, marginBottom: 6, alignItems: 'center' } },
+            h('span', { className: 'ab-muted ab-small', style: { width: 22, flexShrink: 0 } }, String(i + 1)),
+            h('input', {
+              className: 'ab-input sm', style: { width: 56, textAlign: 'center' }, value: item.icon || '', maxLength: 4,
+              title: '图标（可留空）', disabled,
+              onChange: (e) => setItem(i, { icon: e.target.value }),
+            }),
+            h('input', {
+              className: 'ab-input sm', style: { flex: 1, minWidth: 80 }, value: item.label || '', maxLength: 8,
+              title: '显示名字，最多 8 个字', disabled,
+              onChange: (e) => setItem(i, { label: e.target.value }),
+            }),
+            h(Btn, { small: true, disabled: disabled || i === 0, onClick: () => move(i, -1) }, '上移'),
+            h(Btn, { small: true, disabled: disabled || i === list.length - 1, onClick: () => move(i, 1) }, '下移'),
+            h(Btn, { small: true, kind: 'ghost', disabled: disabled || list.length <= 1, onClick: () => remove(i) }, '删除')),
+          h('div', { className: 'ab-flex', style: { gap: 10, alignItems: 'center', flexWrap: 'wrap' } },
+            h('span', { className: 'ab-muted ab-small', style: { width: 60, flexShrink: 0 } }, '正负'),
+            h('input', {
+              type: 'range', min: -1, max: 1, step: 0.1, style: { flex: 1, minWidth: 90 }, value: Number(item.valence) || 0, disabled,
+              onChange: (e) => setItem(i, { valence: Number(e.target.value) }),
+            }),
+            h('span', { className: 'ab-muted ab-small', style: { width: 34, textAlign: 'right' } }, (Number(item.valence) || 0).toFixed(1)),
+            h('span', { className: 'ab-muted ab-small', style: { width: 60, flexShrink: 0 } }, '强弱'),
+            h('input', {
+              type: 'range', min: 0, max: 1, step: 0.1, style: { flex: 1, minWidth: 90 }, value: Number(item.arousal) || 0, disabled,
+              onChange: (e) => setItem(i, { arousal: Number(e.target.value) }),
+            }),
+            h('span', { className: 'ab-muted ab-small', style: { width: 34, textAlign: 'right' } }, (Number(item.arousal) || 0).toFixed(1))),
+          h('div', { className: 'ab-muted ab-small', style: { marginTop: 4 } }, '键名（模型对齐用，一般不用改）：' + (item.key || '—'))))
+        ,
+        h('div', { className: 'ab-flex', style: { gap: 8, marginTop: 4 } },
+          h(Btn, { small: true, disabled: disabled || list.length >= 24, onClick: add }, '＋ 添加一项'),
+          h(Btn, { small: true, kind: 'ghost', disabled, onClick: () => onChange(EMOTION_DEFAULTS.map((item) => ({ ...item }))) }, '恢复出厂十项')),
+      )
+    }
+
+    // 心情页：单标量心情（打分/半衰期/模型判定）+ 情绪向量（心情项可配）+ ta自己的说话方式。
+    // 情绪向量 2026-11-17 从目的引擎页搬来这里：它是「她此刻的心情」，不是「这一轮的目的」，
+    // 目的引擎关掉时心情也要照常显示；两处各画一套进度条只会让人以为有两份心情。
     function Mood({ st, draft, setDraft, toast }) {
+      const f = useField(draft, setDraft)
+      // 「ta自己的说话方式」跟着心情页走：那是聊久了养成的说话习惯（人格/心情一部分），
+      // 不是记忆库设置。放在记忆页会让「记忆」那页混进一条不属于它的东西。
+      const [styles, setStyles] = useState({})
+      const loadIns = () => get('/insights').then((r) => setStyles(r.styles || {}))
+      useEffect(() => { if (modOn(st, 'memory')) loadIns() }, [modOn(st, 'memory')])
+      const stylesCard = h(Card, { title: 'ta自己的说话方式', desc: '聊久了慢慢养成的说法。不会变成另一个人，只是越来越像「你们的」大肥鱼。对每个人和每个群的相处经验、说话习惯在「人物记忆」页。' },
+        h(Row, { label: '使用学来的语气与相处建议', hint: '对所有群和私聊生效。关闭后不带入回复；学习和存档继续，事实记忆不受影响。改完请保存设置。' }, f.sw('memory.adaptStyle', { title: '使用学来的语气与相处建议' })),
+        h(StyleEditor, { k: 'self', label: 'ta自己养成的说法', list: styles.self || [], toast, onSaved: loadIns }))
+      // 心情历史：/state 只带摘要（history 被剥掉，e2e 锁着这个行为），
+      // 所以过去这段「因为…」列表一直渲染不出来。改从模块自带的 /mood/history 按需拉。
+      const [history, setHistory] = useState([])
+      useEffect(() => {
+        if (!modOn(st, 'mood')) return
+        get('/mood/history').then((r) => setHistory(Array.isArray(r.history) ? r.history : [])).catch(() => {})
+      }, [modOn(st, 'mood')])
+      const historyBlock = history.length ? h('div', { className: 'ab-list', style: { marginTop: 8 } }, history.slice(0, 6).map((x, i) => h('div', { key: i, className: 'ab-li' },
+        h('div', { className: 'meta' }, timeAgo(x.at)),
+        h('div', { className: 'body' }, (x.to >= x.from ? '↑ ' : '↓ ') + x.from + ' → ' + x.to, h('span', { className: 'ab-muted ab-small' }, '  ' + x.reason))))) : null
+      // 此刻的情绪（十项进度条）：数据来自 /state.mood.emotionsItems（心情模块下发），
+      // 不再读目的引擎的 status.moods——那是旧的两份心情，2026-11-17 已合并。
+      // st.mood 可能只有摘要（心情模块没跑时 /state 给的是空壳 {value,label,reason}），
+      // 取值一律走可选链：面板任何一页都不该因为「某个模块没跑」整页崩掉。
+      const emotionSource = st.mood || {}
+      const emotionItems = Array.isArray(emotionSource.emotionsItems) ? emotionSource.emotionsItems : []
+      const topEmotion = emotionSource.emotionTop || null
+      const emotionCard = !modOn(st, 'mood') ? null : h(Card, {
+        title: '此刻的情绪',
+        desc: '每种心情现在的强弱；会随时间淡去（下面「多久回到平常」就是它的半衰期），最近发生的事最明显。这一栏和上面的心情数值是同一份状态：数值是她整体高不高兴，这些是她具体在为什么情绪起伏。',
+      },
+        topEmotion
+          ? h('div', { className: 'ab-small', style: { marginBottom: 8 } }, h('b', null, (topEmotion.icon || '💭') + ' ' + topEmotion.label), h('span', { className: 'ab-muted' }, ' · 现在最明显'))
+          : h('div', { className: 'ab-small ab-muted', style: { marginBottom: 8 } }, '现在没什么明显的情绪（平平常常）。'),
+        emotionItems.map((item) => h('div', { key: item.key, className: 'ab-flex', style: { marginBottom: 3, opacity: (item.value || 0) > 0.02 ? 1 : 0.45 } },
+          h('span', { className: 'ab-small', style: { width: 84, flexShrink: 0 } }, (item.icon || '💭') + (item.label || item.key)),
+          h('div', { className: 'ab-mood', style: { flex: 1 } }, h('i', { style: { width: Math.round((item.value || 0) * 100) + '%' } })),
+          h('span', { className: 'ab-muted ab-small', style: { width: 34, textAlign: 'right' } }, Math.round((item.value || 0) * 100) + '%'))),
+        // 心情项（情绪表）跟着心情页走：增删改都是「她有哪些心情」，不是目的引擎的参数。
+        h(Card, { title: '心情项', collapsible: true, defaultOpen: false, className: 'ab-fold-sub', desc: '她有哪些情绪、各叫什么、偏正还是偏负、强还是弱。目的引擎判素材情绪、提示词里的措辞强弱，都按这张表走。' },
+          h(EmotionEditor, {
+            // 草稿里没这个键时按出厂十项显示（后端 normalize 也会补同样的默认值）
+            value: (draft.mood && Array.isArray(draft.mood.emotions) && draft.mood.emotions.length) ? draft.mood.emotions : EMOTION_DEFAULTS,
+            disabled: !modOn(st, 'mood'),
+            onChange: (list) => setDraft(setPath(draft, 'mood.emotions', list)),
+          })),
+      )
+      const moodCard = !modOn(st, 'mood') ? h(ModOff, { name: '心情' }) : h(Card, { title: '心情', right: f.sw('mood.enabled'), desc: '被夸、被哄、被凶都会影响ta的心情（对ta说的话、主人的话影响更大），过一阵子慢慢回到平常。心情好时ta话多、更爱发表情和语音、回得快、群里更爱插话；心情差时话少、回得慢、少发表情，还会带点小脾气。' },
+          h('div', { className: 'ab-flex', style: { marginBottom: 8 } }, h('b', null, emotionSource.label || '平平常常'), h('span', { className: 'ab-muted' }, (emotionSource.value ?? 60) + ' / 100'), emotionSource.reason ? h('span', { className: 'ab-muted ab-small' }, '· 因为' + emotionSource.reason) : null),
+          h('div', { className: 'ab-mood' }, h('i', { style: { width: Math.max(4, emotionSource.value ?? 60) + '%' } })),
+          h('div', { style: { marginTop: 10 } },
+            h(Row, { label: '多久回到平常', hint: '半衰期，心情数值和下面每种情绪都用它' }, f.range('mood.halfLifeHours', 0.5, 24, 0.5, (v) => v + ' 小时')),
+            h(Row, { label: '平常是多少', hint: '基线：没人说话时心情会慢慢往这个值靠（默认 60）' }, f.range('mood.base', 10, 90, 1, (v) => v + ' / 100')),
+            h(Row, { label: '聊天流水留多久', hint: '默认留 7 天，刚说过的话靠它想起来；0 = 整理完就删；-1 = 永久保留；其他数字 = 留这么多天。留得越久，本机存的聊天原文越多' }, f.num('memory.keepChatlogDays', { min: -1, max: 3650 })),
+            h(Row, { label: '整理时合并重复记忆', hint: '同一个人名下说的是一件事的条目并成一条。每个人多一次模型调用，默认关' }, f.sw('memory.mergeGroups')),
+            h(Row, { label: '用模型判断心情', hint: '每轮聊完用模型判一次（能分清开玩笑和真骂、ta主动找你时的心意），更准；每轮多一次很短的模型调用。关着就按关键词' }, f.sw('mood.judge'))),
+          historyBlock,
+        )
+      // 心情页：心情数值 + 此刻的情绪 + ta自己的说话方式
+      return h('div', { className: 'ab-grid' },
+        moodCard,
+        emotionCard,
+        stylesCard,
+      )
+    }
+
+    // 「心情与记忆」拆成两页：心情只管情绪状态和半衰期，记忆页管记忆库、星图、整理、联想、向量检索。
+    // 一页塞十几组设置太挤（实测要滚好几屏才能看到保存条），拆开后各管各的、找设置更快。
+    /**
+     * 记忆页外壳：「记忆条目」/「人物」两个子视图共用一个页签（照 VoiceTab 模式）。
+     * 关键约束：人物视图（PersonaMemory）只在 view==='person' 时挂载——不挂载即不拉人物列表。
+     */
+    function MemoryTab({ memoryView, setMemoryView, st, draft, setDraft, toast, go }) {
+      // 归一化：老用户存的 entries/person 继续有效；没存过 / 异常值一律落默认「星图」
+      const view = memoryView === 'entries' || memoryView === 'person' ? memoryView : 'starmap'
+      const tab = (id, label) => h('button', {
+        key: id, type: 'button', role: 'tab',
+        'aria-selected': view === id,
+        className: cx(view === id && 'on'),
+        onClick: () => setMemoryView(id),
+      }, label)
+      const seg = h('div', { className: 'ab-seg', role: 'tablist', 'aria-label': '记忆子视图' },
+        tab('starmap', '星图'), tab('entries', '记忆条目'), tab('person', '人物'))
+      return h('div', null,
+        h('div', { className: 'ab-flex', style: { margin: '0 0 12px' } }, seg),
+        view === 'person'
+          ? h(PersonaMemory, { toast })
+          : view === 'entries'
+            ? h(MemoryPage, { st, draft, setDraft, toast, go })
+            : h(StarMap, { toast }))
+    }
+
+    function MemoryBacklog() {
+      const [data, setData] = useState(null), [error, setError] = useState(''), [all, setAll] = useState(false)
+      async function refresh() {
+        setError('')
+        const r = await get('/memory/backlog')
+        if (!r.ok || !Array.isArray(r.chats)) { setError(r.message || '读取失败，请重试'); return }
+        setData(r)
+      }
+      const num = n => n.toLocaleString('zh-CN')
+      function label(c) {
+        const id = c.id.replace(/^(?:group|private):/, ''), name = c.name
+        if (name === c.id || name === id) return (c.id.startsWith('group:') ? '群 ' : c.id.startsWith('private:') ? '私聊 ' : '') + id
+        return h(Fragment, null, name, !name.endsWith(id) && h('small', { className: 'ab-muted' }, ' · ' + id))
+      }
+      return h('section', { 'aria-label': '整理进度', style: { margin: '12px 0' } },
+        h('div', { className: 'ab-flex' }, h('strong', null, '整理进度'), h('div', { className: 'ab-spacer' }),
+          h(Btn, { small: true, onClick: refresh }, data ? '刷新进度' : '查看待整理流水')),
+        !data && !error && h('div', { className: 'ab-muted ab-small' }, '只看进度，不会启动整理。'),
+        error && h('p', { role: 'alert' }, error),
+        data && h('div', { style: { marginTop: 8 } },
+          h('b', null, data.pending ? '待整理 ' + num(data.pending) + ' 行' : '没有待整理流水'),
+          h('span', { className: 'ab-muted ab-small' }, ' · 今日已用 ' + num(data.used) + ' / ' + num(data.limit) + ' 批'),
+          data.total > 0 && h('progress', { max: data.total, value: data.total - data.pending, 'aria-label': '纳入整理的流水已处理比例', style: { width: '100%', display: 'block', margin: '6px 0' } }),
+          h('div', { className: 'ab-small ab-muted' }, '纳入整理的流水已处理 ' + num(data.total - data.pending) + ' / ' + num(data.total) + ' 行' + (data.outOfScope ? ' · 不纳入整理 ' + num(data.outOfScope) + ' 行' : '') + (data.oldest ? ' · 最早待整理 ' + data.oldest : '') + ' · ' + new Date(data.at).toLocaleTimeString() + ' 更新'),
+          (all ? data.chats : data.chats.slice(0, 5)).map(c => h('div', { key: c.id, style: { display: 'flex', gap: 8, justifyContent: 'space-between', marginTop: 7 } },
+            h('span', { style: { minWidth: 0, overflowWrap: 'anywhere' } }, label(c)),
+            h('b', { style: { whiteSpace: 'nowrap' } }, num(c.pending) + ' 行'))),
+          data.chats.length > 5 && h(Btn, { small: true, onClick: () => setAll(!all) }, all ? '收起会话' : '查看全部 ' + data.chats.length + ' 个会话')))
+    }
+
+    function MemoryPage({ st, draft, setDraft, toast }) {
       const f = useField(draft, setDraft)
       const [mem, setMem] = useState(null)
       const [stats, setStats] = useState(null)
@@ -2779,7 +5196,25 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const capacity = memoryCapacity(draft.memory.capacity)
       const capacityTotal = Object.values(capacity).reduce((sum, n) => sum + n, 0)
       const [adding, setAdding] = useState({ text: '', aboutName: '', importance: 0.6 })
-      const load = (query) => get('/memories?q=' + encodeURIComponent(query ?? q)).then((r) => { setMem(r.items || []); setStats(r.stats || null) })
+      // 分页：首屏只取一页，点「加载更多」再按 offset 增量加载。
+      const [memMore, setMemMore] = useState(false)
+      const [memTotal, setMemTotal] = useState(0)
+      // 已加载条数单独记：不能拿 mem.length 当 offset——
+      // 删掉一条之后列表会变短，offset 就对不上，会重复取回已经看过的条目。
+      const [memLoaded, setMemLoaded] = useState(0)
+      const load = (query) => get('/memories?q=' + encodeURIComponent(query ?? q) + '&limit=' + MEMORY_PAGE_SIZE + '&offset=0').then((r) => {
+        const items = r.items || []
+        setMem(items); setStats(r.stats || null); setMemMore(!!r.hasMore)
+        setMemTotal(r.total ?? items.length); setMemLoaded(items.length)
+      })
+      const loadMore = async () => {
+        const r = await get('/memories?q=' + encodeURIComponent(q) + '&limit=' + MEMORY_PAGE_SIZE + '&offset=' + memLoaded)
+        if (!r || r.ok === false) return
+        const items = r.items || []
+        setMem((cur) => [...(cur || []), ...items])
+        setMemLoaded((n) => n + items.length)
+        setMemMore(!!r.hasMore); setMemTotal(r.total ?? memTotal)
+      }
       const [styles, setStyles] = useState({})
       const loadIns = () => get('/insights').then((r) => setStyles(r.styles || {}))
       const times = draft.memory.consolidateTimes || []
@@ -2788,101 +5223,270 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       useEffect(() => { if (memOn) { load(''); loadIns() } }, [memOn])
       useEffect(() => { if (!memOn) return; const t = setTimeout(() => load(q), 250); return () => clearTimeout(t) }, [q])
       const last = st.memory && st.memory.lastConsolidate
-      const moodCard = !modOn(st, 'mood') ? h(ModOff, { name: '心情' }) : h(Card, { title: '心情', right: f.sw('mood.enabled'), desc: '被夸、被哄、被凶都会影响ta的心情（对ta说的话、主人的话影响更大），过一阵子慢慢回到平常。心情好时ta话多、更爱发表情和语音、回得快、群里更爱插话；心情差时话少、回得慢、少发表情，还会带点小脾气。' },
-          h('div', { className: 'ab-flex', style: { marginBottom: 8 } }, h('b', null, st.mood.label), h('span', { className: 'ab-muted' }, st.mood.value + ' / 100'), st.mood.reason ? h('span', { className: 'ab-muted ab-small' }, '· 因为' + st.mood.reason) : null),
-          h('div', { className: 'ab-mood' }, h('i', { style: { width: Math.max(4, st.mood.value) + '%' } })),
-          h('div', { style: { marginTop: 10 } },
-            h(Row, { label: '多久回到平常', hint: '半衰期' }, f.range('mood.halfLifeHours', 0.5, 24, 0.5, (v) => v + ' 小时')),
-            h(Row, { label: '平常是多少', hint: '基线：没人说话时心情会慢慢往这个值靠（默认 60）' }, f.range('mood.base', 10, 90, 1, (v) => v + ' / 100')),
-            h(Row, { label: '聊天流水留多久', hint: '默认留 7 天，刚说过的话靠它想起来；0 = 整理完就删；-1 = 永久保留；其他数字 = 留这么多天。留得越久，本机存的聊天原文越多' }, f.num('memory.keepChatlogDays', { min: -1, max: 3650 })),
-            h(Row, { label: '整理时合并重复记忆', hint: '同一个人名下说的是一件事的条目并成一条。每个人多一次模型调用，默认关' }, f.sw('memory.mergeGroups')),
-            h(Row, { label: '用模型判断心情', hint: '每轮聊完用模型判一次（能分清开玩笑和真骂、ta主动找你时的心意），更准；每轮多一次很短的模型调用。关着就按关键词' }, f.sw('mood.judge'))),
-          (st.mood.history || []).length ? h('div', { className: 'ab-list', style: { marginTop: 8 } }, st.mood.history.slice(0, 6).map((x, i) => h('div', { key: i, className: 'ab-li' },
-            h('div', { className: 'meta' }, timeAgo(x.at)),
-            h('div', { className: 'body' }, (x.to >= x.from ? '↑ ' : '↓ ') + x.from + ' → ' + x.to, h('span', { className: 'ab-muted ab-small' }, '  ' + x.reason))))) : null,
-        )
-      if (!memOn) return h('div', { className: 'ab-grid' }, moodCard, h(ModOff, { name: '记忆' }))
+      if (!memOn) return h(ModOff, { name: '记忆' })
+      const chatlogRow = h(Row, { label: '聊天流水留多久', hint: '默认留 7 天，刚说过的话靠它想起来；0 = 整理完就删；-1 = 永久保留；其他数字 = 留这么多天。留得越久，本机存的聊天原文越多' }, f.num('memory.keepChatlogDays', { min: -1, max: 3650 }))
+      const mergeRow = h(Row, { label: '整理时合并重复记忆', hint: '同一个人名下说的是一件事的条目并成一条。每个人多一次模型调用，默认关' }, f.sw('memory.mergeGroups'))
+      // 「更多设置（N 项）」折叠子卡：与聊天页同口径——可见区只放少数高频组行，其余全收进来
+      const more = (title, items) => (items.length ? h(Card, { title: (title || '更多设置') + '（' + items.length + ' 项）', collapsible: true, defaultOpen: false, className: 'ab-fold-sub' }, items) : null)
       return h('div', { className: 'ab-grid' },
-        moodCard,
-        h(Card, { title: 'ta自己的说话方式', desc: '聊久了慢慢养成的说法。不会变成另一个人，只是越来越像「你们的」大肥鱼。对每个人和每个群的相处经验、说话习惯在「人物记忆」页。' },
-          h(StyleEditor, { k: 'self', label: 'ta自己养成的说法', list: styles.self || [], toast, onSaved: loadIns })),
-        h(Card, { title: '记忆库', right: f.sw('memory.enabled'), desc: '长期记忆：ta聊天时自己记的、每天从聊天里整理出来的、写过的空间日记、你手动加的。每一轮回复前，ta会按对方正在说的话翻出最相关的几条。' },
+        // ===== 可见组行 ① 记忆开关与整理（4 项，行内自由排版）=====
+        h(Card, { title: '记忆开关与整理', right: f.sw('memory.enabled'),
+          desc: '长期记忆：ta聊天时自己记的、每天从聊天里整理出来的、写过的空间日记、你手动加的。每一轮回复前，ta会按对方正在说的话翻出最相关的几条。' },
+          st.persona && !st.persona.claimPending ? h('p', { className: 'ab-muted ab-small', style: { marginTop: 0 } }, '这里是「' + (((st.personas || []).find((p) => p.id === st.persona.current) || {}).name || st.persona.current) + '」的记忆。每个人格的记忆分开存，切换人格后这里显示新人格的。') : null,
           h('div', { className: 'ab-grid ab-g4', style: { marginBottom: 12 } },
             h('div', { className: 'ab-card ab-stat' }, h('div', { className: 'n' }, stats ? stats.count : '–'), h('div', { className: 'l' }, '条长期记忆')),
             h('div', { className: 'ab-card ab-stat' }, h('div', { className: 'n' }, stats ? stats.auto : '–'), h('div', { className: 'l' }, '条来自每日整理' + (stats && stats.outdated ? '（另有 ' + stats.outdated + ' 条已过时）' : ''))),
             h('div', { className: 'ab-card ab-stat' }, h('div', { className: 'n', style: { fontSize: 16, paddingTop: 6 } }, last ? new Date(last.at).toLocaleString() : '还没整理过'), h('div', { className: 'l' }, '上次整理'))),
-          h(Row, { label: '每天自动整理两次', hint: '把临时记忆（聊天流水）提炼成长期记忆、相处经验和说话方式；第二次只处理新聊天，过了一天的流水整理完清空；各会话自己的上下文不受影响' },
-            f.sw('memory.dailyConsolidate'), h('span', { className: 'ab-muted' }, '每天'),
-            h('input', { className: 'ab-input sm', type: 'time', value: times[0] || '04:00', onChange: (e) => setTime(0, e.target.value) }),
-            h('span', { className: 'ab-muted' }, '和'),
-            h('input', { className: 'ab-input sm', type: 'time', value: times[1] || '16:00', onChange: (e) => setTime(1, e.target.value) }),
-            h(Btn, { small: true, onClick: async () => { toast('正在整理，可能要一两分钟…'); const r = await post('/memory/extract', {}); toast(r.message); load(); loadIns() } }, '现在整理一次')),
-          h(Row, { label: '自动记忆容量', hint: '默认 3000 条，可调高到 100000；聊天提炼、经历和日记按现有比例分配。手动记忆和分档事实不受此限制，过期与压缩规则照常生效。调低容量后，新记忆可能按原有规则替换旧的普通记忆。' },
-            h('input', {
-              className: 'ab-input sm', type: 'number', min: 3000, max: 100000, step: 1, 'aria-label': '自动记忆容量',
-              value: capacityInput === null ? capacityTotal : capacityInput,
-              onFocus: () => { capacityBeforeEdit.current = capacity },
-              onChange: (e) => {
-                const raw = e.target.value
-                setCapacityInput(raw)
-                const n = Number(raw)
-                if (raw !== '' && Number.isInteger(n) && n >= 3000 && n <= 100000) {
-                  setDraft(setPath(draft, 'memory.capacity', resizeMemoryCapacity(capacityBeforeEdit.current || capacity, n)))
-                }
+          h(MemoryBacklog, { key: st.persona?.current || 'current' }),
+          h('div', { className: 'ab-grp-row' },
+            h(Row, { label: '每天自动整理两次', hint: '把临时记忆（聊天流水）提炼成长期记忆、相处经验和说话方式；第二次只处理新聊天，过了一天的流水整理完清空；各会话自己的上下文不受影响' },
+              f.sw('memory.dailyConsolidate'), h('span', { className: 'ab-muted' }, '每天'),
+              h('input', { className: 'ab-input sm', type: 'time', value: times[0] || '04:00', onChange: (e) => setTime(0, e.target.value) }),
+              h('span', { className: 'ab-muted' }, '和'),
+              h('input', { className: 'ab-input sm', type: 'time', value: times[1] || '16:00', onChange: (e) => setTime(1, e.target.value) }),
+              h(Btn, { small: true, onClick: async () => { toast('正在整理，可能要一两分钟…'); const r = await post('/memory/extract', {}); toast(r.message); load(); loadIns() } }, '现在整理一次')),
+            h(Row, { label: '自动记忆容量', hint: '默认 3000 条，可调高到 100000；聊天提炼、经历和日记按现有比例分配。手动记忆和分档事实不受此限制，过期与压缩规则照常生效。' },
+              h('input', {
+                className: 'ab-input sm', type: 'number', min: 3000, max: 100000, step: 1, 'aria-label': '自动记忆容量',
+                value: capacityInput === null ? capacityTotal : capacityInput,
+                onFocus: () => { capacityBeforeEdit.current = capacity },
+                onChange: (e) => {
+                  const raw = e.target.value
+                  setCapacityInput(raw)
+                  const n = Number(raw)
+                  if (raw !== '' && Number.isInteger(n) && n >= 3000 && n <= 100000) {
+                    setDraft(setPath(draft, 'memory.capacity', resizeMemoryCapacity(capacityBeforeEdit.current || capacity, n)))
+                  }
+                },
+                onBlur: (e) => {
+                  const n = Number(e.target.value)
+                  if ((e.target.value === '' || !Number.isInteger(n) || n < 3000 || n > 100000) && capacityBeforeEdit.current) {
+                    setDraft(setPath(draft, 'memory.capacity', capacityBeforeEdit.current))
+                  }
+                  capacityBeforeEdit.current = null
+                  setCapacityInput(null)
+                },
+              }), h('span', { className: 'ab-muted' }, '条')),
+            chatlogRow,
+            mergeRow,
+          )),
+
+        // ===== 可见组行 ② 每轮想起多少（4 项核心参数，行内自由排版）=====
+        h(Card, { title: '每轮想起多少',
+          desc: '每轮回复前，ta 会按对方正在说的话翻出最相关的几条。这里是「想起多少」的调节。' },
+          h('div', { className: 'ab-grp-row' },
+            h(Row, { label: '每轮最多直接想起几条', hint: '「直接命中」的条数上限：按你说的关键词/意思直接对上的那几条。联想不占这个名额。' }, f.range('memory.recallCount', 0, 12, 1, (v) => v + ' 条')),
+            h(Row, { label: '每轮最多带几条联想', hint: '「间接想起」的条数上限：从上面那几条往外联想出来的。和直接想起各自独立，最后合在一起交给她。' }, f.range('memory.assoc.recall', 0, 8, 1, (v) => v + ' 条')),
+            h(Row, { label: '想起总数上限', hint: '直接 + 联想合起来的总条数；0 = 不额外限制（就等于「直接 N 条 + 联想 M 条」）。调小可以在上下文紧张时封顶。' },
+              f.num('memory.recallTotal', { min: 0, max: 24 }), h('span', { className: 'ab-muted' }, '条')),
+            h(Row, { label: '常驻记忆上限', hint: '每一轮都会带上的长期记忆最多多少字，超了从末尾截断。太小会显得忘事，太大会占上下文；默认 1200，范围 200~4000' }, f.num('memory.residentMaxChars', { min: 200, max: 4000 }), h('span', { className: 'ab-muted' }, '字')),
+          ),
+          h('div', { className: 'ab-note' }, '当前效果：每轮最多直接想起 ' + (draft.memory.recallCount ?? 6) + ' 条 + 联想 ' + (draft.memory.assoc?.recall ?? 3) + ' 条' + ((Number(draft.memory.recallTotal) || 0) > 0 ? '，总数封顶 ' + draft.memory.recallTotal + ' 条' : '（不额外限制总数') + '。'),
+          more('更多设置', [
+            h(Row, { key: 'pp', label: '私人记忆优先', hint: '想起相关记忆时，如果没在问 B站、视频、最近看了什么，优先带关于某个人 / 她自己记的；问具体视频时仍先想起视频' }, f.sw('memory.preferPersonal')),
+            h(Row, { key: 'rm', label: '召回最低相关度', hint: '默认 0，沿用原有检索门槛；调高会更挑剔，可能减少想起的线索。人物加分不会把无关内容抬过线，上一句和关联补充也要过线。' }, f.range('memory.recallMinRelevance', 0, 1, 0.05, (v) => Number(v).toFixed(2))),
+            h(Row, { key: 'md', label: '什么时候自动翻旧账' }, f.select('memory.recallMode', [{ value: 'always', label: '每轮都查' }, { value: 'trigger', label: '提到过去时才查' }])),
+            h(Row, { key: 'tg', label: '翻旧账的触发词', hint: '一行一个，也可用逗号分隔；主动查记忆的工具不受影响' }, f.list('memory.recallTriggers')),
+            h(Row, { key: 'st', label: '记得刚才聊到哪', hint: '同一个人在不同平台接着聊时，也能记得刚才聊到哪。每段聊天多一次很短的模型调用。' }, f.sw('memory.shortTerm')),
+            h(Row, { key: 'sh', label: '记住最近多久的聊天' }, f.num('memory.shortTermHours', { min: 0.1, step: 0.1 }), h('span', { className: 'ab-muted' }, '小时')),
+            h(Row, { key: 'si', label: '聊天停多久后整理' }, f.num('memory.shortTermIdleMinutes', { min: 0 }), h('span', { className: 'ab-muted' }, '分钟')),
+            h(Row, { key: 'sc', label: '刚才的印象最多多少字' }, f.num('memory.shortTermChars', { min: 1 }), h('span', { className: 'ab-muted' }, '字')),
+          ]),
+        ),
+
+        h(Fold, { title: '记忆联想与加深', icon: '🔗',
+          summary: '联想 ' + (draft.memory.assoc?.hops ?? 2) + ' 跳 · 已建 ' + (stats && stats.assoc ? stats.assoc : '–') + ' 条关联' },
+          h('div', { className: 'ab-note' }, '联想 = 按意思把相关的事连起来（「睡不好」能带出「熬夜」，再带出「考试焦虑」），靠本地向量建边，不花钱、不联网。A→B→C 就是「多跳」，下面能调跳数和总量上限，防止无限套娃。记忆加深 = 常被想起的事（含被联想带出来的）慢慢变重要、档位往上走。'),
+          // 联想依赖本地向量模型：模型没就绪时联想是静默失效的，必须在这里说清楚，
+          // 否则用户会以为「开关打开了、参数也调了，怎么一条联想都没有」。
+          ...(stats && stats.vectorLocal?.wanted && !stats.vectorLocal.ready && draft.memory.assoc?.enabled !== false
+            ? [h('div', { className: 'ab-note' }, '⚠️ 记忆联想现在还没生效：本地向量模型还没就绪（记忆本身仍能按关键词找）。模型第一次用到时会自动下载（约 23 MB），就绪后会自动开始建关联，不用再改设置。')]
+            : []),
+          ...(stats && stats.vectorLocal?.wanted && stats.vectorLocal.ready && stats.assoc === 0 && stats.count > 0 && draft.memory.assoc?.enabled !== false
+            ? [h('div', { className: 'ab-note' }, '⏳ 还没有可用的关联：已经有 ' + stats.count + ' 条记忆，系统会在下一分钟自动建边。')]
+            : []),
+          // 可见组行 ③ 只放 3 个最常用的：联想开关、相似门槛、联想跳数；其余进折叠
+          h('div', { className: 'ab-grp-row' },
+            h(Row, { label: '记忆联想', hint: '已建 ' + (stats && stats.assoc ? stats.assoc : '–') + ' 条关联' + (stats && stats.assocAt ? '（' + new Date(stats.assocAt).toLocaleString() + ' 更新）' : '') }, f.sw('memory.assoc.enabled')),
+            h(Row, { label: '多条相似才算关联', hint: '余弦相似度门槛，越高连得越少越准；默认 45%' }, f.range('memory.assoc.minSim', 0.3, 0.9, 0.05, (v) => Math.round(v * 100) + '%')),
+            h(Row, { label: '联想跳数', hint: '0 关、1 = A→B、2 = A→B→C（默认）、3 最多。再高就是套娃，已封顶。条数上限在上面「每轮最多带几条联想」里调' },
+              h('div', { className: 'ab-flex', style: { gap: 8 } }, ['0', '1', '2', '3'].map((v) => h('label', { key: v, className: 'ab-flex', style: { gap: 4, cursor: 'pointer', alignItems: 'center' } },
+                h('input', { type: 'radio', name: 'memory.assoc.hops', checked: String(draft.memory.assoc?.hops ?? 2) === v, onChange: () => setDraft(setPath(draft, 'memory.assoc.hops', Number(v))) }),
+                h('span', null, v === '0' ? '关' : v === '1' ? '1 跳' : v === '2' ? '2 跳' : '3 跳'))))),
+          ),
+          more('更多设置', [
+            h(Row, { key: 'al', label: '每条最多连几个', hint: '度上限，防止一条记忆连到半个库' }, f.num('memory.assoc.limit', { min: 1, max: 8 }), h('span', { className: 'ab-muted' }, '条')),
+            h(Row, { key: 'hd', label: '每多跳一次打几折', hint: '跳得越远越不可信，分数乘以这个系数；默认 55%' }, f.range('memory.assoc.hopDecay', 0.1, 1, 0.05, (v) => Math.round(v * 100) + '%')),
+            h(Row, { key: 'tg', label: '记忆加深（行为驱动升档）', hint: '被想起来的次数和天数够了，重要程度慢慢涨、档位往上走' }, f.sw('memory.tierGrow.enabled')),
+            h(Row, { key: 'ah', label: '联想带出的记忆也算想起', hint: '几次联想折算成「想起来一天」。2 = 联想两次算一次想起（比直接命中轻）；1 = 一样重' }, f.num('memory.tierGrow.assocPerHitDay', { min: 1, max: 20 }), h('span', { className: 'ab-muted' }, '次/天')),
+            h(Row, { key: 'pd', label: '被反复想起后每天涨多少', hint: '默认 0.02/天；要到下面「最少想起几天」才会计入' }, f.num('memory.tierGrow.perDay', { min: 0, max: 0.2, step: 0.01 })),
+            h(Row, { key: 'mh', label: '最少想起几天才开始算', hint: '默认 3 天；偶然想起一两次不该把她记的事推到重要档' }, f.num('memory.tierGrow.minHitDays', { min: 0, max: 60 }), h('span', { className: 'ab-muted' }, '天')),
+            h(Row, { key: 'cp', label: '重要程度上限', hint: '自动加深的天花板，留一点空间给模型标过的重要记忆；默认 0.85' }, f.range('memory.tierGrow.cap', 0, 1, 0.05, (v) => Math.round(v * 100) + '%')),
+            h(Row, { key: 't2', label: '升到「一般」要想起几天、多重要', hint: '默认 5 天且 ≥ 60%' },
+              f.num('memory.tierGrow.tier2.hitDays', { min: 0, max: 365 }), h('span', { className: 'ab-muted' }, '天 /'),
+              f.range('memory.tierGrow.tier2.imp', 0, 1, 0.05, (v) => Math.round(v * 100) + '%')),
+            h(Row, { key: 't3', label: '升到「重要」要想起几天、多重要', hint: '默认 10 天且 ≥ 75%' },
+              f.num('memory.tierGrow.tier3.hitDays', { min: 0, max: 365 }), h('span', { className: 'ab-muted' }, '天 /'),
+              f.range('memory.tierGrow.tier3.imp', 0, 1, 0.05, (v) => Math.round(v * 100) + '%')),
+            h(AssocPreview, { key: 'ap', toast }),
+          ]),
+        ),
+
+        // 低频调优参数统一收进「更多设置」折叠卡（defaultOpen=false：默认不展开，展开区才挂载控件）
+        // 内部仍按 Fold 分组（向量检索 / 重排 / 分层遗忘），保留各组的运行成本与依赖提示文案
+        more('高级调优', [
+        h(Fold, { key: 'vec', title: '向量检索（实验性）', icon: '🧭',
+          summary: stats ? '已同步 ' + (stats.vector || 0) + ' / ' + (stats.count || 0) + ' 条' : '' },
+          h('div', { className: 'ab-note' }, '默认关闭。打开后可以按意思找记忆：推荐用自带的本地小模型（纯离线、不联网、不花钱）；也可以改成自己的在线服务，那时会把记忆文字和查询文字发给你填的地址。'),
+          stats?.vectorLastError && stats.vectorLastErrorAt != null
+            ? h('div', { className: 'ab-note' }, '最近失败（' + new Date(stats.vectorLastErrorAt).toLocaleString() + '）：' + stats.vectorLastError)
+            : null,
+          h(Row, { label: '向量检索（实验性）', hint: '补充按意思找记忆；已同步 ' + (stats ? stats.vector || 0 : '–') + ' 条（可刷新页面查看）' }, f.sw('memory.vector.enabled')),
+          h(Row, { label: '检索方式', hint: '本地模型不用联网；在线服务需要自己准备兼容 OpenAI 的接口' },
+            h('div', { className: 'ab-flex', style: { gap: 8 } },
+              ['local', 'remote'].map((v) => h('label', {
+                key: v,
+                className: 'ab-flex',
+                style: { gap: 4, cursor: 'pointer', alignItems: 'center' },
               },
-              onBlur: (e) => {
-                const n = Number(e.target.value)
-                if ((e.target.value === '' || !Number.isInteger(n) || n < 3000 || n > 100000) && capacityBeforeEdit.current) {
-                  setDraft(setPath(draft, 'memory.capacity', capacityBeforeEdit.current))
-                }
-                capacityBeforeEdit.current = null
-                setCapacityInput(null)
-              },
-            }), h('span', { className: 'ab-muted' }, '条')),
-          h(Row, { label: '每轮最多想起几条' }, f.range('memory.recallCount', 0, 12, 1, (v) => v + ' 条')),
-          h(Row, { label: '什么时候自动翻旧账' }, f.select('memory.recallMode', [{ value: 'always', label: '每轮都查' }, { value: 'trigger', label: '提到过去时才查' }])),
-          h(Row, { label: '翻旧账的触发词', hint: '一行一个，也可用逗号分隔；主动查记忆的工具不受影响' }, f.list('memory.recallTriggers')),
-          h(Row, { label: '记得刚才聊到哪', hint: '同一个人在不同平台接着聊时，也能记得刚才聊到哪。每段聊天多一次很短的模型调用。' }, f.sw('memory.shortTerm')),
-          h(Row, { label: '记住最近多久的聊天' }, f.num('memory.shortTermHours', { min: 0.1, step: 0.1 }), h('span', { className: 'ab-muted' }, '小时')),
-          h(Row, { label: '聊天停多久后整理' }, f.num('memory.shortTermIdleMinutes', { min: 0 }), h('span', { className: 'ab-muted' }, '分钟')),
-          h(Row, { label: '刚才的印象最多多少字' }, f.num('memory.shortTermChars', { min: 1 }), h('span', { className: 'ab-muted' }, '字')),
-          h('div', { className: 'ab-section-title' }, '人物与群印象'),
-          h(Row, { label: '讨厌的人说话时不接的几率', hint: '消息仍会看到和记住；0% 表示照常回复，主人和一起说话的其他人不受影响' }, f.range('memory.dislikeSilence', 0, 1, 0.05, (v) => Math.round(v * 100) + '%')),
-          h(Row, { label: '每项人物印象最多多少字' }, f.num('memory.profileFieldChars', { min: 0 })),
-          h(Row, { label: '群里最多带几个人的画像' }, f.num('memory.profilePeople', { min: 0 })),
-          h(Row, { label: '人物画像总字数上限' }, f.num('memory.profileChars', { min: 0 })),
-          h(Row, { label: '记住群印象', hint: '只在对应的群里带上' }, f.sw('memory.chatImpression')),
-          h(Row, { label: '群印象字数上限' }, f.num('memory.chatImpressionChars', { min: 0 })),
-          h('div', { className: 'ab-section-title' }, '分层记忆与遗忘'),
+                h('input', {
+                  type: 'radio',
+                  name: 'memory.vector.mode',
+                  checked: (draft.memory.vector?.mode === 'remote' ? 'remote' : 'local') === v,
+                  onChange: () => setDraft(setPath(draft, 'memory.vector.mode', v)),
+                }),
+                h('span', null, v === 'local' ? '本地模型（离线，推荐）' : '在线服务（自己配'))))),
+          ...((draft.memory.vector?.mode === 'remote')
+            ? [
+                h(Row, { label: '服务预设', hint: '只是帮你填地址和模型，填完还能改' },
+                  f.select('memory.vector.provider', [
+                    { value: 'siliconflow', label: '硅基流动' },
+                    { value: 'ark', label: '火山方舟（豆包）' },
+                    { value: 'openai', label: 'OpenAI' },
+                    { value: 'ollama', label: '本地 Ollama' },
+                    { value: 'custom', label: '其他兼容服务' },
+                  ], { width: 220 }),
+                  h(Btn, {
+                    small: true, kind: 'ghost',
+                    onClick: () => {
+                      const p = draft.memory.vector?.provider || 'siliconflow'
+                      const preset = {
+                        siliconflow: ['https://api.siliconflow.cn/v1', 'BAAI/bge-m3'],
+                        ark: ['https://ark.cn-beijing.volces.com/api/v3', 'doubao-embedding-large-text-250515'],
+                        openai: ['https://api.openai.com/v1', 'text-embedding-3-small'],
+                        ollama: ['http://127.0.0.1:11434/v1', 'bge-m3'],
+                      }[p]
+                      if (!preset) return toast('自定义服务请自己填地址和模型')
+                      let next = setPath(draft, 'memory.vector.baseUrl', preset[0])
+                      next = setPath(next, 'memory.vector.model', preset[1])
+                      setDraft(next)
+                    },
+                  }, '填入推荐值')),
+                h(Row, { label: '服务地址', hint: 'OpenAI 兼容接口根地址，一般以 /v1 结尾；方舟是 /api/v3' }, f.text('memory.vector.baseUrl', { size: 'wide', placeholder: 'https://api.siliconflow.cn/v1' })),
+                h(Row, { label: '模型', hint: '硅基 BAAI/bge-m3；方舟填控制台开通的 doubao-embedding-*' }, f.text('memory.vector.model', { size: 'wide', placeholder: 'BAAI/bge-m3' })),
+                h(Row, { label: 'API Key', hint: '只存在本机，面板不回显；本地服务可留空' }, f.text('memory.vector.apiKey', { type: 'password', placeholder: draft.memory.vector?.apiKeySet ? '已保存（不改就留空）' : '没有就留空' })),
+                h(Row, { label: '自定义请求头', hint: '一行一个「Key: Value」；给 OneAPI/NewAPI 之类加额外头。填了 Authorization 就不再自动加 Bearer' },
+                  f.area('memory.vector.headers', { size: 'wide', rows: 2, placeholder: 'X-Api-Key: ...' })),
+                h(Row, { label: '向量维度', hint: '0 = 不传；Qwen3 / OpenAI 的 MRL 模型可以截断，改完建议重建索引' }, f.num('memory.vector.dimensions', { min: 0, max: 8192 })),
+                h(Row, { label: '每批多少条', hint: '方舟等单次 input 上限小，默认 10；本地服务可以调大' }, f.num('memory.vector.batchSize', { min: 1, max: 64 })),
+                h(Row, { label: '查询超时', hint: '超过就这一轮先用关键词，不拖慢回复' }, f.num('memory.vector.queryTimeoutMs', { min: 500, max: 15000, step: 500 })),
+                h('div', { className: 'ab-flex', style: { marginTop: 6 } },
+                  h(Btn, { small: true, onClick: async () => { const r = await post('/memory/vector/test', { text: '今天想吃白米饭' }); toast(r.ok ? `向量正常：${r.dims} 维，用时 ${r.ms}ms` : r.message); await load(q) } }, '测试'),
+                  h(Btn, { small: true, kind: 'ghost', onClick: async () => { toast('正在按已保存的设置重建，条数多会分批…'); const r = await post('/memory/vector/rebuild', {}); toast(r.message); setTimeout(() => load(q), 1500) } }, '重建索引')),
+                h('div', { className: 'ab-muted ab-small' }, '「测试」用已保存的设置；改完先点底部保存，再测试/重建。'),
+              ]
+            : [
+                h('div', { className: 'ab-note' }, '本地模型：bge-small-zh-v1.5（512 维），第一次使用时自动下载（约 23 MB，存到插件数据目录的 models 文件夹）。没装向量运行时会自动退回关键词检索，不影响其他功能。'),
+                ...((stats && stats.vectorModel && stats.vectorModel.running)
+                  ? [h('div', { className: 'ab-note' }, '⏳ 正在下载本地模型：' + (stats.vectorModel.file || '准备中') + '（' + Math.round((stats.vectorModel.bytes || 0) / 1048576) + ' MB）。下完会自动开始建索引，期间先按关键词找记忆。')]
+                  : []),
+                ...((stats && stats.vectorModel && stats.vectorModel.error && !stats.vectorReady)
+                  ? [h('div', { className: 'ab-note' }, '⚠️ ' + stats.vectorModel.error + '。现在会按关键词找记忆，装好模型后会自动开始索引；也可以自己把 model_int8.onnx / vocab.txt 放进数据目录的 models 文件夹。')]
+                  : []),
+                // 模型「还没有」且不正在下载、也没有报错 —— 这时联想是静默失效的，
+                // 以前面板一句话都不说，用户只会觉得「联想怎么没反应」。
+                // 这正是从 Release 安装、assets 缺失时的真实状态。
+                ...((stats && stats.vectorLocal?.wanted && !stats.vectorLocal.ready && !(stats.vectorModel && stats.vectorModel.running) && !(stats.vectorModel && stats.vectorModel.error) && draft.memory.vector?.enabled)
+                  ? [h('div', { className: 'ab-note' }, '⏳ 本地模型还没下载好：记忆能用（按关键词找），但「记忆联想」要等模型就绪才会生效。第一次用到时会自动下载（约 23 MB），下一分钟开始。')]
+                  : []),
+                ...((draft.memory.vector?.enabled && stats && (stats.vector || 0) === 0 && (stats.count || 0) > 0 && stats.vectorReady)
+                  ? [h('div', { className: 'ab-note' }, '⏳ 等待开始建索引：' + (stats.count || 0) + ' 条记忆还没同步，下一分钟会自动开始。')]
+                  : []),
+                ...((draft.memory.vector?.enabled && (stats ? (stats.vector || 0) < (stats.count || 0) && (stats.vector || 0) > 0 : false))
+                  ? [h('div', { className: 'ab-note' }, '⏳ 正在后台建立索引：' + (stats.vector || 0) + ' / ' + (stats.count || 0) + ' 条。分批进行，不影响聊天；索引没建完时先按关键词找记忆。')]
+                  : []),
+                h('div', { className: 'ab-note' }, '空间占用约每万条记忆 26 MB；换模型后需要重新索引。'),
+              ]),
+        ),
+
+        h(Fold, { title: '重排候选（Reranker，可选）', icon: '🎯' },
+          h('div', { className: 'ab-note' }, '语义检索会多取一些候选，再由重排模型按「查询 + 记忆」逐条打分，取最相关的几条进提示词。默认关；地址/Key 留空会复用 embedding 服务。超时或失败自动保留原顺序，不影响回复。'),
+          h(Row, { label: '启用重排', hint: '只在已经通过群聊/人物权限过滤的候选上跑' }, f.sw('memory.rerank.enabled')),
+          h(Row, { label: '服务地址', hint: '留空复用 embedding 的地址' }, f.text('memory.rerank.baseUrl', { size: 'wide', placeholder: 'https://api.siliconflow.cn/v1' })),
+          h(Row, { label: '重排模型' }, f.text('memory.rerank.model', { size: 'wide', placeholder: 'BAAI/bge-reranker-v2-m3' })),
+          h(Row, { label: 'API Key', hint: '留空复用 embedding 的 Key' }, f.text('memory.rerank.apiKey', { type: 'password', placeholder: '没有就留空' })),
+          h(Row, { label: '取前多少条候选重排' }, f.num('memory.rerank.topN', { min: 2, max: 50 }), h('span', { className: 'ab-muted' }, '条')),
+          h(Row, { label: '超时多少毫秒放弃' }, f.num('memory.rerank.timeoutMs', { min: 500, max: 10000 }), h('span', { className: 'ab-muted' }, 'ms')),
+          h('div', { className: 'ab-flex', style: { marginTop: 6 } },
+            h(Btn, { small: true, onClick: async () => {
+              const r = await post('/memory/rerank/test', { text: '主人喜欢吃什么' })
+              if (r.moduleOff) toast('重排接口还没生效：把 DSH 完全退出再打开，不是刷新页面')
+              else toast(r.ok ? `重排正常：${r.model}，最高分 ${Number(r.score).toFixed(3)}` : r.message)
+            } }, '测试重排')),
+          h('div', { className: 'ab-muted ab-small' }, '重排只处理已经通过群聊/人物权限过滤的候选，不会看到不该带出的记忆。'),
+        ),
+
+        // 人物与群印象：低频画像开关与字数上限，收进折叠（保留 7 项）
+        more('人物与群印象', [
+          h(Row, { key: 'oa', label: '只记住有交集的人', hint: '只给私聊过、在群里 @ 她、回复她或被她回复过的人，以及 QQ 好友和白名单朋友建立人物记忆。路过群友不占位置，群里的公共事情照常记；已有画像保留。' }, f.sw('memory.profileOnlyAcquainted')),
+          h(Row, { key: 'ds', label: '讨厌的人说话时不接的几率', hint: '消息仍会看到和记住；0% 表示照常回复，主人和一起说话的其他人不受影响' }, f.range('memory.dislikeSilence', 0, 1, 0.05, (v) => Math.round(v * 100) + '%')),
+          h(Row, { key: 'fc', label: '每项人物印象最多多少字' }, f.num('memory.profileFieldChars', { min: 0 })),
+          h(Row, { key: 'pp', label: '群里最多带几个人的画像' }, f.num('memory.profilePeople', { min: 0 })),
+          h(Row, { key: 'pc', label: '人物画像总字数上限' }, f.num('memory.profileChars', { min: 0 })),
+          h(Row, { key: 'ci', label: '记住群印象', hint: '只在对应的群里带上' }, f.sw('memory.chatImpression')),
+          h(Row, { key: 'cc', label: '群印象字数上限' }, f.num('memory.chatImpressionChars', { min: 0 })),
+        ]),
+
+        h(Fold, { title: '分层记忆与遗忘', icon: '📚' },
           h(Row, { label: '压缩旧聊天和记忆', hint: '原话到期前先压成梗概；失败或预算不足时保留原文' }, f.sw('memory.gistEnabled')),
           h(Row, { label: '梗概过多少天变成印象' }, f.num('memory.gistDays', { min: 0 })),
           h(Row, { label: '印象保留多少天' }, f.num('memory.impressionDays', { min: 0 })),
           h(Row, { label: '每天最多压缩多少批', hint: '压缩同时占用下面的每日整理批次' }, f.num('memory.gistDailyBatches', { min: 0 })),
           h(Row, { label: '每天整理和压缩共用批次' }, f.num('memory.extractDailyBatches', { min: 0 })),
-          h(Row, { label: '琐碎事实保留多少天' }, f.num('memory.tierDays.1', { min: 0 })),
-          h(Row, { label: '一般事实保留多少天' }, f.num('memory.tierDays.2', { min: 0 })),
-          h(Row, { label: '重要事实保留多少天', hint: '永久档不会自动过期；没有档位的老记忆沿用原来的遗忘方式' }, f.num('memory.tierDays.3', { min: 0 })),
+          // 档位天数：用后端 factTiers 动态生成（beta 侧把档位表改成后端下发，
+          // 硬编码 3 个会让新增的档位没法配天数）
+          ...(stats?.factTiers || []).filter((t) => t.days !== null).map((t) => h(Row, { key: t.id, label: t.label + '事实保留多少天' },
+            f.num('memory.tierDays.' + t.id, { min: 0 })),
+          ),
+          h(Row, {
+            label: '忘得多快',
+            hint: '默认 20 天。数值越小忘得越快、越像真人：8 左右时一天后剩七成、一个月后基本淡忘；20 时普通记忆约两个月才淡掉。重要度 0.6 以上的和永久档不受影响。',
+          }, f.num('memory.retentionBase', { min: 1, max: 365 }), h('span', { className: 'ab-muted' }, '天')),
           h(Row, { label: '把细节浓缩成长期印象', hint: '具体的事慢慢淡忘，留下更概括的关系和感受（比如「主人很疼她，总惦记她爱吃的东西」）。这些印象不会被自动整理改掉，也不会过期；手动加的和你自己总结的不会被压缩。每次整理最多多两次模型调用，默认开。' }, f.sw('memory.compress')),
           h(Row, { label: '多久以前的事开始浓缩', hint: '这些天以前的琐碎记忆才会被概括；最近的事先留着具体细节。默认 14 天' }, f.num('memory.compressAfterDays', { min: 1, max: 365 }), h('span', { className: 'ab-muted' }, '天')),
           h(Row, { label: '私聊时想起别处的话', hint: '和你私聊时，带上她最近 24 小时在别的聊天里说过的话，每轮多占约 300 字。只进你的私聊，别处一律不带。默认关。' }, f.sw('memory.crossContext')),
-          h('div', { className: 'ab-section-title' }, '向量检索（实验性）'),
-          h('div', { className: 'ab-note' }, '默认关闭。请自己准备兼容 OpenAI 的 embedding 服务，例如 Ollama 的 bge-m3。开启后会把记忆文字和查询文字发给填写的地址；使用云端服务时请自行确认。'),
-          h(Row, { label: '向量检索（实验性）', hint: '补充按意思找记忆；已同步 ' + (stats ? stats.vector || 0 : '–') + ' 条（可刷新页面查看）' }, f.sw('memory.vector.enabled')),
-          h(Row, { label: '服务地址', hint: '填写兼容 OpenAI 的接口根地址，一般以 /v1 结尾' }, f.text('memory.vector.baseUrl', { size: 'wide', placeholder: 'http://127.0.0.1:11434/v1' })),
-          h(Row, { label: '模型' }, f.text('memory.vector.model', { size: 'wide', placeholder: 'bge-m3' })),
-          h(Row, { label: 'API Key', hint: '不需要密钥的本地服务可留空' }, f.text('memory.vector.apiKey', { type: 'password', placeholder: draft.memory.vector?.apiKeySet ? '已保存（不改就留空）' : '没有就留空' })),
-          h('div', { className: 'ab-section-title' }, '手动加一条'),
-          h('div', { className: 'ab-flex' },
+        ),
+        ]),
+
+        h(Fold, { title: '手动加一条', icon: '✍️', summary: '你想让她一定记住的事' },
+          h('div', { className: 'ab-flex', style: { gap: 8, flexWrap: 'wrap' } },
             h('input', { className: 'ab-input', style: { flex: '2 1 260px' }, placeholder: '要ta记住的事，例如：主人不吃香菜', value: adding.text, onChange: (e) => setAdding({ ...adding, text: e.target.value }) }),
             h('input', { className: 'ab-input', style: { flex: '1 1 120px' }, placeholder: '关于谁（可选）', value: adding.aboutName, onChange: (e) => setAdding({ ...adding, aboutName: e.target.value }) }),
             h(Select, { value: adding.importance, width: 120, onChange: (v) => setAdding({ ...adding, importance: v }), options: [{ value: 0.3, label: '随口一提' }, { value: 0.6, label: '比较重要' }, { value: 0.9, label: '非常重要' }] }),
-            h(Btn, { small: true, kind: 'primary', disabled: !adding.text.trim(), onClick: async () => { const r = await post('/memory/add', adding); toast(r.ok ? '记住了' : r.message); setAdding({ text: '', aboutName: '', importance: 0.6 }); load() } }, '记住')),
-          h('div', { className: 'ab-section-title' }, '翻一翻'),
+            h(Btn, { small: true, kind: 'primary', disabled: !adding.text.trim(), onClick: async () => { const r = await post('/memory/add', adding); toast(r.ok ? '记住了' : r.message); setAdding({ text: '', aboutName: '', importance: 0.6 }); load() } }, '记住'))),
+
+        h(Fold, { title: '翻一翻', icon: '🔍', summary: mem === null ? '加载中…' : (q ? '搜「' + q + '」· ' + mem.length + ' 条' : '共 ' + memTotal + ' 条' + (memMore ? '（已显示 ' + mem.length + '）' : '')) },
           h('input', { className: 'ab-input wide', placeholder: '搜索记忆，例如：白米饭、游戏、约定…', value: q, onChange: (e) => setQ(e.target.value) }),
           mem === null ? h(Empty, { icon: '⏳', text: '加载中…' }) : mem.length === 0 ? h(Empty, { icon: '🫧', text: q ? '没找到相关的记忆' : '还没有记住什么。' }) :
-            h('div', { className: 'ab-list', style: { marginTop: 8 } }, mem.map((m) => h(MemoryRow, { key: m.id, m, onChanged: () => load(), toast })))),
+            h('div', null,
+              h('div', { className: 'ab-list', style: { marginTop: 8 } }, mem.map((m) => h(MemoryRow, { key: m.id, m, onChanged: () => load(), toast }))),
+              // 库大了以后一次只给 300 条，剩下的靠这个按钮接着加载，
+              // 否则后面的记忆在面板里完全看不到（搜索也搜不出来）。
+              memMore ? h('div', { className: 'ab-flex', style: { marginTop: 10, justifyContent: 'center' } },
+                h(Btn, { small: true, onClick: loadMore }, '加载更多（已显示 ' + mem.length + ' / ' + memTotal + '）')) : null)),
         h(RecallLog, null),
         h(MemoryImport, { toast, onDone: () => load() }),
+        h(MemoryInherit, { st, toast, onDone: () => load() }),
       )
     }
 
@@ -2915,8 +5519,124 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [page, setPage] = useState('wall')
       return h('div', { className: 'ab-pm' },
         h('div', { className: 'ab-pm-head' },
-          h(Seg, { value: page, onChange: setPage, options: [{ value: 'wall', label: '人物墙' }, { value: 'chats', label: '群印象' }, { value: 'timeline', label: '时间轴' }] })),
-        page === 'wall' ? h(PersonaWall, { toast }) : page === 'chats' ? h(PersonaChats, { toast }) : h(PersonaTimeline, { toast }))
+          h(Seg, { value: page, onChange: setPage, options: [{ value: 'wall', label: '人物墙' }, { value: 'graph', label: '关系星图' }, { value: 'chats', label: '群印象' }, { value: 'timeline', label: '时间轴' }] })),
+        h(MemoryPlatforms),
+        page === 'wall' ? h(PersonaWall, { toast }) : page === 'graph' ? h(PersonaGraph, { toast }) : page === 'chats' ? h(PersonaChats, { toast }) : h(PersonaTimeline, { toast }))
+    }
+
+    function MemoryPlatforms() {
+      const [list, setList] = useState(null)
+      const [error, setError] = useState('')
+      const load = async () => {
+        try {
+          const r = await get('/memory/platforms')
+          if (!r.ok) throw new Error(r.message || '来源统计没读出来')
+          setList(r.list || []); setError('')
+        } catch (e) { setError(e.message) }
+      }
+      useEffect(() => { load() }, [])
+      const names = { qq: 'QQ', douyin: '抖音', bili: 'B站', heybox: '小黑盒', unknown: '来源未知' }
+      return h(Card, { title: '来源平台', desc: '统计目前可用的记录，已忘和停记内容不计；多来源梗概在每个来源各计一次。', right: h(Btn, { small: true, kind: 'ghost', onClick: load }, '刷新') },
+        error ? h('div', { className: 'ab-note err' }, error) : list === null ? h('div', { className: 'ab-muted' }, '读取中…') : !list.length ? h('div', { className: 'ab-muted' }, '还没有记录') :
+        h('div', { className: 'ab-pm-platforms' }, h('table', { className: 'ab-table num' },
+          h('thead', null, h('tr', null, ['平台', '原话', '梗概 / 印象', '看过的内容'].map((x) => h('th', { key: x, scope: 'col' }, x)))),
+          h('tbody', null, list.map((p) => h('tr', { key: p.platform }, h('td', null, names[p.platform] || p.platform), h('td', null, p.episodes), h('td', null, p.gists), h('td', null, p.seen)))))))
+    }
+
+    // 有界的确定性布局：斥力让节点散开，关系边把相关的人拉近，不保存坐标。
+    function starPositions(nodes, links) {
+      const height = Math.max(340, Math.ceil(nodes.length / 3) * 90 + 40)
+      const points = nodes.map((p, i) => ({ ...p, x: 60 + (i % 3) * 120, y: 45 + Math.floor(i / 3) * 90, r: 12 + Math.min(10, Math.sqrt(Math.max(0, p.closeness || 0)) * 2) }))
+      const byId = new Map(points.map((p) => [p.qq, p]))
+      for (let step = 0; step < 70; step++) {
+        const shifts = points.map(() => ({ x: 0, y: 0 }))
+        for (let i = 0; i < points.length; i++) for (let j = i + 1; j < points.length; j++) {
+          const dx = points[i].x - points[j].x, dy = points[i].y - points[j].y
+          const distance = Math.max(1, Math.hypot(dx, dy))
+          const force = Math.min(8, 1200 / (distance * distance))
+          shifts[i].x += dx / distance * force; shifts[i].y += dy / distance * force
+          shifts[j].x -= dx / distance * force; shifts[j].y -= dy / distance * force
+        }
+        const indices = new Map(points.map((p, i) => [p.qq, i]))
+        for (const edge of links) {
+          const a = byId.get(edge.source), b = byId.get(edge.target)
+          if (!a || !b) continue
+          const dx = b.x - a.x, dy = b.y - a.y, distance = Math.max(1, Math.hypot(dx, dy))
+          const force = (distance - 100) * 0.018
+          shifts[indices.get(a.qq)].x += dx / distance * force; shifts[indices.get(a.qq)].y += dy / distance * force
+          shifts[indices.get(b.qq)].x -= dx / distance * force; shifts[indices.get(b.qq)].y -= dy / distance * force
+        }
+        points.forEach((p, i) => {
+          p.x = Math.max(30, Math.min(330, p.x + Math.max(-8, Math.min(8, shifts[i].x))))
+          p.y = Math.max(30, Math.min(height - 40, p.y + Math.max(-8, Math.min(8, shifts[i].y))))
+        })
+      }
+      return { points, height }
+    }
+
+    function PersonaGraph({ toast }) {
+      const [data, setData] = useState(null)
+      const [error, setError] = useState('')
+      const [query, setQuery] = useState('')
+      const [page, setPage] = useState(0)
+      const [selected, setSelected] = useState('')
+      const load = async () => {
+        try {
+          const r = await get('/persona/graph')
+          if (!r.ok) throw new Error(r.message || '关系星图没读出来')
+          setData(r); setError('')
+          setSelected((qq) => r.nodes.some((p) => p.qq === qq) ? qq : '')
+        } catch (e) { setError(e.message) }
+      }
+      useEffect(() => { load() }, [])
+      const filtered = (data?.nodes || []).filter((p) => [p.qq, p.name].some((s) => String(s).toLowerCase().includes(query.trim().toLowerCase())))
+      const last = Math.max(0, Math.ceil(filtered.length / 48) - 1), current = Math.min(page, last)
+      const nodes = filtered.slice(current * 48, (current + 1) * 48)
+      const layout = useMemo(() => starPositions(nodes, data?.links || []), [data, query, current])
+      if (error) return h('div', { className: 'ab-note err' }, error, h(Btn, { small: true, onClick: load }, '重试'))
+      if (!data) return h(Empty, { text: '读取中…' })
+      const positions = new Map(layout.points.map((p) => [p.qq, p]))
+      const links = data.links.filter((e) => positions.has(e.source) && positions.has(e.target))
+      return h('div', { className: cx('ab-pm-split ab-pm-graph', selected && 'open') },
+        h('div', { className: 'ab-pm-list' }, h(Card, { title: '关系星图', desc: '圆越大，最近互动越亲近；线表示记下的人物关系。点一个人查看详情。', right: h(Btn, { small: true, kind: 'ghost', onClick: load }, '刷新') },
+          h('input', { className: 'ab-input', style: { width: '100%', boxSizing: 'border-box' }, 'aria-label': '在星图里找人', placeholder: '名字或 QQ 号', value: query, onChange: (e) => { setQuery(e.target.value); setPage(0) } }),
+          !nodes.length ? h(Empty, { text: '还没有符合条件的人物记忆' }) : h('div', { className: 'ab-pm-stars' }, h('svg', { viewBox: `0 0 360 ${layout.height}`, 'aria-label': '人物关系星图' },
+            links.map((edge) => { const a = positions.get(edge.source), b = positions.get(edge.target); return h('line', { key: edge.id, x1: a.x, y1: a.y, x2: b.x, y2: b.y, stroke: 'var(--ab-sub)', strokeOpacity: 0.35, strokeWidth: 1.5 }, h('title', null, edge.text)) }),
+            layout.points.map((p) => h('g', { key: p.qq, role: 'button', tabIndex: 0, 'aria-label': `${p.name}，${p.interactions} 次互动，查看详情`, onClick: () => setSelected(p.qq), onKeyDown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setSelected(p.qq) } } },
+              h('title', null, `${p.name} (${p.qq}) · ${p.interactions} 次互动`),
+              h('circle', { cx: p.x, cy: p.y, r: 28, fill: 'transparent' }),
+              h('circle', { cx: p.x, cy: p.y, r: p.r, fill: faceColor(p.qq), stroke: p.isOwner ? 'var(--ab-sea)' : 'var(--ab-card)', strokeWidth: p.isOwner ? 3 : 1 }),
+              h('text', { x: p.x, y: p.y + 4, textAnchor: 'middle', fill: '#fff', fontSize: 12, pointerEvents: 'none' }, [...p.name][0] || '?'),
+              h('text', { x: p.x, y: p.y + p.r + 15, textAnchor: 'middle', fill: 'var(--ab-text)', fontSize: 11, pointerEvents: 'none' }, [...p.name].slice(0, 8).join('')))))),
+          h('div', { className: 'ab-flex ab-small ab-muted', style: { marginTop: 8 } },
+            `${filtered.length} 人 · 本页 ${links.length} 条关系`,
+            last ? h('span', null, h(Btn, { small: true, disabled: !current, onClick: () => setPage(current - 1) }, '上一页'), ` ${current + 1}/${last + 1} `, h(Btn, { small: true, disabled: current === last, onClick: () => setPage(current + 1) }, '下一页')) : null),
+          links.length ? h('details', { className: 'ab-small', style: { marginTop: 8 } }, h('summary', null, '本页的关系'), links.map((e) => h('div', { key: e.id }, e.text))) : null)),
+        selected ? h(PersonaDetail, { key: selected, qq: selected, toast, back: () => setSelected(''), onChanged: load }) : null)
+    }
+
+    /** 展开时才查；推荐没有编辑、删除和命中记账。 */
+    function RelatedMemories({ m }) {
+      const [open, setOpen] = useState(false)
+      const [list, setList] = useState(null)
+      const [error, setError] = useState('')
+      useEffect(() => {
+        let alive = true
+        if (!open) return () => { alive = false }
+        setList(null); setError('')
+        get('/memory/related?id=' + encodeURIComponent(m.id) + '&kind=' + encodeURIComponent(m.kind || '')).then((r) => {
+          if (!alive) return
+          if (!r.ok) setError(r.message || '相关记忆没读出来')
+          else setList(r.list || [])
+        }).catch((e) => { if (alive) setError(e.message) })
+        return () => { alive = false }
+      }, [open, m.id, m.text, m.related, m.at])
+      return h('div', { className: 'ab-pm-related' },
+        !open && (m.relatedItems || []).length ? h('div', { className: 'ab-muted' }, m.relatedItems.map((r) => h('div', { key: r.id }, '相关：' + r.text + (r.validityText ? '（' + r.validityText + '）' : '')))) : null,
+        h('button', { type: 'button', className: 'ab-pm-link', 'aria-expanded': open, onClick: () => setOpen(!open) }, open ? '收起相关记忆' : '看看相关记忆'),
+        open ? h('div', { 'aria-live': 'polite' }, error ? h('div', { className: 'ab-note err' }, error) : list === null ? '查找中…' : !list.length ? h('div', { className: 'ab-muted' }, '暂时没有相关的记忆') :
+          list.map((it) => h('article', { key: it.id }, h('div', { className: 'text' }, it.displayText || it.text),
+            h('div', { className: 'ab-muted' }, [it.reason, memoryDate(it.saidAt || it.at), it.chatId ? gistSource(it.chatId) : ''].filter(Boolean).join(' · '))))) : null)
     }
 
     function PersonaWall({ toast }) {
@@ -2928,10 +5648,10 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [status, setStatus] = useState('')
       const [selected, setSelected] = useState('')
       const load = async () => {
-        const r = await get('/persona/overview')
+        const r = await getCached('/persona/overview')
         if (!r.ok) { setError(r.message || '人物列表没读出来'); return }
         setError(''); setList(r.list || [])
-        setSelected((cur) => cur || (window.innerWidth > 760 && r.list?.[0]?.qq) || '')
+        setSelected((cur) => (r.list || []).some((p) => p.qq === cur) ? cur : (window.innerWidth > 760 && r.list?.[0]?.qq) || '')
       }
       useEffect(() => { load() }, [])
       if (error) return h('div', { className: 'ab-note err' }, error)
@@ -2957,18 +5677,68 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         selected ? h(PersonaDetail, { key: selected, qq: selected, toast, back: () => setSelected(''), onChanged: load }) : h('div', { className: 'ab-pm-detail' }, h(Empty, { text: '选一个人看看' })))
     }
 
+    function PersonMemoryReset({ qq, toast, onDone }) {
+      const [busy, setBusy] = useState(false)
+      const reset = async () => {
+        if (busy || !confirm(`清理 QQ ${qq} 的记忆并重开私聊？\n相关记忆会被删除，清理前的消息将退出机器人上下文。旧会话仍可在 QQ 和 DSH 中查看，权限设置会保留。`)) return
+        setBusy(true)
+        try {
+          const result = await post('/persona/person/reset', { qq })
+          toast(result.message || (result.ok ? '记忆已清理' : '清理失败'), result.ok ? 'ok' : 'err')
+          if (result.ok) await onDone?.()
+        } finally { setBusy(false) }
+      }
+      return h(Btn, { small: true, kind: 'danger', disabled: busy, onClick: reset }, '清理记忆并重开私聊')
+    }
+
     function PersonaDetail({ qq, toast, back, onChanged }) {
       const [data, setData] = useState(null)
       const [form, setForm] = useState(null)
       const [editing, setEditing] = useState(false)
+      const [relationEdit, setRelationEdit] = useState(null)
       const [tagInput, setTagInput] = useState('')
       const [error, setError] = useState('')
-      const load = async (keepForm = false) => {
-        const r = await get('/persona/person?qq=' + encodeURIComponent(qq))
+      const [notesBusy, setNotesBusy] = useState(false)
+      const load = async (keepForm = false, notesLimit = 20) => {
+        const n = Math.min(100, Math.max(20, Math.trunc(Number(notesLimit) || 20)))
+        const r = await getCached('/persona/person?qq=' + encodeURIComponent(qq) + '&notesLimit=' + n)
         if (!r.ok) { setError(r.message || '人物详情没读出来'); return }
         setError(''); setData(r)
         if (!keepForm) setForm({ ...Object.fromEntries(PERSON_FIELDS.map(([key]) => [key, r.person[key] || ''])), tags: r.person.tags || [] })
       }
+      const loadMoreNotes = async () => {
+        if (notesBusy) return
+        const shown = (data.notes || []).length
+        if (shown >= (data.notesTotal || 0)) return
+        setNotesBusy(true)
+        try {
+          const r = await getCached('/persona/person/notes?qq=' + encodeURIComponent(qq) + '&limit=20&offset=' + shown)
+          if (!r.ok) return toast(r.message || '加载失败', 'err')
+          setData((prev) => prev ? { ...prev, notes: [...(prev.notes || []), ...(r.list || [])] } : prev)
+        } finally { setNotesBusy(false) }
+      }
+      const removeNote = (id) => {
+        const gone = (data.notes || []).find((m) => m.id === id)
+        const ended = gone ? memoryEnded(gone) : false
+        setData((prev) => prev ? {
+          ...prev,
+          notes: (prev.notes || []).filter((m) => m.id !== id),
+          notesTotal: Math.max(0, (prev.notesTotal || 1) - 1),
+          notesLive: Math.max(0, (prev.notesLive || 0) - (ended ? 0 : 1)),
+          notesOld: Math.max(0, (prev.notesOld || 0) - (ended ? 1 : 0)),
+        } : prev)
+      }
+      const removeGist = (id) => setData((prev) => prev ? { ...prev, gists: (prev.gists || []).filter((g) => g.id !== id) } : prev)
+      const editNote = (id, text) => setData((prev) => prev ? {
+        ...prev,
+        notes: (prev.notes || []).map((m) => m.id === id ? { ...m, text, displayText: text } : m),
+      } : prev)
+      const restoreNote = (id) => setData((prev) => prev ? {
+        ...prev,
+        notes: (prev.notes || []).map((m) => m.id === id ? { ...m, invalidAt: undefined, validUntil: undefined, validityText: '' } : m),
+        notesLive: (prev.notesLive || 0) + 1,
+        notesOld: Math.max(0, (prev.notesOld || 0) - 1),
+      } : prev)
       useEffect(() => { load() }, [qq])
       if (error) return h('div', { className: 'ab-pm-detail' }, h('div', { className: 'ab-note err' }, error))
       if (!data || !form) return h('div', { className: 'ab-pm-detail' }, h(Empty, { icon: '⏳', text: '加载中…' }))
@@ -2979,18 +5749,46 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         const { tags, ...fields } = form
         const r = await post('/persona/person/save', { qq, ...fields, ...(tagsChanged ? { tags } : {}) })
         toast(r.message, r.ok ? 'ok' : 'err')
-        if (r.ok) { setEditing(false); await load(); onChanged() }
+        if (r.ok) { setEditing(false); await load(false, Math.max(20, (data.notes || []).length)); onChanged() }
+      }
+      const editRelation = async (r) => {
+        setRelationEdit(r.id)
+        const text = window.prompt('按「主语 关系 宾语」修改这条关系，例如：大肥鱼 是 主人的猫', r.text)
+        if (text == null) { setRelationEdit(null); return }
+        const parts = String(text).trim().split(/\s+/)
+        if (parts.length < 3) { toast('要写成「主语 关系 宾语」', 'err'); setRelationEdit(null); return }
+        const subj = parts.shift()
+        const obj = parts.pop()
+        const pred = parts.join(' ')
+        const res = await post('/memory/relations/save', { ...r, subj, pred, obj })
+        toast(res.message || (res.ok ? '改好了' : '没改成'), res.ok ? 'ok' : 'err')
+        setRelationEdit(null)
+        if (res.ok) await load(true)
       }
       const rebuild = async () => {
-        if (!data.notes.some((m) => !m.invalidAt && m.scope !== 'group' && !['hearsay', 'guess'].includes(m.status))) return toast('还没有能用来重写小档案的事实', 'err')
+        if (!(data.notesLive > 0)) return toast('还没有能用来重写小档案的事实', 'err')
         if (changed && !confirm('重写会放弃还没保存的修改，继续吗？')) return
         const r = await post('/profiles/rebuild', { qq })
         toast(r.message, r.ok ? 'ok' : 'err')
-        await load(!r.ok)
+        await load(!r.ok, Math.max(20, (data.notes || []).length))
+      }
+      const forgetPerson = async () => {
+        if (!confirm(`删除关于「${personName(p)}」的全部人物记忆？画像、事实、关系、相处经验和标签都会清掉。`)) return
+        if (!confirm('再次确认：删除后无法恢复，过去的原话也会标为已忘，不会重新提炼。继续删除吗？')) return
+        const r = await post('/persona/person/delete', { qq })
+        toast(r.message, r.ok ? 'ok' : 'err')
+        if (r.ok) { back(); onChanged() }
+      }
+      const toggleNoMemory = async (enabled) => {
+        const deleteExisting = enabled && confirm('以后不再留下这个人的记忆。要同时删除已有记忆吗？点「确定」删除；点「取消」保留已有记忆，但不再使用。')
+        const r = await post('/persona/person/no-memory', { qq, enabled, deleteExisting })
+        toast(r.message, r.ok ? 'ok' : 'err')
+        if (r.ok) { setEditing(false); await load(); onChanged() }
       }
       const traits = [['style', '说话方式'], ['persona', '性格'], ['handle', '怎么相处']]
-      const live = data.notes.filter((m) => !memoryEnded(m))
-      const old = data.notes.filter(memoryEnded)
+      const notes = data.notes || []
+      const live = notes.filter((m) => !memoryEnded(m))
+      const old = notes.filter(memoryEnded)
       return h('div', { className: 'ab-pm-detail' },
         h('div', { className: 'ab-pm-back' }, h(Btn, { small: true, kind: 'ghost', onClick: back }, '← 返回名单')),
         h('div', { className: 'ab-pm-hero' },
@@ -3004,6 +5802,11 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             h('div', { className: 'meta' }, 'QQ ' + qq + ' · ' + (p.lastActive ? memoryDate(p.lastActive) + ' 来过' : '最近没来过')),
             h('p', { className: cx('quote', !p.text && 'empty') }, p.text || 'ta对这个人还没有整体印象。'),
             (p.tags || []).length ? h('div', { className: 'ab-pm-trait' }, '标签：' + p.tags.join(' · ')) : null)),
+        h(Card, { title: '是否留下记忆', desc: '讨厌 = 不爱搭理；不再记住 = 不留记忆。两者分别设置。消息仍照常进入聊天，她能看懂当下的对话。撤销后，以后的互动会恢复记忆。' },
+          h(Row, { label: '不再记住', hint: p.isOwner ? '主人始终会被记住。' : p.noMemory ? '已停止形成人物记忆，已有记忆也不会带进聊天。' : '可以随时开启或撤销。' },
+            h('input', { type: 'checkbox', role: 'switch', 'aria-label': '不再记住', checked: Boolean(p.noMemory && !p.isOwner), disabled: p.isOwner, onChange: (e) => toggleNoMemory(e.target.checked) })),
+          !p.isOwner ? h(Btn, { small: true, kind: 'ghost', onClick: forgetPerson }, '删除这个人') : null,
+          h(PersonMemoryReset, { qq, toast, onDone: () => { back(); return onChanged() } })),
         editing ? h(Card, { title: '编辑印象' },
           h('div', { className: 'ab-pm-form' }, PERSON_FIELDS.map(([key, label]) => h('label', { key, className: key === 'text' ? 'full' : '' }, label,
             h('textarea', { className: 'ab-textarea', rows: key === 'text' ? 3 : 2, value: form[key], onChange: (e) => setForm({ ...form, [key]: e.target.value }) })))),
@@ -3019,40 +5822,56 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h('div', { className: 'k' }, label), h('div', { className: cx('v', !p[key] && 'empty') }, p[key] || '还不了解')))),
         data.shortTerm ? h(Card, { title: '刚才聊到哪' }, h('div', null, data.shortTerm.text)) : null,
         h(Card, { title: '私聊里的相处经验', desc: '私聊时优先用这里，上面的「说话方式」和「怎么相处」在群里用。' },
-          h(InsightCard, { p: { key: 'qq:' + qq, list: data.insights || [] }, style: data.styles || [], toast, onSaved: () => load(true) })),
+          h(InsightCard, { p: { key: 'qq:' + qq, list: data.insights || [] }, style: data.styles || [], toast, onSaved: () => load(true, Math.max(20, (data.notes || []).length)) })),
         (data.relations || []).length ? h(Card, { title: '人物关系' }, data.relations.map((r) => h('div', { key: r.id, className: 'ab-pm-fact' },
           h('span', { className: 'ab-pm-dot', 'aria-hidden': 'true' }),
           h('div', { className: 'main' }, h('div', { className: 'text' }, r.text), h('div', { className: 'sub' }, h('span', null, memoryDate(r.at)), h('span', null, gistSource(r.chatId)))),
-          h('div', { className: 'ab-pm-acts' }, h('button', { type: 'button', className: 'ab-pm-link danger', onClick: async () => {
+          h('div', { className: 'ab-pm-acts' }, h('button', { type: 'button', className: 'ab-pm-link', disabled: relationEdit === r.id, onClick: () => editRelation(r) }, relationEdit === r.id ? '改…' : '改'), h('button', { type: 'button', className: 'ab-pm-link danger', onClick: async () => {
             if (!confirm('删除这条关系？')) return
             const res = await post('/memory/relations/delete', { id: r.id })
             toast(res.message, res.ok ? 'ok' : 'err')
-            if (res.ok) await load(true)
+            if (res.ok) await load(true, Math.max(20, (data.notes || []).length))
           } }, '删'))))) : null,
-        h(Card, { title: `记得的事 ${live.length ? live.length : ''}`.trim() },
-          live.length ? live.map((m) => h(PersonaFact, { key: m.id, m, toast, onChanged: () => load(true) })) : h(Empty, { text: '还没记住关于这个人的事。' })),
-        data.gists.length ? h(Card, { title: '留下的感觉' }, h(GistLine, { list: data.gists, toast, onChanged: () => load(true) })) : null,
-        old.length ? h('details', { className: 'ab-card' }, h('summary', { className: 'ab-small' }, `已过时的 ${old.length} 条`),
-          h('div', { style: { marginTop: 8 } }, old.map((m) => h(PersonaFact, { key: m.id, m, toast, onChanged: () => load(true) })))) : null)
+        h(Card, { title: `记得的事 ${data.notesLive ?? live.length}`.trim() },
+          live.length ? live.map((m) => h(PersonaFact, { key: m.id, m, tiers: data.factTiers, toast, onChanged: () => load(true), onDeleted: removeNote, onEdited: editNote, onRestored: restoreNote })) : h(Empty, { text: '还没记住关于这个人的事。' }),
+          notes.length < (data.notesTotal || 0) ? h('div', { className: 'ab-flex', style: { marginTop: 8 } },
+            h(Btn, { small: true, kind: 'ghost', disabled: notesBusy, onClick: loadMoreNotes }, notesBusy ? '加载中…' : `加载更多（已显示 ${notes.length}/${data.notesTotal}）`)) : null),
+        data.gists.length ? h(Card, { title: '留下的感觉' }, h(GistLine, { list: data.gists, toast, onChanged: () => load(true), onDeleted: removeGist })) : null,
+        old.length ? h('details', { className: 'ab-card' }, h('summary', { className: 'ab-small' }, `已过时的 ${data.notesOld ?? old.length} 条${old.length < (data.notesOld || 0) ? '（已显示 ' + old.length + '）' : ''}`),
+          h('div', { style: { marginTop: 8 } }, old.map((m) => h(PersonaFact, { key: m.id, m, tiers: data.factTiers, toast, onChanged: () => load(true), onDeleted: removeNote, onEdited: editNote, onRestored: restoreNote })))) : null)
     }
 
-    function PersonaFact({ m, toast, onChanged }) {
+    function PersonaFact({ m, tiers = [], toast, onChanged, onDeleted, onEdited, onRestored }) {
       const [editing, setEditing] = useState(false)
       const [text, setText] = useState(m.text || '')
-      useEffect(() => { setText(m.text || '') }, [m.text])
+      const [tierValue, setTierValue] = useState(m.tier)
+      useEffect(() => { setText(m.text || ''); setTierValue(m.tier) }, [m.text, m.tier])
       const save = async () => {
-        const r = await post('/memory/update', { id: m.id, text: text.trim() })
+        const r = await post('/memory/update', { id: m.id, text: text.trim(), ...(tierValue !== m.tier && tierValue !== undefined ? { tier: tierValue } : {}) })
         toast(r.ok ? '改好了' : r.message, r.ok ? 'ok' : 'err')
-        if (r.ok) { setEditing(false); await onChanged() }
+        if (!r.ok) return
+        setEditing(false)
+        if (onEdited) onEdited(m.id, text.trim())
+        else await onChanged()
       }
       const remove = async () => {
         if (!confirm('删除这条？')) return
         const r = await post('/memory/delete', { id: m.id })
         toast(r.ok ? '删掉了' : r.message, r.ok ? 'ok' : 'err')
-        if (r.ok) await onChanged()
+        if (r.ok) {
+          if (onDeleted) onDeleted(m.id)
+          else await onChanged()
+        }
       }
-      const restore = async () => { const r = await post('/memory/restore', { id: m.id }); toast(r.ok ? '恢复了' : r.message, r.ok ? 'ok' : 'err'); if (r.ok) await onChanged() }
-      const tier = { 0: '永久', 1: '琐碎', 3: '重要', core: '长期印象' }[m.tier]
+      const restore = async () => {
+        const r = await post('/memory/restore', { id: m.id })
+        toast(r.ok ? '恢复了' : r.message, r.ok ? 'ok' : 'err')
+        if (!r.ok) return
+        if (onRestored) onRestored(m.id)
+        else await onChanged()
+      }
+      const tierLabel = m.tierLabel || ({ 4: '短暂', 1: '琐碎', 5: '小事', 2: '一般', 3: '重要', 0: '永久', core: '永久' })[m.tier] || ''
+      const tier = tierLabel + (m.tierDays !== null && m.tierDays !== undefined ? ` · ${m.tierDays}天` : '')
       const status = { hearsay: '听说', guess: '可能' }[m.status]
       return h('div', { className: cx('ab-pm-fact', memoryEnded(m) && 'old') },
         h('span', { className: cx('ab-pm-dot', m.tier !== undefined && m.tier !== 'core' && 't' + m.tier), 'aria-hidden': 'true' }),
@@ -3060,28 +5879,33 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           editing ? h('div', null,
             h('textarea', { className: 'ab-textarea', style: { width: '100%', boxSizing: 'border-box', minHeight: 60, fontFamily: 'inherit' }, value: text, onChange: (e) => setText(e.target.value) }),
             h('div', { className: 'ab-flex', style: { marginTop: 6 } },
+              m.tier !== 'core' ? h('select', { className: 'ab-select', 'aria-label': '事实档位', value: tierValue ?? '', onChange: (e) => setTierValue(e.target.value === '' ? undefined : Number(e.target.value)) },
+                m.tier === undefined ? h('option', { value: '' }, '沿用原有遗忘方式') : null,
+                tiers.map((t) => h('option', { key: t.id, value: t.id }, t.label + (t.days === null ? '' : ` · ${t.days}天`)))) : null,
               h(Btn, { small: true, kind: 'primary', disabled: !text.trim(), onClick: save }, '保存'),
-              h(Btn, { small: true, kind: 'ghost', onClick: () => { setText(m.text || ''); setEditing(false) } }, '取消')))
+              h(Btn, { small: true, kind: 'ghost', onClick: () => { setText(m.text || ''); setTierValue(m.tier); setEditing(false) } }, '取消')))
             : h('div', { className: 'text' }, m.displayText || m.text),
-          !editing && (m.relatedItems || []).length ? h('div', { className: 'ab-small ab-muted', style: { marginTop: 5 } },
-            m.relatedItems.map((r) => h('div', { key: r.id }, '相关：' + r.text + (r.validityText ? '（' + r.validityText + '）' : '')))) : null,
           !editing ? h('div', { className: 'sub' },
             h('span', null, m.validityText || memoryDate(m.saidAt || m.at)),
             tier ? h('span', { className: 'ab-pm-tag' }, tier) : null,
             status ? h('span', { className: 'ab-pm-tag warn' }, status) : null,
-            memoryEnded(m) && m.supersededText ? h('span', null, '现在是：' + m.supersededText) : null) : null),
+            memoryEnded(m) && m.supersededText ? h('span', null, '现在是：' + m.supersededText) : null) : null,
+          !editing ? h(RelatedMemories, { m }) : null),
         !editing ? h('div', { className: 'ab-pm-acts' },
           memoryEnded(m) ? h('button', { type: 'button', className: 'ab-pm-link', onClick: restore }, '恢复') : h('button', { type: 'button', className: 'ab-pm-link', onClick: () => setEditing(true) }, '改'),
           h('button', { type: 'button', className: 'ab-pm-link danger', onClick: remove }, '删')) : null)
     }
 
     /** 聊天梗概和看过内容共用时间线。 */
-    function GistLine({ list, toast, onChanged, showFrom }) {
+    function GistLine({ list, toast, onChanged, onDeleted, showFrom }) {
       const remove = async (g) => {
         if (!confirm('删除这条' + gistLevel(g) + '？')) return
         const r = await post(g.kind === 'seen' ? '/memory/delete' : '/memory/gists/delete', { id: g.id })
         toast(r.message, r.ok ? 'ok' : 'err')
-        if (r.ok) await onChanged()
+        if (r.ok) {
+          if (onDeleted) onDeleted(g.id)
+          else await onChanged()
+        }
       }
       let day = ''
       return h('div', { className: 'ab-pm-tl' }, list.flatMap((g) => {
@@ -3090,7 +5914,8 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         day = when
         return [head, h('div', { key: g.id, className: cx('ab-pm-tl-item', Number(g.level) >= 2 && 'feel') },
           h('div', { className: 'main' }, h('div', { className: 'text' }, g.displayText || g.text),
-            h('div', { className: 'from' }, [g.kind === 'seen' ? '看过的内容' : '', ...(g.platforms || []), showFrom && g.chatId ? gistSource(g.chatId) : ''].filter(Boolean).join(' · '))),
+            h('div', { className: 'from' }, [g.kind === 'seen' ? '看过的内容' : '', ...(g.platforms || []), showFrom && g.chatId ? gistSource(g.chatId) : ''].filter(Boolean).join(' · ')),
+            h(RelatedMemories, { m: g })),
           h('div', { className: 'ab-pm-acts' }, h('button', { type: 'button', className: 'ab-pm-link danger', onClick: () => remove(g) }, '删')))]
       }))
     }
@@ -3099,7 +5924,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [list, setList] = useState(null)
       const [error, setError] = useState('')
       const load = async () => {
-        const r = await get('/memory/chats')
+        const r = await getCached('/memory/chats')
         if (!r.ok) { setError(r.message || '群印象没读出来'); return }
         setError(''); setList(r.list || [])
       }
@@ -3147,19 +5972,43 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [level, setLevel] = useState('')
       const [kind, setKind] = useState('')
       const [platform, setPlatform] = useState('')
-      const load = async () => {
-        const r = await get('/memory/timeline')
+      const [hasMore, setHasMore] = useState(false)
+      const [total, setTotal] = useState(0)
+      const [busy, setBusy] = useState(false)
+      const [facets, setFacets] = useState({ chats: [], platforms: [] })
+      const load = async (append = false) => {
+        const offset = append && list ? list.length : 0
+        const p = new URLSearchParams({ limit: '50', offset: String(offset) })
+        if (chat) p.set('chatId', chat)
+        if (level) p.set('level', level)
+        if (kind) p.set('kind', kind)
+        if (platform) p.set('platform', platform)
+        const r = await getCached('/memory/timeline?' + p.toString())
         if (!r.ok) { setError(r.message || '时间轴没读出来'); return }
+        setError('')
         const next = r.list || []
-        if (chat && !next.some((g) => g.chatId === chat)) setChat('')
-        setError(''); setList(next)
+        setList((prev) => append ? [...(prev || []), ...next] : next)
+        setHasMore(Boolean(r.hasMore))
+        setTotal(Number(r.total) || 0)
+        if (r.facets) setFacets({ chats: r.facets.chats || [], platforms: r.facets.platforms || [] })
       }
-      useEffect(() => { load() }, [])
+      const loadMore = async () => {
+        if (busy || !hasMore) return
+        setBusy(true)
+        try { await load(true) } finally { setBusy(false) }
+      }
+      const removeGist = (id) => {
+        const nextLoaded = Math.max(0, (list || []).length - 1)
+        const nextTotal = Math.max(0, total - 1)
+        setList((prev) => (prev || []).filter((g) => g.id !== id))
+        setTotal(nextTotal)
+        setHasMore(nextTotal > nextLoaded)
+      }
+      useEffect(() => { load(false) }, [chat, level, kind, platform])
       if (error) return h('div', { className: 'ab-note err' }, error)
       if (list === null) return h(Empty, { icon: '⏳', text: '加载中…' })
-      const chats = [...new Set(list.map((g) => g.chatId).filter(Boolean))]
-      const platforms = [...new Set(list.flatMap((g) => g.platforms || []))].sort()
-      const shown = list.filter((g) => (!chat || g.chatId === chat) && (!level || String(g.level) === level) && (!kind || g.kind === kind) && (!platform || (g.platforms || []).includes(platform)))
+      const chats = facets.chats.length ? facets.chats : [...new Set(list.map((g) => g.chatId).filter(Boolean))]
+      const platforms = facets.platforms.length ? facets.platforms : [...new Set(list.flatMap((g) => g.platforms || []))].sort()
       return h(Card, { title: '时间轴', desc: '聊过的梗概和看过的内容，都能在这里翻一翻。', right: h('div', { className: 'ab-pm-filters' },
         h('select', { className: 'ab-select', 'aria-label': '筛选经历类型', value: kind, onChange: (e) => { setKind(e.target.value); setLevel('') } },
           h('option', { value: '' }, '全部经历'), h('option', { value: 'gist' }, '聊天的梗概'), h('option', { value: 'seen' }, '看过的内容')),
@@ -3169,15 +6018,17 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h('option', { value: '' }, '全部聊天'), chats.map((id) => h('option', { key: id, value: id }, gistSource(id)))),
         h('select', { className: 'ab-select', 'aria-label': '筛选层级', value: level, disabled: kind === 'seen', onChange: (e) => setLevel(e.target.value) },
           h('option', { value: '' }, '全部'), h('option', { value: '1' }, '梗概'), h('option', { value: '2' }, '印象'))) },
-      shown.length ? h(GistLine, { list: shown, toast, onChanged: load, showFrom: !chat }) : h(Empty, { text: list.length ? '没有符合条件的记录。' : '还没有压缩过的记忆，流水到期后会慢慢出现。' }))
+      list.length ? h(GistLine, { list, toast, onChanged: () => load(false), onDeleted: removeGist, showFrom: !chat }) : h(Empty, { text: total ? '没有符合条件的记录。' : '还没有压缩过的记忆，流水到期后会慢慢出现。' }),
+      hasMore ? h('div', { className: 'ab-flex', style: { marginTop: 8 } },
+        h(Btn, { small: true, kind: 'ghost', disabled: busy, onClick: loadMore }, busy ? '加载中…' : `加载更多（已显示 ${list.length}/${total}）`)) : null)
     }
 
     /** 最近几轮她想起了什么、因为哪些词想起来的。 */
     function RecallLog() {
       const [list, setList] = useState(null)
-      const load = () => get('/memory/recalls').then((r) => setList(r.list || []))
+      const load = () => getCached('/memory/recalls?limit=10').then((r) => setList(r.list || []))
       useEffect(() => { load() }, [])
-      return h(Card, { title: '最近想起了什么', desc: '每次回复前ta会按对方说的话翻记忆。这里能看到最近几次想起了哪几条、是因为哪几个词想起来的；想不起来的那次也会列出来。', right: h(Btn, { small: true, kind: 'ghost', onClick: load }, '刷新') },
+      return h(Card, { title: '最近想起了什么', desc: '每次回复前ta会按对方说的话翻记忆。这里能看到最近几次想起了哪几条、是因为哪几个词想起来的；想不起来的那次也会列出来。', right: h(Btn, { small: true, kind: 'ghost', onClick: () => { bustCache(); load() } }, '刷新') },
         !list ? h(Empty, { icon: '⏳', text: '加载中…' }) : list.length === 0 ? h(Empty, { icon: '🫧', text: '还没有记录（重启后从头记）。' }) :
           h('div', { className: 'ab-list' }, list.slice(0, 10).map((r, i) => h('div', { key: i, className: 'ab-li' },
             h('div', { className: 'meta' }, timeAgo(r.at), h('br'), h('span', { className: 'ab-small' }, String(r.where || '').replace(/^private:/, '私聊 ').replace(/^group:/, '群 '))),
@@ -3186,7 +6037,1432 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
               r.hits.length ? r.hits.map((x) => h('div', { key: x.id, style: { marginTop: 3 } }, '· ' + x.text, h('span', { className: 'ab-muted ab-small' }, '  ← ' + (x.why.join('、') || '—') + ' · ' + x.score))) : h('div', { className: 'ab-muted', style: { marginTop: 3 } }, '这次什么都没想起来'))))))
     }
 
-    /** 导入旧档案：粘贴或上传文字，模型挑出值得记的，勾选后存进记忆库。 */
+    // ═══════════════════════════════════════════════════════════
+    // 以下 7 个组件来自 feat/assoc-on-1.3beta（记忆星图 + 联想 + 折叠组）
+    // Fold / AssocPreview / smDraw / usePersisted / StarMap / AddStarForm / MemoryPage
+    // ═══════════════════════════════════════════════════════════
+    /**
+     * 可折叠卡片。记忆页有八九组设置，全铺开要滚好几屏才能看到保存条；
+     * 折起来只留标题 + 一行摘要，想改哪组点开哪组。
+     * right（开关之类）会吃掉点击事件，点开关不会把整张卡折起来。
+     */
+    function Fold({ title, summary, icon, children, defaultOpen, right }) {
+      const [open, setOpen] = useState(!!defaultOpen)
+      return h('div', { className: 'ab-card', style: { marginBottom: 10 } },
+        h('div', {
+          className: 'ab-flex',
+          style: { cursor: 'pointer', userSelect: 'none', alignItems: 'center', gap: 8 },
+          onClick: () => setOpen(!open),
+        },
+          h('span', { style: { fontSize: 13, opacity: 0.7, width: 12, flex: '0 0 auto' } }, open ? '▾' : '▸'),
+          h('h3', { style: { margin: 0, fontSize: 15 } }, icon ? h('span', { style: { marginRight: 6 } }, icon) : null, title),
+          h('div', { className: 'ab-spacer' }),
+          summary ? h('span', { className: 'ab-muted ab-small', style: { textAlign: 'right' } }, summary) : null,
+          right ? h('span', { onClick: (e) => e.stopPropagation(), style: { flex: '0 0 auto' } }, right) : null),
+        open ? h('div', { style: { marginTop: 12 } }, children) : null)
+    }
+
+    /**
+     * 联想预览：输一句 → 走真正的 recall 路径 → 看见「直接命中 / 第几跳 / 从谁联想过来 / 分数打了几折」。
+     * 面板「翻一翻」用的是 list()，不经过联想扩散，所以那边看不到跳数，才单独做这个小面板。
+     * 后端用 shown:false 调用，预览不会把记忆算成「想起过」（不会偷偷加深）。
+     */
+    function AssocPreview({ toast }) {
+      const [q, setQ] = useState('')
+      const [busy, setBusy] = useState(false)
+      const [data, setData] = useState(null)
+      const run = async () => {
+        const text = q.trim()
+        if (!text) { toast('先输入一句话', 'err'); return }
+        setBusy(true)
+        try {
+          const r = await get('/memory/assoc/preview?q=' + encodeURIComponent(text))
+          if (!r.ok) { toast(r.message || '预览失败', 'err'); setData(null); return }
+          setData(r)
+        } catch (e) { toast('预览失败：' + e.message, 'err') } finally { setBusy(false) }
+      }
+      const hopTag = (n) => (n ? (n === 1 ? '第 1 跳' : `第 ${n} 跳`) : '直接命中')
+      return h(Card, { title: '联想预览', desc: '看看「A→B→C」实际会带出什么。这里只预览，不会把记忆算作被想起过。' },
+        h('div', { className: 'ab-flex', style: { gap: 8 } },
+          h('input', { className: 'ab-input', style: { flex: 1 }, placeholder: '比如：睡不好、考试、做饭', value: q,
+            onChange: (e) => setQ(e.target.value), onKeyDown: (e) => { if (e.key === 'Enter') run() } }),
+          h(Btn, { kind: 'primary', small: true, disabled: busy, onClick: run }, busy ? '查询中…' : '预览')),
+        data ? h('div', { style: { marginTop: 10 } },
+          h('div', { className: 'ab-note' }, `${data.query}：直接命中 ${data.counts.direct} 条，1 跳 ${data.counts.hop1} 条，2 跳 ${data.counts.hop2} 条${data.counts.hop3 ? `，3 跳 ${data.counts.hop3} 条` : ''}（当前设置：${data.hops} 跳上限、最多 ${data.recall} 条）`),
+          data.items.length === 0 ? h(Empty, { text: '没想起相关的事' }) : h('div', null,
+            data.items.map((it) => h('div', { key: it.id, className: 'ab-row', style: { alignItems: 'flex-start' } },
+              h('div', { className: 'ab-label', style: { flex: 1 } },
+                h('b', null, it.text),
+                h('small', null, hopTag(it.hop) + (it.hop ? `　分数 ${it.score}` : '') + (it.why ? `　${it.why}` : '')),
+                it.via ? h('small', { className: 'ab-muted' }, '从「' + ((data.items.find((x) => x.id === it.via) || {}).text || it.via) + '」联想过来') : null),
+              h('div', { className: 'ab-ctl' }, h('span', { className: 'ab-pm-tag' }, hopTag(it.hop)))))) ) : null)
+    }
+
+    /**
+     * 画一帧星空。参数全是显式的，便于从 React 里调用。
+     * 返回值是这一帧的命中表（星 / 星团 / 子星云）。
+     */
+    // ═══════════════════════════════════════════════════════════════════════
+    // 记忆星图
+    //
+    // 渲染层（renderStarMap 及其常量）**原样搬自 memory-constellation 0.9.2
+    // 的 panel.js**（draw 函数 + tick 循环），只把 React 闭包改成显式参数。
+    // 那些注释是原作者反复调优留下的（为什么星尘不闪、为什么标签要粘滞、
+    // 为什么辉光只画亮星），照着写不可能达到同样质量，所以整段保留。
+    // ═══════════════════════════════════════════════════════════════════════
+
+    const SM_REGION = {
+      person: { label: '人物', color: '#6ee7ff' },
+      event: { label: '经历', color: '#ff9ecd' },
+      core: { label: '核心', color: '#ffd166' },
+      // 深色底上原色太淡（#a9bcd8 / #5b6678 / #8b93a7 几乎融进背景），统一提亮
+      knowledge: { label: '知识', color: '#7fb2f0' },
+      outdated: { label: '已过时', color: '#8a97ab' },
+      archived: { label: '已归档', color: '#a9b6cb' },
+    }
+    const SM_TIER_LABEL = { short: '临时', long: '长期', core: '永久' }
+    const SM_EDGE_KINDS = { person: '同一个人', tag: '同标签', similar: '内容相似', conflict: '冲突', assoc: '联想' }
+    const SM_EDGE_WHITE = '220, 230, 245'
+    const SM_CHILD_TINTS = ['255, 159, 200', '127, 212, 255', '255, 209, 102', '167, 139, 250', '134, 239, 172', '240, 166, 202', '186, 146, 255']
+    const SM_GROUP_TINTS = ['255, 209, 102', '134, 239, 172', '127, 212, 255', '255, 159, 200', '167, 139, 250', '255, 160, 122', '186, 146, 255', '248, 113, 113']
+    const smClamp = (n, min, max) => Math.min(max, Math.max(min, n))
+    /** 星图搜索/筛选：记忆星图渲染前统一判一次，避免筛选逻辑和渲染各写一套（#85）。 */
+    const smStarMatches = (s, query = '', typeFilter = '', quickFilter = '', nowMs = Date.now()) => {
+      const q = String(query || '').trim().toLowerCase()
+      if (q) {
+        const hay = [s.text, s.about, s.aboutName, ...(Array.isArray(s.tags) ? s.tags : [])].join(' ').toLowerCase()
+        if (!hay.includes(q)) return false
+      }
+      if (typeFilter) {
+        if (typeFilter === 'archived') { if (!s.archivedAt) return false }
+        else if (typeFilter === 'outdated') { if (!s.invalidAt || s.archivedAt) return false }
+        else if (typeFilter === 'core') { if (s.tier !== 'core' && s.region !== 'core') return false }
+        else if (s.region !== typeFilter) return false
+      }
+      if (quickFilter === 'dim' && !(Number(s.brightness) < 0.35)) return false
+      if (quickFilter === 'recent') {
+        const at = Number(s.lastHit || s.at || 0)
+        if (!at || nowMs - at > 7 * 86400_000) return false
+      }
+      return true
+    }
+    const smTintIndexOf = (id) => {
+      const text = String(id || '')
+      let hash = 0
+      for (let i = 0; i < text.length; i += 1) hash = (hash * 31 + text.charCodeAt(i)) >>> 0
+      return hash % SM_GROUP_TINTS.length
+    }
+    // 按 id 哈希取色，撞色时顺延到下一个空位，保证这批模块颜色互不相同。
+    const smTintMapOf = (groups = []) => {
+      const map = new Map()
+      const used = new Set()
+      groups.forEach((group) => {
+        let index = smTintIndexOf(group.id)
+        for (let step = 0; step < SM_GROUP_TINTS.length; step += 1) {
+          const candidate = (index + step) % SM_GROUP_TINTS.length
+          if (!used.has(candidate)) { index = candidate; break }
+        }
+        used.add(index)
+        map.set(group.id, SM_GROUP_TINTS[index])
+      })
+      return map
+    }
+    const smShortText = (v, n = 12) => (String(v || '').length > n ? String(v || '').slice(0, n) + '…' : String(v || ''))
+    const SM_DUST = Array.from({ length: 140 }, (_, i) => {
+      const a = Math.imul(i + 3, 1103515245) >>> 0
+      const b = Math.imul(i + 11, 12345) >>> 0
+      return { x: (a % 1000) / 1000, y: (b % 1000) / 1000, size: 0.6 + ((a >>> 8) % 100) / 100 * 1.2 }
+    })
+    // 会缓慢流动的远景星场：不同深度、不同速度，像一片在飘的星空。
+    const SM_FLOW = Array.from({ length: 160 }, (_, i) => {
+      const a = Math.imul(i + 7, 2654435761) >>> 0
+      const b = Math.imul(i + 19, 40503) >>> 0
+      const c = Math.imul(i + 31, 1103515245) >>> 0
+      const z = 0.35 + ((a >>> 8) % 100) / 100 * 0.65
+      return { x: (a % 1000) / 1000, y: (b % 1000) / 1000, z, size: 0.5 + (((c >>> 8) % 100) / 100) * 1.1, speed: 0.006 + z * 0.022, warm: (c % 100) > 78 }
+    })
+
+    function smDraw(ctx, { W, H, stars, layout, stats, edges, view, opt, bgCanvas, glowCanvas, hover, labelBoxes, labelSeen, now }) {
+      const layoutGroups = (layout && layout.groups) || []
+      const boxHit = (x, y, w, h) => labelBoxes.current.some((b) => Math.abs(b.x - x) < (b.w + w) / 2 && Math.abs(b.y - y) < (b.h + h) / 2)
+
+      // ── 背景层：只在尺寸变化时重画 ──
+      if (bgCanvas.width !== W || bgCanvas.height !== H) {
+        bgCanvas.width = W
+        bgCanvas.height = H
+        const bg = bgCanvas.getContext('2d')
+        bg.fillStyle = '#050a14'
+        bg.fillRect(0, 0, W, H)
+        for (const [x, y, r, cr, cg, cb, alpha] of [[0.3, 0.28, 0.55, 72, 98, 210, 0.18], [0.74, 0.2, 0.4, 132, 74, 186, 0.12], [0.58, 0.8, 0.6, 40, 112, 168, 0.1]]) {
+          const g = bg.createRadialGradient(x * W, y * H, 0, x * W, y * H, r * Math.min(W, H))
+          g.addColorStop(0, `rgba(${cr},${cg},${cb},${alpha})`)
+          g.addColorStop(1, `rgba(${cr},${cg},${cb},0)`)
+          bg.fillStyle = g
+          bg.fillRect(0, 0, W, H)
+        }
+        for (const d of SM_DUST) {
+          bg.fillStyle = `rgba(150,180,230,${0.05 + d.size * 0.1})`
+          bg.fillRect(d.x * W, d.y * H, d.size, d.size)
+        }
+      }
+      ctx.drawImage(bgCanvas, 0, 0, W, H)
+      if (opt.motion) {
+        // 背景不逐帧闪：星尘固定亮度，流动星场只保留很慢的漂移。
+        for (let i = 0; i < SM_DUST.length; i += 5) {
+          const d = SM_DUST[i]
+          ctx.fillStyle = 'rgba(190,214,245,0.16)'
+          ctx.fillRect(d.x * W, d.y * H, 1.2, 1.2)
+        }
+        const T = now * 0.001
+        for (const f of SM_FLOW) {
+          const x = (((f.x + T * f.speed * 0.35) % 1) + 1) % 1
+          const y = (((f.y + T * f.speed * 0.1) % 1) + 1) % 1
+          const alpha = 0.1 + 0.16 * f.z
+          const px = x * W
+          const py = y * H
+          if (f.z > 0.9 && f.size > 1.2) {
+            ctx.strokeStyle = `rgba(190,214,245,${alpha * 0.3})`
+            ctx.lineWidth = 0.7
+            ctx.beginPath()
+            ctx.moveTo(px, py)
+            ctx.lineTo(px - f.speed * W * 0.2, py - f.speed * H * 0.05)
+            ctx.stroke()
+          }
+          ctx.fillStyle = f.warm ? `rgba(255,226,190,${alpha})` : `rgba(190,214,245,${alpha})`
+          ctx.fillRect(px, py, f.size, f.size)
+        }
+      }
+
+      const R = (layout && layout.radius) || 470
+      const camZ = R * 3 * view.camScale
+      const cyw = Math.cos(view.yaw), syw = Math.sin(view.yaw)
+      const cp = Math.cos(view.pitch), sp = Math.sin(view.pitch)
+      const focal = Math.min(W, H) * 0.95
+      const project = (p) => {
+        const worldX = p.x - view.cam.x
+        const worldY = p.y - view.cam.y
+        const worldZ = p.z - view.cam.z
+        const x1 = worldX * cyw + worldZ * syw
+        const z1 = -worldX * syw + worldZ * cyw
+        const y2 = worldY * cp - z1 * sp
+        const z2 = worldY * sp + z1 * cp
+        const depth = camZ - z2
+        if (depth < 60) return null
+        const k = focal * view.zoom / depth
+        return { x: W / 2 + x1 * k, y: H / 2 - y2 * k, k, depth, t: smClamp((z2 / R + 1) / 2, 0, 1) }
+      }
+      const proj = new Map()
+      for (const star of stars) { const p = project(star); if (p) proj.set(star.id, p) }
+      // 局部深度因子：project 里的 p.t 是「归一化到整个星图半径」的深度，聚焦到某个
+      // 子星云后，前后星星的 t 差异只有零点零几，近大远小/深度雾几乎失效，所以放大也
+      // 分不清前后两层。这里按当前视野里实际的最近/最远距离重新归一化出 td（1=近、0=远）。
+      let minDepth = Infinity, maxDepth = -Infinity
+      for (const p of proj.values()) { if (p.depth < minDepth) minDepth = p.depth; if (p.depth > maxDepth) maxDepth = p.depth }
+      const depthSpan = Math.max(1, maxDepth - minDepth)
+      for (const p of proj.values()) p.td = smClamp((maxDepth - p.depth) / depthSpan, 0, 1)
+      // clip=true 时：端点即使跑出画面，也拉回边界外一点继续画，而不是返回 null。
+      // 选中某颗星时它的连线常常连到别的子星云/星团（可能在画面外），
+      // 若按老逻辑丢弃整条边，用户就看不出这颗星和外面还有连接。
+      const edgeEndpoint = (id, clip = false) => {
+        const p = proj.get(id)
+        if (!p) return null
+        const off = p.x < -40 || p.x > W + 40 || p.y < -30 || p.y > H + 30
+        if (!off) return p
+        if (!clip) return null
+        return { x: smClamp(p.x, -24, W + 24), y: smClamp(p.y, -24, H + 24), k: p.k, depth: p.depth, t: p.t }
+      }
+
+      const groupTints = smTintMapOf(layoutGroups)
+      const starsById = new Map(stars.map((s) => [s.id, s]))
+      const nowMs = Date.now()
+      const active = Boolean(String(opt.query || '').trim() || opt.typeFilter || opt.quickFilter || opt.tierFilter)
+      const matchedIds = new Set(active ? stars.filter((s) => (!opt.tierFilter || (s.tier === opt.tierFilter && !s.archivedAt)) && smStarMatches(s, opt.query, opt.typeFilter, opt.quickFilter, nowMs)).map((s) => s.id) : [])
+      const matchedClusters = new Set()
+      const clusterRanked = new Map()
+      const childRanked = new Map()
+      const rankOf = (s) => smClamp(Number(s.hits) || 0, 0, 60) / 60 * 0.62 + smClamp(s.brightness, 0, 1) * 0.24 + smClamp(s.importance, 0, 1) * 0.14
+      for (const s of stars) {
+        if (active && matchedIds.has(s.id) && s.cluster) matchedClusters.add(s.cluster)
+        const rank = rankOf(s)
+        const list = clusterRanked.get(s.cluster) || []
+        list.push({ id: s.id, rank })
+        clusterRanked.set(s.cluster, list)
+        if (s.child) {
+          const cl = childRanked.get(s.child) || []
+          cl.push({ id: s.id, rank })
+          childRanked.set(s.child, cl)
+        }
+      }
+      for (const list of clusterRanked.values()) list.sort((a, b) => b.rank - a.rank || (a.id < b.id ? -1 : 1))
+      for (const list of childRanked.values()) list.sort((a, b) => b.rank - a.rank || (a.id < b.id ? -1 : 1))
+      const childTints = new Map()
+      for (const g of layoutGroups) (g.childClusters || []).forEach((child, i) => childTints.set(child.id, SM_CHILD_TINTS[i % SM_CHILD_TINTS.length]))
+      const colorOf = (s) => {
+        const tint = s.child ? childTints.get(s.child) : ''
+        return tint ? `rgb(${tint})` : (SM_REGION[s.region] || SM_REGION.knowledge).color
+      }
+      const highlightIds = new Set()
+      for (const g of layoutGroups) {
+        const children = g.childClusters || []
+        if (children.length) for (const child of children) (childRanked.get(child.id) || []).slice(0, 3).forEach((e) => highlightIds.add(e.id))
+        else (clusterRanked.get(g.id) || []).slice(0, 5).forEach((e) => highlightIds.add(e.id))
+      }
+      for (const s of stars) if (s.tier === 'core') highlightIds.add(s.id)
+      const starOrder = [...stars].sort((a, b) => {
+        const tierOf = (s) => (s.tier === 'core' ? 3 : highlightIds.has(s.id) ? 2 : 1)
+        const ta = a.invalidAt ? 0 : tierOf(a)
+        const tb = b.invalidAt ? 0 : tierOf(b)
+        return ta - tb || (a.id < b.id ? -1 : 1)
+      })
+      const edgeAllowed = (e) => (opt.edgeKinds || []).includes(e.kind)
+      const edgeIndex = new Map()
+      const idleEdges = !opt.edgeOn ? [] : opt.edgeMode === 'focus' ? []
+        : (edges || []).filter(edgeAllowed).slice(0, opt.edgeMode === 'subtle' ? Math.min(opt.edgeMax, 40) : opt.edgeMax)
+      for (const e of (edges || [])) {
+        if (!edgeAllowed(e)) continue
+        if (!edgeIndex.has(e.a)) edgeIndex.set(e.a, [])
+        if (!edgeIndex.has(e.b)) edgeIndex.set(e.b, [])
+        edgeIndex.get(e.a).push(e)
+        edgeIndex.get(e.b).push(e)
+      }
+      const edgeFocusId = opt.selected || hover.current
+      const edgeList = !opt.edgeOn ? [] : active ? (edges || []).filter((e) => edgeAllowed(e) && matchedIds.has(e.a) && matchedIds.has(e.b)) : edgeFocusId ? (edgeIndex.get(edgeFocusId) || []) : idleEdges
+      const zoomGain = smClamp(view.zoom, 0.55, 3)
+      const edgeWidth = smClamp(0.35 + 0.25 * zoomGain, 0.35, 1.1)
+      const baseAlpha = active ? 0.2 : edgeFocusId ? 0.35 : 0.06 * (opt.edgeMode === 'subtle' ? 0.6 : 1)
+      for (const e of edgeList) {
+        // 选中/悬停时启用裁剪：连线的一端跑出画面，也要画到边缘，不能整条断掉。
+        const a = edgeEndpoint(e.a, Boolean(edgeFocusId)), b = edgeEndpoint(e.b, Boolean(edgeFocusId))
+        if (!a || !b) continue
+        const alpha = smClamp(baseAlpha * zoomGain * (opt.edgeStrength || 1), 0, 0.65)
+        if (alpha <= 0) continue
+        ctx.strokeStyle = `rgba(${SM_EDGE_WHITE}, ${alpha})`
+        ctx.lineWidth = edgeWidth
+        ctx.setLineDash([])
+        ctx.beginPath()
+        ctx.moveTo(a.x, a.y)
+        ctx.lineTo(b.x, b.y)
+        ctx.stroke()
+      }
+      ctx.setLineDash([])
+
+      // ── 半分辨率辉光层模拟 bloom ──
+      if (opt.glow && typeof ctx.filter === 'string') {
+        const gw = Math.max(160, Math.floor(W / 2))
+        const gh = Math.max(170, Math.floor(H / 2))
+        if (glowCanvas.width !== gw || glowCanvas.height !== gh) { glowCanvas.width = gw; glowCanvas.height = gh }
+        const gc = glowCanvas.getContext('2d')
+        gc.setTransform(1, 0, 0, 1, 0, 0)
+        gc.clearRect(0, 0, gw, gh)
+        gc.setTransform(0.5, 0, 0, 0.5, 0, 0)
+        for (const s of stars) {
+          if (s.invalidAt) continue
+          const lit = highlightIds.has(s.id) || s.id === opt.selected || s.id === hover.current || (active && matchedIds.has(s.id))
+          if (!lit) continue
+          const p = proj.get(s.id)
+          if (!p) continue
+          if (p.x < -40 || p.x > W + 40 || p.y < -30 || p.y > H + 30) continue
+          const b = smClamp(s.brightness, 0, 1)
+          gc.globalAlpha = p.t * (0.22 + 0.55 * b)
+          gc.fillStyle = colorOf(s)
+          gc.beginPath()
+          gc.arc(p.x, p.y, 2.4 + b * 1.6, 0, Math.PI * 2)
+          gc.fill()
+        }
+        gc.globalAlpha = 0.7
+        gc.fillStyle = '#ffd166'
+        gc.beginPath()
+        gc.arc(W / 2, H / 2, Math.max(10, Math.min(W, H) * 0.025), 0, Math.PI * 2)
+        gc.fill()
+        gc.globalAlpha = 1
+        ctx.save()
+        ctx.globalCompositeOperation = 'lighter'
+        ctx.globalAlpha = 0.85
+        ctx.filter = 'blur(6px)'
+        ctx.drawImage(glowCanvas, 0, 0, W, H)
+        ctx.restore()
+      }
+
+      // ── 星团光环、层级射线、辐条、核心星 ──
+      const font = '-apple-system, "Noto Sans SC", sans-serif'
+      ctx.textAlign = 'center'
+      const groupHits = []
+      for (const group of layoutGroups) {
+        const p = project(group)
+        if (!p) continue
+        if (p.x < -60 || p.x > W + 60 || p.y < -40 || p.y > H + 40) continue
+        const fs = Math.round(smClamp(10 + p.t * 3, 10, 13))
+        ctx.font = `${fs}px ${font}`
+        const fading = group.id === 'fading'
+        const archived = group.id === 'archived'
+        const tint = fading ? '255, 190, 122' : archived ? '139, 147, 167' : (groupTints.get(group.id) || SM_GROUP_TINTS[0])
+        const rr = (group.r || 0) * p.k
+        const groupActive = opt.groupSelected === group.id || opt.hoverGroup === group.id
+        ctx.globalAlpha = groupActive ? 0.2 + 0.12 * p.t : (archived ? 0.03 : 0.04 + 0.05 * p.t)
+        ctx.strokeStyle = `rgba(${tint},1)`
+        ctx.lineWidth = groupActive ? 1.3 : 1
+        ctx.beginPath()
+        ctx.moveTo(W / 2, H / 2)
+        ctx.lineTo(p.x, p.y)
+        ctx.stroke()
+        if (rr > 4) {
+          ctx.globalAlpha = groupActive ? 0.26 + 0.24 * p.t : (fading ? 0.12 : archived ? 0.06 : 0.05) + 0.1 * p.t
+          ctx.strokeStyle = groupActive ? '#ffd166' : fading ? '#ffbe7a' : archived ? '#8b93a7' : `rgb(${tint})`
+          ctx.lineWidth = groupActive ? 1.8 : 1
+          ctx.setLineDash(fading || archived ? [5, 5] : [])
+          ctx.beginPath()
+          ctx.arc(p.x, p.y, rr, 0, Math.PI * 2)
+          ctx.stroke()
+          ctx.setLineDash([])
+          if (!fading && !archived && rr > 12) {
+            ctx.globalAlpha = (groupActive ? 0.22 : 0.06) * (0.5 + 0.5 * p.t)
+            ctx.setLineDash([2, 5])
+            ctx.beginPath()
+            ctx.arc(p.x, p.y, rr * 1.12, 0, Math.PI * 2)
+            ctx.stroke()
+            ctx.setLineDash([])
+          }
+          ctx.globalAlpha = 1
+        }
+        const spokes = (clusterRanked.get(group.id) || []).filter((e) => proj.has(e.id)).slice(0, 5)
+        for (const entry of spokes) {
+          const spp = proj.get(entry.id)
+          ctx.globalAlpha = (0.07 + 0.1 * p.t) * (groupActive ? 2 : 1)
+          ctx.strokeStyle = `rgba(${tint},1)`
+          ctx.lineWidth = 1
+          ctx.beginPath()
+          ctx.moveTo(p.x, p.y)
+          ctx.lineTo(spp.x, spp.y)
+          ctx.stroke()
+        }
+        const coreR = smClamp((2.6 + Math.log10(Math.max(10, group.total)) * 1.05) * smClamp(p.k / 0.35, 0.9, 2.4), 2.6, 14)
+        ctx.globalAlpha = (groupActive ? 0.2 : 0.08) * p.t
+        ctx.fillStyle = `rgba(${tint},1)`
+        ctx.beginPath()
+        ctx.arc(p.x, p.y, coreR * 2.6, 0, Math.PI * 2)
+        ctx.fill()
+        ctx.globalAlpha = 0.9 * p.t
+        ctx.beginPath()
+        ctx.arc(p.x, p.y, coreR, 0, Math.PI * 2)
+        ctx.fill()
+        ctx.globalAlpha = 0.95 * p.t
+        ctx.fillStyle = '#fff8e6'
+        ctx.beginPath()
+        ctx.arc(p.x, p.y, coreR * 0.42, 0, Math.PI * 2)
+        ctx.fill()
+        // 命中圈盖到虚线环（rr*1.12）之外一点，否则点星团边缘那圈虚线/子星云外延
+        // 的空白会掉进「点空白」分支，把视角整个重置掉。
+        groupHits.push({ id: group.id, x: p.x, y: p.y, r: Math.max(14, rr * 1.15), point: group })
+      }
+
+      // ── 星团标签：按团大小定优先级，避让带粘滞，避免旋转时一闪一闪 ──
+      const labelGroups = [...layoutGroups].sort((a, b) => (b.total || 0) - (a.total || 0) || (a.id < b.id ? -1 : 1))
+      for (const group of labelGroups) {
+        const p = project(group)
+        if (!p) continue
+        if (p.x < -60 || p.x > W + 60 || p.y < -40 || p.y > H + 40) continue
+        const fs = Math.round(smClamp(10 + p.t * 3, 10, 13))
+        ctx.font = `${fs}px ${font}`
+        const fading = group.id === 'fading'
+        const archived = group.id === 'archived'
+        const tint = fading ? '255, 190, 122' : archived ? '139, 147, 167' : (groupTints.get(group.id) || SM_GROUP_TINTS[0])
+        const rr = (group.r || 0) * p.k
+        const hot = matchedClusters.has(group.id) || opt.groupSelected === group.id || opt.hoverGroup === group.id
+        const text = `${group.label} · ${group.total}`
+        const lx = smClamp(p.x, 50, W - 50)
+        const ly = smClamp(p.y - Math.max(14, rr * 0.62), 14, H - 8)
+        const tw = ctx.measureText(text).width + 8
+        const bh = fs + 3
+        const boxTop = ly - fs + 2
+        const collided = boxHit(lx, boxTop + bh / 2, tw, bh)
+        if (collided && !hot) {
+          const lastSeen = labelSeen.current.get(group.id) || 0
+          if (now - lastSeen > 1200) continue
+        }
+        const fade = collided ? 0.55 : 1
+        ctx.globalAlpha = fade
+        ctx.fillStyle = `rgba(5, 10, 20, ${(0.35 + 0.3 * p.t) * fade})`
+        ctx.fillRect(lx - tw / 2, boxTop, tw, bh)
+        ctx.fillStyle = hot ? `rgba(255, 209, 102, ${(0.5 + 0.45 * p.t) * fade})`
+          : fading ? `rgba(255, 190, 122, ${(0.3 + 0.6 * p.t) * fade})`
+            : archived ? `rgba(139, 147, 167, ${(0.25 + 0.5 * p.t) * fade})`
+              : `rgba(${tint}, ${(0.4 + 0.55 * p.t) * fade})`
+        ctx.fillText(text, lx, ly)
+        ctx.globalAlpha = 1
+        labelBoxes.current.push({ x: lx, y: boxTop + bh / 2, w: tw, h: bh })
+        labelSeen.current.set(group.id, now)
+      }
+      ctx.textAlign = 'center'
+      ctx.globalAlpha = 1
+
+      // ── 团内子星云 ──
+      const childHits = []
+      for (const group of layoutGroups) {
+        const children = group.childClusters || []
+        if (!children.length) continue
+        if (opt.groupSelected && opt.groupSelected !== group.id && opt.hoverGroup !== group.id) continue
+        const groupActive = opt.groupSelected === group.id || opt.hoverGroup === group.id
+        const childFade = groupActive ? 1 : smClamp((view.zoom - 1.02) / 0.55, 0, 1)
+        if (!groupActive && childFade <= 0.01) continue
+        const groupP = project(group)
+        const groupTint = groupTints.get(group.id) || SM_GROUP_TINTS[0]
+        children.forEach((child, index) => {
+          const point = { x: group.x + child.x, y: group.y + child.y, z: group.z + child.z }
+          const p = project(point)
+          if (!p) return
+          if (p.x < -50 || p.x > W + 50 || p.y < -40 || p.y > H + 40) return
+          const rr = Math.max(2, child.r * p.k)
+          const tint = SM_CHILD_TINTS[index % SM_CHILD_TINTS.length]
+          const chosen = opt.groupSelected === group.id && opt.groupChild === child.id
+          if (groupActive && groupP) {
+            ctx.globalAlpha = (chosen ? 0.42 : 0.2) * p.t
+            ctx.strokeStyle = `rgba(${groupTint},1)`
+            ctx.lineWidth = chosen ? 1.6 : 1.1
+            ctx.beginPath()
+            ctx.moveTo(groupP.x, groupP.y)
+            ctx.lineTo(p.x, p.y)
+            ctx.stroke()
+          }
+          ctx.globalAlpha = (groupActive ? 0.06 + 0.1 * p.t : 0.03) * childFade
+          ctx.fillStyle = `rgba(${tint},1)`
+          ctx.beginPath()
+          ctx.arc(p.x, p.y, rr * 1.35, 0, Math.PI * 2)
+          ctx.fill()
+          ctx.globalAlpha = (chosen ? 0.55 : groupActive ? 0.24 : 0.12) * childFade
+          ctx.strokeStyle = chosen ? '#ffd166' : `rgb(${tint})`
+          ctx.lineWidth = chosen ? 1.8 : 1
+          ctx.beginPath()
+          ctx.arc(p.x, p.y, rr, 0, Math.PI * 2)
+          ctx.stroke()
+          const coreR = smClamp(rr * 0.22, 1.6, 7)
+          ctx.globalAlpha = (chosen ? 0.28 : 0.12) * p.t * childFade
+          ctx.fillStyle = `rgba(${tint},1)`
+          ctx.beginPath()
+          ctx.arc(p.x, p.y, coreR * 3.2, 0, Math.PI * 2)
+          ctx.fill()
+          ctx.globalAlpha = 0.8 * p.t * childFade
+          ctx.beginPath()
+          ctx.arc(p.x, p.y, coreR, 0, Math.PI * 2)
+          ctx.fill()
+          if (groupActive) {
+            const kids = (childRanked.get(child.id) || []).filter((e) => proj.has(e.id)).slice(0, 6)
+            ctx.strokeStyle = `rgba(${tint},1)`
+            ctx.lineWidth = 1
+            for (const entry of kids) {
+              const kp = proj.get(entry.id)
+              ctx.globalAlpha = (chosen ? 0.26 : 0.12) * p.t
+              ctx.beginPath()
+              ctx.moveTo(p.x, p.y)
+              ctx.lineTo(kp.x, kp.y)
+              ctx.stroke()
+            }
+          }
+          if (childFade > 0.15) childHits.push({ id: child.id, group: group.id, x: p.x, y: p.y, r: Math.max(14, rr), point })
+          if (groupActive) {
+            const text = `${child.label} · ${child.total}`
+            ctx.globalAlpha = 1
+            ctx.font = `${Math.round(smClamp(9 + p.t * 2, 9, 11))}px ${font}`
+            const tw = ctx.measureText(text).width + 8
+            const ly = smClamp(p.y - rr - 8, 12, H - 10)
+            const boxTop = ly - 9
+            if (!chosen && boxHit(p.x, boxTop + 6, tw, 14)) return
+            ctx.fillStyle = 'rgba(5,10,20,0.66)'
+            ctx.fillRect(p.x - tw / 2, boxTop, tw, 14)
+            ctx.fillStyle = chosen ? 'rgba(255,209,102,0.95)' : `rgba(${tint},0.82)`
+            ctx.fillText(text, p.x, ly)
+            labelBoxes.current.push({ x: p.x, y: boxTop + 6, w: tw, h: 14 })
+          }
+        })
+      }
+      ctx.globalAlpha = 1
+      ctx.textAlign = 'center'
+
+      // ── 星点 ──
+      const kBase = focal / (R * 3)
+      const starLabelAlpha = smClamp((view.zoom - 1.75) / 0.55, 0, 1)
+      const hits = []
+      const labelCandidates = []
+      const huge = stars.length > 6000 && view.zoom < 1.7
+      const paintStar = (star, p, emphasized) => {
+        const matched = active && matchedIds.has(star.id)
+        const dim = active && !matched
+        const isFocus = star.id === opt.selected || star.id === hover.current
+        const b = smClamp(star.brightness, 0, 1)
+        const hitLevel = smClamp(Math.log1p(Math.max(0, Number(star.hits) || 0)) / 4.2, 0, 1)
+        const lit = highlightIds.has(star.id)
+        const tier = star.tier === 'short' || star.tier === 'core' ? star.tier : 'long'
+        const mag = Math.max(0.35, p.k / kBase)
+        const baseR = 0.95 + 0.3 * b + 0.3 * hitLevel + (lit ? 0.55 : 0) + (tier === 'core' ? 0.3 : 0)
+        const r = smClamp(baseR * Math.pow(mag, 0.46) * (0.55 + 0.45 * (p.td ?? p.t)), 0.9, 6.5)
+        const depthFade = 0.72 + 0.28 * p.t
+        const color = colorOf(star)
+        if (dim) {
+          ctx.globalAlpha = 0.1 * p.t
+          ctx.fillStyle = color
+          ctx.beginPath()
+          ctx.arc(p.x, p.y, Math.max(0.8, r * 0.8), 0, Math.PI * 2)
+          ctx.fill()
+          ctx.globalAlpha = 1
+          // 变暗但**仍然可点**：筛选只是视觉提示，不该让没被选中的星失联
+          // （用户反馈「自己的经历点不开详细」就是被这行 return 挡掉的）
+          hits.push({ id: star.id, x: p.x, y: p.y, r: Math.max(9, r + 5) })
+          return
+        }
+        if (star.invalidAt) {
+          // 已归档/已过时的星：老版本 alpha 0.5~0.85，这里原来 0.3 太淡，
+          // 灰蓝虚线环 + 实心点几乎融进背景，用户反馈「已归档看不清」。
+          const ar = Math.max(1.7, r)
+          ctx.globalAlpha = smClamp(0.5 + 0.3 * p.t, 0, 0.85)
+          ctx.fillStyle = color
+          ctx.beginPath()
+          ctx.arc(p.x, p.y, ar, 0, Math.PI * 2)
+          ctx.fill()
+          ctx.globalAlpha = smClamp(0.3 + 0.3 * p.t, 0, 0.65)
+          ctx.strokeStyle = 'rgba(190, 200, 218, 0.9)'
+          ctx.lineWidth = 1
+          ctx.setLineDash([2, 2])
+          ctx.beginPath()
+          ctx.arc(p.x, p.y, ar + 2.4, 0, Math.PI * 2)
+          ctx.stroke()
+          ctx.setLineDash([])
+          ctx.globalAlpha = 1
+          hits.push({ id: star.id, x: p.x, y: p.y, r: Math.max(10, r + 6) })
+          return
+        }
+        if (huge && !lit && !isFocus && !matched) {
+          ctx.globalAlpha = smClamp(p.t * 0.3, 0, 0.3)
+          ctx.fillStyle = color
+          ctx.fillRect(p.x, p.y, 1.2, 1.2)
+          ctx.globalAlpha = 1
+          return
+        }
+        if (lit || isFocus || matched) {
+          ctx.globalAlpha = (0.04 + 0.09 * b) * p.t * depthFade
+          ctx.fillStyle = color
+          ctx.beginPath()
+          ctx.arc(p.x, p.y, r * 2.2, 0, Math.PI * 2)
+          ctx.fill()
+        }
+        const sizeAlpha = smClamp(r / 2.4, 0.62, 1)
+        // 深度雾：用局部深度因子 td（1=近、0=远）做近亮远淡。之前用全局 p.t，聚焦后
+        // 前后星星的 t 差异几乎为 0，分不清层次；td 按当前视野最近/最远重新归一化后，
+        // 前后层在放大时也能看出深浅。下限从 0.3 降到 0.12，让远处真正雾化（近处仍亮）。
+        const depthFog = smClamp(Math.pow(p.td ?? p.t, 1.4), 0, 1)
+        const rawAlpha = depthFog * (0.35 + 0.45 * b) * depthFade * sizeAlpha
+        ctx.globalAlpha = smClamp(rawAlpha, 0.12, 0.95)
+        ctx.fillStyle = color
+        ctx.beginPath()
+        ctx.arc(p.x, p.y, r, 0, Math.PI * 2)
+        ctx.fill()
+        if (isFocus) {
+          const len = r * 4 + 3
+          ctx.globalAlpha = smClamp(0.3 * p.t, 0, 0.4)
+          ctx.strokeStyle = '#ffd166'
+          ctx.lineWidth = 0.9
+          ctx.beginPath()
+          ctx.moveTo(p.x - len, p.y)
+          ctx.lineTo(p.x + len, p.y)
+          ctx.moveTo(p.x, p.y - len)
+          ctx.lineTo(p.x, p.y + len)
+          ctx.stroke()
+        }
+        if (isFocus || matched) {
+          ctx.globalAlpha = (emphasized ? 0.95 : 0.8) * p.t
+          ctx.strokeStyle = '#ffd166'
+          ctx.lineWidth = emphasized ? 1.6 : 1.1
+          ctx.beginPath()
+          ctx.arc(p.x, p.y, r + (emphasized ? 5 : 4), 0, Math.PI * 2)
+          ctx.stroke()
+        } else if (tier === 'core') {
+          // 永久记忆：金色常亮环，不随清晰度变暗。
+          ctx.globalAlpha = 0.42 * p.t
+          ctx.strokeStyle = '#ffd166'
+          ctx.lineWidth = 1.2
+          ctx.beginPath()
+          ctx.arc(p.x, p.y, r + 3, 0, Math.PI * 2)
+          ctx.stroke()
+        } else if (tier === 'short') {
+          // 临时候选：虚线细环，提醒它随时可能被归档。
+          ctx.globalAlpha = 0.32 * p.t
+          ctx.strokeStyle = color
+          ctx.lineWidth = 1
+          ctx.setLineDash([2, 2])
+          ctx.beginPath()
+          ctx.arc(p.x, p.y, r + 2, 0, Math.PI * 2)
+          ctx.stroke()
+          ctx.setLineDash([])
+        }
+        ctx.globalAlpha = 1
+        // 所有星都注册命中区：原来 < 2.05 的不登记，导致暗淡的小星星（久远/低重要度的
+        // 记忆，比如自己过去的经历）根本点不开详情。命中半径统一给到 9px 兜底。
+        hits.push({ id: star.id, x: p.x, y: p.y, r: Math.max(9, r + 5) })
+        if (!star.invalidAt && starLabelAlpha > 0 && b >= 0.3) {
+          labelCandidates.push({ star, x: p.x, y: p.y, r, rank: rankOf(star) + (isFocus ? 5 : 0) })
+        }
+      }
+      const deferred = []
+      for (const star of starOrder) {
+        const p = proj.get(star.id)
+        if (!p) continue
+        if (p.x < -40 || p.x > W + 40 || p.y < -30 || p.y > H + 30) continue
+        if (star.id === opt.selected || star.id === hover.current || (active && matchedIds.has(star.id))) {
+          deferred.push([star, p])
+          continue
+        }
+        paintStar(star, p, false)
+      }
+      for (const [star, p] of deferred) paintStar(star, p, true)
+
+      // ── 记忆中枢：太阳状核心，脉冲 + 十条光线 ──
+      // 它固定画在画面正中心。聚焦某个星团时星团也被挪到正中心，
+      // 两者会完全重叠——看起来就像「点星团结果聚焦到了记忆中枢」。
+      // 所以选中星团时把中枢淡出。注意这里必须用 opt.groupSelected，
+      // smDraw 是独立函数，没有组件里的 groupSel 变量。
+      const hubFade = opt.groupSelected ? 0 : smClamp((view.camScale - 0.55) / 0.3, 0, 1)
+      const pulse = opt.motion ? 1 + Math.sin(now * 0.0007) * 0.018 : 1
+      const hubR = Math.max(7, Math.min(W, H) * 0.016) * pulse
+      if (opt.motion && hubFade > 0) {
+        for (let i = 0; i < 10; i += 1) {
+          const angle = now * 0.00002 + i * Math.PI / 5
+          const len = hubR * (2.6 + (i % 4) * 0.5)
+          ctx.globalAlpha = 0.5 * hubFade
+          ctx.strokeStyle = `rgba(255, 209, 102, ${0.05 + (i % 3) * 0.025})`
+          ctx.lineWidth = 1
+          ctx.beginPath()
+          ctx.moveTo(W / 2 + Math.cos(angle) * hubR * 1.2, H / 2 + Math.sin(angle) * hubR * 1.2)
+          ctx.lineTo(W / 2 + Math.cos(angle) * len, H / 2 + Math.sin(angle) * len)
+          ctx.stroke()
+        }
+      }
+      ctx.globalAlpha = 0.05 * hubFade
+      ctx.fillStyle = '#ffd166'
+      ctx.beginPath()
+      ctx.arc(W / 2, H / 2, hubR * 4.6, 0, Math.PI * 2)
+      ctx.fill()
+      ctx.globalAlpha = 0.12 * hubFade
+      ctx.beginPath()
+      ctx.arc(W / 2, H / 2, hubR * 2.4, 0, Math.PI * 2)
+      ctx.fill()
+      ctx.globalAlpha = 0.55 * hubFade
+      ctx.beginPath()
+      ctx.arc(W / 2, H / 2, hubR * 1.45, 0, Math.PI * 2)
+      ctx.fill()
+      ctx.globalAlpha = 0.95 * hubFade
+      ctx.fillStyle = '#fff6d8'
+      ctx.beginPath()
+      ctx.arc(W / 2, H / 2, hubR, 0, Math.PI * 2)
+      ctx.fill()
+      ctx.globalAlpha = hubFade
+      if (hubFade > 0.02) {
+        ctx.fillStyle = 'rgba(255, 231, 163, 0.9)'
+        ctx.font = `13px ${font}`
+        ctx.fillText('记忆中枢', W / 2, H / 2 - hubR - 12)
+        ctx.fillStyle = 'rgba(255, 231, 163, 0.45)'
+        ctx.font = `11px ${font}`
+        ctx.fillText(`${(stats && stats.total) || 0} 条记忆`, W / 2, H / 2 + hubR + 18)
+      }
+
+      // ── 放大后给清晰、重要的单星补标签 ──
+      if (labelCandidates.length && starLabelAlpha > 0) {
+        labelCandidates.sort((a, b) => b.rank - a.rank || (a.star.id < b.star.id ? -1 : 1))
+        ctx.font = `11px ${font}`
+        let shown = 0
+        for (const item of labelCandidates) {
+          if (shown >= 12) break
+          const text = `${smShortText(item.star.aboutName || (item.star.tags && item.star.tags[0]) || '记忆', 10)} · ${Math.round(item.star.brightness * 100)}%`
+          const width = ctx.measureText(text).width + 10
+          const left = smClamp(item.x - width / 2, 6, W - width - 6)
+          const top = smClamp(item.y + item.r + 6, 12, H - 21)
+          if (boxHit(left + width / 2, top + 7, width, 15)) continue
+          ctx.globalAlpha = starLabelAlpha
+          ctx.fillStyle = 'rgba(5, 10, 20, 0.72)'
+          ctx.fillRect(left, top, width, 15)
+          ctx.fillStyle = item.star.id === opt.selected ? 'rgba(255, 209, 102, 0.95)' : 'rgba(198, 218, 244, 0.85)'
+          ctx.textAlign = 'left'
+          ctx.fillText(text, left + 5, top + 11)
+          ctx.globalAlpha = 1
+          labelBoxes.current.push({ x: left + width / 2, y: top + 7, w: width, h: 15 })
+          shown += 1
+        }
+        ctx.textAlign = 'center'
+      }
+
+      const focus = hover.current || opt.selected
+      const fp = focus ? proj.get(focus) : null
+      const fs2 = focus ? starsById.get(focus) : null
+      if (fp && fs2) {
+        ctx.font = `11px ${font}`
+        const text = `${fs2.aboutName || '杂项'} · ${Math.round(fs2.brightness * 100)}%`
+        const width = ctx.measureText(text).width + 12
+        const left = smClamp(fp.x - width / 2, 6, W - width - 6)
+        const top = fp.y > 32 ? fp.y - 26 : Math.min(H - 22, fp.y + 16)
+        ctx.fillStyle = 'rgba(16, 24, 40, 0.92)'
+        ctx.fillRect(left, top, width, 18)
+        ctx.fillStyle = 'rgba(226, 236, 250, 0.9)'
+        ctx.textAlign = 'left'
+        ctx.fillText(text, left + 6, top + 13)
+      }
+      ctx.globalAlpha = 0.38
+      ctx.fillStyle = '#9fb6d8'
+      ctx.font = `11px ${font}`
+      ctx.textAlign = 'left'
+      ctx.fillText('拖拽旋转 · 滚轮缩放 · 点星/星团查看', 12, H - 12)
+      ctx.fillText(
+        opt.groupChild ? `子星云：${opt.groupChildLabel || ''}`
+          : opt.tierFilter ? `只看${SM_TIER_LABEL[opt.tierFilter]}记忆 · ${matchedIds.size} 颗`
+            : huge ? `大量记忆：${stars.length} 颗星，普通星点自动简化` : '全部星星常驻显示',
+        12, H - 28,
+      )
+      ctx.textAlign = 'right'
+      ctx.fillText(`×${view.zoom.toFixed(1)}`, W - 12, 18)
+      ctx.fillText(`全部 ${stars.length} 颗`, W - 12, 34)
+      ctx.globalAlpha = 1
+      ctx.textAlign = 'center'
+      return { hits, groupHits, childHits, project }
+    }
+
+    /** 星图开关/筛选存在本地，切页再回来不会重置。 */
+    function usePersisted(key, initial) {
+      const full = 'aurabot.pref.' + key
+      const [v, setV] = useState(() => {
+        try {
+          const raw = localStorage.getItem(full)
+          if (raw === null) return initial
+          const parsed = JSON.parse(raw)
+          // 类型要和初值一致，否则旧的脏值会让界面崩
+          return typeof parsed === typeof initial ? parsed : initial
+        } catch (e) { return initial }
+      })
+      useEffect(() => {
+        try { localStorage.setItem(full, JSON.stringify(v)) } catch (e) {}
+      }, [v])
+      return [v, setV]
+    }
+
+    /**
+     * 记忆星图面板。
+     * 渲染走 smDraw（原版算法）；这里只负责状态、交互和侧栏清单。
+     */
+    function StarMap({ toast, onChanged }) {
+      // 默认展开；收起状态存本地，切页回来不会又弹开。
+      const [open, setOpen] = usePersisted('sm.open', true)
+      const [data, setData] = useState(null)
+      const [busy, setBusy] = useState(false)
+      const [sel, setSel] = useState(null)
+      const [groupSel, setGroupSel] = useState('')
+      const [childSel, setChildSel] = useState('')
+      // hover 只用来切鼠标样式（低频），悬停目标本体走 hoverRef / hoverGroupRef
+      const [hover, setHover] = useState(null)
+      // 面板开关（和原版一致）
+      const [query, setQuery] = useState('')
+      const [typeFilter, setTypeFilter] = usePersisted('sm.typeFilter', '')
+      const [quickFilter, setQuickFilter] = usePersisted('sm.quickFilter', '')
+      const [tierFilter, setTierFilter] = usePersisted('sm.tierFilter', '')
+      // 这几项是「看图的偏好」，不该每次切页都重置回默认，存本地
+      const [spin, setSpin] = usePersisted('sm.spin', true)
+      const [glow, setGlow] = usePersisted('sm.glow', true)
+      const [motion, setMotion] = usePersisted('sm.motion', true)
+      const [edgeOn, setEdgeOn] = usePersisted('sm.edgeOn', true)
+      const [edgeMode, setEdgeMode] = usePersisted('sm.edgeMode', 'subtle')
+      const [edgeStrength, setEdgeStrength] = usePersisted('sm.edgeStrength', 0.3)
+      const [edgeMax, setEdgeMax] = useState(60)
+      const [edgeKinds, setEdgeKinds] = useState(['person', 'tag', 'similar', 'conflict', 'assoc'])
+      const [detail, setDetail] = useState(null)
+      // 编辑框（原版点「编辑」后出现，改文字和重要度）
+      const [edit, setEdit] = useState(null)
+      // 画布左上角的模块清单：**默认收起来**，不挡星星；点标题才展开。
+      const [legendOpen, setLegendOpen] = usePersisted('sm.legendOpen', false)
+
+      const canvasRef = useRef(null)
+      const wrapRef = useRef(null)
+      const bgRef = useRef(null)
+      const glowRef = useRef(null)
+      const viewRef = useRef(null)
+      const hitsRef = useRef([])
+      const groupHitsRef = useRef([])
+      // 绘制异常只记第一次，用来在面板上提示「星图画不出来是因为什么」
+      const drawErrRef = useRef('')
+      const [drawErr, setDrawErr] = useState('')
+      const childHitsRef = useRef([])
+      const hoverRef = useRef(null)
+      // 鼠标移动时用这两个 ref 记当前悬停目标：渲染循环每帧读它们，
+      // 只在「换了一颗星」时才 setState（只为切光标），避免每像素都重渲染。
+      const localHoverRef = useRef(null)
+      const hoverGroupRef = useRef('')
+      const labelBoxesRef = useRef([])
+      const labelSeenRef = useRef(new Map())
+      const dragRef = useRef(null)
+
+      const load = async () => {
+        setBusy(true)
+        try {
+          const r = await get('/memory/graph')
+          if (!r.ok) { toast(r.message || '星图加载失败', 'err'); return }
+          setData(r)
+        } catch (e) { toast('星图加载失败：' + e.message, 'err') } finally { setBusy(false) }
+      }
+      useEffect(() => { if (open && !data) load() }, [open])
+
+      const post = async (path, body, okMsg) => {
+        try {
+          const r = await fetch('/aurabot/api' + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) }).then((x) => x.json())
+          toast(r.message || (r.ok ? (okMsg || '完成') : '失败'), r.ok ? 'ok' : 'err')
+          if (r.ok) {
+            // 不要先 setData(null)：那会让渲染 effect 以 data=null 白跑一次。
+            // 直接重新拉一次，成功后用新数据替换，顺便把侧栏详情同步到最新状态。
+            const fresh = await get('/memory/graph').catch(() => null)
+            if (fresh && fresh.ok) {
+              setData(fresh)
+              setDetail((cur) => (cur ? (fresh.stars || []).find((s) => s.id === cur.id) || null : null))
+            }
+            onChanged?.()
+          }
+          return r
+        } catch (e) { toast('操作失败：' + e.message, 'err'); return { ok: false } }
+      }
+
+      // ── 渲染循环 ──
+      useEffect(() => {
+        if (!open || !data) return
+        const canvas = canvasRef.current
+        const wrap = wrapRef.current
+        if (!canvas || !wrap) return
+        if (!viewRef.current) {
+          // zoom 的初值必须和 targetZoom 一致，否则第一帧从 1.7 一路缩到 1.2，
+          // 眼睛会看到画面「突然动了一下」——这就是每次进页面都觉得突兀的原因。
+          viewRef.current = {
+            yaw: 0.45, pitch: 0.32, zoom: 1.2, targetZoom: 1.2,
+            cam: { x: 0, y: 0, z: 0 }, camTarget: { x: 0, y: 0, z: 0 }, camScale: 1, camScaleTarget: 1,
+            focusId: null, fYaw: 0.45, fPitch: 0.32, vYaw: 0, vPitch: 0, dragging: false,
+          }
+        }
+        const view = viewRef.current
+        const bgCanvas = bgRef.current || (bgRef.current = document.createElement('canvas'))
+        const glowCanvas = glowRef.current || (glowRef.current = document.createElement('canvas'))
+        // 子星云名字只在选中变化时算一次；放进 tick 里会变成每帧一次全量扫描（60fps 白烧 CPU）。
+        const childLabel = (() => {
+          if (!childSel) return ''
+          for (const g of (data.layout?.groups || [])) {
+            const hit = (g.childClusters || []).find((c) => c.id === childSel)
+            if (hit) return hit.label
+          }
+          return ''
+        })()
+        let raf = 0
+        let last = performance.now()
+        const tick = (time) => {
+          const dt = Math.min(0.05, (time - last) / 1000)
+          last = time
+          if (!view.dragging) {
+            if (view.focusId) {
+              const dy = ((view.fYaw - view.yaw + Math.PI) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2) - Math.PI
+              view.yaw += dy * Math.min(1, dt * 4.5)
+              view.pitch += (view.fPitch - view.pitch) * Math.min(1, dt * 4.5)
+              view.vYaw = 0
+              view.vPitch = 0
+              // 到达目标角度就解除锁定，否则视角会一直被拽回默认、拖不动
+              if (Math.abs(dy) < 0.005 && Math.abs(view.fPitch - view.pitch) < 0.005) view.focusId = null
+            } else {
+              view.yaw += view.vYaw * dt * 60
+              view.pitch = smClamp(view.pitch + view.vPitch * dt * 60, -1.25, 1.25)
+              const decay = Math.pow(0.9, dt * 60)
+              view.vYaw *= decay
+              view.vPitch *= decay
+              if (spin && !sel && !groupSel) view.yaw += dt * 0.05
+            }
+          }
+          view.zoom += (view.targetZoom - view.zoom) * Math.min(1, dt * 9)
+          const camLerp = Math.min(1, dt * 3.6)
+          // 安全阀：防止镜头被挪到星图外面（只兜住离谱值，不限制正常聚焦）。
+          // 旧版聚焦是「完整移到目标坐标」，所以上限放到 1.1 倍半径；
+          // camScale 下限同步放宽到 0.2（旧版 focusOn 用 0.5、focusPoint 用 0.45）。
+          const Rlim = (data.layout && data.layout.radius) || 470
+          const camLim = Rlim * 1.1
+          view.camTarget.x = smClamp(view.camTarget.x, -camLim, camLim)
+          view.camTarget.y = smClamp(view.camTarget.y, -camLim, camLim)
+          view.camTarget.z = smClamp(view.camTarget.z, -camLim, camLim)
+          view.camScaleTarget = smClamp(view.camScaleTarget, 0.2, 3)
+          view.cam.x += (view.camTarget.x - view.cam.x) * camLerp
+          view.cam.y += (view.camTarget.y - view.cam.y) * camLerp
+          view.cam.z += (view.camTarget.z - view.cam.z) * camLerp
+          view.camScale += (view.camScaleTarget - view.camScale) * camLerp
+          const W = Math.max(320, Math.round(wrap.clientWidth))
+          const H = Math.max(340, Math.round(W * 0.62))
+          const dpr = window.devicePixelRatio || 1
+          const pw = Math.floor(W * dpr), ph = Math.floor(H * dpr)
+          if (canvas.width !== pw || canvas.height !== ph) { canvas.width = pw; canvas.height = ph }
+          canvas.style.width = W + 'px'
+          canvas.style.height = H + 'px'
+          const ctx = canvas.getContext('2d')
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+          ctx.clearRect(0, 0, W, H)
+          labelBoxesRef.current = []
+          // 兜底：smDraw 里任何一处抛异常都会让 requestAnimationFrame 链断掉，
+          // 画布从此一片空白（连星星都没有）。捕获后把画面清成空、继续下一帧，
+          // 至少不会整块卡死；错误只记一次，免得每帧刷屏。
+          try {
+            const out = smDraw(ctx, {
+              W, H, stars: data.stars || [], layout: data.layout, stats: data.stats, edges: data.edges,
+              view, bgCanvas, glowCanvas,
+              hover: hoverRef, labelBoxes: labelBoxesRef, labelSeen: labelSeenRef, now: time,
+              opt: { query, typeFilter, quickFilter, tierFilter, spin, glow, motion, edgeOn, edgeMode, edgeStrength, edgeMax, edgeKinds, selected: sel, groupSelected: groupSel, groupChild: childSel, groupChildLabel: childLabel, hoverGroup: hoverGroupRef.current },
+            })
+            hitsRef.current = out.hits
+            groupHitsRef.current = out.groupHits
+            childHitsRef.current = out.childHits
+            drawErrRef.current = ''
+          } catch (e) {
+            if (!drawErrRef.current) {
+              drawErrRef.current = e && e.message ? e.message : String(e)
+              setDrawErr(drawErrRef.current)
+              console.error('[星图] 绘制失败：', e)
+            }
+            hitsRef.current = []
+            groupHitsRef.current = []
+            childHitsRef.current = []
+          }
+          raf = requestAnimationFrame(tick)
+        }
+        raf = requestAnimationFrame(tick)
+        return () => cancelAnimationFrame(raf)
+      }, [open, data, sel, groupSel, childSel, spin, glow, motion, query, typeFilter, quickFilter, tierFilter, edgeOn, edgeMode, edgeStrength, edgeMax, edgeKinds])
+
+      // 滚轮缩放（passive: false 才能 preventDefault）
+      useEffect(() => {
+        const canvas = canvasRef.current
+        if (!canvas) return
+        const onWheel = (event) => {
+          event.preventDefault()
+          const view = viewRef.current
+          if (!view) return
+          view.targetZoom = smClamp(view.targetZoom * Math.exp(-event.deltaY * 0.0015), 0.55, 15)
+        }
+        canvas.addEventListener('wheel', onWheel, { passive: false })
+        return () => canvas.removeEventListener('wheel', onWheel)
+      }, [open, data])
+
+      // ── 鼠标交互 ──
+      const pick = (x, y) => {
+        let best = null, bestD = Infinity
+        for (const hit of hitsRef.current) {
+          const d = Math.hypot(hit.x - x, hit.y - y)
+          if (d <= hit.r && d < bestD) { bestD = d; best = hit }
+        }
+        return best
+      }
+      const pickGroup = (x, y) => {
+        let best = null, bestD = Infinity
+        for (const hit of groupHitsRef.current) {
+          const d = Math.hypot(hit.x - x, hit.y - y)
+          if (d <= hit.r && d < bestD) { bestD = d; best = hit }
+        }
+        return best
+      }
+      const pickChild = (x, y) => {
+        let best = null, bestD = Infinity
+        for (const hit of childHitsRef.current) {
+          const d = Math.hypot(hit.x - x, hit.y - y)
+          if (d <= hit.r && d < bestD) { bestD = d; best = hit }
+        }
+        return best
+      }
+      const onDown = (e) => {
+        // 只有左键才开始拖拽。右键会触发 contextmenu，如果这里也记起点，
+        // 右键那一下会被当成一次拖拽，视角直接被甩走（截图里星点飞了的真因）。
+        if (e.button !== 0) return
+        dragRef.current = { x: e.clientX, y: e.clientY, yaw: viewRef.current?.yaw || 0.45, pitch: viewRef.current?.pitch || 0.32 }
+        if (viewRef.current) {
+          viewRef.current.dragging = true
+          // 拖拽立即打断「返回动画」的视角锁定，否则镜头会被拽回默认角度
+          viewRef.current.focusId = null
+        }
+      }
+      const onMove = (e) => {
+        const d = dragRef.current
+        const canvas = canvasRef.current
+        if (!canvas || !viewRef.current) return
+        if (!d) {
+          // 悬停检测。只写 ref，不 setState —— 渲染循环每帧都读 hoverRef，
+          // 每移动一次鼠标就 setState 会把 React 拖垮（原版也是只用 ref）。
+          const rect = canvas.getBoundingClientRect()
+          const mx = e.clientX - rect.left, my = e.clientY - rect.top
+          const s = pick(mx, my)
+          const g = pickGroup(mx, my)
+          const nextId = s ? s.id : null
+          if (localHoverRef.current !== nextId) {
+            localHoverRef.current = nextId
+            hoverRef.current = nextId
+            // 只为了让光标样式变一下，这个变化频率低，setState 可以接受
+            setHover(nextId)
+          }
+          hoverGroupRef.current = g ? g.id : ''
+          return
+        }
+        // 右键/中键拖拽不动视角（也防住按住右键移动时把镜头甩飞）
+        if (e.buttons && (e.buttons & 1) === 0) return
+        const dx = e.clientX - d.x, dy = e.clientY - d.y
+        viewRef.current.yaw = d.yaw + dx * 0.007
+        viewRef.current.pitch = smClamp(d.pitch + dy * 0.007, -1.25, 1.25)
+        viewRef.current.vYaw = dx * 0.0006
+        viewRef.current.vPitch = dy * 0.0006
+      }
+      const onUp = (e) => {
+        const d = dragRef.current
+        dragRef.current = null
+        if (viewRef.current) viewRef.current.dragging = false
+        if (!d) return
+        // 位移阈值对齐旧版（12px）：手在「按下→抬起」间难免微动，3px 太严，
+        // 几乎每次点击都被当成拖拽丢掉，点星团/星星自然「没反应」。
+        const moved = Math.abs(e.clientX - d.x) > 12 || Math.abs(e.clientY - d.y) > 12
+        if (moved) return
+        const canvas = canvasRef.current
+        if (!canvas) return
+        const rect = canvas.getBoundingClientRect()
+        const mx = e.clientX - rect.left, my = e.clientY - rect.top
+        const child = pickChild(mx, my)
+        const zoomNow = viewRef.current?.zoom || 1
+        // 星星可点条件对齐旧版 panel.js：放大到 1.75 以上，或已经钻进某个星团/子星云。
+        // 光有 zoom 门槛不够——点星团聚焦后 zoom 只到 1.7（< 1.8），此时想点团内星星会落空。
+        const star = (zoomNow >= 1.75 || groupSel || childSel) ? pick(mx, my) : null
+        const groupHit = pickGroup(mx, my)
+        // 点击点是否落在「当前聚焦子星云」的命中圈内。点错星星时落点可能同时擦到
+        // 兄弟子星云（pickChild 会返回更近的那个）；只要还在当前子星云命中圈内，
+        // 就属于「子星云内空白/点错」，必须不动——这是最高优先级规则。
+        const inCurrentChild = Boolean(childSel) && childHitsRef.current.some((h) => (
+          h.id === childSel && Math.hypot(h.x - mx, h.y - my) <= h.r
+        ))
+        // 退回「只聚焦父团」：清子星云聚焦，镜头回到父团，缩放回团级。供两处复用。
+        // 保留 sel/detail：选中星星的**连接线**要留着——子星团之间的星星常有边，
+        // 转移时清掉选中会让人看不到这些连接（用户明确要求）。
+        const backToParent = () => {
+          setChildSel(''); setEdit(null)
+          const pg = (data.layout?.groups || []).find((x) => String(x.id) === groupSel)
+          if (pg && viewRef.current) {
+            viewRef.current.focusId = null
+            viewRef.current.camTarget = { x: Number(pg.x) || 0, y: Number(pg.y) || 0, z: Number(pg.z) || 0 }
+            viewRef.current.camScaleTarget = 0.5
+            viewRef.current.targetZoom = 1.7
+          }
+        }
+        // 星星优先（点星星要看具体记忆），其次子星云，最后星团——对齐旧版 pick 顺序
+        // star → child → group。星星常会挤在子星云的命中圈内，若让子星云先命中，
+        // 点星星永远被抢走、看不了详情。
+        // 「点歪了不该动」的基准是「当前聚焦的子星云」（不是父团）：
+        // 点在当前子星云内 → 不动；点在子星云外 → 该切换切换、该退回退回。
+
+        if (star) {
+          // 不清 groupSel、也不清 childSel：点星星只是「顺便看一眼详情」，不改变
+          // 所在层级（点前在子星云里，点完还在子星云里）。清了会解除「只显示选中
+          // 星团/子星云」的过滤，所有星团重新出现，视觉上像视角被重置。
+          setSel(star.id)
+          const full = (data.stars || []).find((s) => s.id === star.id)
+          if (!full) toast('这条记忆已不在星图里', 'err')
+          setDetail(full || null)
+          // 换了一颗星才清编辑框；点同一颗星保留，免得打断正在编辑的内容
+          if (star.id !== sel) setEdit(null)
+          // 点星星**不动镜头**：镜头一挪，当前星团就被甩出画面，看起来像「视角被重置」。
+          if (viewRef.current) viewRef.current.focusId = null
+          return
+        }
+        if (child) {
+          // 点中的子星云 = 当前聚焦的子星云，或点击点仍落在当前子星云命中圈内 →
+          // 都属于「子星云内空白/点错」，不动（最高优先级，点歪了不能被移走视角）。
+          if (child.id === childSel || inCurrentChild) return
+          // 点中「别的子星云」（同团兄弟或跨团）：有意点击，转移聚焦过去。
+          // 保留 sel/detail：选中星星的**连接线**要留着——子星团之间的星星常有边，
+          // 转移时清掉选中会让人看不到这些连接（用户明确要求）。只清编辑框。
+          setGroupSel(child.group); setChildSel(child.id); setEdit(null)
+          // 和旧版 focusPoint 一致：点开子星云时镜头跟到它的绝对坐标。
+          // child.point 已经是「团坐标 + 子星云偏移」的绝对坐标，直接作镜头目标。
+          // camScale 0.26 / zoom 2.6 对齐旧版 focusPoint(child, 2.6, 0.26)：
+          // 比默认更近，让挤成一团的子星云尽量摊开、星星可分辨。
+          const cp = child.point
+          if (cp && viewRef.current) {
+            viewRef.current.focusId = null
+            viewRef.current.camTarget = {
+              x: Number(cp.x) || 0,
+              y: Number(cp.y) || 0,
+              z: Number(cp.z) || 0,
+            }
+            viewRef.current.camScaleTarget = 0.26
+            viewRef.current.targetZoom = 2.6
+          }
+          return
+        }
+        // 星团：走到这里说明这一下既没点中星星、也没点中子星云。
+        if (groupHit) {
+          // 最高优先级：点击点仍在「当前聚焦子星云」命中圈内 → 子星云内空白，不动。
+          // （点错星星时可能同时命中父团/别的团，但都不能移动视角。）
+          if (inCurrentChild) return
+          // 关键：pickGroup 只返回「最近的那个团」，点在大团内部时可能同时压着别的团、
+          // 且别的团圆心更近 → 会误判成「点别的团」。所以这里不认 pickGroup 的结果，
+          // 单独判断「点击点是否落在当前聚焦星团的圆盘内」。
+          const curGroupHit = groupSel ? groupHitsRef.current.find((h) => h.id === groupSel) : null
+          const curDiskR = curGroupHit ? (Number(curGroupHit.rr) || Number(curGroupHit.r) || 0) : 0
+          const inCurrentGroupDisk = Boolean(curGroupHit) && Math.hypot(curGroupHit.x - mx, curGroupHit.y - my) <= curDiskR
+
+          // 点在「当前聚焦星团」的圆盘内 = 团内：
+          //  · 聚焦子星云时 → 这是「子星云外的父团空白」，退回父团
+          //  · 只聚焦星团时 → 这是「团内空白」（当前层级内容），不动
+          // 这样点在大团内部、即使那里同时压着别的大团，也不会被切走。
+          if (inCurrentGroupDisk) {
+            if (childSel) backToParent()
+            return
+          }
+          const groupId = String(groupHit.id || '')
+          if (groupId === groupSel) return
+          // 点中「别的星团」且确实在当前团圆盘外：有意点击目标，正常切过去。
+          // 同样保留 sel/detail（连接线），只清编辑框。
+          setGroupSel(groupId); setChildSel(''); setEdit(null)
+          const g = (data.layout?.groups || []).find((x) => String(x.id) === groupId)
+          if (g && viewRef.current) {
+            // camScale 0.5：比默认视角近、但仍在「中枢显形阈值 0.55」之下。
+            const cx = Number(g.x) || 0, cy = Number(g.y) || 0, cz = Number(g.z) || 0
+            viewRef.current.focusId = null
+            viewRef.current.camTarget = { x: cx, y: cy, z: cz }
+            viewRef.current.camScaleTarget = 0.5
+            viewRef.current.targetZoom = 1.7
+          }
+          return
+        }
+        // 点空白（没点中星星/子星云/星团）：点在「当前聚焦星团外」，逐级退回。
+        //  · 聚焦子星云 → 退回聚焦父团
+        //  · 聚焦星团   → 退回全景
+        //  · 全景       → 不动
+        // 退回时同样保留 sel/detail（连接线）：选中星星的边关系在退回全景后
+        // 依然要能看到；要取消选中，点详情卡的「×」或换选另一颗星即可。
+        if (childSel) { backToParent(); return }
+        if (groupSel) { setGroupSel(''); setChildSel(''); setEdit(null); resetView() }
+        return
+      }
+
+
+      const resetView = () => {
+        if (!viewRef.current) return
+        const v = viewRef.current
+        // 返回动画：zoom / cam / camScale 只设「目标值」，渲染循环会用 lerp 平滑逼近；
+        // 不再直接赋值 zoom/cam/camScale，否则整片星空瞬间跳回默认（闪回）。
+        // yaw/pitch 借 focusId 机制（fYaw/fPitch 是目标角度）平滑转回默认。
+        v.focusId = '__home__'
+        v.fYaw = 0.45
+        v.fPitch = 0.32
+        v.targetZoom = 1.2
+        v.vYaw = 0
+        v.vPitch = 0
+        v.camTarget = { x: 0, y: 0, z: 0 }
+        v.camScaleTarget = 1
+      }
+
+      const stars = data?.stars || []
+      const groups = data?.layout?.groups || []
+      const TIER_LABEL = SM_TIER_LABEL
+      const TYPE_OPTS = [{ v: '', t: '全部区域' }, { v: 'person', t: '人物' }, { v: 'event', t: '经历' }, { v: 'knowledge', t: '知识' }, { v: 'core', t: '核心' }, { v: 'outdated', t: '已过时' }, { v: 'archived', t: '已归档' }]
+      const stats = data?.stats || (stars.length ? {
+        total: stars.length,
+        live: stars.filter((s) => !s.archivedAt && !s.invalidAt).length,
+        archived: stars.filter((s) => s.archivedAt).length,
+        bright: stars.filter((s) => (s.brightness || 0) >= 0.7).length,
+        dim: stars.filter((s) => (s.brightness || 0) < 0.35).length,
+      } : null)
+
+      return h(Card, {
+        title: '记忆星图',
+        desc: '把记忆画成星空：越亮记得越牢，位置按人物/经历/知识/核心分区。点星星能复习、改层级、编辑或删除。',
+        right: h('div', { className: 'ab-flex', style: { gap: 8 } },
+          h(Btn, { small: true, onClick: () => { setOpen(!open); if (!open && !data) load() } }, open ? '收起' : '展开'),
+          open ? h(Btn, { small: true, onClick: () => post('/memory/graph/optimize', {}, '已优化') }, '重新布局') : null,
+          open ? h(Btn, { small: true, onClick: load }, busy ? '刷新中…' : '刷新') : null),
+      }, !open ? null : [
+        h('div', { key: 'stats', className: 'ab-note' }, stats
+          ? `共 ${stats.total} 颗星：存活 ${stats.live}、归档 ${stats.archived}、清晰 ${stats.bright}、快忘了 ${stats.dim}`
+          : (busy ? '正在读取星图…' : '还没有记忆，星图是空的')),
+
+        // 搜索与筛选：搜索框吃掉剩余宽度，三个下拉固定宽度不抢位，右侧跟一个「重置」
+        h('div', { key: 'ctrl', style: { display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', margin: '8px 0' } },
+          h('input', { className: 'ab-input sm', style: { flex: '1 1 160px', minWidth: 130 }, placeholder: '搜星星：内容 / 人名 / 标签', value: query, onChange: (e) => setQuery(e.target.value) }),
+          h('select', { className: 'ab-input sm', style: { flex: '0 0 auto', width: 96 }, value: typeFilter, onChange: (e) => setTypeFilter(e.target.value) }, TYPE_OPTS.map((o) => h('option', { key: o.v, value: o.v }, o.t))),
+          h('select', { className: 'ab-input sm', style: { flex: '0 0 auto', width: 96 }, value: tierFilter, onChange: (e) => setTierFilter(e.target.value) },
+            [{ v: '', t: '全部层级' }, { v: 'short', t: '临时' }, { v: 'long', t: '长期' }, { v: 'core', t: '永久' }].map((o) => h('option', { key: o.v, value: o.v }, o.t))),
+          h('select', { className: 'ab-input sm', style: { flex: '0 0 auto', width: 104 }, value: quickFilter, onChange: (e) => setQuickFilter(e.target.value) },
+            [{ v: '', t: '不筛选' }, { v: 'dim', t: '只看快忘了' }, { v: 'recent', t: '只看最近 7 天' }].map((o) => h('option', { key: o.v, value: o.v }, o.t))),
+          h(Btn, { small: true, onClick: resetView }, '重置视角')),
+
+        // 显示开关（缩成一行小字，不抢画布）
+        h('div', { key: 'opts', className: 'ab-flex', style: { gap: 10, flexWrap: 'wrap', marginBottom: 8, fontSize: 12, opacity: 0.85 } },
+          [['自动旋转', spin, setSpin], ['辉光', glow, setGlow], ['动态星尘', motion, setMotion], ['关系线', edgeOn, setEdgeOn]].map(([label, val, set]) =>
+            h('label', { key: label, style: { display: 'flex', gap: 3, alignItems: 'center', cursor: 'pointer' } },
+              h('input', { type: 'checkbox', checked: val, onChange: (e) => set(e.target.checked) }), label)),
+          edgeOn ? h('select', { className: 'ab-input sm', value: edgeMode, onChange: (e) => setEdgeMode(e.target.value) },
+            [{ v: 'focus', t: '只在选中时' }, { v: 'subtle', t: '微光' }, { v: 'normal', t: '标准' }].map((o) => h('option', { key: o.v, value: o.v }, o.t))) : null,
+          edgeOn && edgeMode !== 'focus' ? h('label', { style: { display: 'flex', gap: 3, alignItems: 'center' } }, '强度',
+            h('input', { type: 'range', min: 0.05, max: 1, step: 0.05, value: edgeStrength, onChange: (e) => setEdgeStrength(Number(e.target.value)), style: { width: 56 } })) : null),
+
+        // 画布
+        h('div', { key: 'canvas', ref: wrapRef, style: { position: 'relative', borderRadius: 12, overflow: 'hidden', border: '1px solid rgba(120,160,220,0.25)', background: '#0a1120', minHeight: 360 } },
+          // 数据没到时铺一层「正在读记忆库」，画布淡入时它是淡出的，
+          // 页面不会从「一小块空白」突然长成「满屏星空」。
+          !data ? h('div', {
+            key: 'ph',
+            style: { position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'rgba(178,204,240,0.6)', fontSize: 13, letterSpacing: 1 },
+          }, busy ? '正在读记忆库…' : '星图待加载') : null,
+          h('canvas', { ref: bgRef, style: { display: 'none' } }),
+          h('canvas', { ref: glowRef, style: { display: 'none' } }),
+          h('canvas', {
+            ref: canvasRef,
+            // 淡入：数据到位前是空的，直接「啪」一下出现满屏星星很突兀，
+            // 用 220ms 透明度过渡把它变成一次平稳的显现。
+            style: { display: 'block', cursor: dragRef.current ? 'grabbing' : (hover ? 'pointer' : 'grab'), touchAction: 'none', opacity: data ? 1 : 0, transition: 'opacity .22s ease-out' },
+            onMouseDown: onDown, onMouseMove: onMove, onMouseUp: onUp,
+            onMouseLeave: () => {
+              dragRef.current = null
+              if (viewRef.current) viewRef.current.dragging = false
+              hoverRef.current = null
+              localHoverRef.current = null
+              hoverGroupRef.current = ''
+              setHover(null)
+            },
+          }),
+          // 左上角清单：**默认只显示一行标题**，点开才铺开层级+星团。
+          // 收起时宽度自适应（只有「清单 · 星团 11 ＋」这么点），几乎不挡星星。
+          h('div', {
+            key: 'legend',
+            className: 'ab-thin-scroll',
+            style: {
+              position: 'absolute', left: 10, top: 10,
+              width: legendOpen ? 160 : 'auto', maxWidth: 'calc(100% - 20px)',
+              maxHeight: 'calc(100% - 20px)', overflowY: 'auto', overflowX: 'hidden', zIndex: 3,
+              padding: legendOpen ? '3px 8px 3px 4px' : '3px 9px 3px 6px', borderRadius: 8,
+              background: 'rgba(6, 11, 22, 0.6)',
+              border: '1px solid rgba(120, 160, 220, 0.2)',
+              scrollbarWidth: legendOpen ? 'thin' : 'none',
+              scrollbarGutter: legendOpen ? 'stable' : 'auto',
+            },
+          },
+            h('div', {
+              onClick: () => setLegendOpen((x) => !x),
+              title: legendOpen ? '收起清单' : '展开清单（层级筛选 + 星团列表）',
+              style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 8, padding: '2px 4px 4px', cursor: 'pointer' },
+            },
+              h('span', { style: { fontSize: 10, letterSpacing: 1, color: 'rgba(178, 204, 240, 0.7)' } }, legendOpen ? '层级' : '清单'),
+              // 收起时把星团数量写在标题上，不展开也知道规模
+              !legendOpen ? h('span', { style: { fontSize: 10, color: 'rgba(178, 204, 240, 0.55)' } }, '星团 ' + groups.length) : null,
+              h('span', { style: { fontSize: 10, color: 'rgba(178, 204, 240, 0.6)', flex: '0 0 auto' } }, legendOpen ? '－' : '＋')),
+
+            // 层级筛选：点一下只看这一档，再点取消
+            !legendOpen ? null : h('div', { style: { padding: '0 0 6px', marginBottom: 4, borderBottom: '1px solid rgba(120, 160, 220, 0.18)' } },
+              [['core', '永久', '255, 209, 102'], ['long', '长期', '143, 197, 255'], ['short', '临时', '159, 182, 216']].map(([t, label, tint]) => {
+                const active = tierFilter === t
+                return h('div', {
+                  key: t,
+                  onClick: () => setTierFilter(active ? '' : t),
+                  title: active ? '再点一次查看全部层级' : '只看' + label + '记忆',
+                  style: { display: 'flex', alignItems: 'center', gap: 6, padding: '2px 5px', borderRadius: 5, cursor: 'pointer', background: active ? 'rgba(255, 209, 102, 0.12)' : 'transparent' },
+                },
+                  h('span', { style: { width: 7, height: 7, flex: '0 0 auto', borderRadius: '50%', background: `rgb(${tint})`, boxShadow: `0 0 6px rgba(${tint}, 0.7)` } }),
+                  h('span', { style: { flex: '1 1 auto', fontSize: 11, color: active ? '#ffd166' : 'rgba(226, 236, 255, 0.86)' } }, label),
+                  h('span', { style: { fontSize: 10, color: 'rgba(178, 204, 240, 0.55)' } }, String(stars.filter((s) => s.tier === t).length)) )
+              })),
+
+            // 模块（星团）列表：跟层级一起受清单开关控制（收起时整块只剩标题一行）
+            !legendOpen ? null : groups.map((g) => {
+              const tint = g.id === 'archive' ? '139, 147, 167' : (SM_GROUP_TINTS[smTintIndexOf(g.id)] || SM_GROUP_TINTS[0])
+              const active = groupSel === g.id
+              const children = g.childClusters || []
+              return h('div', { key: g.id },
+                h('div', {
+                  onClick: () => setGroupSel(active ? '' : g.id),
+                  style: { display: 'flex', alignItems: 'center', gap: 6, padding: '3px 5px', borderRadius: 5, cursor: 'pointer', background: active ? 'rgba(255, 209, 102, 0.12)' : 'transparent' },
+                },
+                  h('span', { style: { width: 7, height: 7, flex: '0 0 auto', borderRadius: '50%', background: `rgb(${tint})`, boxShadow: `0 0 6px rgba(${tint}, 0.7)` } }),
+                  h('span', { style: { flex: '1 1 auto', minWidth: 0, fontSize: 11, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', color: active ? '#ffd166' : 'rgba(226, 236, 255, 0.86)' } }, smShortText(g.label, 8)),
+                  h('span', { style: { fontSize: 10, color: 'rgba(178, 204, 240, 0.55)' } }, g.total)),
+                active ? children.map((c, i) => {
+                  const childTint = SM_CHILD_TINTS[i % SM_CHILD_TINTS.length]
+                  return h('div', {
+                    key: c.id,
+                    onClick: (ev) => { ev.stopPropagation(); setGroupSel(g.id); setChildSel(c.id) },
+                    style: { display: 'flex', alignItems: 'center', gap: 6, padding: '2px 5px 2px 18px', borderRadius: 5, cursor: 'pointer', background: childSel === c.id ? 'rgba(255, 209, 102, 0.1)' : 'transparent' },
+                  },
+                    h('span', { style: { width: 5, height: 5, flex: '0 0 auto', borderRadius: '50%', background: `rgb(${childTint})`, boxShadow: `0 0 5px rgba(${childTint}, 0.7)` } }),
+                    h('span', { style: { flex: '1 1 auto', minWidth: 0, fontSize: 10, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', color: childSel === c.id ? '#ffd166' : 'rgba(214, 226, 245, 0.78)' } }, smShortText(c.label, 9)),
+                    h('span', { style: { fontSize: 9, color: 'rgba(178, 204, 240, 0.5)' } }, c.total))
+                }) : null)
+            }),
+          ),
+          // 选中的星详情：绝对定位在星图右上角（和左上角清单对称），不占页面流
+          detail ? h('div', {
+            key: 'detail',
+            className: 'ab-card ab-thin-scroll',
+            style: {
+              position: 'absolute', right: 10, top: 10,
+              width: 'min(240px, calc(100% - 20px))', maxHeight: 'calc(100% - 20px)',
+              overflowY: 'auto', overflowX: 'hidden', zIndex: 4, margin: 0,
+              padding: '10px 12px', borderRadius: 8,
+              background: 'rgba(6, 11, 22, 0.88)',
+              border: '1px solid rgba(120, 160, 220, 0.28)',
+              boxShadow: '0 8px 24px rgba(0,0,0,0.45)', backdropFilter: 'blur(6px)',
+            },
+          },
+            h('div', { className: 'ab-flex', style: { justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 } },
+              h('strong', { style: { fontSize: 12, lineHeight: 1.5 } }, detail.text),
+              h('span', {
+                onClick: () => { setDetail(null); setSel(null); setEdit(null) },
+                title: '关闭',
+                style: { flex: '0 0 auto', cursor: 'pointer', color: 'rgba(178,204,240,0.6)', fontSize: 14, lineHeight: 1 },
+              }, '×')),
+            h('div', { className: 'ab-muted ab-small', style: { margin: '6px 0' } },
+              `层级 ${TIER_LABEL[detail.tier] || '长期'} · 清晰度 ${Math.round((detail.brightness || 0) * 100)}% · 重要度 ${Math.round((detail.importance || 0) * 100)}%` +
+              (detail.aboutName ? ` · 关于 ${detail.aboutName}` : '') +
+              (detail.cluster ? ` · 星团 ${detail.cluster}` : '')),
+            h('div', { className: 'ab-flex', style: { gap: 6, flexWrap: 'wrap', marginTop: 6 } },
+              h(Btn, { small: true, onClick: () => post('/memory/graph/review', { id: detail.id }, '已复习') }, '还记得'),
+              h(Btn, { small: true, onClick: () => post('/memory/graph/tier', { id: detail.id, tier: 'short' }, '已改为临时') }, '临时'),
+              h(Btn, { small: true, onClick: () => post('/memory/graph/tier', { id: detail.id, tier: 'long' }, '已改为长期') }, '长期'),
+              h(Btn, { small: true, onClick: () => post('/memory/graph/tier', { id: detail.id, tier: 'core' }, '已改为永久') }, '永久'),
+              detail.archivedAt || detail.invalidAt ? h(Btn, { small: true, onClick: () => post('/memory/graph/restore', { id: detail.id }, '已恢复') }, '恢复') : null,
+              h(Btn, { small: true, onClick: () => setEdit({ text: detail.text, importance: detail.importance ?? 0.5 }) }, '编辑'),
+              h(Btn, { small: true, kind: 'danger', onClick: () => post('/memory/graph/remove', { id: detail.id }, '已删除') }, '删除')),
+            edit ? h('div', { style: { marginTop: 8 } },
+              h('div', { className: 'ab-flex', style: { gap: 6, flexWrap: 'wrap', alignItems: 'center' } },
+                h('input', { className: 'ab-input', style: { flex: '1 1 140px', fontSize: 11 }, value: edit.text, onChange: (e) => setEdit({ ...edit, text: e.target.value }) }),
+                h('input', { className: 'ab-input sm', type: 'number', min: 0, max: 1, step: 0.05, style: { width: 64 }, value: edit.importance, onChange: (e) => setEdit({ ...edit, importance: Number(e.target.value) || 0 }) }),
+                h(Btn, { small: true, onClick: async () => {
+                  if (!edit.text.trim()) { toast('内容不能为空', 'err'); return }
+                  const r = await post('/memory/graph/update', { id: detail.id, patch: { text: edit.text.trim(), importance: edit.importance } }, '已修改')
+                  if (r.ok) setEdit(null)
+                } }, '保存'),
+                h(Btn, { small: true, onClick: () => setEdit(null) }, '取消'))) : null) : null,
+        ),
+        busy ? h('div', { key: 'busy', className: 'ab-muted ab-small', style: { marginTop: 6 } }, '正在计算星图布局…') : null,
+        // 绘制异常时把原因直接显示出来，别再让用户对着空画布猜
+        drawErr ? h('div', { key: 'drawnote', className: 'ab-note err', style: { marginTop: 8 } }, '星图绘制失败：' + drawErr + '（下面的星星列表仍可用）') : null,
+
+        // 新增（清单已经收进画布左上角，这里不再重复列一遍）
+        h('div', { key: 'add', style: { marginTop: 10 } },
+          h('div', { className: 'ab-section-title' }, '在星图上加一颗'),
+          h(AddStarForm, { post })),
+
+      ])
+    }
+
+    /** 星图里新增一颗星的小表单。 */
+    function AddStarForm({ post }) {
+      const [text, setText] = useState('')
+      const [imp, setImp] = useState(0.5)
+      const [tier, setTier] = useState('long')
+      return h('div', { className: 'ab-flex', style: { gap: 8, flexWrap: 'wrap', alignItems: 'center' } },
+        h('input', { className: 'ab-input', style: { flex: '1 1 200px' }, placeholder: '加一条记忆…', value: text, onChange: (e) => setText(e.target.value) }),
+        h('input', { className: 'ab-input sm', type: 'number', min: 0, max: 1, step: 0.05, style: { width: 80 }, value: imp, onChange: (e) => setImp(Number(e.target.value) || 0) }),
+        h('select', { className: 'ab-input sm', value: tier, onChange: (e) => setTier(e.target.value) },
+          [['short', '临时'], ['long', '长期'], ['core', '永久']].map(([v, t]) => h('option', { key: v, value: v }, t))),
+        h(Btn, { small: true, onClick: async () => {
+          if (!text.trim()) return
+          await post('/memory/graph/add', { text: text.trim(), importance: imp, tier })
+          setText('')
+        } }, '加上去'),
+      )
+    }
+
     function MemoryImport({ toast, onDone }) {
       const [text, setText] = useState('')
       const [busy, setBusy] = useState(false)
@@ -3227,6 +7503,72 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
               h(Btn, { small: true, kind: 'ghost', onClick: () => setCands(null) }, '取消')))) : null)
     }
 
+    // 从另一个人格继承记忆：先看要整理多少、确认会花 token，再一批批交给模型改人称（进度按批走，失败只重试那一批）；
+    // 预览勾选后存进当前人格。样式照「导入旧档案」，进度条照表情包「AI 起名中」。
+    const INHERIT_OPS = { keep: '原样', rewrite: '改写', drop: '丢掉', missing: '模型没处理' }
+    function MemoryInherit({ st, toast, onDone }) {
+      const current = st.persona?.current || st.config?.persona?.current
+      const others = (st.personas || []).filter((p) => p.id !== current)
+      const [from, setFrom] = useState(others[0]?.id || '')
+      const [busy, setBusy] = useState(false)
+      const [job, setJob] = useState(null) // 整理中：{ plan, index, acc, token, label, error }
+      const [preview, setPreview] = useState(null) // 预览：{ plan, list: [{ id, label, note, text, op, next, reason, pick }] }
+      if (!others.length || st.persona?.claimPending) return null
+      const run = async (plan, start, acc, token) => {
+        for (let i = start; i < plan.batches.length; i++) {
+          const b = plan.batches[i]
+          const label = b.label + (b.parts > 1 ? ' ' + b.part + '/' + b.parts : '')
+          setJob({ plan, index: i, acc, token, label })
+          const r = await post('/memory/inherit/batch', { from: plan.from, to: plan.to, index: i })
+          if (token.stop) return
+          if (!r.ok) return setJob({ plan, index: i, acc, token, label, error: r.message })
+          acc = [...acc, ...r.results.map((x) => ({ ...x, label: b.label, pick: x.op === 'keep' || x.op === 'rewrite' }))]
+        }
+        setJob(null)
+        setPreview({ plan, list: acc })
+      }
+      const start = async () => {
+        setBusy(true)
+        const plan = await post('/memory/inherit/plan', { from })
+        setBusy(false)
+        if (!plan.ok) return toast(plan.message, 'err')
+        const cost = plan.calls ? '要调用模型 ' + plan.calls + ' 次，粗估约 ' + Math.max(1, Math.round(plan.tokens / 1000)) + 'k tokens。' : '这次不用调用模型。'
+        if (!confirm('把「' + plan.fromName + '」的 ' + plan.records + ' 条记忆导入给「' + plan.toName + '」？\n人称要改成「' + plan.toName + '」自己，会调用模型逐条整理，会消耗 token：' + cost + '\n「' + plan.fromName + '」最近一次整理之后的聊天还没变成记忆，不会被继承。')) return
+        setPreview(null)
+        return run(plan, 0, [], { stop: false })
+      }
+      const set = (i, patch) => setPreview({ ...preview, list: preview.list.map((x, j) => (j === i ? { ...x, ...patch } : x)) })
+      const picked = preview ? preview.list.filter((x) => x.pick && String(x.next || '').trim()).length : 0
+      const commit = async () => {
+        const items = preview.list.filter((x) => x.pick && String(x.next || '').trim()).map((x) => ({ id: x.id, text: x.next }))
+        const r = await post('/memory/inherit/commit', { from: preview.plan.from, to: preview.plan.to, items })
+        toast(r.message, r.ok ? 'ok' : 'err')
+        if (r.ok) { setPreview(null); onDone() }
+      }
+      return h(Card, { title: '从其他人格导入', desc: '把另一个人格的记忆继承过来，当成现在这个人格自己的经历、关系和约定。模型会逐条把指代旧人格的说法改成现在这个人格自己，丢掉旧人格自己的设定（名字、口癖这些）；你勾选以后再存进记忆库。旧人格的记忆不会被改动。' },
+        h('div', { className: 'ab-flex' },
+          h('select', { className: 'ab-select', 'aria-label': '从哪个人格导入', value: from, disabled: !!job, onChange: (e) => setFrom(e.target.value) },
+            others.map((p) => h('option', { key: p.id, value: p.id }, p.name))),
+          h(Btn, { small: true, kind: 'primary', disabled: busy || !!job || !from, onClick: start }, busy ? h(Fragment, null, h('i', { className: 'ab-spin' }), ' 正在计算…') : '从这个人格导入')),
+        job ? h('div', { style: { marginTop: 10 } },
+          h('div', { className: 'ab-small' }, job.error ? job.label + '：' + job.error : '整理中 ' + job.label + '（' + (job.index + 1) + ' / ' + job.plan.batches.length + '）'),
+          job.error ? null : h('div', { className: 'ab-progress' }, h('i', { style: { width: Math.round((job.index / job.plan.batches.length) * 100) + '%' } })),
+          h('div', { className: 'ab-flex', style: { marginTop: 8 } },
+            job.error ? h(Btn, { small: true, kind: 'primary', onClick: () => run(job.plan, job.index, job.acc, job.token) }, '重试这一批') : null,
+            h(Btn, { small: true, kind: 'ghost', onClick: () => { job.token.stop = true; setJob(null) } }, '取消'))) : null,
+        preview ? h('div', { style: { marginTop: 10 } },
+          [...new Set(preview.list.map((x) => x.label))].map((label) => h('div', { key: label, style: { marginTop: 8 } },
+            h('div', { className: 'ab-small', style: { color: 'var(--ab-sub)', marginBottom: 4 } }, label),
+            h('div', { className: 'ab-list' }, preview.list.map((x, i) => (x.label !== label ? null : h('div', { key: x.id, className: 'ab-li' },
+              h('input', { type: 'checkbox', checked: !!x.pick, 'aria-label': '存这一条', onChange: (e) => set(i, { pick: e.target.checked }), style: { accentColor: 'var(--ab-sea)', marginTop: 3 } }),
+              h('div', { className: 'body' },
+                h('input', { className: 'ab-input', value: x.next, 'aria-label': '存进去的文字', onChange: (e) => set(i, { next: e.target.value }) }),
+                h('div', { className: 'ab-muted ab-small', style: { marginTop: 2 } }, (x.note ? x.note + '｜' : '') + INHERIT_OPS[x.op] + (x.next !== x.text ? '｜原文：' + x.text : '') + (x.reason ? '｜' + x.reason : ''))))))))),
+          h('div', { className: 'ab-flex', style: { marginTop: 8 } },
+            h(Btn, { small: true, kind: 'primary', onClick: commit, disabled: !picked }, '存进记忆库（' + picked + ' 条）'),
+            h(Btn, { small: true, kind: 'ghost', onClick: () => setPreview(null) }, '取消'))) : null)
+    }
+
     function StyleEditor({ k, label, list, toast, onSaved }) {
       const [text, setText] = useState(list.join('\n'))
       useEffect(() => setText(list.join('\n')), [list.join('\n')])
@@ -3249,22 +7591,44 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         h(StyleEditor, { k: p.key, label: '学到的说话习惯', list: style || [], toast, onSaved }))
     }
 
-    function MemoryRow({ m, onChanged, toast }) {
+    function MemoryRow({ m, onChanged, onDeleted, onEdited, onRestored, toast }) {
       const [edit, setEdit] = useState(false)
       const [text, setText] = useState(m.text)
+      // 删除后只从当前列表移除，不重拉第一页（保持分页位置）
+      const remove = async () => {
+        const r = await post('/memory/delete', { id: m.id })
+        if (!r.ok) return
+        if (onDeleted) onDeleted(m.id)
+        else onChanged()
+      }
+      const save = async () => {
+        const r = await post('/memory/update', { id: m.id, text })
+        if (!r.ok) { toast(r.message || '没改成', 'err'); return }
+        setEdit(false)
+        toast('改好了', 'ok')
+        if (onEdited) onEdited(m.id, text)
+        else onChanged()
+      }
+      const restore = async () => {
+        const r = await post('/memory/restore', { id: m.id })
+        toast(r.ok ? '恢复了' : r.message, r.ok ? 'ok' : 'err')
+        if (!r.ok) return
+        if (onRestored) onRestored(m.id)
+        else onChanged()
+      }
       if (memoryEnded(m)) {
         return h('div', { className: 'ab-li', style: { opacity: 0.6 } },
           h('div', { className: 'meta' }, m.validityText || timeAgo(m.invalidAt || m.validUntil), h('br'), h('span', { className: 'ab-pill', style: { padding: '0 6px', fontSize: 11 } }, '已过时')),
           h('div', { className: 'body' }, h('s', null, (m.aboutName ? '[' + m.aboutName + '] ' : '') + m.text), m.supersededText ? h('div', { className: 'ab-muted ab-small' }, '→ 现在是：' + m.supersededText) : null),
-          h(Btn, { small: true, kind: 'ghost', onClick: async () => { await post('/memory/restore', { id: m.id }); toast('恢复了', 'ok'); onChanged() } }, '恢复'),
-          h(Btn, { small: true, kind: 'ghost', onClick: async () => { await post('/memory/delete', { id: m.id }); onChanged() } }, '删掉'))
+          h(Btn, { small: true, kind: 'ghost', onClick: restore }, '恢复'),
+          h(Btn, { small: true, kind: 'ghost', onClick: remove }, '删掉'))
       }
       return h('div', { className: 'ab-li' },
         h('div', { className: 'meta' }, timeAgo(m.at), h('br'), h('span', { className: 'ab-pill', style: { padding: '0 6px', fontSize: 11 } }, SOURCE[m.source] || '记忆')),
-        edit ? h('input', { className: 'ab-input wide', value: text, onChange: (e) => setText(e.target.value), onKeyDown: async (e) => { if (e.key === 'Enter') { await post('/memory/update', { id: m.id, text }); setEdit(false); toast('改好了', 'ok'); onChanged() } if (e.key === 'Escape') setEdit(false) } })
+        edit ? h('input', { className: 'ab-input wide', value: text, onChange: (e) => setText(e.target.value), onKeyDown: async (e) => { if (e.key === 'Enter') save(); if (e.key === 'Escape') setEdit(false) } })
           : h('div', { className: 'body' }, m.aboutName ? h('b', null, '[' + m.aboutName + '] ') : null, m.displayText || m.text, m.validityText ? h('div', { className: 'ab-muted ab-small' }, m.validityText) : null, m.importance >= 0.8 ? h('span', { title: '很重要' }, ' ★') : null),
         h(Btn, { small: true, kind: 'ghost', onClick: () => setEdit(!edit) }, edit ? '取消' : '改'),
-        h(Btn, { small: true, kind: 'ghost', onClick: async () => { await post('/memory/delete', { id: m.id }); onChanged() } }, '忘掉'))
+        h(Btn, { small: true, kind: 'ghost', onClick: remove }, '忘掉'))
     }
 
     /** 导入音色：把 .zip / .pth / .index 拖进来或点选，自动识别；下面列出已有的音色，可以删。 */
@@ -3364,7 +7728,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [s, setS] = useState(st.song)
       const [q, setQ] = useState('')
       const [found, setFound] = useState(null)
-      const [pitch, setPitch] = useState(0)
+      const [pitch, setPitch] = useState(st.config.song.pitch || 0)
+      const [startSec, setStartSec] = useState('')
+      const [durationSec, setDurationSec] = useState('')
       const [acct, setAcct] = useState(null)
       const load = () => get('/song/status').then((r) => r.ok && setS(r))
       // 安装中 / 正在唱的时候每 3 秒刷新一次进度
@@ -3377,7 +7743,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       }, [s && s.install.running, s && Boolean(s.current), s && s.queue.length])
       if (!s) return h(Empty, { icon: '⏳', text: '加载中…' })
       const search = async () => { if (!q.trim()) return; setFound(null); const r = await get('/song/search?q=' + encodeURIComponent(q)); setFound(r.list || []); if (!r.ok) toast(r.message, 'err') }
-      const sing = async (song) => { const r = await post('/song/request', { songId: song.id, song: song.name, pitch }); toast(r.message, r.ok ? 'ok' : 'err'); load() }
+      const validSegment = (startSec === '' || (Number.isSafeInteger(Number(startSec)) && Number(startSec) >= 0 && Number(startSec) <= 86400))
+        && (durationSec === '' || (Number.isSafeInteger(Number(durationSec)) && Number(durationSec) > 0 && Number(durationSec) <= st.config.song.maxVoiceSec))
+      const sing = async (song) => { if (!validSegment) return; const r = await post('/song/request', { songId: song.id, song: song.name, pitch, ...(startSec !== '' ? { startSec: Number(startSec) } : {}), ...(durationSec !== '' ? { durationSec: Number(durationSec) } : {}) }); toast(r.message, r.ok ? 'ok' : 'err'); load() }
       const voices = s.voices.map((v) => ({ value: v.id, label: v.id, desc: v.hasIndex ? '带 .index' : '' }))
       return h('div', { className: 'ab-grid' },
         h(Card, { title: '翻唱', right: f.sw('song.enabled'), desc: '让ta用自己的声音唱歌：点歌 → 从网易云下载 → 分离人声和伴奏 → 用 RVC 换成ta的声音 → 混音 → 发语音条。主人在 QQ 里说「唱首歌」，或者发 /sing 歌名 都行。' },
@@ -3407,12 +7775,14 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         h(VoiceImport, { s, toast, onChange: load }),
         h(Card, { title: '声音', desc: '用哪个音色唱、默认变调和语音条的长度。' },
           h(Row, { label: '音色' }, voices.length ? h(Select, { value: draft.song.voice || (voices[0] && voices[0].value), options: voices, onChange: (v) => setDraft(setPath(draft, 'song.voice', v)) }) : h('span', { className: 'ab-muted' }, '还没有模型')),
-          h(Row, { label: '默认变调', hint: 'ta自己点歌时会按原唱男声 / 女声定，这里是你在面板里试唱时的默认值' }, f.range('song.pitch', -12, 12, 1, (v) => (v > 0 ? '+' : '') + v + ' 半音')),
+          h(Row, { label: '自动定变调', hint: '没指定变调时，先听原唱人声是男声还是女声，再按下面的声线定 0 / +12 / -12（只升降整八度，不和伴奏跑调）' }, f.sw('song.autoPitch')),
+          h(Row, { label: '她的声线', hint: '当前音色是女声还是男声，自动定变调按这个算' }, f.choices('song.selfVoice', [{ value: 'female', label: '女声' }, { value: 'male', label: '男声' }])),
+          h(Row, { label: '默认变调', hint: '自动定变调关着、或者测不出原唱音高时用；面板试唱也按这个' }, f.range('song.pitch', -12, 12, 1, (v) => (v > 0 ? '+' : '') + v + ' 半音')),
           h(Row, { label: '语音条最长', hint: '歌比这个长就截一段' }, f.range('song.maxVoiceSec', 30, 300, 10, (v) => v + ' 秒')),
-          h(Row, { label: '截哪一段' }, f.choices('song.clipStart', [{ value: 'auto', label: '副歌附近', desc: '从全曲大约 30% 的地方开始' }, { value: 'head', label: '从头开始' }])),
+          h(Row, { label: '截哪一段' }, f.choices('song.clipStart', [{ value: 'auto', label: '副歌附近', desc: '自动分析音量和重复段找副歌入口（分析失败回退约 30%）' }, { value: 'head', label: '从头开始' }])),
           h(Row, { label: '人声音量' }, f.range('song.vocalVolume', 0.2, 2, 0.05, (v) => Math.round(v * 100) + '%')),
           h(Row, { label: '伴奏音量' }, f.range('song.instVolume', 0.1, 2, 0.05, (v) => Math.round(v * 100) + '%')),
-          h(Row, { label: '只有主人能点歌' }, f.sw('song.ownerOnly')),
+          h(Row, { label: '限制点歌权限', hint: '开启时主人和权限页授权的私聊对象可以点歌。' }, f.sw('song.ownerOnly')),
         ),
         h(Card, { title: '网易云', desc: '不登录也能唱免费歌；会员歌、版权歌要填网易云的 Cookie。' },
           h(Row, { label: 'Cookie（MUSIC_U）', hint: '电脑浏览器登录 music.163.com → F12 → 应用 / 存储 → Cookie → 复制 MUSIC_U 的值。只存在本机，不显示' },
@@ -3427,25 +7797,88 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             h(Btn, { small: true, onClick: search, disabled: !q.trim() }, '搜索'),
             h('span', { className: 'ab-muted ab-small' }, '变调'),
             h('input', { className: 'ab-input sm', type: 'number', min: -24, max: 24, value: pitch, onChange: (e) => setPitch(Number(e.target.value) || 0) })),
+          h(Row, { label: '这次唱哪一段', hint: `都留空沿用上方设置；只填时长就从头唱。本次最长 ${st.config.song.maxVoiceSec} 秒，改上限要先保存。` },
+            h('input', { className: 'ab-input sm', type: 'number', min: 0, max: 86400, step: 1, 'aria-label': '开始秒数', placeholder: '开始秒数', value: startSec, onChange: e => setStartSec(e.target.value) }),
+            h('span', { className: 'ab-muted' }, '秒起，唱'),
+            h('input', { className: 'ab-input sm', type: 'number', min: 1, max: st.config.song.maxVoiceSec, step: 1, 'aria-label': '片段时长', placeholder: '时长', value: durationSec, onChange: e => setDurationSec(e.target.value) }), h('span', { className: 'ab-muted' }, '秒')),
+          !validSegment ? h('div', { className: 'ab-note warn', role: 'alert' }, '开始位置填非负整数；时长填正整数，不能超过已保存的最长时长。') : null,
           found === null ? null : found.length === 0 ? h('div', { className: 'ab-muted', style: { marginTop: 8 } }, '没搜到') :
             h('table', { className: 'ab-table', style: { marginTop: 10 } }, h('tbody', null, found.map((x) => h('tr', { key: x.id },
               h('td', null, x.name, x.vip ? h('span', { className: 'ab-badge', style: { marginLeft: 6 } }, '会员') : null),
               h('td', { className: 'ab-muted' }, x.artists),
               h('td', { className: 'ab-muted' }, Math.floor(x.durationSec / 60) + ':' + String(x.durationSec % 60).padStart(2, '0')),
-              h('td', null, h(Btn, { small: true, kind: 'primary', disabled: !s.ready || !draft.song.enabled, onClick: () => sing(x) }, '唱给我听')))))),
+              h('td', null, h(Btn, { small: true, kind: 'primary', disabled: !s.ready || !draft.song.enabled || !validSegment, onClick: () => sing(x) }, '唱给我听')))))),
           !draft.song.enabled ? h('div', { className: 'ab-muted ab-small', style: { marginTop: 8 } }, '先打开上面的「翻唱」开关并保存。') : null,
-          s.current ? h('div', { className: 'ab-note', style: { marginTop: 10 } }, h('i', { className: 'ab-spin' }), ' 正在唱「' + s.current.title + '」：' + s.current.stage + (s.queue.length ? '（后面还有 ' + s.queue.length + ' 首）' : '')) : null,
+          s.current ? h('div', { className: 'ab-note', style: { marginTop: 10 } }, h('i', { className: 'ab-spin' }), ' 正在唱「' + s.current.title + '」：' + s.current.stage + (s.current.clip ? `（第 ${s.current.clip.startSec} 秒起，最多 ${s.current.clip.durationSec} 秒）` : '') + (s.queue.length ? '（后面还有 ' + s.queue.length + ' 首）' : '')) : null,
           s.history.length ? h('div', { className: 'ab-list', style: { marginTop: 10 } }, s.history.map((x, i) => h('div', { key: i, className: 'ab-li' },
             h('div', { className: 'meta' }, timeAgo(x.at)),
-            h('div', { className: 'body' }, (x.ok ? '✓ ' : '✗ ') + x.title + (x.voice ? ' · ' + x.voice + (x.pitch ? ' ' + (x.pitch > 0 ? '+' : '') + x.pitch : '') : ''), h('div', { className: 'ab-muted ab-small' }, x.message))))) : null,
+            h('div', { className: 'body' }, (x.ok ? '✓ ' : '✗ ') + x.title + (x.voice ? ' · ' + x.voice + (x.pitch ? ' ' + (x.pitch > 0 ? '+' : '') + x.pitch : '') : ''), h('div', { className: 'ab-muted ab-small' }, (x.clip ? `第 ${x.clip.startSec} 秒起，最多 ${x.clip.durationSec} 秒 · ` : '') + x.message))))) : null,
         ),
       )
     }
 
 /** B 站 Cookie：SESSDATA 和 bili_jct 分两个框填（前缀已经写好），可以显示 / 隐藏；粘整串也行，会自动拆开。 */
-    function BiliCookie({ draft, setDraft }) {
+    function BiliCookie({ draft, setDraft, load }) {
       const [show, setShow] = useState(false)
+      const [qr, setQr] = useState(null) // { id?, png?, state: 'loading'|'waiting'|'expired'|'error', message? }
+      const qrTimer = useRef(null)
+      const qrId = useRef('')
       const b = draft.bili
+      const stopQr = () => { if (qrTimer.current) { clearInterval(qrTimer.current); qrTimer.current = null } }
+      const cancelQr = (id) => { if (id) post('/bili/qr/cancel', { id }).catch(() => {}) }
+      const closeQr = () => { const id = qrId.current; qrId.current = ''; stopQr(); setQr(null); cancelQr(id) }
+      const pollQr = (id) => {
+        stopQr()
+        const tick = async () => {
+          try {
+            const r = await get('/bili/qr/status?id=' + encodeURIComponent(id))
+            if (qrId.current !== id) return // 浮层已经关了，别再往旧会话上轮询
+            if (r.state === 'done') {
+              qrId.current = ''
+              stopQr()
+              setQr(null)
+              if (load) load()
+              return
+            }
+            if (r.state === 'expired' || r.state === 'error') {
+              stopQr()
+              setQr({ id, state: r.state, message: r.message || (r.state === 'expired' ? '二维码过期了' : '出错了，重试一下') })
+            }
+          } catch {}
+        }
+        tick()
+        qrTimer.current = setInterval(tick, 1500)
+      }
+      const openQr = async () => {
+        const old = qrId.current
+        qrId.current = ''
+        stopQr()
+        cancelQr(old)
+        setQr({ state: 'loading' })
+        const r = await post('/bili/qr/start')
+        if (!r || !r.id) { setQr({ state: 'error', message: (r && r.message) || '出码失败，重试一下' }); return }
+        if (!r.png) { qrId.current = r.id; setQr({ id: r.id, state: 'error', message: r.message || '没出码，重试一下' }); return }
+        qrId.current = r.id
+        setQr({ id: r.id, png: r.png, state: 'waiting' })
+        pollQr(r.id)
+      }
+      // 组件卸载时一定要清定时器并通知后端收浏览器
+      useEffect(() => () => { const id = qrId.current; qrId.current = ''; if (qrTimer.current) clearInterval(qrTimer.current); cancelQr(id) }, [])
+      const modal = !qr ? null : h('div', {
+        style: { position: 'fixed', inset: 0, background: 'rgba(12,28,38,.45)', zIndex: 80, display: 'flex', alignItems: 'center', justifyContent: 'center' },
+        onClick: closeQr,
+      }, h('div', {
+        style: { background: '#fff', borderRadius: 12, padding: '20px 24px', width: 300, textAlign: 'center', boxShadow: '0 12px 40px rgba(0,0,0,.25)' },
+        onClick: (e) => e.stopPropagation(),
+      },
+        h('div', { style: { fontWeight: 600, marginBottom: 10 } }, '扫码登录 B 站'),
+        qr.png ? h('img', { src: 'data:image/png;base64,' + qr.png, width: 200, height: 200, alt: '二维码', style: { display: 'block', margin: '0 auto', borderRadius: 6 } }) : null,
+        h('div', { className: 'ab-muted ab-small', style: { marginTop: 10 } },
+          qr.state === 'loading' ? '正在出码…' : qr.state === 'waiting' ? '等你扫码…' : qr.state === 'expired' ? '二维码过期了' : (qr.message || '出错了')),
+        qr.state === 'waiting' ? h('div', { className: 'ab-muted ab-small', style: { marginTop: 6 } }, '用手机 B 站 App 扫这个码，扫完在手机上点确认。票只存在这台服务器上，跟你自己浏览器登录的那个号互不影响。') : null,
+        h('div', { className: 'ab-flex', style: { justifyContent: 'center', marginTop: 12 } },
+          qr.state === 'expired' || qr.state === 'error' ? h(Btn, { small: true, kind: 'primary', onClick: openQr }, '重新生成') : null,
+          h(Btn, { small: true, kind: 'ghost', onClick: closeQr }, '取消'))))
       const field = (key, prefix, setKey, hintKey, ph) => h('div', { className: 'ab-flex', style: { flexWrap: 'nowrap', marginBottom: 6 } },
         h('code', { className: 'ab-small', style: { minWidth: 82, textAlign: 'right' } }, prefix),
         h('input', {
@@ -3459,8 +7892,10 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           field('biliJct', 'bili_jct=', 'biliJctSet', 'biliJctHint', '粘贴 bili_jct 的值'),
           h('div', { className: 'ab-flex' },
             h(Btn, { small: true, onClick: () => setShow(!show) }, show ? '隐藏' : '显示'),
+            h(Btn, { small: true, kind: 'primary', onClick: openQr }, '扫码登录'),
             b.sessdataSet || b.biliJctSet ? h(Btn, { small: true, kind: 'ghost', onClick: () => { if (confirm('清空保存的 B 站 Cookie？')) setDraft(setPath(setPath(setPath(draft, 'bili.sessdata', null), 'bili.biliJct', null), 'bili.cookie', null)) } }, '清空') : null,
-            h('span', { className: 'ab-muted ab-small' }, '「显示」看的是正在填的内容；保存过的出于安全不回传，只显示结尾几位'))))
+            h('span', { className: 'ab-muted ab-small' }, '「显示」看的是正在填的内容；保存过的出于安全不回传，只显示结尾几位')),
+          modal))
     }
 
 /** 本地接口：数据目录 local/ 里的脚本接管语音合成、生图、翻唱换声、语音识别。 */
@@ -3517,9 +7952,15 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         const r = await post(path, body)
         toast(r.message || okMsg, r.ok === false ? 'err' : 'ok')
         if (r.list) setModules(r.list)
+        if (r.modules) setModules(r.modules)
         if (r.prompt && r.ok) copy(r.prompt, toast)
         reload()
         return r
+      }
+      const remove = async (path, action) => {
+        if (!confirm(`${action}「${m.name}」？` + (m.builtin ? '删掉后会用回内置版本。' : ''))) return
+        const purge = confirm('把它的数据和设置也清掉吗？确定=一起清掉；取消=留着')
+        await act(path, { id: m.id, purge }, action === '卸载' ? '卸载好了' : m.builtin ? '副本删掉了，现在用内置的' : '删掉了')
       }
       const what = [m.tools.length ? '工具：' + m.tools.join('、') : '', m.commands.length ? '命令：' + m.commands.map((c) => '/' + c).join(' ') : ''].filter(Boolean).join('　')
       const errs = (m.error ? [{ label: '加载', message: m.error }] : []).concat(m.errors || [])
@@ -3537,7 +7978,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             m.builtin && !m.hasUser ? h(Btn, { small: true, onClick: () => act('/modules/fork', { id: m.id }, '复制好了'), title: '把这个内置模块的源码复制到 modules/' + m.id + '/，改了就替换内置的' }, '复制一份来改') : null,
             m.hasUser ? h(Btn, { small: true, onClick: () => post('/modules/open?id=' + encodeURIComponent(m.id)).then((r) => toast(r.message)) }, '打开文件夹') : null,
             m.hasUser ? h(Btn, { small: true, onClick: () => get('/modules/prompt?id=' + encodeURIComponent(m.id)).then((r) => copy(r.prompt, toast, '复制好了，粘给 DSH，把【】里那句换成你想要的')) }, '复制给 DSH 的话') : null,
-            m.hasUser && !m.safeSkipped ? h(Btn, { small: true, onClick: () => act('/modules/reload', { id: m.id }, '重新加载好了') }, '重新加载') : null)),
+            m.hasUser && !m.safeSkipped ? h(Btn, { small: true, onClick: () => act('/modules/reload', { id: m.id }, '重新加载好了') }, '重新加载') : null,
+            m.hasUser && m.community ? h(Btn, { small: true, kind: 'danger', onClick: () => remove('/modules/community/remove', '卸载'), title: '从市场卸载，源码和本地改动会归档到 modules/.trash' }, '卸载') : null,
+            m.hasUser && !m.community ? h(Btn, { small: true, kind: 'danger', onClick: () => remove('/modules/remove', m.builtin ? '删除副本' : '删除'), title: m.builtin ? '删掉你复制 / 改的版本，之后用回内置模块' : '删掉 modules/' + m.id + ' 和它的缓存' }, m.builtin ? '删除副本' : '删除') : null)),
         h('div', { className: 'side' },
           h(Switch, { on: m.enabled, onChange: (v) => setMod({ enabled: v }), title: m.enabled ? '关掉这个模块' : '打开这个模块' }),
           m.builtin && m.hasUser ? h('label', { className: 'ab-small ab-muted', style: { display: 'flex', alignItems: 'center', gap: 6 } }, '用内置的', h(Switch, { on: m.useBuiltin, onChange: (v) => setMod({ useBuiltin: v }) })) : null))
@@ -3609,6 +8052,33 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     const CAP_LABEL = { network: '联网', filesystem: '读写本机文件', process: '启动其他程序', 'dynamic-code': '动态执行代码', 'plugin-config': '读写插件配置（含账号 Cookie）', 'plugin-internals': '使用插件内部接口' }
     const CATEGORY_LABEL = { platform: '逛平台', social: '聊天互动', creative: '创作', desktop: '桌面', manage: '管理', tool: '工具' }
     const capText = (m) => (m.capabilities || []).map((c) => CAP_LABEL[c] || c)
+    /**
+     * 模块排序（纯函数，测试可直接调用）：
+     * - default：保持索引里的原顺序
+     * - hot：按 GitHub 下载次数，同分按名字
+     * - latest：按发布时间（索引 publishedAt → GitHub Release 时间），没时间的保持原顺序排最后
+     * - updated：按最近更新时间（索引 updatedAt → publishedAt → Release 时间），同上
+     */
+    const marketTimeOf = (m, mode) => {
+      const fields = mode === 'latest' ? [m.publishedAt, m.releasedAt, m.updatedAt] : [m.updatedAt, m.publishedAt, m.releasedAt]
+      for (const value of fields) {
+        const t = Date.parse(String(value || ''))
+        if (Number.isFinite(t)) return t
+      }
+      return 0
+    }
+    const sortMarketModules = (list, mode) => {
+      const arr = Array.isArray(list) ? list.slice() : []
+      if (mode === 'hot') {
+        return arr.sort((a, b) => (Number(b.downloads) || 0) - (Number(a.downloads) || 0) || String(a.name || a.id).localeCompare(String(b.name || b.id), 'zh'))
+      }
+      if (mode === 'latest' || mode === 'updated') {
+        return arr.map((m, i) => ({ m, i, t: marketTimeOf(m, mode) }))
+          .sort((a, b) => b.t - a.t || a.i - b.i)
+          .map((x) => x.m)
+      }
+      return arr
+    }
     function Market({ st, toast, reload, go }) {
       const [data, setData] = useState(null)
       const [busy, setBusy] = useState('')
@@ -3616,8 +8086,50 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [q, setQ] = useState('')
       const [show, setShow] = useState('all')
       const [cat, setCat] = useState('')
+      const [sort, setSort] = useState('hot') // hot | latest | updated | default
       const load = (force) => get('/modules/community' + (force ? '?force=1' : '')).then(setData)
       useEffect(() => { load() }, [])
+      // 模块市场地址：下拉选官方源（GitHub / Gitee 镜像）或自定义。拉当前值与可选源，改完可保存或恢复默认。
+      const [regUrl, setRegUrl] = useState('')
+      const [regDef, setRegDef] = useState('')
+      const [regSources, setRegSources] = useState([])
+      const [regMode, setRegMode] = useState('')
+      const loadReg = () => get('/panel/market/registry').then((r) => {
+        if (!r.ok) return
+        setRegUrl(r.registryUrl || '')
+        setRegDef(r.default || '')
+        setRegMode('')
+        if (Array.isArray(r.sources) && r.sources.length) setRegSources(r.sources)
+      })
+      useEffect(() => { loadReg() }, [])
+      const REG_SOURCE_FALLBACK = [
+        { id: 'github', label: 'GitHub 官方源', url: 'https://raw.githubusercontent.com/aureth-labs/dsh-aurabot-qq-mods/registry/index.json' },
+        { id: 'gitee', label: 'Gitee 官方镜像', url: 'https://raw.giteeusercontent.com/aureth-labs/dsh-aurabot-qq-mods/raw/registry/index.json' },
+        { id: 'custom', label: '自定义', url: '' },
+      ]
+      const regList = regSources.length ? regSources : REG_SOURCE_FALLBACK
+      const regClean = String(regUrl || '').trim().replace(/\/+$/, '')
+      const regMatched = (regList.find((s) => s.id !== 'custom' && s.url && s.url.replace(/\/+$/, '') === regClean) || {}).id
+      const regPreset = regMode || regMatched || (regClean ? 'custom' : 'github')
+      const pickSource = (id) => {
+        const s = regList.find((x) => x.id === id)
+        setRegMode(id)
+        setRegUrl(s && s.url ? s.url : '')
+      }
+      const regHint = regPreset === 'gitee'
+        ? 'Gitee 官方镜像：国内直连更稳，内容每天从 GitHub 的 registry 分支同步一次。'
+        : regPreset === 'custom'
+          ? '自定义地址：填指向 index.json 的完整 http(s) 链接；留空等于用 GitHub 官方源。'
+          : 'GitHub 官方源：默认地址，国内访问 raw.githubusercontent.com 可能不稳。'
+      const saveReg = async (override) => {
+        setBusy('reg')
+        try {
+          const value = typeof override === 'string' ? override : String(regUrl).trim()
+          const r = await post('/panel/market/registry', { registryUrl: value })
+          if (!r.ok) toast(r.message || '没成功', 'err')
+          else { toast(r.message || '保存好了', 'ok'); loadReg(); load(true) }
+        } catch (e) { toast(e.message) } finally { setBusy('') }
+      }
       // 一直查进度：恢复备份、老用户迁移时模块在后台装，不是从这个页面点的
       useEffect(() => {
         let was = false
@@ -3641,7 +8153,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const progText = (word) => (prog ? stageText() : word + '中…')
       const STAGE_BAR = { index: 10, install: 90, start: 95 }
       const progBar = prog ? h('div', { className: 'ab-card', style: { marginBottom: 12 } },
-        h('div', { className: 'ab-flex', style: { justifyContent: 'space-between' } }, h('b', null, '正在安装「' + (prog.name || prog.id) + '」'), h('span', { className: 'ab-muted ab-small' }, stageText())),
+        h('div', { className: 'ab-flex', style: { justifyContent: 'space-between' } }, h('b', null, (prog.batch ? '正在一键更新 ' + prog.batch.index + '/' + prog.batch.total + '：' : '正在安装「') + (prog.name || prog.id) + (prog.batch ? '' : '」')), h('span', { className: 'ab-muted ab-small' }, stageText())),
         h('div', { style: { height: 6, borderRadius: 3, background: 'var(--ab-foam-2)', marginTop: 8, overflow: 'hidden' } },
           h('div', { style: { height: '100%', width: (STAGE_BAR[prog.stage] || Math.max(12, 10 + percent * 0.8)) + '%', background: 'var(--ab-sea)', transition: 'width .3s' } }))) : null
       const done = async (r) => {
@@ -3658,16 +8170,43 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         try { await done(await post('/modules/community/install', { id: m.id, confirmReplace: Boolean(m.replacesBuiltin) })) } finally { setBusy('') }
       }
       const remove = async (m) => {
-        if (!confirm('卸载「' + m.name + '」？')) return
-        const purge = confirm('把它的数据和设置也清掉吗？\n确定 = 一起清掉；取消 = 留着，以后重装还能用')
+        if (!confirm('卸载「' + m.name + '」？\n模块目录和本地改动会移到 modules/.trash。')) return
+        const purge = confirm('把模块数据和设置也清掉吗？\n确定 = 清除数据和设置\n取消 = 保留数据和设置，重装还能用')
         setBusy(m.id)
         try { await done(await post('/modules/community/remove', { id: m.id, purge })) } finally { setBusy('') }
       }
       const list = (data && data.list) || []
+      const stats = (data && data.downloads) || {}
       const counts = { all: list.length, installed: list.filter((m) => m.installed).length, update: list.filter((m) => m.update).length }
+      // 一键更新：把「可更新」的模块一次更新完。后端整批只占一个锁，单个失败不影响后面的。
+      const updateAll = async () => {
+        const n = counts.update
+        if (!n) return toast('没有可更新的模块', 'ok')
+        if (!confirm('把 ' + n + ' 个可更新的模块一起更新？\n\n批量更新期间别关 DSH；某一个失败不会影响其它的，结果会告诉你哪几个没成功。')) return
+        setBusy('update-all')
+        try {
+          const r = await post('/modules/community/update-all', {})
+          await done(r)
+          if (r.failed && r.failed.length) toast('没更新成功：' + r.failed.map((x) => x.name || x.id).join('、'), 'err')
+        } catch (e) { toast(e.message, 'err') } finally { setBusy('') }
+      }
       const word = q.trim().toLowerCase()
       const cats = [...new Set(list.map((m) => m.category).filter(Boolean))]
-      const shown = list.filter((m) => (!cat || m.category === cat) && (show === 'all' || (show === 'installed' && m.installed) || (show === 'update' && m.update)) && (!word || (m.name + ' ' + m.id + ' ' + (m.description || '') + ' ' + (m.tags || []).join(' ')).toLowerCase().includes(word)))
+      // 安装量只能从 GitHub 读，读不到时热度排序不可用；最新发布/最近更新不受影响
+      const canHot = !stats.failed && list.some((m) => Number(m.downloads) > 0)
+      const effectiveSort = sort === 'hot' && !canHot ? 'default' : sort
+      const timeMode = effectiveSort === 'latest' || effectiveSort === 'updated' ? effectiveSort : ''
+      const filtered = list.filter((m) => (!cat || m.category === cat) && (show === 'all' || (show === 'installed' && m.installed) || (show === 'update' && m.update)) && (!word || (m.name + ' ' + m.id + ' ' + (m.description || '') + ' ' + (m.tags || []).join(' ')).toLowerCase().includes(word)))
+      const shown = sortMarketModules(filtered, effectiveSort)
+      const missingTimes = timeMode ? shown.filter((m) => !marketTimeOf(m, timeMode)).length : 0
+      const dateTextOf = (m) => { const t = marketTimeOf(m, timeMode || 'latest'); return t ? new Date(t).toISOString().slice(0, 10) : '' }
+      // 模块仓库地址：每个市场模块都在模块库 modules/<id> 下，默认深入到它自己的目录
+      // /tree/main/modules/<id>（比条目里的 homepage 更准——有的 homepage 指向别处仓库根）；
+      // 认不出模块库仓库才退 homepage（只认 http/https，索引是外部数据）
+      const repoUrl = (m) => (stats.source
+        ? 'https://github.com/' + stats.source + '/tree/main/modules/' + m.id
+        : /^https?:\/\//i.test(String(m.homepage || '')) ? m.homepage : '')
+      const num = (n) => (Number(n) >= 10000 ? (Number(n) / 10000).toFixed(1).replace(/\.0$/, '') + ' 万' : String(Number(n) || 0))
       const openSettings = (m) => {
         const running = (st.modules || []).find((x) => x.id === m.id)
         return running && running.tab ? () => go(running.tab) : null
@@ -3676,9 +8215,15 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const card = (m) => {
         const settings = m.installed ? openSettings(m) : null
         const note = [m.delisted ? '已从市场下架' : '', m.foreign ? '有同名的自己写的文件夹，不会覆盖' : '', m.blocked].filter(Boolean).join(' · ')
+        const url = repoUrl(m)
+        const title = url
+          ? h('a', { href: url, target: '_blank', rel: 'noreferrer', title: '打开仓库主页', style: { color: 'inherit', textDecoration: 'none' } }, m.name)
+          : m.name
         return h('div', { key: m.id, className: 'ab-card', style: { display: 'flex', flexDirection: 'column' } },
-          h('h3', null, m.name, m.update ? h('span', { className: 'ab-badge' }, '可更新') : null),
+          h('h3', null, title, m.update ? h('span', { className: 'ab-badge' }, '可更新') : null),
           h('div', { className: 'ab-small ab-muted' }, 'v' + (m.installed || m.version) + (m.update ? ' → v' + m.version : '') + (CATEGORY_LABEL[m.category] ? ' · ' + CATEGORY_LABEL[m.category] : '') + (m.author ? ' · ' + m.author : '') + (m.license ? ' · ' + m.license : '')),
+          canHot ? h('div', { className: 'ab-small ab-muted', style: { marginTop: 2 } }, '下载 ' + num(m.downloads) + ' 次' + (m.delisted ? '' : ' · 含更新')) : null,
+          timeMode && dateTextOf(m) ? h('div', { className: 'ab-small ab-muted', style: { marginTop: 2 } }, (timeMode === 'updated' ? '最近更新 ' : '发布于 ') + dateTextOf(m)) : null,
           h('p', { className: 'ab-desc', style: { margin: '8px 0' } }, m.description),
           capText(m).length ? h('div', { className: 'ab-small ab-muted', style: { marginBottom: 10 } }, '会用到：' + capText(m).join('、')) : null,
           note ? h('div', { className: 'ab-note warn', style: { marginBottom: 10 } }, note) : null,
@@ -3690,16 +8235,33 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       }
       return h('div', { className: 'ab-grid' },
         progBar,
-        h(Card, { title: '模块市场', desc: '给ta装更多本事。模块由社区提供、维护者审核后上架；它们和插件在同一进程运行，能接触账号配置，装之前看清下面列的能力。', right: h(Btn, { small: true, kind: 'ghost', onClick: () => load(true) }, '刷新') },
+        // 市场地址是低频设置：默认折叠，点标题才展开，别占着市场上面一整块
+        h(Card, { title: '模块市场地址', collapsible: true, defaultOpen: false, desc: '选官方源，或填自己的索引——自建索引、ghproxy 中转、内网部署都行。换好后市场会立即按新地址刷新。' },
+          h(Row, { label: '索引源', hint: regHint },
+            h('div', { className: 'ab-flex', style: { gap: 8, flexWrap: 'wrap', width: '100%' } },
+              h('select', { className: 'ab-select', 'aria-label': '模块市场索引源', value: regPreset, onChange: (e) => pickSource(e.target.value) },
+                regList.map((s) => h('option', { key: s.id, value: s.id }, s.label))),
+              h('input', { className: 'ab-input', style: { flex: '1 1 320px', minWidth: 220 }, value: regUrl, placeholder: regDef || 'https://…/registry/index.json', onChange: (e) => { setRegMode('custom'); setRegUrl(e.target.value) } }))),
+          h('div', { className: 'ab-flex', style: { marginTop: 8 } },
+            h(Btn, { small: true, disabled: busy === 'reg', onClick: () => saveReg() }, busy === 'reg' ? '保存中…' : '保存地址'),
+            h(Btn, { small: true, disabled: busy === 'reg' || regPreset === 'github', onClick: () => { setRegMode('github'); setRegUrl(regDef || ''); saveReg(regDef || '') } }, '恢复默认 GitHub 源'))),
+        h(Card, { title: '模块市场', desc: '给ta装更多本事。模块由社区提供、维护者审核后上架；它们和插件在同一进程运行，能接触账号配置，装之前看清下面列的能力。下载次数来自模块库 GitHub Releases（更新也算一次），只是热度参考。', right: h('div', { className: 'ab-flex' },
+            counts.update ? h(Btn, { small: true, kind: 'primary', disabled: Boolean(busy), onClick: updateAll }, busy === 'update-all' ? progText('更新') : '一键更新 ' + counts.update) : null,
+            h(Btn, { small: true, kind: 'ghost', onClick: () => load(true) }, '刷新')) },
           h('div', { className: 'ab-flex' },
             h('input', { className: 'ab-input', placeholder: '搜模块', value: q, onChange: (e) => setQ(e.target.value) }),
-            chip('all', '全部'), chip('installed', '已安装'), chip('update', '可更新')),
+            chip('all', '全部'), chip('installed', '已安装'), chip('update', '可更新'),
+            canHot ? h('button', { type: 'button', className: cx('ab-chip', effectiveSort === 'hot' && 'on'), onClick: () => setSort((v) => (v === 'hot' ? 'default' : 'hot')), title: '按模块安装包在 GitHub 上的下载次数排序' }, '按热度') : null,
+            h('button', { type: 'button', className: cx('ab-chip', effectiveSort === 'latest' && 'on'), onClick: () => setSort((v) => (v === 'latest' ? 'default' : 'latest')), title: '按模块当前版本的发布时间排序（索引 publishedAt，缺失时用 GitHub Release 时间）' }, '最新发布'),
+            h('button', { type: 'button', className: cx('ab-chip', effectiveSort === 'updated' && 'on'), onClick: () => setSort((v) => (v === 'updated' ? 'default' : 'updated')), title: '按模块最近更新时间排序（索引 updatedAt，缺失时用发布时间）' }, '最近更新')),
           cats.length > 1 ? h('div', { className: 'ab-flex', style: { marginTop: 10 } }, [''].concat(cats).map((c) => h('button', { key: c || 'any', type: 'button', className: cx('ab-chip', cat === c && 'on'), onClick: () => setCat(c) }, c ? CATEGORY_LABEL[c] || c : '全部分类'))) : null,
+          stats.failed && list.length ? h('div', { className: 'ab-small ab-muted', style: { marginTop: 8 } }, '这次没读到下载次数（GitHub 接口连不上或额度用完了），按热度排不了，可以改用「最新发布 / 最近更新」。') : null,
+          missingTimes ? h('div', { className: 'ab-small ab-muted', style: { marginTop: 8 } }, '有 ' + missingTimes + ' 个模块没有发布时间/更新时间，按原顺序排在最后。') : null,
           ((data && data.revoked) || []).map((r) => h('div', { key: r.id, className: 'ab-note err', style: { marginTop: 10 } }, '「' + r.id + '」' + r.version + ' 已撤回：' + r.reason + '。建议关闭或卸载。'))),
         !data ? h(Empty, { icon: '⏳', text: '加载中…' }) : null,
         data && data.ok === false ? h('div', { className: 'ab-note warn' }, '市场打不开：' + data.message) : null,
         data && data.ok !== false && !shown.length ? h(Empty, { icon: '🐟', text: list.length ? '没有符合条件的模块' : '市场里还没有模块' }) : null,
-        shown.length ? h('div', { className: 'ab-grid', style: { gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))' } }, shown.map(card)) : null,
+        shown.length ? h('div', { className: 'ab-grid ab-market-grid' }, shown.map(card)) : null,
         h(ModuleTutorial, { toast }))
     }
 
@@ -3759,13 +8321,19 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       static getDerivedStateFromError(error) { return { error } }
       render() { return this.state.error ? h('div', { className: 'ab-note err' }, '这个模块的面板出错了：' + String((this.state.error && this.state.error.message) || this.state.error)) : this.props.children }
     }
-    function ExtPanel({ m, settings, draftSettings, setSettings, toast, reload }) {
+    // saveOverride：不传就照旧直接 POST 保存（模块自己的面板页）；传了就用调用方的保存流程。
+    // 「生图」页把 dsh-image 嵌进「接口格式」时传草稿保存：那里的一切改动都要跟着「保存设置」一起落盘，
+    // 否则同一个面板在两处行为不一致（一处即时生效，一处等保存）。
+    function ExtPanel({ m, settings, draftSettings, setSettings, toast, reload, saveOverride }) {
       const [Comp, setComp] = useState(null)
       const [err, setErr] = useState('')
       useEffect(() => {
         let alive = true
         fetch(API + '/modules/panel?id=' + encodeURIComponent(m.id) + '&t=' + Date.now(), { cache: 'no-store' }).then((r) => (r.ok ? r.text() : Promise.reject(new Error('读不到 panel.js')))).then((src) => {
-          const call = (p, body) => (body === undefined ? get('/ext/' + m.id + p) : post('/ext/' + m.id + p, body))
+          // 接口挂载位置跟服务端一致：内置模块（以及从内置搬出去的）接口在根路径，别的模块在自己 /ext/<id>/ 下。
+          // 按老写法一律拼 /ext/<id>，内置模块面板里的 call('/x') 会去请求 /ext/<id>/x，直接 404。
+          const base = m.routesAtRoot ? '' : '/ext/' + m.id
+          const call = (p, body) => (body === undefined ? get(base + p) : post(base + p, body))
           const ui = { Card, Btn, Switch, Row, Empty, Select, Seg, Range }
           const C = new Function('React', 'h', 'ui', 'call', src)(React, h, ui, call)
           if (typeof C !== 'function') throw new Error('panel.js 最后要 return 一个组件（函数）')
@@ -3775,7 +8343,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       }, [m.id, m.startedAt])
       if (err) return h('div', { className: 'ab-note err' }, '面板加载失败：' + err)
       if (!Comp) return h(Empty, { icon: '⏳', text: '加载中…' })
-      const save = async (patch) => { const r = await post('/save', { ext: { [m.id]: patch } }); toast(r.ok === false ? r.message : '保存好了', r.ok === false ? 'err' : 'ok'); reload() }
+      const save = async (patch) => { if (typeof saveOverride === 'function') return saveOverride(patch); const r = await post('/save', { ext: { [m.id]: patch } }); toast(r.ok === false ? r.message : '保存好了', r.ok === false ? 'err' : 'ok'); reload() }
       return h(PanelBoundary, null, h(Comp, { settings, draftSettings, setSettings, save, toast, reload }))
     }
     function ExtPage({ st, draft, setDraft, toast, reload, mod, embedded }) {
@@ -3803,6 +8371,50 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         m.panel ? h(ExtPanel, { m, settings, draftSettings, setSettings, toast, reload }) : null)
     }
 
+    const CONTENT_PLATFORMS = [
+      { id: 'bili', label: 'B站', mod: 'bili' },
+      { id: 'douyin', label: '抖音', mod: 'douyin' },
+      { id: 'heybox', label: '小黑盒', mod: 'heybox' },
+    ]
+
+    /**
+     * 内容平台页外壳：B站 / 抖音 / 小黑盒 三个子视图共用一个页签。
+     * 只挂载选中的平台——不选不挂载，各平台数据互不拉取。
+     * 默认取首个当前可用的平台（boot.modules 里对应模块 running）；
+     * 尊重 aurabot.content-view 上次选择，存的平台若不可用则回落首个可用。
+     */
+    function ContentTab({ contentView, setContentView, boot, st, draft, setDraft, toast }) {
+      const mods = (boot && boot.modules) || (st && st.modules) || []
+      // 全部平台都可点（模块没在跑的也能点进标签）；running 只用来决定默认选中哪个。
+      const all = CONTENT_PLATFORMS.map((p) => p.id)
+      const defaultId = (CONTENT_PLATFORMS.find((p) => mods.some((m) => m && m.id === p.mod && m.running)) || CONTENT_PLATFORMS[0]).id
+      // 归一化：上次选择合法就沿用，否则回落默认。这里不能用「可用集合」判断——
+      // 否则模块没跑的平台一点就被弹回，表现为「按钮点不动」。
+      const picked = all.includes(contentView) ? contentView : defaultId
+      const seg = h('div', { className: 'ab-seg', role: 'tablist', 'aria-label': '内容平台子视图' },
+        CONTENT_PLATFORMS.map((p) => h('button', {
+          key: p.id, type: 'button', role: 'tab',
+          'aria-selected': picked === p.id,
+          className: cx(picked === p.id && 'on'),
+          onClick: () => setContentView(p.id),
+        }, p.label)))
+      const runningOf = (id) => {
+        const p = CONTENT_PLATFORMS.find((x) => x.id === id)
+        return Boolean(p && mods.some((m) => m && m.id === p.mod && m.running))
+      }
+      // 模块没在跑时不要挂载子组件：它的 load() 会打到不存在的路由，拿回 {ok:false}
+      // 这种没有 history 的残对象，渲染层一取 .length 就整页崩（「这一页出错了」）。
+      return h('div', null,
+        h('div', { className: 'ab-flex', style: { margin: '0 0 12px' } }, seg),
+        !runningOf(picked)
+          ? h(Card, { title: '这个平台还没启用' },
+              h('div', { className: 'ab-note' }, '对应的模块没在跑，所以看不到它的设置和登录状态。'),
+              h('div', { className: 'ab-small ab-muted', style: { marginTop: 8 } }, '到「模块」页把它启动（或装上），回来再点这个标签就行。'))
+          : picked === 'bili' ? h(Bili, { draft, setDraft, toast })
+            : picked === 'douyin' ? h(Douyin, { draft, setDraft, toast })
+              : h(Heybox, { draft, setDraft, toast }))
+    }
+
     const BILI_KIND = { watch: '看了', comment: '评论', reply: '回复', share: '分享给你', shot: '发你截图', error: '没成功' }
 
     /** B 站：登录、定时刷、评论 / 回复、分享给主人，以及她刷过什么。 */
@@ -3811,20 +8423,38 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [s, setS] = useState(null)
       const [busy, setBusy] = useState('')
       const [shots, setShots] = useState(null)
-      const load = () => get('/bili/state').then(setS).catch((e) => toast(e.message, 'err'))
-      const loadShots = () => get('/bili/shots').then((r) => setShots(r.items || [])).catch((e) => { setShots([]); toast(e.message, 'err') })
+      const [shotsTotal, setShotsTotal] = useState(0)
+      const [shotsHasMore, setShotsHasMore] = useState(false)
+      const [shotsBusy, setShotsBusy] = useState(false)
+      const load = () => get('/bili/state').then((r) => { if (r && Array.isArray(r.history)) setS(r); else if (r && r.ok === false) toast(r.message || '读取 B 站状态失败', 'err') }).catch((e) => toast(e.message, 'err'))
+      const loadShots = (append = false, force = false) => {
+        const offset = append && shots ? shots.length : 0
+        return getCached('/bili/shots?limit=25&offset=' + offset, force).then((r) => {
+          const items = r.items || []
+          setShots((prev) => append ? [...(prev || []), ...items] : items)
+          setShotsTotal(Number(r.total) || 0)
+          setShotsHasMore(Boolean(r.hasMore))
+        }).catch((e) => { if (!append) setShots([]); toast(e.message, 'err') })
+      }
+      const loadMoreShots = async () => {
+        if (shotsBusy || !shotsHasMore) return
+        setShotsBusy(true)
+        try { await loadShots(true) } finally { setShotsBusy(false) }
+      }
       useEffect(() => { load(); loadShots() }, [])
       const act = (path, label) => async () => { setBusy(label); const r = await post(path); setBusy(''); toast(r.message, r.ok ? 'ok' : 'err'); load(); loadShots() }
       const acct = s && s.account
       return h('div', { className: 'ab-grid' },
         h(Card, { title: '刷 B 站', right: f.sw('bili.enabled'), desc: 'ta会定时去 B 站刷几个视频：从ta的兴趣、记忆里你喜欢的东西和下面的关键词里挑方向去搜，读简介、字幕和热评，再按自己的性格决定评不评论、要不要私聊分享给你、记住什么。看过的、评过的都记成ta的经历，聊天时会自然提起。你在 QQ 里发 B 站链接或分享卡片，ta也能点进去看完再聊。' },
-          h(BiliCookie, { draft, setDraft }),
+          h(BiliCookie, { draft, setDraft, load }),
           h('div', { className: 'ab-flex', style: { marginTop: 4 } },
             h(Btn, { small: true, onClick: async () => { await get('/bili/account'); load() } }, '检查登录'),
             acct ? h('span', { className: 'ab-small', style: { color: acct.isLogin ? 'var(--ab-ok)' : 'var(--ab-warn)' } }, acct.isLogin ? '已登录：' + acct.uname : '没登录（只能看，不能评论）') : null),
         ),
-        h(Card, { title: '怎么刷', desc: '只在「主动搭话」里设的醒着时间内刷。' },
+        h(Card, { title: '怎么刷', desc: '只在「目的引擎」里设的醒着时间内刷。' },
           h(Row, { label: '定时自己去刷' }, f.sw('bili.autoBrowse')),
+          h(Row, { label: '只在谷时刷', hint: '避开 DeepSeek 峰时（北京时间工作日 9-12、14-18）；峰时跳过定时刷和看回复，等谷时再跑，周末和法定节假日全天可刷' }, f.sw('bili.offpeak')),
+          (draft.bili && draft.bili.offpeak && s && s.lastSkipReason) ? h(Row, { label: '上次跳过' }, h('span', { className: 'ab-small', style: { color: 'var(--ab-warn)' } }, s.lastSkipReason)) : null,
           h(Row, { label: '多久刷一轮' }, f.range('bili.intervalHours', 1, 24, 1, (v) => v + ' 小时')),
           h(Row, { label: '每天最多刷' }, f.range('bili.maxRunsPerDay', 0, 12, 1, (v) => v + ' 轮')),
           h(Row, { label: '一轮看几个视频' }, f.range('bili.perRun', 1, 6, 1, (v) => v + ' 个')),
@@ -3837,6 +8467,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h(Row, { label: '自己发评论', hint: '只管ta自己刷视频时发不发；别人让ta发，看「权限」页的 B 站评论' }, f.sw('bili.comment'), h('span', { className: 'ab-muted' }, '每天最多'), f.num('bili.maxCommentsPerDay', { min: 0, max: 50 }), h('span', { className: 'ab-muted' }, '条')),
           h(Row, { label: '回别人回ta的评论' }, f.sw('bili.reply'), h('span', { className: 'ab-muted' }, '每天最多'), f.num('bili.maxRepliesPerDay', { min: 0, max: 100 }), h('span', { className: 'ab-muted' }, '条')),
           h(Row, { label: '看到好玩的分享给你', hint: '私聊发给主人，带视频链接' }, f.sw('bili.shareToOwner')),
+          h(Row, { label: '也提议发到群里', hint: '刷到合适的先私聊问主人，批准了才发；关着就不提' }, f.sw('bili.groupShare.enabled')),
+          h(Row, { label: '发到哪个群', hint: '群号。留空则不生效' }, f.text('bili.groupShare.groupId', { placeholder: '群号' })),
+          h(Row, { label: '每天最多发', hint: '只算真发进群的条数' }, f.num('bili.groupShare.dailyLimit', { min: 0, max: 20 }), h('span', { className: 'ab-muted' }, '条')),
           h(Row, { label: '顺手点赞' }, f.sw('bili.like')),
         ),
         h(Card, { title: '看画面（抽帧 + 视觉）', desc: '默认只读标题、简介、字幕和热评。打开后用 ffmpeg 抽帧交给视觉模型，截图保存到本机，可以在 QQ 聊天里让ta挑一张发送。没有 ffmpeg、模型明确不支持图片或处理失败时，自动继续文字阅读。' },
@@ -3847,17 +8480,32 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h(Row, { label: 'ffmpeg 路径', hint: '留空就自己在 PATH 里找；找不到就填绝对路径' }, f.text('bili.ffmpegPath', { placeholder: 'C:\\ffmpeg\\bin\\ffmpeg.exe' })),
           s && s.vision ? h('div', { className: 'ab-small', style: { marginTop: 4, color: s.vision.ffmpeg ? 'var(--ab-ok)' : 'var(--ab-warn)' } }, (s.vision.ffmpeg ? '✓ 已找到 ffmpeg：' + s.vision.ffmpeg : '✗ 没找到 ffmpeg：抽帧会被跳过，装一个或者在上面填路径') + (s.shots ? '　·　手上存了 ' + s.shots.count + ' 张截图' : '')) : null,
         ),
-        h(Card, { title: '截图库' + (shots ? '（' + shots.length + ' / ' + ((draft.bili && draft.bili.shotLibrary) || 300) + '）' : ''), right: h('div', { className: 'ab-flex' },
-          h(Btn, { small: true, kind: 'ghost', onClick: loadShots }, '刷新')) },
+        h(Card, { title: '截图库' + (shots ? '（' + shots.length + (shotsTotal > shots.length ? '/' + shotsTotal : '') + '，上限 ' + ((draft.bili && draft.bili.shotLibrary) || 300) + '）' : ''), right: h('div', { className: 'ab-flex' },
+          h(Btn, { small: true, kind: 'ghost', onClick: () => { bustCache(); loadShots(false, true) } }, '刷新')) },
           !shots ? h(Empty, { icon: '⏳', text: '加载中…' }) : shots.length === 0 ? h(Empty, { icon: '🎬', text: '还没有截图。打开上面的「让ta看画面」刷一轮 B 站，就会开始截。' }) :
-            h('div', { className: 'ab-shots' }, shots.map((it) => h(ShotCell, { key: it.file, it, onChanged: () => { loadShots(); load() }, toast }))),
+            h('div', { className: 'ab-shots' }, shots.map((it) => h(ShotCell, {
+              key: it.file, it, toast,
+              // 删掉后只从本地列表移除这一张，不重拉第一页、不改变滚动位置
+              onChanged: (file) => {
+                if (file) {
+                  const nextLoaded = Math.max(0, (shots || []).length - 1)
+                  const nextTotal = Math.max(0, shotsTotal - 1)
+                  setShots((prev) => (prev || []).filter((x) => x.file !== file))
+                  setShotsTotal(nextTotal)
+                  setShotsHasMore(nextTotal > nextLoaded)
+                }
+                load()
+              },
+            }))),
+          shotsHasMore ? h('div', { className: 'ab-flex', style: { marginTop: 8 } },
+            h(Btn, { small: true, kind: 'ghost', disabled: shotsBusy, onClick: loadMoreShots }, shotsBusy ? '加载中…' : `加载更多（已显示 ${shots ? shots.length : 0}/${shotsTotal}）`)) : null,
         ),
         h(Card, { title: 'ta刷过什么', right: h('div', { className: 'ab-flex' },
           h(Btn, { small: true, onClick: act('/bili/replies', 'replies'), disabled: !!busy }, busy === 'replies' ? '正在看…' : '看看有没有人回ta'),
           h(Btn, { small: true, kind: 'primary', onClick: act('/bili/run', 'run'), disabled: !!busy }, busy === 'run' ? h(Fragment, null, h('i', { className: 'ab-spin' }), ' 正在刷…') : '现在刷一轮')) },
           s && s.pauseReason ? h('div', { className: 'ab-note warn', style: { marginBottom: 8 } }, '今天先不发评论和回复了：' + s.pauseReason + '。登录失效请保存新 Cookie 后点「检查登录」；验证、风控或频率限制不会因登录成功而解除。') : null,
           s ? h('div', { className: 'ab-muted ab-small', style: { marginBottom: 8 } }, '今天自动刷了 ' + s.runs + ' 轮 · 评论 ' + s.comments + ' 条 · 回复 ' + s.replies + ' 条' + (s.lastRun ? ' · 上次 ' + timeAgo(s.lastRun) : '') + '（手动刷不占次数）') : null,
-          !s ? h(Empty, { icon: '⏳', text: '加载中…' }) : s.history.length === 0 ? h(Empty, { icon: '📺', text: '还没刷过。点「现在刷一轮」试试。' }) :
+          !s ? h(Empty, { icon: '⏳', text: '加载中…' }) : !Array.isArray(s.history) || s.history.length === 0 ? h(Empty, { icon: '📺', text: '还没刷过。点「现在刷一轮」试试。' }) :
             h('div', { className: 'ab-list' }, s.history.map((x, i) => h('div', { key: i, className: 'ab-li' },
               h('div', { className: 'meta' }, timeAgo(x.at), h('br'), BILI_KIND[x.kind] || x.kind),
               h('div', { className: 'body' }, x.bvid ? h('a', { href: 'https://www.bilibili.com/video/' + x.bvid, target: '_blank', rel: 'noreferrer' }, '《' + x.title + '》') : h('b', null, '《' + x.title + '》'), x.text ? h('div', { className: 'ab-muted' }, x.text) : null)))),
@@ -3931,7 +8579,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             if (!confirm('删掉这张截图？\n' + cap)) return
             const r = await post('/bili/shot/delete', { file: it.file })
             toast(r.message || '删掉了', r.ok ? 'ok' : 'err')
-            onChanged()
+            if (r.ok) onChanged(it.file)
           },
         }, '✕'),
       )
@@ -3997,11 +8645,11 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             h(Btn, { small: true, kind: 'primary', onClick: act('/douyin/confirm-owner', 'confirm', { input: ((draft.douyin || {}).owner || {}).input || '' }), disabled: !!busy }, busy === 'confirm' ? '核对中…' : '核对'),
             s && s.owner ? h('span', { className: 'ab-small', style: { color: 'var(--ab-ok)' } }, '已核对：' + s.owner.nickname) : h('span', { className: 'ab-small ab-muted' }, '还没核对（不核对就不会 @你）')),
         ),
-        h(Card, { title: '抖音私信', desc: '你在抖音上私信ta，ta会用自己的口气回（只认上面核对过的你，别人的私信不理）。让ta找视频的话，ta会尝试刷一轮再私信分享给你；这条流程仍需实际环境验证。只在「主动搭话」里设的醒着时间内回。' },
+        h(Card, { title: '抖音私信', desc: '你在抖音上私信ta，ta会用自己的口气回（只认上面核对过的你，别人的私信不理）。让ta找视频的话，ta会尝试刷一轮再私信分享给你；这条流程仍需实际环境验证。只在「目的引擎」里设的醒着时间内回。' },
           h(Row, { label: '回你的抖音私信' }, f.sw('douyin.ownerDm')),
           h(Row, { label: '多久看一次' }, f.num('douyin.dmPollMinutes', { min: 1, max: 60 }), h('span', { className: 'ab-muted' }, '分钟'), h(Btn, { small: true, onClick: act('/douyin/dms', 'dms'), disabled: !!busy }, busy === 'dms' ? '正在看…' : '现在看一次')),
         ),
-        h(Card, { title: '怎么刷', desc: '只在「主动搭话」里设的醒着时间内自己刷。主人在 QQ 里让ta「去刷会儿抖音」也行。' },
+        h(Card, { title: '怎么刷', desc: '只在「目的引擎」里设的醒着时间内自己刷。主人在 QQ 里让ta「去刷会儿抖音」也行。' },
           h(Row, { label: '定时自己去刷' }, f.sw('douyin.autoBrowse')),
           h(Row, { label: '多久刷一轮' }, f.range('douyin.intervalHours', 1, 24, 1, (v) => v + ' 小时')),
           h(Row, { label: '每天最多刷' }, f.range('douyin.maxRunsPerDay', 0, 12, 1, (v) => v + ' 轮')),
@@ -4037,7 +8685,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             (s.newAccount ? '（新号，上限减半）' : '') +
             (s.lastRun ? ' · 上次 ' + timeAgo(s.lastRun) : '') +
             (s.lastSkipReason ? ' · 上次没刷成：' + s.lastSkipReason : '')) : null,
-          !s ? h(Empty, { icon: '⏳', text: '加载中…' }) : s.history.length === 0 ? h(Empty, { icon: '📱', text: '还没刷过。先扫码登录、打开开关，再点「现在刷一轮」。' }) :
+          !s ? h(Empty, { icon: '⏳', text: '加载中…' }) : !Array.isArray(s.history) || s.history.length === 0 ? h(Empty, { icon: '📱', text: '还没刷过。先扫码登录、打开开关，再点「现在刷一轮」。' }) :
             h('div', { className: 'ab-list' }, s.history.map((x, i) => h('div', { key: i, className: 'ab-li' },
               h('div', { className: 'meta' }, timeAgo(x.at), h('br'), DOUYIN_KIND[x.kind] || x.kind),
               h('div', { className: 'body' },
@@ -4078,7 +8726,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         const actN = parts.filter(findAct).length
         return { act: actN, plain: parts.length - actN }
       }
-      // 选话题：活动 / 普通互斥；活动只能 1 个，普通最多 3 个
+      // 选话题：活动 / 普通不互斥，但一帖共享 3 个名额（活动最多 1 个）。
+      // 口径与模块侧 resolveHashtagItems 的 HASHTAG_TOTAL_CAP=3 一致，别在这边放宽。
+      const TOPIC_CAP = 3
       const toggleTopic = (i, name) => setDraft(function (d) {
         const hb = d.heybox || {}
         const list = (Array.isArray(hb.dailyPosts) ? hb.dailyPosts : []).slice()
@@ -4090,11 +8740,13 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         if (parts.includes(name)) {
           nextVals = parts.filter(function (x) { return x !== name })
         } else if (wantAct) {
-          nextVals = [name]
+          // 换活动：新的顶替旧的，普通话题保留但只留得下 2 个（活动占 1 席）
+          const plains = parts.filter(function (x) { return !isActIn(x) })
+          if (plains.length > TOPIC_CAP - 1) toast('活动占 1 个名额，普通话题只保留前 ' + (TOPIC_CAP - 1) + ' 个', 'err')
+          nextVals = [name].concat(plains.slice(0, TOPIC_CAP - 1))
         } else {
-          const plainOnly = parts.filter(function (x) { return !isActIn(x) })
-          if (plainOnly.length >= 3) { toast('普通话题最多选 3 个', 'err'); return d }
-          nextVals = plainOnly.concat([name])
+          if (parts.length >= TOPIC_CAP) { toast('一帖最多挂 ' + TOPIC_CAP + ' 个话题（活动、普通共享名额）', 'err'); return d }
+          nextVals = parts.concat([name])
         }
         item.hashtagsText = joinHashtags(nextVals)
         item.hashtags = nextVals.slice()
@@ -4109,12 +8761,13 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       }
       const renderSelSummary = function (i) {
         const c = countSel(i)
-        if (c.act > 0) return h('span', { className: 'ab-small', style: { whiteSpace: 'nowrap', color: 'var(--ab-ok)' } }, '已选创作活动 ' + c.act + '/1')
-        if (c.plain > 0) {
-          const color = c.plain >= 3 ? 'var(--ab-warn)' : 'var(--ab-ok)'
-          return h('span', { className: 'ab-small', style: { whiteSpace: 'nowrap', color: color } }, '已选普通话题 ' + c.plain + '/3')
+        const total = c.act + c.plain
+        if (total > 0) {
+          const color = total >= TOPIC_CAP ? 'var(--ab-warn)' : 'var(--ab-ok)'
+          const detail = c.act > 0 ? '活动 ' + c.act + '/1 + 普通 ' + c.plain : '普通 ' + c.plain
+          return h('span', { className: 'ab-small', style: { whiteSpace: 'nowrap', color: color } }, '已选话题 ' + total + '/' + TOPIC_CAP + '（' + detail + '）')
         }
-        return h('span', { className: 'ab-small ab-muted', style: { whiteSpace: 'nowrap' } }, '未选（活动 / 普通各选一种）')
+        return h('span', { className: 'ab-small ab-muted', style: { whiteSpace: 'nowrap' } }, '未选（活动、普通共享 ' + TOPIC_CAP + ' 个名额）')
       }
       // 搜索 + 分组渲染（创作活动在前）
       const renderTopicGroups = function (i) {
@@ -4278,7 +8931,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         ),
         riskCard(),
         h(Card, {
-          title: 'ta的逛法', desc: '只在「主动搭话」里设的醒着时间内自己逛。主人在 QQ 里让ta「去逛逛小黑盒」也行。逛是只读的，不会乱点赞评论。',
+          title: 'ta的逛法', desc: '只在「目的引擎」里设的醒着时间内自己逛。主人在 QQ 里让ta「去逛逛小黑盒」也行。逛是只读的，不会乱点赞评论。',
         },
           h(Row, { label: '定时自己去逛' }, f.sw('heybox.autoBrowse')),
           h(Row, { label: '只在谷时逛', hint: '避开工作日 9-12、14-18 两个高峰（那会儿模型排队久、单价高，逛一轮很费 token）。峰时ta会等，不占额度' },
@@ -4408,7 +9061,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
                       f.num('heybox.dailyPosts.' + i + '.wordsMin', { min: 0, max: 2000 }), h('span', { className: 'ab-muted' }, '–'),
                       f.num('heybox.dailyPosts.' + i + '.wordsMax', { min: 0, max: 3000 }), h('span', { className: 'ab-muted' }, '字')),
                   ),
-                  h(Row, { label: '话题', hint: '创作活动和普通话题只能选一种：选活动会自动清掉普通（限 1 个），选普通会清掉活动（最多 3 个）' },
+                  h(Row, { label: '话题', hint: '创作活动和普通话题可以一起挂，但一帖共享 3 个名额：活动最多 1 个，占 1 席后普通话题还能选 2 个' },
                     h('div', { style: { width: '100%' } },
                       h('div', { className: 'ab-flex', style: { marginBottom: 6 } },
                         h('input', {
@@ -4468,7 +9121,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           right: h('div', { className: 'ab-flex' },
             h(Btn, { small: true, kind: 'primary', onClick: () => post('/heybox/acts/refresh').then((r) => { toast(r.message || '已刷新', r.ok === false ? 'err' : 'ok'); load() }).catch(() => toast('刷新失败', 'err')), disabled: !!busy }, busy === 'acts' ? '刷新中…' : '刷新话题'),
             h(Btn, { small: true, onClick: load }, '重新读')),
-          desc: '写帖要挂话题就从这里挑（带「活动」角标的优先，有奖励）。活动和普通话题**可以一起挂**：活动最多 1 个 + 普通最多 3 个（共 4 个）。她发帖时话题是以**纯文本名字**提交的，服务端自己匹配成话题；传对象（name+hashtag_id）会让发帖直接失败。',
+          desc: '写帖要挂话题就从这里挑（带「活动」角标的优先，有奖励）。活动和普通话题**可以一起挂**，但一帖**共享 3 个名额**：活动最多 1 个，剩下的给普通话题（和排期里的话题勾选、模块侧截断同一口径）。她发帖时话题是以**纯文本名字**提交的，服务端自己匹配成话题；传对象（name+hashtag_id）会让发帖直接失败。',
         },
           (() => {
             const acts = s && (s.actsList || [])
@@ -4551,7 +9204,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const shown = Math.min(50, Math.max(1, Number(draft.imageGen && draft.imageGen.galleryShown) || 20))
       const [data, setData] = useState(null)
       const load = async () => {
-        const r = await get('/image/gallery?limit=' + shown).catch(() => null)
+        const r = await getCached('/image/gallery?limit=' + shown).catch(() => null)
         setData(r && r.ok ? r : { items: [], total: 0, dir: '' })
       }
       useEffect(() => { load() }, [shown])
@@ -4618,46 +9271,222 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         if (path.endsWith('/login')) setWaiting({ url: r.url, needPaste: r.needPaste })
         else { setWaiting(null); refresh(); toast(path.endsWith('/logout') ? '已退出 ChatGPT' : path.endsWith('/cancel') ? '已取消登录' : '登录成功') }
       }
+      // 1455 被系统保留时：没登录（或正在登录）才提示并显示粘贴框；登录完成后收起，只留「重新登录」
+      const callbackUnavailable = Boolean(status && status.callback && status.callback.available === false)
+      const needManualCallback = callbackUnavailable && (!status?.loggedIn || Boolean(waiting))
       return h('div', null,
         h('div', { className: 'ab-note', style: { margin: '8px 0' } }, '实验性订阅接法：使用非公开图片端点，可用性和额度由账号、工作区及服务端决定。登录信息仅存本机。'),
+        needManualCallback
+          ? h('div', { className: 'ab-note warn', style: { margin: '8px 0' } }, '本机 1455 端口被系统保留（Windows 开了 Hyper-V / WSL 时常见）：插件没法自动接收回调，浏览器会显示「无法访问」，但地址栏里就是完整回调地址，复制回来粘贴即可完成登录。')
+          : null,
         h(Row, { label: 'ChatGPT 账号' },
           h('span', { className: 'ab-small' }, status === null ? '读取登录状态…' : status.loggedIn ? '已登录：' + (status.email || status.accountId) : '尚未登录'),
-          h(Btn, { small: true, onClick: act('/image/codex/login'), disabled: busy || Boolean(waiting) }, '登录 ChatGPT'),
+          h(Btn, { small: true, onClick: act('/image/codex/login'), disabled: busy || Boolean(waiting) }, status?.loggedIn ? '重新登录 ChatGPT' : '登录 ChatGPT'),
           status?.loggedIn ? h(Btn, { small: true, onClick: act('/image/codex/logout'), disabled: busy }, '退出') : null),
-        waiting ? h('div', { className: 'ab-note' },
-          h('div', null, waiting.needPaste ? '端口 1455 被占用：打开授权链接登录，再粘贴完整回调地址。' : '请在浏览器完成登录。回调成功后自动刷新，也可以手动粘贴完整回调地址。'),
-          h('a', { href: waiting.url, target: '_blank', rel: 'noreferrer', style: { display: 'block', wordBreak: 'break-all' } }, '打开 ChatGPT 授权页'),
-          h('input', { className: 'ab-input', value: input, type: 'password', autoComplete: 'off', placeholder: '粘贴完整回调地址', onChange: (e) => setInput(e.target.value) }),
-          h(Btn, { small: true, onClick: act('/image/codex/complete', { input }), disabled: busy || !input.trim() }, '完成登录'),
-          h(Btn, { small: true, onClick: act('/image/codex/cancel'), disabled: busy }, '取消登录')) : null,
-        h(Row, { label: '模型', hint: '可用模型由服务端决定' }, f.select('imageGen.codex.model', [
-          { value: 'gpt-image-2', label: 'gpt-image-2' }, { value: 'gpt-image-2.5-flare', label: 'gpt-image-2.5-flare' }, { value: 'gpt-image-2.5-sunburst', label: 'gpt-image-2.5-sunburst' },
-        ], { width: 260 })),
+        (waiting || needManualCallback) ? h('div', { className: 'ab-note' },
+          h('div', null, waiting
+            ? (waiting.needPaste ? '1455 收不到回调：' : '') + '在浏览器完成登录后，把地址栏里的完整回调地址粘到下面。'
+            : '先在浏览器完成登录，再把地址栏里的完整回调地址粘到下面；点上面的登录按钮会生成并打开授权链接。'),
+          waiting?.url
+            ? h('a', { href: waiting.url, target: '_blank', rel: 'noreferrer', style: { display: 'block', wordBreak: 'break-all' } }, '打开 ChatGPT 授权页')
+            : null,
+          h('input', { className: 'ab-input', value: input, type: 'password', autoComplete: 'off', placeholder: waiting ? '粘贴完整回调地址' : '完成浏览器登录后再粘贴', onChange: (e) => setInput(e.target.value) }),
+          h(Btn, { small: true, onClick: act('/image/codex/complete', { input }), disabled: busy || !waiting || !input.trim() }, '完成登录'),
+          waiting ? h(Btn, { small: true, onClick: act('/image/codex/cancel'), disabled: busy }, '取消登录') : null) : null,
+        // 预设只是提示，模型名允许自己填（#256）：新模型出现时不用改源码。
+        h(Row, { label: '模型', hint: '常用：gpt-image-2 / gpt-image-2.5-flare / gpt-image-2.5-sunburst；也可直接填服务端支持的自定义模型名' },
+          h('input', { className: 'ab-input', style: { width: 260 }, value: draft.imageGen?.codex?.model ?? '', onChange: (e) => setDraft(setPath(draft, 'imageGen.codex.model', e.target.value)) })),
         h(Row, { label: '质量', hint: '所选模型需支持该选项' }, f.select('imageGen.codex.quality', ['auto', 'low', 'medium', 'high', 'xhigh', 'max'].map((value) => ({ value, label: value })), { width: 180 })),
         h(Row, { label: '背景' }, f.select('imageGen.codex.background', ['auto', 'opaque', 'transparent'].map((value) => ({ value, label: value })), { width: 180 })),
         h('div', { className: 'ab-muted ab-small' }, '订阅接法通过构图提示引导，实际尺寸由服务端选择。'),
       )
     }
 
-    function ImageGen({ draft, setDraft, toast }) {
+    // 官方推荐（赞助商）地址：固定第一项，面板里不可删；官网从这里跳
+    const SPONSOR_BASE = 'https://ntmd.cn/v1'
+    const SPONSOR_SITE = 'https://ntmd.cn'
+
+    // 生视频：本地脚本 / MiniMax / 自定义异步任务；确认、扩写、抽帧是三种接口通用的
+    function Video({ st, draft, setDraft, toast, reload }) {
+      const f = useField(draft, setDraft)
+      const v = draft.video || {}
+      const provider = v.provider || 'local'
+      const localOn = !!(draft.local && draft.local.video)
+      return h('div', { className: 'ab-grid' },
+        h(Card, {
+          title: '生视频',
+          desc: '她可以按描述生成一段视频。选好接口、填好参数，然后在聊天里让她「生成一段视频：…」。生成本身很慢，做好会自动发到聊天。',
+        },
+          h('div', { style: { margin: '4px 0 12px' } }, f.choices('video.provider', [
+            { value: 'local', label: '本地脚本', desc: localOn ? '走本地接口 video.mjs（ComfyUI 等，已开启）' : '走本地接口 video.mjs（ComfyUI 等，还没开启）' },
+            { value: 'minimax', label: 'MiniMax H3', desc: '云端异步任务，按秒计费' },
+            { value: 'custom', label: '自定义接口', desc: '任何「创建任务 → 轮询 → 结果地址」的接口' },
+          ])),
+          provider === 'local' ? h(Row, { label: '本地接口', hint: '去「系统 → 本地接口」把「生视频」打开，并写好 video.mjs 脚本' },
+            h(Btn, { small: true, onClick: () => toast(localOn ? '「生视频」本地接口已开启' : '请先到「系统 → 本地接口」打开「生视频」', localOn ? 'ok' : 'err') }, localOn ? '已开启' : '还没开启')) : null,
+          provider === 'minimax' ? [
+            h(Row, { key: 'k', label: 'API Key', hint: 'MiniMax 开放平台「接口密钥」；只存在本机配置里' }, f.text('video.minimax.apiKey', { size: 'wide', type: 'password', placeholder: v.minimax && v.minimax.apiKeySet ? '已保存（不改就留空）' : 'sk-api-…' })),
+            h(Row, { key: 'm', label: '模型' }, f.select('video.minimax.model', [
+              { value: 'MiniMax-H3', label: 'H3（质量优先，支持 2K）' },
+              { value: 'MiniMax-H3-Highspeed', label: 'H3 Highspeed（快）' },
+              { value: 'MiniMax-H3-Lite', label: 'H3 Lite（便宜）' },
+              { value: 'MiniMax-H3-Max', label: 'H3 Max（极速，5 秒起）' },
+            ], { width: 260 })),
+            h(Row, { key: 'r', label: '分辨率' }, f.select('video.minimax.resolution', [
+              { value: '480P', label: '480P' }, { value: '768P', label: '768P' }, { value: '2K', label: '2K（仅 H3）' },
+            ], { width: 160 })),
+            h(Row, { key: 'd', label: '默认时长', hint: '4~15 秒；H3 Max 5 秒起' }, f.num('video.minimax.duration', { min: 4, max: 15 })),
+            h(Row, { key: 'a', label: '画面比例' }, f.select('video.minimax.ratio', [
+              { value: '16:9', label: '16:9' }, { value: '9:16', label: '9:16' }, { value: '4:3', label: '4:3' },
+              { value: '3:4', label: '3:4' }, { value: '1:1', label: '1:1' }, { value: '21:9', label: '21:9' },
+            ], { width: 140 })),
+            h(Row, { key: 'b', label: '服务地址', hint: '国内用 api.minimax.cn；海外账号改 api.minimax.io' }, f.text('video.minimax.baseUrl', { size: 'wide', placeholder: 'https://api.minimax.cn' })),
+          ] : null,
+          provider === 'custom' ? [
+            h(Row, { key: 'cu', label: '创建地址', hint: '创建任务的地址；可用 {prompt} {seconds} {image} {reqid}' }, f.text('video.custom.createUrl', { size: 'wide', placeholder: 'https://api.example.com/v1/videos' })),
+            h(Row, { key: 'cm', label: '创建方式' }, f.select('video.custom.createMethod', [{ value: 'POST', label: 'POST' }, { value: 'GET', label: 'GET' }], { width: 120 })),
+            h(Row, { key: 'ch', label: '请求头', hint: '一行一个「Key: Value」，例如 Authorization: Bearer xxx' }, f.area('video.custom.headers', { size: 'wide', rows: 2, placeholder: v.custom && v.custom.headersSet ? '已保存（不改就留空）' : 'Authorization: Bearer xxx' })),
+            h(Row, { key: 'cb', label: '请求体', hint: 'POST 时发这个 JSON；可用 {prompt} {seconds} {image} {reqid}' }, f.area('video.custom.body', { size: 'wide', rows: 5, placeholder: '{"prompt":"{prompt}","duration":{seconds}}' })),
+            h(Row, { key: 'ct', label: '任务 ID 路径', hint: '从创建结果里取任务 ID，例如 task_id 或 task.id' }, f.text('video.custom.taskIdPath', { placeholder: 'task_id' })),
+            h(Row, { key: 'cq', label: '轮询地址', hint: '可用 {taskId}' }, f.text('video.custom.queryUrl', { size: 'wide', placeholder: 'https://api.example.com/v1/videos/{taskId}' })),
+            h(Row, { key: 'cs', label: '状态路径' }, f.text('video.custom.statusPath', { placeholder: 'status' })),
+            h(Row, { key: 'cv', label: '成功 / 失败状态值', hint: '成功一个值，失败可逗号分隔多个' },
+              h('div', { className: 'ab-flex' }, f.text('video.custom.successValue', { placeholder: 'succeeded' }), f.text('video.custom.failValue', { placeholder: 'failed,cancelled' }))),
+            h(Row, { key: 'cr', label: '结果地址路径', hint: '视频 URL 在返回 JSON 里的路径' }, f.text('video.custom.urlPath', { size: 'wide', placeholder: 'content.url' })),
+            h(Row, { key: 'cp', label: '轮询间隔（毫秒）' }, f.num('video.custom.pollMs', { min: 1000, max: 60000, step: 1000 })),
+          ] : null,
+          h(Row, { label: '生成前先确认', hint: '先把描述发给对方，回复「确认」才真的生成；按秒计费的接口建议开' }, f.sw('video.confirm')),
+          h(Row, { label: '提示词扩写', hint: '先让模型把一句话场景扩成分镜提示词（镜头/主体/光线/风格）' }, f.sw('video.enhance')),
+          h(Row, { label: '生成后抽帧自检', hint: '抽 4 帧看懂画面，之后聊天里她记得自己做了什么视频' }, f.sw('video.selfView')),
+          h(Row, { label: '最长等多久（分钟）', hint: '三种接口共用这一项' }, f.num('local.videoTimeoutMin', { min: 1, max: 120 })),
+        ),
+      )
+    }
+    function ImageGen({ st, draft, setDraft, toast, reload }) {
       const f = useField(draft, setDraft)
       const c = draft.imageGen
+      // 扩展模块「生图 · DSH 已接入模型」（id: dsh-image）自带面板和设置。以前它在同一个
+      // 「生图」页下面再单独占一张卡，等于同一个开关 / 模型下拉出现两遍；现在把它收进
+      // 「接口格式」当第五种接法，只在这一处出现（面板本身仍然由模块自己的 panel.js 画）。
+      const dshMod = ((st && st.modules) || []).find((m) => m.id === 'dsh-image' && m.running)
+      const dshDraft = { ...((dshMod && dshMod.defaults) || {}), ...(((draft.ext || {})['dsh-image']) || {}) }
+      const dshReady = Boolean(dshMod) && dshDraft.enabled === true && String(dshDraft.target || '') !== ''
+      // 模块设置写在 ext.dsh-image 里：跟着这个页面的草稿一起改，随「保存设置」落盘。
+      const setDshSettings = (patch) => setDraft((previous) => ({ ...previous, ext: { ...previous.ext, 'dsh-image': { ...((previous.ext || {})['dsh-image']), ...patch } } }))
+      // 模块面板里的保存也走草稿：面板自己不做 toast 提示，这里补一句，省得以为没生效。
+      const saveDsh = (patch) => { setDshSettings(patch); toast('已改，记得点「保存设置」'); return Promise.resolve({ ok: true }) }
+      const [testing, setTesting] = useState('')
+      const [results, setResults] = useState({})
+      // 「获取模型」按当前服务地址拉 /models；列表只是候选，手填模型名始终可用。
+      const [models, setModels] = useState([])
+      const [modelsLoading, setModelsLoading] = useState(false)
+      const [modelsError, setModelsError] = useState('')
+      const modelSource = `${c.provider}|${c.baseUrl}|${c.apiKeySet ? 1 : 0}`
+      useEffect(() => { setModels([]); setModelsError('') }, [modelSource])
+      const fetchModels = async () => {
+        setModelsLoading(true); setModelsError('')
+        try {
+          const r = await post('/image/models', { imageGen: c })
+          const list = Array.isArray(r.models) ? r.models : []
+          if (r.ok !== true) { setModels([]); setModelsError(r.message || '获取失败'); toast(r.message || '获取模型失败', 'err'); return }
+          setModels(list)
+          setModelsError(list.length ? '' : '接口没有返回任何模型')
+          toast(list.length ? `找到 ${list.length} 个模型，点下面的列表选择` : '接口没有返回任何模型', list.length ? 'ok' : 'err')
+        } finally { setModelsLoading(false) }
+      }
+      const modelField = () => h(Fragment, null,
+        h(Row, { label: '模型' }, h('div', { className: 'ab-flex', style: { gap: 8, flexWrap: 'wrap' } },
+          f.text('imageGen.model', { size: 'wide', placeholder: '例如 Kwai-Kolors/Kolors' }),
+          h(Btn, { small: true, disabled: modelsLoading, onClick: fetchModels, title: '按上面的服务地址和 API Key 拉一次 /models' }, modelsLoading ? '获取中…' : '获取模型'))),
+        models.length ? h(Row, { label: '可用模型', hint: '点选后填入上面的模型名；也可以继续手动输入' },
+          h(Select, { value: models.includes(c.model) ? c.model : '', options: models.map((id) => ({ value: id, label: id })), width: 360, placeholder: '从获取到的模型里选择', onChange: (v) => setDraft(setPath(draft, 'imageGen.model', v)) })) : null,
+        modelsError ? h('div', { className: 'ab-note err', role: 'alert', style: { marginTop: -4, marginBottom: 8 } }, '获取模型失败：' + modelsError) : null)
+      const snapshot = JSON.stringify(c); const current = useRef(snapshot); current.current = snapshot
+      useEffect(() => { setResults({}) }, [snapshot])
+      const test = async (id) => {
+        const key = id || 'primary'; const version = snapshot
+        setTesting(key); setResults(old => ({ ...old, [key]: { pending: true, message: '正在测试，生图可能需要几分钟…' } }))
+        try { const r = await post('/image/test', { id, imageGen: c }); const result = current.current !== version ? { ok: false, message: '测试期间配置已更改，请重新测试。' } : { ok: r.ok === true, message: r.message || (r.ok ? '生图成功' : '测试失败') }; setResults(old => ({ ...old, [key]: result })); toast(result.message, result.ok ? 'ok' : 'err') }
+        finally { setTesting('') }
+      }
+      const testButton = (id) => { const key = id || 'primary'; const r = results[key]; return h('div', { className: 'ab-flex', style: { gap: 8, marginTop: 6, flexWrap: 'wrap' } }, h(Btn, { small: true, disabled: Boolean(testing), onClick: () => test(id) }, testing === key ? '测试中…' : '测试生图'), r ? h('span', { className: 'ab-small', role: 'status', style: { color: r.pending ? 'var(--ab-warn)' : r.ok ? 'var(--ab-ok)' : 'var(--ab-err)', fontWeight: 600 } }, r.pending ? r.message : (r.ok ? '✓ 测试成功：' : '✗ ') + r.message) : null) }
+      const fallbacks = Array.isArray(c.fallbacks) ? c.fallbacks : []
+      const setFallbacks = next => setDraft(setPath(draft, 'imageGen.fallbacks', next))
+      const setFallback = (i, k, value) => setFallbacks(fallbacks.map((e, j) => j === i ? { ...e, [k]: value } : e))
+      const moveFallback = (i, step) => { const next = fallbacks.slice(); const j = i + step; if (j < 0 || j >= next.length) return; [next[i], next[j]] = [next[j], next[i]]; setFallbacks(next) }
       const custom = c.custom || {}
-      const isCustom = c.provider === 'custom'
-      const isCodex = c.provider === 'codex'
+      // 模块已经就绪（开着 + 选了模型）时优先停在它那页：实际生图就是它先接管，界面要和行为一致。
+      const [tab, setTab] = useState(() => dshReady ? 'dsh' : c.provider === 'codex' ? 'codex' : c.provider === 'custom' ? 'custom' : c.provider === 'minimax' ? 'minimax' : c.baseUrl === SPONSOR_BASE ? 'sponsor' : 'openai')
+      const isCustom = tab === 'custom'
+      const isCodex = tab === 'codex'
+      const isMinimax = tab === 'minimax'
+      const mm = c.minimax || {}
       const isPost = custom.method === 'POST'
       const params = Array.isArray(custom.params) ? custom.params : []
       const setParams = (next) => setDraft(setPath(draft, 'imageGen.custom.params', next))
       const setP = (i, k, v) => setParams(params.map((p, j) => (j === i ? { ...p, [k]: v } : p)))
+      const [sponsorHintClosed, setSponsorHintClosed] = useState(false)
+      const sponsorSelected = c.baseUrl === SPONSOR_BASE
+      const sponsorOptions = [{ value: SPONSOR_BASE, label: '国粹 · ntmd.cn · 0.04/张（官方推荐赞助商）' }]
+      const changeTab = (v) => {
+        setTab(v)
+        // DSH 模型这条路不写内置生图的 provider：它的开关和模型在模块自己的设置里，
+        // 切过去再切回来，原来填的服务地址 / Key 不该被顺手改掉。
+        if (v === 'dsh') return
+        if (v === 'sponsor') {
+          setDraft(setPath(draft, 'imageGen.provider', 'openai'))
+          setSponsorHintClosed(false)
+        } else {
+          setDraft(setPath(draft, 'imageGen.provider', v))
+        }
+      }
+      const pickSponsor = (v) => {
+        setDraft({ ...draft, imageGen: { ...draft.imageGen, provider: 'openai', baseUrl: v } })
+        setSponsorHintClosed(false)
+        toast('已选官方推荐地址，记得保存')
+      }
       return h('div', { className: 'ab-grid' },
-        h(Card, { title: '让ta画图', right: f.sw('imageGen.enabled'), desc: '接上生图服务后，让ta「画一张……」就会画好发出来。可选 OpenAI 兼容接口、自定义接口，或登录 ChatGPT 使用实验性 Codex 订阅接法。本机 SD WebUI / ComfyUI 可在「本地接口」页接「生图」。也可以让ta照着最近发的图、引用消息里的图或自己的画作来改；服务不支持参考图时会明确告诉你。' },
+        h(Card, { title: '让ta画图', right: f.sw('imageGen.enabled'), desc: '接上生图服务后，让ta「画一张……」就会画好发出来。可选 OpenAI 兼容接口、自定义接口、登录 ChatGPT 使用实验性 Codex 订阅接法、MiniMax H3（多图参考 / 一次多张），或直接用 DSH 里已接入的生图模型（豆包 Seedream 等）。本机 SD WebUI / ComfyUI 可在「本地接口」页接「生图」。也可以让ta照着最近发的图、引用消息里的图或自己的画作来改；服务不支持参考图时会明确告诉你。' },
           h(Row, { label: '接口格式', hint: '第二个适合 pollinations 这类「GET 一个地址就出图」的服务' },
             h(Seg, {
-              value: isCodex ? 'codex' : isCustom ? 'custom' : 'openai',
-              onChange: (v) => setDraft(setPath(draft, 'imageGen.provider', v)),
-              options: [{ value: 'openai', label: 'OpenAI 格式' }, { value: 'custom', label: '自定义接口' }, { value: 'codex', label: 'Codex 订阅（实验性）' }],
+              value: tab,
+              onChange: changeTab,
+              // 「DSH 已接入模型」只在模块真的装了并在跑时才出现：没装就别摆一个点进去是空的按钮。
+              options: [{ value: 'openai', label: 'OpenAI 格式' }, { value: 'custom', label: '自定义接口' }, { value: 'codex', label: 'Codex 订阅（实验性）' }, { value: 'minimax', label: 'MiniMax H3' }, { value: 'sponsor', label: '官方推荐地址' }, ...((dshMod || tab === 'dsh') ? [{ value: 'dsh', label: 'DSH 已接入模型' }] : [])],
             })),
-          isCodex ? h(CodexSub, { draft, setDraft, toast }) : isCustom ? h('div', null,
+          tab === 'sponsor' ? h('div', null,
+            sponsorSelected && !sponsorHintClosed ? h('div', { className: 'ab-note', style: { marginBottom: 10 } },
+              h('div', null, '国粹（官方推荐赞助商）：官网地址 ',
+                h('a', { href: SPONSOR_SITE, target: '_blank', rel: 'noreferrer' }, 'ntmd.cn'),
+                '，接口地址 ' + SPONSOR_BASE + ' —— 0.04/张 超快出图'),
+              h('div', { className: 'ab-flex', style: { marginTop: 6 } },
+                h(Btn, { small: true, kind: 'ghost', onClick: () => setSponsorHintClosed(true) }, '收起'))) : null,
+            h(Row, { label: '服务地址', hint: '选择官方推荐赞助商地址；选中即设为当前服务地址' },
+              h(Select, { value: sponsorSelected ? SPONSOR_BASE : '', options: sponsorOptions, width: 320, ariaLabel: '赞助商服务地址', placeholder: '选择赞助商服务地址', onChange: pickSponsor })),
+            h(Row, { label: 'API Key', hint: '只存在本机，不会显示出来' }, f.text('imageGen.apiKey', { type: 'password', placeholder: c.apiKeySet ? '已保存（不改就留空）' : '没有就留空' })),
+            modelField(),
+          ) : tab === 'dsh' ? h('div', null,
+            dshMod
+              ? h(ExtPanel, { m: dshMod, settings: dshDraft, draftSettings: dshDraft, setSettings: setDshSettings, toast, reload, saveOverride: saveDsh })
+              : h('div', { className: 'ab-note err' }, '扩展模块 dsh-image 没在跑：去「已安装」里打开它，再回到这一页。'),
+          ) : isCodex ? h(CodexSub, { draft, setDraft, toast }) : isMinimax ? h('div', null,
+            h(Row, { label: 'API Key', hint: '留空 = 复用「语音」页的 MiniMax Key（同一个开放平台 Key）；也可单独填一份' },
+              f.text('imageGen.minimax.apiKey', { type: 'password', placeholder: mm.apiKeySet ? '已保存（不改就留空）' : '可留空，复用语音里的 MiniMax Key' })),
+            h(Row, { label: '服务地址', hint: '国内平台 https://api.minimax.cn；海外平台 https://api.minimax.io' },
+              f.text('imageGen.minimax.baseUrl', { size: 'wide', placeholder: 'https://api.minimax.cn' })),
+            h(Row, { label: '模型' },
+              f.select('imageGen.minimax.model', [
+                { value: 'MiniMax-H3-Image', label: 'MiniMax-H3-Image' },
+                { value: 'MiniMax-H3-Image-Highspeed', label: 'MiniMax-H3-Image-Highspeed（更快）' },
+              ], { width: 300 })),
+            h(Row, { label: '一次生成几张', hint: '接口每次最多 10 张，按成功张数计费；说「画几张」时她也会按需填' },
+              f.select('imageGen.minimax.n', [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => ({ value: n, label: n + ' 张' })), { width: 160 })),
+            h(Row, { label: '输出面积', hint: '1K≈1024²、2K≈2048²、4K≈4096²；H3 原图约 16MP，2K 一般够用也更快' },
+              f.select('imageGen.minimax.area', ['1K', '2K', '4K'].map((v) => ({ value: v, label: v })), { width: 140 })),
+            h(Row, { label: '提示词增强', hint: '默认开启：短描述会先扩写成完整画面（官方 H3-Image-Context-IR）；关闭后按原提示词直接生成' },
+              f.sw('imageGen.minimax.enhance')),
+            h('div', { className: 'ab-note', style: { marginTop: 8 } }, 'MiniMax H3 支持拿 1~16 张参考图改画，也支持一次生成多张；参考图可用聊天里最近收到的图、引用图或图库画作。老配置不用改：只有把「接口格式」切到 MiniMax H3 才会走这个接法。'),
+          ) : isCustom ? h('div', null,
             h(Row, { label: '请求方式', hint: 'GET 把参数都拼在地址上；POST 放进请求体' },
               h(Seg, {
                 value: isPost ? 'POST' : 'GET',
@@ -4690,8 +9519,19 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           ) : h('div', null,
             h(Row, { label: '服务地址', hint: '一般以 /v1 结尾' }, f.text('imageGen.baseUrl', { size: 'wide', placeholder: 'https://api.siliconflow.cn/v1' })),
             h(Row, { label: 'API Key', hint: '只存在本机，不会显示出来' }, f.text('imageGen.apiKey', { type: 'password', placeholder: c.apiKeySet ? '已保存（不改就留空）' : '没有就留空' })),
-            h(Row, { label: '模型' }, f.text('imageGen.model', { size: 'wide', placeholder: '例如 Kwai-Kolors/Kolors' })),
+            modelField(),
           ),
+          h('div', { className: 'ab-muted ab-small' }, '测试会实际生成图片，可能消耗额度；使用当前页面配置，不自动切换或发送到 QQ。'),
+          testButton(''),
+          h(Row, { label: '生图失败自动切换', hint: '连接失败或接口返回错误时按顺序尝试；备用服务会收到画图描述及参考图，图片下载失败不会重发' }, f.sw('imageGen.fallbackEnabled')),
+          h('div', { className: 'ab-label', style: { marginTop: 12 } }, h('b', null, '备用接口与模型（从上到下为优先级）')),
+          fallbacks.map((e, i) => h('div', { key: e.id, className: 'ab-note', style: { marginBottom: 8 } },
+            h('div', { className: 'ab-flex', style: { gap: 6, marginBottom: 6 } }, h('b', null, '备用 ' + (i + 1)), h(Btn, { small: true, disabled: i === 0, onClick: () => moveFallback(i, -1) }, '上移'), h(Btn, { small: true, disabled: i === fallbacks.length - 1, onClick: () => moveFallback(i, 1) }, '下移'), h(Btn, { small: true, onClick: () => setFallbacks(fallbacks.filter((_, j) => j !== i)) }, '删除')),
+            h(Row, { label: '接法' }, h(Seg, { value: e.provider || 'openai', onChange: value => setFallback(i, 'provider', value), options: [{ value: 'openai', label: 'OpenAI 格式' }, { value: 'codex', label: 'Codex 订阅' }] })),
+            e.provider !== 'codex' ? h(Row, { label: '服务地址' }, h('input', { className: 'ab-input', value: e.baseUrl || '', placeholder: 'https://example.com/v1', onChange: event => setFallback(i, 'baseUrl', event.target.value) })) : h('div', { className: 'ab-muted ab-small' }, '使用已登录的 ChatGPT 账号及订阅质量、背景设置。'),
+            e.provider !== 'codex' ? h(Row, { label: 'API Key' }, h('input', { className: 'ab-input', type: 'password', value: e.apiKey || '', placeholder: e.apiKeySet ? '已保存（不改就留空）' : '没有就留空', onChange: event => setFallback(i, 'apiKey', event.target.value) })) : null,
+            h(Row, { label: '模型' }, h('input', { className: 'ab-input', value: e.model || '', placeholder: '模型名称', onChange: event => setFallback(i, 'model', event.target.value) })), testButton(e.id))),
+          h(Btn, { small: true, onClick: () => setFallbacks([...fallbacks, { id: crypto.randomUUID(), provider: 'openai', baseUrl: '', apiKey: '', model: '' }]) }, '＋ 添加备用接口 / 模型'),
           h(Row, { label: '默认构图', hint: isCodex ? '通过构图提示引导，实际尺寸由服务端选择，不保证严格比例' : '聊天工具可指定本次构图。服务不支持所选尺寸时会报告失败，请换一种构图；自定义接口需使用尺寸占位符' },
             f.select('imageGen.shape', [
               { value: 'her', label: '让ta选择', desc: isCodex ? '未指定时由服务端选择' : '未指定时沿用图片尺寸' },
@@ -4701,10 +9541,11 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
               { value: 'wide', label: isCodex ? '宽幅 16:9' : '宽幅 16:9（1536 × 864）' },
             ], { width: 260 })),
           !isCodex && (!c.shape || c.shape === 'her') ? h(Row, { label: '图片尺寸', hint: isCustom ? '接口地址 / 参数里可以用 {size} 或 {width}/{height}' : '未指定构图时沿用这个尺寸' },
-            f.select('imageGen.size', [{ value: '1024x1024', label: '1024 × 1024', desc: '方图' }, { value: '768x1024', label: '768 × 1024', desc: '竖图' }, { value: '1024x768', label: '1024 × 768', desc: '横图' }, { value: '512x512', label: '512 × 512', desc: '小图，更快' }], { width: 200 })) : null,
+            f.select('imageGen.size', [{ value: '1024x1024', label: '1024 × 1024', desc: '方图' }, { value: '768x1024', label: '768 × 1024', desc: '竖图' }, { value: '1024x768', label: '1024 × 768', desc: '横图' }, { value: '512x512', label: '512 × 512', desc: '小图，更快' }, { value: '2048x2048', label: '2K · 2048 × 2048', desc: '2K 方图' }, { value: '4096x4096', label: '4K · 4096 × 4096', desc: '4K 方图' }], { width: 230 })) : null,
           h(Row, { label: '固定风格', hint: '每次画都会加在描述前面' }, f.text('imageGen.stylePrompt', { size: 'wide', placeholder: '例如：日系二次元，柔和光线，蓝白配色' })),
-          h(Row, { label: '只给主人画', hint: '关掉后群友也能让ta画（会花你的额度）' }, f.sw('imageGen.ownerOnly')),
+          h(Row, { label: '限制生图权限', hint: '开启时主人和权限页授权的私聊对象可以生图；关闭后允许白名单中的聊天使用。' }, f.sw('imageGen.ownerOnly')),
           h(Row, { label: '允许参考图改画', hint: '默认开启，只接受当前聊天收到的图、引用图或图库文件名；Codex 订阅暂不支持' }, f.sw('imageGen.img2img')),
+          !isCustom && !isCodex ? h(Row, { label: '允许按需生成 GIF', hint: '接口需支持 GIF。明确说“动图”或“动起来”时才用，普通画图保持静态；默认生成约 1.6 秒短循环，可能更慢、更费额度。' }, f.sw('imageGen.allowGif', { title: '允许按需生成 GIF' })) : null,
           h(Row, { label: '让ta画完自己看一眼', hint: '开着才把画好的图传给ta看（模型不支持看图时自动不传）；关掉就只回一句「画好了」，不传图' }, f.sw('imageGen.seeOwn')),
           isCustom ? h('div', { className: 'ab-note', style: { marginTop: 10 } }, '例子：地址填 https://image.pollinations.ai/prompt/{prompt}，再加 model=flux-anime、width=1080、height=1920、nologo=true 四个参数，GET 就会请求 …/prompt/<提示词>?model=flux-anime&width=1080&…') : null,
           !c.enabled ? h('div', { className: 'ab-note', style: { marginTop: 10 } }, '还没开启。填好接口信息、打开右上角开关并保存后，ta就会多一个「画图」能力。') : null,
@@ -4713,8 +9554,141 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       )
     }
 
+    /** 云备份（Gitee 私有仓库 / WebDAV）：每天到点自动打包，把最新备份推上去，远端只留最近 N 份。 */
+    function RemoteBackup({ toast, st, onRestored }) {
+      const [s, setS] = useState(null)
+      const [form, setForm] = useState(null)
+      const [remoteFiles, setRemoteFiles] = useState(null)
+      const [remoteBusy, setRemoteBusy] = useState(false)
+      const [restoring, setRestoring] = useState(false)
+      const set = (k) => (e) => setForm({ ...form, [k]: k === 'keep' ? Math.max(1, Math.round(Number(e.target.value) || 1)) : (k === 'enabled' || k === 'autoCreate' || k === 'forceOverwrite' || k === 'webdavConfigOnly' ? e.target.checked : e.target.value) })
+      const load = () => get('/backup/remote/state').then((state) => {
+        setS(state)
+        const v = state.remote || {}
+        const saved = (st && st.config && st.config.backup && st.config.backup.remote) || {}
+        setForm({
+          provider: v.provider === 'webdav' || (!v.provider && saved.provider === 'webdav') ? 'webdav' : 'gitee',
+          enabled: !!v.enabled, owner: v.owner || '', repo: v.repo || '', token: '', branch: v.branch || 'master',
+          time: v.time || '03:30', keep: v.keep || 7, autoCreate: v.autoCreate !== false, forceOverwrite: !!v.forceOverwrite,
+          webdavUrl: v.webdav?.url || '', webdavUsername: v.webdav?.username || '', webdavPassword: '',
+          webdavConfigOnly: (v.webdav?.configOnly ?? v.configOnly ?? saved.webdav?.configOnly) !== false,
+        })
+      })
+      useEffect(() => { load() }, [])
+      const running = Boolean(s && s.job && s.job.running)
+      useEffect(() => { if (!running) return; const t = setInterval(load, 1000); return () => clearInterval(t) }, [running])
+      const call = (p, body) => fetch(API + p, { method: 'POST', headers: { 'x-aurabot-backup': '1', 'content-type': 'application/json' }, body: JSON.stringify(body || {}) }).then((r) => r.json())
+      const after = (r2) => { toast(r2.ok ? (r2.message || '好了') : r2.message, r2.ok ? 'ok' : 'err'); load() }
+      if (!form) return null
+      const job = s && s.job
+      const webdav = form.provider === 'webdav'
+      const Input = (k, placeholder, type) => h('input', { className: 'ab-input', type: type || 'text', placeholder, value: form[k], onChange: set(k), style: { minWidth: 0 } })
+      const Field = (label, k, placeholder, type) => h('div', { style: { flex: 1, minWidth: 0 } },
+        h('div', { className: 'ab-small ab-muted', style: { marginBottom: 2 } }, label),
+        Input(k, placeholder, type))
+      const saveBody = () => {
+        const b = { provider: form.provider, enabled: form.enabled, time: form.time, keep: form.keep }
+        if (webdav) {
+          b.webdav = { url: form.webdavUrl.trim(), username: form.webdavUsername.trim(), configOnly: form.webdavConfigOnly, ...(form.webdavPassword ? { password: form.webdavPassword } : {}) }
+        } else {
+          Object.assign(b, { owner: form.owner.trim(), repo: form.repo.trim(), branch: form.branch.trim() || 'master', autoCreate: form.autoCreate, forceOverwrite: form.forceOverwrite })
+          if (form.token) b.token = form.token
+        }
+        return b
+      }
+      const loadRemote = async () => {
+        setRemoteBusy(true)
+        try {
+          const r = await call('/backup/remote/list')
+          if (!r.ok) toast(r.message, 'err')
+          else setRemoteFiles(r.files || [])
+        } finally { setRemoteBusy(false) }
+      }
+      const restoreRemote = async (name) => {
+        if (!confirm('从 WebDAV 拉回并导入「' + name + '」？\n\n重启 DSH 后，这台电脑上的配置、记忆、人设等会被备份里的内容替换。')) return
+        setRestoring(true)
+        try {
+          const r = await call('/backup/remote/restore', { name })
+          toast(r.ok ? (r.message || '已拉回，重启 DSH 后换上') : r.message, r.ok ? 'ok' : 'err')
+          if (r.ok) {
+            setRemoteFiles(null)
+            if (onRestored) onRestored()
+          }
+        } finally { setRestoring(false) }
+      }
+      return h(Card, { title: '云备份（Gitee / WebDAV）', desc: '每天到点自动打包一份备份，推到你的私有仓库或 WebDAV，换电脑或坏盘时也能找回来。' },
+        h(Seg, {
+          value: form.provider,
+          onChange: (v) => setForm({ ...form, provider: v }),
+          options: [{ value: 'webdav', label: 'WebDAV' }, { value: 'gitee', label: 'Gitee 私有仓库' }],
+        }),
+        webdav
+          ? h('div', { className: 'ab-note warn', style: { margin: '10px 0' } }, '⚠️ 备份里有全部聊天记录、记忆和账号凭证。WebDAV 请用自己可控的私有网盘，并尽量走 HTTPS；插件会自动创建 aurabot-backups 文件夹，只把 zip 上传到你的服务器，不会传给第三方。')
+          : h('div', { className: 'ab-note warn', style: { margin: '10px 0' } }, '⚠️ 仓库必须是「私有」的！备份里有你全部的聊天记录、记忆和账号凭证，推到公开仓库等于把它们挂到网上。推送前会先向 Gitee 核实仓库确实是私有的，公开仓库一律拒绝推。'),
+        h('div', { className: 'ab-flex', style: { alignItems: 'center' } },
+          h('label', { className: 'ab-small', style: { display: 'flex', gap: 6, alignItems: 'center', cursor: 'pointer' } }, h('input', { type: 'checkbox', checked: form.enabled, onChange: set('enabled') }), '每天自动备份并推送'),
+          form.enabled ? h('span', { className: 'ab-small ab-muted' }, '下次：' + (s && s.nextAt ? String(s.nextAt).slice(0, 16).replace('T', ' ') : '到点就跑')) : null),
+        webdav
+          ? h('div', null,
+            h('div', { className: 'ab-flex', style: { marginTop: 10 } },
+              Field('服务器地址', 'webdavUrl', 'https://dav.jianguoyun.com/dav/')),
+            h('div', { className: 'ab-flex', style: { marginTop: 8 } },
+              Field('用户名', 'webdavUsername', '坚果云账号邮箱 / WebDAV 用户名'),
+              Field('密码/应用授权码', 'webdavPassword', s && s.remote && s.remote.webdav && s.remote.webdav.hasPassword ? '已保存，留空就不改' : '坚果云：账户信息 → 安全选项 → 添加应用密码', 'password')),
+            h('div', { className: 'ab-small ab-muted', style: { marginTop: 6 } }, '会自动在服务器根目录创建 aurabot-backups 文件夹；填到已有文件夹也可以。'),
+            h('label', { className: 'ab-small', style: { display: 'flex', gap: 6, alignItems: 'center', cursor: 'pointer', marginTop: 10 } },
+              h('input', { type: 'checkbox', checked: form.webdavConfigOnly, onChange: set('webdavConfigOnly') }), '仅备份配置与数据文件（不含画作、表情、截图等媒体）'),
+            h('div', { className: 'ab-small ab-muted', style: { marginTop: 4, lineHeight: 1.7 } },
+              '勾选后打包 config.json、人格、记忆库、日记/心情、模块配置、聊天流水和当前工作区 DSH 会话；不包含画作 imagegen、表情 stickers、B站截图 bili-shots、抖音资料、语音缓存、市场模块代码、日志和缓存。上传的 zip 会明显更小；远端保留份数对完整备份和仅配置备份分别计算。'))
+          : h('div', null,
+            h('div', { className: 'ab-flex', style: { marginTop: 10 } },
+              Field('Gitee 用户名', 'owner', '如 gitee.com/小鱼 里的「小鱼」'),
+              Field('仓库名（私有）', 'repo', '如 aurabot-backup，没有会自动建'),
+              Field('分支（一般不用改）', 'branch', 'master')),
+            h('div', { className: 'ab-flex', style: { marginTop: 8 } },
+              Field('Gitee 私人令牌', 'token', s && s.remote && s.remote.hasToken ? '已保存，留空就不改' : '下面第 2 步生成的那串', 'password')),
+            h('div', { className: 'ab-flex', style: { marginTop: 8, alignItems: 'center', flexWrap: 'wrap' } },
+              h('label', { className: 'ab-small', style: { display: 'flex', gap: 6, alignItems: 'center', cursor: 'pointer' } }, h('input', { type: 'checkbox', checked: form.autoCreate, onChange: set('autoCreate') }), '仓库不存在时自动建（建的就是私有，推荐开）'),
+              h('label', { className: 'ab-small', style: { display: 'flex', gap: 6, alignItems: 'center', cursor: 'pointer' } }, h('input', { type: 'checkbox', checked: form.forceOverwrite, onChange: set('forceOverwrite') }), '允许覆盖已有内容的仓库'))),
+        h('div', { className: 'ab-flex', style: { marginTop: 8 } },
+          Field('每天几点备份', 'time', '如 03:30'),
+          Field('远端留几份', 'keep', '如 7')),
+        h('div', { className: 'ab-flex', style: { marginTop: 10, alignItems: 'center' } },
+          h('span', { className: 'ab-flex' },
+            h(Btn, { small: true, kind: 'primary', disabled: running, onClick: async () => after(await call('/backup/remote/config', saveBody())) }, '保存设置'),
+            h(Btn, { small: true, disabled: running, onClick: async () => { if (!confirm('现在就把最新备份推到 ' + (webdav ? 'WebDAV' : 'Gitee') + '？（不会重新打包，推 backups 里最新的一份）')) return; after(await call('/backup/push')) } }, running ? '推送中…' : '立即推送'))),
+        job && job.error ? h('div', { className: 'ab-note err', style: { marginTop: 10 } }, '推送失败：' + job.error) : null,
+        job && job.result ? h('div', { className: 'ab-small ab-muted', style: { marginTop: 10 } }, '上次推送：' + job.result.message) : null,
+        webdav ? h('div', { style: { marginTop: 14 } },
+          h('div', { className: 'ab-section-title' }, '从 WebDAV 恢复'),
+          h('div', { className: 'ab-flex' },
+            h(Btn, { small: true, disabled: remoteBusy || restoring, onClick: loadRemote }, remoteBusy ? '读取中…' : '拉取备份列表')),
+          remoteFiles === null
+            ? h('div', { className: 'ab-muted ab-small', style: { marginTop: 6 } }, '点「拉取备份列表」读取远端 aurabot-backups 里的备份。')
+            : remoteFiles.length === 0
+              ? h('div', { className: 'ab-muted ab-small', style: { marginTop: 6 } }, '远端 aurabot-backups 里还没有备份。')
+              : h('div', { style: { marginTop: 8 } }, remoteFiles.map((name) => h('div', { key: name, className: 'ab-flex', style: { alignItems: 'center', padding: '5px 0', borderTop: '1px solid var(--ab-line)' } },
+                h('span', { className: 'ab-small', style: { flex: 1, minWidth: 0, wordBreak: 'break-all' } }, (name.startsWith('aurabot-config-') ? '仅配置 · ' : '') + name),
+                h(Btn, { small: true, disabled: restoring, onClick: () => restoreRemote(name) }, restoring ? '拉取中…' : '拉回并恢复'))))) : null,
+        h('details', { open: webdav ? !(s && s.remote && s.remote.webdav && s.remote.webdav.hasPassword) : !(s && s.remote && s.remote.hasToken), style: { marginTop: 10 } },
+          h('summary', { className: 'ab-small', style: { cursor: 'pointer' } }, webdav ? '📖 WebDAV 怎么填（点这里收起）' : '📖 第一次用？跟着下面 4 步做（点这里收起）'),
+          webdav
+            ? h('div', { className: 'ab-small ab-muted', style: { marginTop: 8, lineHeight: 1.8 } },
+              h('div', null, h('b', null, '第 1 步 · 服务器地址：'), '坚果云填 https://dav.jianguoyun.com/dav/（带 /dav/，只填域名根目录会 HTTP 410）；其他网盘填 WebDAV 根地址。'),
+              h('div', null, h('b', null, '第 2 步 · 用户名和密码/应用授权码：'), '坚果云用户名就是账号邮箱；密码不是登录密码，去网页端「账户信息 → 安全选项 → 添加应用密码」生成一个，填到第二栏。'),
+              h('div', null, h('b', null, '第 3 步 · 保存并试推：'), '点「保存设置」，再点「立即推送」。成功后每天按设置时间自动上传，远端按「留几份」清理旧 zip。'),
+              h('div', { style: { marginTop: 6 } }, '插件会自动创建 aurabot-backups 文件夹；如果服务器不允许根目录建目录，可以先手动建好再把地址填到该文件夹。'))
+            : h('div', { className: 'ab-small ab-muted', style: { marginTop: 8, lineHeight: 1.8 } },
+              h('div', null, h('b', null, '第 1 步 · 注册 Gitee：'), '打开 ', h('a', { href: 'https://gitee.com/signup', target: '_blank', rel: 'noreferrer' }, 'gitee.com'), ' 注册一个账号（手机号或邮箱都行，免费的）。'),
+              h('div', null, h('b', null, '第 2 步 · 生成令牌：'), '登录后点右上角头像 →「设置」→ 左侧「安全设置」→「私人令牌」→「+ 生成新令牌」，勾选 ', h('b', null, 'projects'), ' 权限后提交，把显示出来的那串字符复制粘贴到上面的「Gitee 私人令牌」里（只显示一次，丢了就重新生成一个）。'),
+              h('div', null, h('b', null, '第 3 步 · 安装 git：'), '打开 ', h('a', { href: 'https://git-scm.com/downloads', target: '_blank', rel: 'noreferrer' }, 'git-scm.com/downloads'), '，下载 Windows 版，一路点「下一步」装完，然后重启 DSH。装过的可以跳过。'),
+              h('div', null, h('b', null, '第 4 步 · 填上面的表格：'), '「Gitee 用户名」填你个人主页地址 gitee.com/ 后面那串；「仓库名」自己起一个，比如 aurabot-backup；「私人令牌」粘第 2 步的；勾上「每天自动备份并推送」，点「保存设置」。仓库让插件自动建就行（建出来就是私有的）。如果自己在 Gitee 网页上建，右上角「+」→ 新建仓库时务必选 ', h('b', null, '「私有」'), '，不要勾「设置初始化 README」。'),
+              h('div', { style: { marginTop: 6 } }, '弄完点一次「立即推送」试试，提示「已推送」就成功了，之后每天都会自动备份。备份超过 95MB 会自动分成若干卷推送（文件名带 .part01、.part02…）；恢复时把各卷按顺序合并回一个 zip 再导入——Windows 命令示例：copy /b aurabot-backup-xxx.zip.part01+aurabot-backup-xxx.zip.part02+… 完整的.zip')),
+        h('div', { className: 'ab-small ab-muted', style: { marginTop: 10 } }, webdav ? 'WebDAV 密码只存在本机配置里，不会展示；推送由插件直接上传，不经过第三方。' : '令牌只存在本机配置里，不会上传；推送走电脑上装的 git。有报错看上面的红字，一般都是令牌权限没勾对或 git 没装。')))
+    }
+
     /** 备份：打包数据目录，换电脑时导入，重启 DSH 后换上。 */
-    function Backup({ toast }) {
+    function Backup({ toast, st }) {
       const [s, setS] = useState(null)
       const [path, setPath] = useState('')
       const [busy, setBusy] = useState(false)
@@ -4747,6 +9721,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           job && job.error ? h('div', { className: 'ab-note err', style: { marginTop: 10 } }, '备份失败：' + job.error) : null,
           job && job.result ? h('div', { className: 'ab-small ab-muted', style: { marginTop: 10 } }, '刚生成：' + job.result.name + '，' + job.result.files + ' 个文件' + (job.result.skipped.length ? '；有 ' + job.result.skipped.length + ' 个文件没能带上：' + job.result.skipped.slice(0, 5).join('、') : '')) : null,
           s && s.list.length ? h('div', { style: { marginTop: 10 } }, s.list.slice(0, 8).map((b) => h('div', { key: b.name, className: 'ab-small' }, b.name + ' · ' + size(b.bytes)))) : null),
+        h(RemoteBackup, { toast, st, onRestored: load }),
         h(Card, { title: '恢复', desc: '在新电脑上先装好 DSH 和 Aurabot，再把备份拖进来。重启 DSH 后自动换上设置和数据、重新下载市场模块、放回 QQ 会话，原来的文件留在 backups 文件夹。' },
           s && s.modules && s.modules.length ? h('div', { className: 'ab-small ab-muted', style: { marginBottom: 8 } }, '还没装回来的模块：' + s.modules.join('、') + '（下次启动再试）') : null,
           s && s.pending ? h('div', { className: 'ab-note warn' }, '已导入 ' + s.pending.files + ' 个文件（备份于 ' + String(s.pending.createdAt || '').slice(0, 16).replace('T', ' ') + '），重启 DSH 后换上。',
@@ -4763,6 +9738,20 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h('div', { className: 'ab-small ab-muted' }, 'DSH 自己的设置和模型密钥、QQ 网关 SnowLuma 的登录、QQ 工作区以外的 DSH 会话；抖音和小黑盒的浏览器登录要重新扫码；日志和缓存不备份；翻唱环境和桌宠的 Electron 要重新安装；数据目录以外的路径（比如 ffmpeg、本地图片文件夹）在新电脑上要重新填。')))
     }
 
+    /** 浏览器：需要浏览器的功能（逛网页 / 刷抖音 / 小红书 / 小黑盒验证）走哪个浏览器。 */
+    function Browser({ st, draft, setDraft }) {
+      const on = (draft.browser && draft.browser.useDshSidebar) === true
+      return h('div', { className: 'ab-grid' },
+        h(Card, { title: '使用 DSH 侧边浏览器', desc: '打开后，ta 需要浏览器的功能都连 DSH 的共享浏览器（侧边浏览器）：画面在 DSH 右侧「Agent 浏览器」里实时可见、可直接接手点按；不再为逛网页 / 刷抖音 / 小红书 / 小黑盒验证各开一个独立窗口。关掉则回到原来的专用浏览器（每模块独立窗口、独立登录资料）。' },
+          h(Row, { label: '使用 DSH 侧边浏览器', hint: '共享一个浏览器实例；切换过去后各平台要在共享浏览器里重新登录一次' },
+            h(Switch, { on, onChange: (v) => setDraft(setPath(draft, 'browser.useDshSidebar', v)) })),
+          on
+            ? h('div', { className: 'ab-note' }, '已启用：共享浏览器没在跑时会自动拉起；这些功能「关闭浏览器」只断开连接，不会关掉 DSH 的共享窗口。')
+            : h('div', { className: 'ab-note' }, '当前走各模块的专用浏览器：每个模块一个独立窗口、独立登录资料。'),
+        ),
+      )
+    }
+
     /** 安全防护：SSRF 这类内置防护的强度。 */
     function Security({ st, draft, setDraft }) {
       const f = useField(draft, setDraft)
@@ -4772,7 +9761,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       return h('div', { className: 'ab-grid' },
         h(Card, { title: '更新推送', desc: '插件有新版本时，面板会提示并给出更新命令。' },
           h(Row, { label: '订阅不稳定版本', hint: '打开后也会收到 beta 和 rc 测试版，能早点用上新功能，但可能有问题；关掉只收正式版' }, h(Switch, { on: unstable, onChange: (v) => setDraft(setPath(draft, 'update.unstable', v)) }))),
-        h(Card, { title: '危险命令确认', right: f.sw('security.dangerConfirm'), desc: '打开后，ta在私聊里要执行终端危险命令（删根目录、格式化、关机、下载后直接执行等）之前，会先发 QQ 私聊问你；你回复「确认」才执行，回复「取消」或 60 秒没回就拦下。默认关。只拦真正致命的命令，普通删除/构建/改文件不受影响。' }),
+        h(Card, { title: '危险命令确认', right: f.sw('security.dangerConfirm'), desc: '打开后，ta在私聊里要执行终端危险命令（删根目录、格式化、关机、下载后直接执行等）之前，会先发 QQ 私聊问你；你回复「确认」才执行，回复「取消」或 60 秒没回就拦下。默认开；只拦真正致命的命令，普通删除/构建/改文件不受影响。' }),
         h(Card, { title: 'SSRF 防护', desc: '限制 ta 下载图片、语音时能访问哪些地址 —— 防止有人用一条链接诱导 ta 去访问你电脑或内网里的服务（路由器管理页、云服务器的 169.254.169.254、本机端口之类）。' },
           h(Row, { label: '防护强度', hint: '部署在服务器上、或者群里有陌生人时，用「严格」' },
             h(Seg, {
@@ -4801,11 +9790,11 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
               placeholder: '127.0.0.1',
               onChange: (e) => setDraft(setPath(draft, 'security.trustedProxy', e.target.value)),
             })),
-          h(Row, { label: '面板对外域名（反代部署）', hint: '面板经反代对外时填域名（如 panel.example.com）。跨站防护把这个域名发来的请求也算「同源」，不然从远端打开面板一保存就会被 403' },
+          h(Row, { label: '面板对外域名（反代部署）', hint: '面板经反代对外时填域名（如 panel.example.com）。跨站防护把这个域名发来的请求也算「同源」，不然从远端打开面板一保存就会被 403。有多个入口（对外域名 + 内网地址）时用逗号分隔' },
             h('input', {
               className: 'ab-input',
               value: (draft.security && draft.security.publicHostname) || '',
-              placeholder: 'panel.example.com',
+              placeholder: 'panel.example.com, 10.0.0.5',
               onChange: (e) => setDraft(setPath(draft, 'security.publicHostname', e.target.value)),
             })),
           h('div', { className: 'ab-muted ab-small', style: { marginTop: 6 } },
@@ -4817,6 +9806,44 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h('div', { className: 'ab-muted ab-small', style: { whiteSpace: 'pre-wrap' } },
             ['· 只下载 http / https，并限制单张图片大小', '· 只从白名单里的会话收表情', '· 群管操作只认主人，对象不能是主人自己', '· 联动（bridge）默认关闭，开放时必须带密钥', '· 表情的改名 / 删除只对主人开放'].join('\n')),
         ),
+      )
+    }
+
+    /** 面板里的调试对话：不经过 QQ、不写记忆，直接把她说的话显示出来。 */
+    function DebugChat({ toast }) {
+      const [msgs, setMsgs] = useState([])
+      const [text, setText] = useState('')
+      const [busy, setBusy] = useState(false)
+      const say = async () => {
+        const t = text.trim()
+        if (!t || busy) return
+        setMsgs((m) => [...m, { who: 'me', text: t }])
+        setText('')
+        setBusy(true)
+        try {
+          const r = await post('/debug/say', { text: t })
+          setMsgs((m) => [...m, { who: 'her', text: r.ok ? (r.text || '（她这次没说话）') : '✗ ' + (r.message || '出错了') }])
+        } catch (error) {
+          setMsgs((m) => [...m, { who: 'her', text: '✗ ' + error.message }])
+        } finally {
+          setBusy(false)
+        }
+      }
+      return h('div', null,
+        msgs.length ? h('div', { className: 'ab-list', style: { maxHeight: 340, overflow: 'auto', marginBottom: 8 } },
+          msgs.map((m, i) => h('div', { key: i, className: 'ab-li' },
+            h('div', { className: 'meta' }, m.who === 'me' ? '你' : '她'),
+            h('div', { className: 'body' }, m.text)))) : h(Empty, { icon: '🐳', text: '说点什么试试 —— 比如「在吗」「今天心情怎么样」' }),
+        h('div', { className: 'ab-flex', style: { marginTop: 6 } },
+          h('input', {
+            className: 'ab-input',
+            style: { flex: 1 },
+            value: text,
+            placeholder: '对她说…（回车发送）',
+            onChange: (e) => setText(e.target.value),
+            onKeyDown: (e) => { if (e.key === 'Enter') say() },
+          }),
+          h(Btn, { small: true, kind: 'primary', disabled: busy || !text.trim(), onClick: say }, busy ? '她在想…' : '发送')),
       )
     }
 
@@ -4848,6 +9875,12 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const login = st.onebot.login
       const [procs, setProcs] = useState(null)
       const [live, setLive] = useState('dry')
+      // 接入机器人号：按钮 busy、45 秒还没连上就提示、以及一键诊断结果
+      const [attachBusy, setAttachBusy] = useState(false)
+      const [attachAt, setAttachAt] = useState(0)
+      const [slowAttach, setSlowAttach] = useState(false)
+      const [diag, setDiag] = useState(null)
+      const [diagBusy, setDiagBusy] = useState(false)
       const qqOk = /^\d{5,11}$/.test(draft.botQQ || '') && /^\d{5,11}$/.test(draft.ownerQQ || '') && draft.botQQ !== draft.ownerQQ
       const external = draft.gateway === 'onebot'
       const verified = conn && login && String(login.uin) === String(st.config.botQQ) && !st.onebot.problem
@@ -4861,6 +9894,34 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         const r = await post('/setup/done', { existingConnection: true })
         toast(r.message, r.ok ? 'ok' : 'err')
         if (r.ok) { try { localStorage.removeItem('aurabot.wiz') } catch (e) {} reload(); onClose && onClose() }
+      }
+      // 点了接入之后每 2 秒刷新一次状态；45 秒还没好就提示去看诊断
+      useEffect(() => {
+        if (!attachAt || verified) return undefined
+        const slow = setTimeout(() => setSlowAttach(true), 45000)
+        const timer = setInterval(() => reload(), 2000)
+        return () => { clearTimeout(slow); clearInterval(timer) }
+      }, [attachAt, verified])
+      const attach = async () => {
+        if (attachBusy) return
+        setAttachBusy(true)
+        setAttachAt(Date.now())
+        setSlowAttach(false)
+        try {
+          const r = await Promise.race([
+            post('/snowluma/attach'),
+            new Promise((resolve) => setTimeout(() => resolve({ ok: false, message: '接入超时（35 秒）：SnowLuma 控制台或 QQ 可能卡住了，点「一键诊断」看看' }), 35000)),
+          ])
+          toast(r.message, r.ok ? 'ok' : 'err')
+        } catch (e) { toast('接入失败：' + (e.message || e), 'err') }
+        setAttachBusy(false)
+        reload()
+      }
+      const diagnose = async () => {
+        setDiagBusy(true)
+        const r = await get('/snowluma/diagnose')
+        setDiagBusy(false)
+        setDiag(r)
       }
       const body = [
         // 0. QQ 号
@@ -4884,7 +9945,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
               h('div', { style: { marginTop: 6 } }, h(Btn, { small: true, onClick: () => window.open(sl.downloadPage, '_blank') }, '打开下载页 ↗')))),
             h('div', { className: cx('ab-step', sl.installed && 'done') }, h('div', null, h('b', null, '解压到纯英文目录'), h('div', { className: 'ab-muted ab-small' }, '推荐 C:\\Aurabot\\snowluma，解压后目录里能直接看到 index.mjs。'),
               h('div', { className: 'ab-flex', style: { marginTop: 6 } }, f.text('snowluma.dir', { size: 'wide', placeholder: 'C:\\Aurabot\\snowluma' }), h(Btn, { small: true, onClick: async () => { await save(draft); reload() } }, '检查')),
-              h('div', { className: 'ab-small', style: { marginTop: 4, color: sl.installed ? 'var(--ab-ok)' : 'var(--ab-warn)' } }, sl.installed ? '✓ 找到了 SnowLuma v' + sl.version : sl.reason))))),
+              h('div', { className: 'ab-small', style: { marginTop: 4, color: sl.installed && (!sl.compat || sl.compat.status === 'ok') ? 'var(--ab-ok)' : 'var(--ab-warn)' } }, sl.installed ? '✓ 找到了 SnowLuma v' + sl.version + (sl.compat ? '（' + sl.compat.label + '）' : '') : sl.reason))))),
         // 2. 启动 + 协议（接自己的 OneBot 时不用）
         external ? h('div', null, h('p', { className: 'ab-desc' }, '用的是你自己的 OneBot 服务，这一步不用做，直接下一步。')) :
         h('div', null,
@@ -4896,16 +9957,29 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         // 3. 接入
         h('div', null,
           external ? h('p', { className: 'ab-desc' }, '确认你的 OneBot 服务登录的是机器人号 ' + (st.config.botQQ || '') + '，然后点「测试连接」。插件连上后会先核对登录的号，不是机器人号就断开。') :
-          h('p', { className: 'ab-desc' }, '在这台电脑上另开一个 QQ，登录机器人号 ' + (st.config.botQQ || '') + '（可以最小化）。你的大号 QQ 照常开着就行——插件只会接入机器人号，绝不碰别的号。'),
+          h('p', { className: 'ab-desc' }, '在这台电脑上另开一个 QQ，登录机器人号 ' + (st.config.botQQ || '') + '（可以最小化）。你的大号 QQ 照常开着就行——插件只会接入机器人号，绝不碰别的号。QQ 需要 NT 9.9.33 及以上（SnowLuma 2.4 的要求）：旧版 QQ 注入不了，先升级 QQ。'),
           external ? h('div', { className: 'ab-flex' },
             h(Btn, { kind: 'primary', small: true, onClick: async () => { const r = await post('/onebot/reconnect'); toast(r.message, r.ok ? 'ok' : 'err'); reload() } }, '连接'),
             h(Btn, { small: true, onClick: async () => { const r = await get('/onebot/test'); toast(r.message) } }, '测试连接')) :
-          h('div', { className: 'ab-flex' },
-            h(Btn, { kind: 'primary', small: true, onClick: async () => { const r = await post('/snowluma/attach'); toast(r.message); setTimeout(reload, 1500) } }, '接入机器人号'),
+          h('div', { className: 'ab-flex', style: { flexWrap: 'wrap', gap: 8 } },
+            h(Btn, { kind: 'primary', small: true, disabled: attachBusy, onClick: attach }, attachBusy ? '接入中…' : '接入机器人号'),
+            h(Btn, { small: true, disabled: diagBusy, onClick: diagnose }, diagBusy ? '诊断中…' : '一键诊断'),
             h(Btn, { small: true, onClick: async () => { const r = await get('/snowluma/processes'); setProcs(r.list || []); if (!r.ok) toast(r.message) } }, '看看有哪些 QQ 进程'),
             h(Btn, { small: true, onClick: async () => { const r = await get('/onebot/test'); toast(r.message) } }, '测试连接')),
           sl.lastAttach && sl.lastAttach.at ? h('div', { className: 'ab-small', style: { marginTop: 8, color: sl.lastAttach.ok ? 'var(--ab-ok)' : 'var(--ab-warn)' } }, sl.lastAttach.message) : null,
-          conn && login ? h('div', { className: 'ab-note', style: { marginTop: 10 } }, login.uin === st.config.botQQ ? '✓ 连上了：' + login.nickname + '（' + login.uin + '）' : '⚠ 连上的是 ' + login.uin + '，不是机器人号') : h('div', { className: 'ab-muted ab-small', style: { marginTop: 10 } }, '接入后需要十几秒识别登录状态，稍等一下会自动刷新。'),
+          conn && login
+            ? h('div', { className: 'ab-note', style: { marginTop: 10 } }, login.uin === st.config.botQQ ? '✓ 连上了：' + login.nickname + '（' + login.uin + '）' : '⚠ 连上的是 ' + login.uin + '，不是机器人号')
+            : h('div', null,
+              st.onebot.problem ? h('div', { className: 'ab-note warn', style: { marginTop: 10 } }, h('b', null, '还连不上的原因：'), st.onebot.problem,
+                slowAttach ? h('div', { className: 'ab-small', style: { marginTop: 6 } }, '已经等了 45 秒还没连上：先按上面的原因排查，或者点「一键诊断」。') : null) : null,
+              h('div', { className: 'ab-muted ab-small', style: { marginTop: 8 } }, '接入后一般十几秒内会连上；连不上时这里会直接写出卡在哪一步。')),
+          diag ? h('div', { className: 'ab-note', style: { marginTop: 10 } },
+            h('div', { className: 'ab-small' }, '诊断结果：' + (diag.ok ? ((diag.items || []).some((it) => it.warn) ? '正常，有提示项（橙色 !）' : '全部正常') : '有问题，看下面带 ✗ 的项')),
+            (diag.items || []).map((it) => h('div', { key: it.id, className: 'ab-small', style: { padding: '5px 0', borderTop: '1px solid var(--ab-line)' } },
+              h('span', { style: { color: it.warn ? '#e6a23c' : it.ok ? 'var(--ab-ok)' : 'var(--ab-warn)' } }, it.warn ? '! ' : it.ok ? '✓ ' : '✗ '),
+              h('b', { style: it.warn ? { color: '#e6a23c' } : null }, it.label + '：'), it.detail,
+              (it.warn || !it.ok) && it.hint ? h('div', { className: 'ab-muted' }, '→ ' + it.hint) : null)),
+            diag.problem ? h('div', { className: 'ab-muted ab-small', style: { marginTop: 6 } }, '当前提示：' + diag.problem) : null) : null,
           procs ? h('table', { className: 'ab-table', style: { marginTop: 10 } }, h('tbody', null, procs.map((p) => h('tr', { key: p.pid }, h('td', null, p.pid), h('td', null, p.uin || '识别不出'), h('td', null, p.nickname || ''), h('td', null, p.isBot ? h('span', { className: 'ab-badge' }, '机器人号') : h('span', { className: 'ab-muted ab-small' }, '不会碰')))))) : null),
         // 4. 完成
         h('div', null,
@@ -4920,7 +9994,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       return h('div', { className: 'ab-card', style: { padding: '20px 22px' } },
         h('div', { className: 'ab-flex', style: { marginBottom: 6 } }, h('h3', { style: { margin: 0, fontSize: 16 } }, '设置向导'), h('span', { className: 'ab-muted ab-small' }, '第 ' + (step + 1) + ' / ' + WIZ_STEPS.length + ' 步 · ' + WIZ_STEPS[step]), h('div', { className: 'ab-spacer' }),
           st.config.setupDone && onClose ? h(Btn, { small: true, kind: 'ghost', onClick: onClose }, '关闭向导') : null),
-        !st.config.setupDone ? h('details', { style: { marginTop: 10 } }, h('summary', { className: 'ab-small' }, '换电脑了？从备份恢复'), h('div', { style: { marginTop: 10 } }, h(Backup, { toast }))) : null,
+        !st.config.setupDone ? h('details', { style: { marginTop: 10 } }, h('summary', { className: 'ab-small' }, '换电脑了？从备份恢复'), h('div', { style: { marginTop: 10 } }, h(Backup, { toast, st }))) : null,
         h('div', { className: 'ab-wiz-bar' }, WIZ_STEPS.map((s, i) => h('button', { key: s, type: 'button', className: cx('seg', i < step && 'done', i === step && 'on'), onClick: () => i <= step && go(i), title: s }, h('span', null, s)))),
         verified && !st.config.setupDone ? h('div', { className: 'ab-note', style: { marginTop: 12 } }, '机器人号已经连接并核对通过。', ' ', h(Btn, { small: true, onClick: useExisting }, '使用现有连接，进入面板')) : null,
         h('div', { style: { minHeight: 220, marginTop: 14 } }, body),
@@ -4953,14 +10027,77 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             localStorage.setItem('aurabot.navlast', JSON.stringify(last))
             localStorage.setItem('aurabot.persona-tab-v2', '1')
           }
+          // 语音识别（asr）已并入「语音」页：旧页签迁到 voice，并记住要看「听语音」子视图。
+          if (!localStorage.getItem('aurabot.voice-tab-v1')) {
+            let last = {}
+            try { last = JSON.parse(localStorage.getItem('aurabot.navlast') || '{}') || {} } catch (e) {}
+            if (localStorage.getItem('aurabot.tab') === 'asr') {
+              localStorage.setItem('aurabot.tab', 'voice')
+              localStorage.setItem('aurabot.voice-view', 'listen')
+            }
+            for (const key of Object.keys(last)) if (last[key] === 'asr') last[key] = 'voice'
+            localStorage.setItem('aurabot.navlast', JSON.stringify(last))
+            localStorage.setItem('aurabot.voice-tab-v1', '1')
+          }
+          // 人物记忆（persona）已并入「记忆」页：旧页签迁到 memory，并记住要看「人物」子视图。
+          // 排在 persona-tab-v2 之后：更早的 persona = 旧人格页，仍按历史规则归到 character。
+          if (!localStorage.getItem('aurabot.memory-tab-v1')) {
+            let last = {}
+            try { last = JSON.parse(localStorage.getItem('aurabot.navlast') || '{}') || {} } catch (e) {}
+            if (localStorage.getItem('aurabot.tab') === 'persona') {
+              localStorage.setItem('aurabot.tab', 'memory')
+              localStorage.setItem('aurabot.memory-view', 'person')
+            }
+            for (const key of Object.keys(last)) if (last[key] === 'persona') last[key] = 'memory'
+            localStorage.setItem('aurabot.navlast', JSON.stringify(last))
+            localStorage.setItem('aurabot.memory-tab-v1', '1')
+          }
+          // B站 / 抖音 / 小黑盒已并入「内容平台」：旧页签迁到 content + 对应子视图。
+          if (!localStorage.getItem('aurabot.content-tab-v1')) {
+            let last = {}
+            try { last = JSON.parse(localStorage.getItem('aurabot.navlast') || '{}') || {} } catch (e) {}
+            const cur = localStorage.getItem('aurabot.tab')
+            if (cur === 'bili' || cur === 'douyin' || cur === 'heybox') {
+              localStorage.setItem('aurabot.tab', 'content')
+              localStorage.setItem('aurabot.content-view', cur)
+            }
+            for (const key of Object.keys(last)) {
+              if (last[key] === 'bili' || last[key] === 'douyin' || last[key] === 'heybox') last[key] = 'content'
+            }
+            localStorage.setItem('aurabot.navlast', JSON.stringify(last))
+            localStorage.setItem('aurabot.content-tab-v1', '1')
+          }
           return localStorage.getItem('aurabot.tab') || 'overview'
         } catch (e) { return 'overview' }
       })
       const [toastMsg, setToastMsg] = useState(null)
+      // 语音页子视图：'send' 发语音 / 'listen' 听语音（旧「语音识别」页迁入 listen）
+      const [voiceView, setVoiceView] = useState(() => { try { const v = localStorage.getItem('aurabot.voice-view'); return ['listen', 'services'].includes(v) ? v : 'send' } catch (e) { return 'send' } })
+      // 切换子视图时记住选择：下次进来还停在同一视图
+      const pickVoiceView = (v) => { setVoiceView(v); try { localStorage.setItem('aurabot.voice-view', v) } catch (e) {} }
+      // 记忆页子视图：'starmap' 星图（默认）/ 'entries' 记忆条目 / 'person' 人物。
+      // 老用户已存的 entries/person 继续有效；没存过或值异常 → 默认星图。
+      const [memoryView, setMemoryView] = useState(() => {
+        try {
+          const v = localStorage.getItem('aurabot.memory-view')
+          return v === 'entries' || v === 'person' ? v : 'starmap'
+        } catch (e) { return 'starmap' }
+      })
+      const pickMemoryView = (v) => { setMemoryView(v); try { localStorage.setItem('aurabot.memory-view', v) } catch (e) {} }
+      // 内容平台子视图：bili / douyin / heybox（旧三个独立页签迁入这里）
+      const [contentView, setContentView] = useState(() => { try { return localStorage.getItem('aurabot.content-view') || '' } catch (e) { return '' } })
+      const pickContentView = (v) => { setContentView(v); try { localStorage.setItem('aurabot.content-view', v) } catch (e) {} }
       const [wizardOpen, setWizardOpen] = useState(false)
+      const [boot, setBoot] = useState(null)         // /panel/bootstrap 成功摘要
+      const [bootErr, setBootErr] = useState(null)   // { code, message }：TIMEOUT / BOOTSTRAPPING / CONNECT / AUTH / STATE / CONFIG
+      const [ready, setReady] = useState(false)      // bootstrap + /state 水合 + /panel/config 草稿全部就绪
+      const [lastSyncAt, setLastSyncAt] = useState(0) // 最近一次 pulse 成功时间（失败时保留旧数据并标注更新时间）
       const toastTimer = useRef(null)
       const dirtyRef = useRef(false)
+      const draftBaseRef = useRef(null)
+      const [saveConflict, setSaveConflict] = useState('')
       const saveRef = useRef(null)
+      const pluginStartRef = useRef(0)
       // kind：ok / err / 不填 = 普通
       const toast = (m, kind) => {
         const text = String(m || '')
@@ -4969,14 +10106,149 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         clearTimeout(toastTimer.current)
         toastTimer.current = setTimeout(() => setToastMsg(null), 3200)
       }
+      // /state 只做一次性水合（旧消费页仍按需读取）：不再回灌草稿——草稿唯一来源是 /panel/config。
       const reload = useCallback(async () => {
-        const r = await get('/state')
-        if (!r || r.ok === false) { setErr(r && r.message ? r.message : '读不到插件状态'); return }
+        const r = await sharedGet('/state')
+        if (!r || r.ok === false) { setErr(r && r.message ? r.message : '读不到插件状态'); return r }
+        if (Number(r.startedAt)) pluginStartRef.current = Number(r.startedAt)
         setErr('')
         setSt(r)
-        if (!dirtyRef.current) setDraft(clone(r.config))
+        return r
       }, [])
-      useEffect(() => { reload(); const t = setInterval(reload, 5000); return () => clearInterval(t) }, [reload])
+      const bootRef = useRef(null)          // 最近一次有效的 bootstrap/pulse 摘要（bootId/版本/导航版本）
+      const configRevRef = useRef(null)     // 当前草稿基线对应的 configRevision
+      const draftSnapRef = useRef(null)     // 最近一次权威配置快照（/panel/config 或保存回执）
+      const readRegistry = useRef(new Set()) // 在途轻量读取的 AbortController，卸载时统一放弃
+      const retryRef = useRef(null)
+      // 草稿基线初始化/刷新：只认 /panel/config。没在编辑时直接采纳快照；正在编辑时保留本地草稿，
+      // 但权威快照仍存进 draftSnapRef 供保存回执对账，st.config 同步为最新已知值（展示用）。
+      const loadConfigDraft = useCallback(async () => {
+        const r = await sharedPanelGet('/panel/config', { registry: readRegistry.current })
+        if (!r || r.ok === false) return r
+        const snap = clone(r.config || {})
+        if (r.configRevision != null) configRevRef.current = r.configRevision
+        draftSnapRef.current = snap
+        setSt((prev) => (prev ? { ...prev, config: clone(snap) } : prev))
+        setDraft((current) => {
+          if (!dirtyRef.current || !current) {
+            draftBaseRef.current = clone(snap)
+            return clone(snap)
+          }
+          return current
+        })
+        return r
+      }, [])
+      // 启动序列：外壳先渲染 → /panel/bootstrap（3 秒截止 + 指数退避）→ 并行水合 /state 与 /panel/config。
+      // bootstrap 前不打 /state；未就绪时按可识别状态提示（超时/启动中/连不上/权限受限）。
+      useEffect(() => {
+        let stopped = false
+        let timer = null
+        let delay = 2000
+        const clear = () => { if (timer) { clearTimeout(timer); timer = null } }
+        const attempt = async () => {
+          if (stopped) return
+          const r = await sharedPanelGet('/panel/bootstrap', { registry: readRegistry.current })
+          if (stopped) return
+          if (!r || r.ok === false) {
+            setBootErr({ code: (r && r.code) || 'CONNECT', message: (r && r.message) || '暂时连不上插件' })
+            if ((r && r.code) === 'AUTH') return // 权限受限：自动重试没有意义，等用户/管理员处理
+            delay = Math.min(delay * 2, 15000)
+            timer = setTimeout(attempt, delay)
+            return
+          }
+          bootRef.current = r
+          setBoot(r)
+          const [sr, cr] = await Promise.all([reload(), loadConfigDraft()])
+          if (stopped) return
+          if (!sr || sr.ok === false || !cr || cr.ok === false) {
+            const msg = !sr || sr.ok === false ? (sr && sr.message) || '读不到插件状态' : (cr && cr.message) || '读不到插件配置'
+            setBootErr({ code: !sr || sr.ok === false ? 'STATE' : 'CONFIG', message: msg })
+            delay = Math.min(delay * 2, 15000)
+            timer = setTimeout(attempt, delay)
+            return
+          }
+          setBootErr(null)
+          setReady(true)
+        }
+        retryRef.current = () => { clear(); delay = 2000; attempt() }
+        attempt()
+        return () => { stopped = true; clear(); retryRef.current = null }
+      }, [])
+      // 卸载时放弃所有在途轻量读取（bootstrap/pulse/config）
+      useEffect(() => () => {
+        for (const ctl of readRegistry.current) { try { ctl.abort() } catch (e) { /* 已结束的忽略 */ } }
+        readRegistry.current.clear()
+      }, [])
+      // 轮询收敛：根轮询读 /panel/pulse（稳定期 12 秒，bootstrap 后预热期 2 秒）；
+      // 页面隐藏时停止，恢复时立即补一次；连续失败按退避放缓（保留最近成功结果并靠 lastSyncAt 标注）。
+      useEffect(() => {
+        if (!ready) return undefined
+        let stopped = false
+        let timer = null
+        let failures = 0
+        const mountedAt = Date.now()
+        const clear = () => { if (timer) { clearTimeout(timer); timer = null } }
+        const schedule = (ms) => { if (!stopped) { clear(); timer = setTimeout(tick, ms) } }
+        const tick = async () => {
+          if (stopped) return
+          if (document.visibilityState === 'hidden') return
+          const r = await sharedPanelGet('/panel/pulse', { registry: readRegistry.current })
+          if (stopped) return
+          if (!r || r.ok === false) {
+            failures++
+            schedule(Math.min(12000 * Math.pow(2, Math.min(failures - 1, 2)), 30000))
+            return
+          }
+          failures = 0
+          setLastSyncAt(Date.now())
+          const prevBoot = bootRef.current
+          if (prevBoot && r.bootId && r.bootId !== prevBoot.bootId) {
+            // 宿主重启：旧在途响应全部失效；保留草稿并提示重新核对；重新走一遍 bootstrap+水合
+            toast('插件刚刚重启过：界面正在切换到新实例，未保存的草稿已保留，请重新核对后再保存。', 'err')
+            setReady(false)
+            setBoot(null)
+            bootRef.current = null
+            if (retryRef.current) retryRef.current()
+            return
+          }
+          // 轻量合并：controls（总开关/试运行/调试）与 connections 快照就地更新到 st；草稿一律不动
+          if (r.controls) {
+            if (bootRef.current) bootRef.current = { ...bootRef.current, controls: r.controls }
+            setSt((prev) => (prev ? { ...prev, config: {
+              ...prev.config,
+              enabled: r.controls.enabled != null ? Boolean(r.controls.enabled) : prev.config.enabled,
+              dryRun: r.controls.dryRun != null ? Boolean(r.controls.dryRun) : prev.config.dryRun,
+              debug: r.controls.debug != null ? Boolean(r.controls.debug) : prev.config.debug,
+            } } : prev))
+          }
+          if (r.connections) {
+            setSt((prev) => {
+              if (!prev) return prev
+              const onebot = connectionsToOnebot(r.connections, prev.onebot)
+              return { ...prev, connections: r.connections, ...(onebot ? { onebot } : {}) }
+            })
+          }
+          if (r.setupDone != null && bootRef.current) bootRef.current = { ...bootRef.current, setupDone: Boolean(r.setupDone) }
+          // 配置版本变化：草稿没在编辑时按草稿规则刷新（来源仍是 /panel/config）；在编辑的延后到保存/离开时对账
+          if (r.configRevision != null && configRevRef.current != null && r.configRevision !== configRevRef.current && !dirtyRef.current) loadConfigDraft()
+          else if (r.configRevision != null && configRevRef.current == null) configRevRef.current = r.configRevision
+          // 导航版本变化：合并一次 bootstrap 刷新
+          if (r.navigationRevision != null && bootRef.current && bootRef.current.navigationRevision != null && r.navigationRevision !== bootRef.current.navigationRevision) {
+            sharedPanelGet('/panel/bootstrap', { registry: readRegistry.current }).then((b) => {
+              if (!stopped && b && b.ok !== false) { setBoot(b); bootRef.current = b }
+            })
+          }
+          schedule(Date.now() - mountedAt < 10000 ? 2000 : 12000)
+        }
+        const onVis = () => {
+          if (document.visibilityState === 'hidden') { clear(); return }
+          clear()
+          tick()
+        }
+        document.addEventListener('visibilitychange', onVis)
+        tick()
+        return () => { stopped = true; clear(); document.removeEventListener('visibilitychange', onVis) }
+      }, [ready])
       const go = (id) => { setTab(id); try { localStorage.setItem('aurabot.tab', id) } catch (e) {} }
       // 标签多、一屏放不下：滚轮横着滚，选中的标签自动滚进视野
       const tabsRef = useRef(null)
@@ -4988,23 +10260,128 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         return () => el.removeEventListener('wheel', onWheel)
       })
       useEffect(() => { tabsRef.current?.querySelector('.ab-tab.on')?.scrollIntoView({ block: 'nearest', inline: 'nearest' }) }, [tab])
-      const dirty = useMemo(() => !!(st && draft) && JSON.stringify(draft) !== JSON.stringify(st.config), [st, draft])
+      // 未保存标记对的是「草稿基线」（/panel/config 快照），不再是 /state 的配置——
+      // pulse 和 /save 返回的配置只更新展示，不回灌草稿，也不做基线。
+      const dirty = useMemo(() => Boolean(draft && draftBaseRef.current) && JSON.stringify(draft) !== JSON.stringify(draftBaseRef.current), [draft])
       dirtyRef.current = dirty
       const setD = (d) => setDraft(d)
-      const save = async (override) => {
-        const body = override || draft
-        const r = await post('/save', body)
-        if (r.ok === false) { toast(r.message || '保存失败', 'err'); return false }
+      const discardDraft = () => {
         dirtyRef.current = false
-        setSt(r)
-        setDraft(clone(r.config))
+        setSaveConflict('')
+        if (draftBaseRef.current) setDraft(clone(draftBaseRef.current))
+        loadConfigDraft() // 顺手把基线对齐到最新权威快照（没在编辑时直接采纳）
+      }
+      const saveImpl = async (override) => {
+        const { allow, commandAllow, capabilityAllow, ...rest } = clone(override || draft)
+        // 基线来自 /panel/config 快照；只提交本次编辑过的顶层字段，没变的键不回传
+        //（整表字段照旧整键发送，mergeFromPanel 语义不变）。
+        const baseline = draftBaseRef.current || st.config
+        const changed = (a, b) => JSON.stringify(a) !== JSON.stringify(b)
+        const expected = {}
+        const body = {}
+        for (const k of Object.keys(rest)) {
+          if (k === 'memberFilter' || k === 'group' || k === 'memory') continue // 这几个有单独的基线比对，见下
+          if (changed(rest[k], baseline ? baseline[k] : undefined)) body[k] = rest[k]
+        }
+        // 未编辑的群设置不回写；编辑过的带上草稿基线，避免悄悄撤销 QQ 命令。
+        if (changed(rest.memberFilter, baseline.memberFilter)) { body.memberFilter = rest.memberFilter; expected.memberFilter = baseline.memberFilter }
+        if (changed(allow?.groups, baseline.allow?.groups)) {
+          body.allow = { groups: allow.groups }
+          expected.groups = baseline.allow.groups
+        }
+        if (changed(rest.group?.moduleOnlyGroups, baseline.group?.moduleOnlyGroups)) expected.groups = baseline.allow.groups
+        if (changed(rest.group, baseline.group)) { body.group = rest.group; expected.group = baseline.group }
+        if (changed(rest.memory, baseline.memory)) {
+          const mem = clone(rest.memory || {})
+          if (changed(mem.groupExtraction, baseline.memory?.groupExtraction)) expected.groupExtraction = baseline.memory?.groupExtraction || {}
+          else delete mem.groupExtraction
+          if (changed(mem.passiveGroups, baseline.memory?.passiveGroups)) expected.passiveGroups = baseline.memory?.passiveGroups
+          else delete mem.passiveGroups
+          if (Object.keys(mem).length) body.memory = mem
+        }
+        if (Object.keys(expected).length) body._groupSettingsBase = expected
+        // 提交前使先前的配置 GET 过期（读到一半的旧快照不许再被当成新基线）
+        bustPanelGet('/panel/config')
+        const r = await post('/save', body)
+        if (r.ok === false) {
+          if (typeof r.message === 'string' && r.message.indexOf('连不上插件') === 0) {
+            // 回执未知（网络中断/超时）：先重读权威快照显示最新已知状态，保留草稿，由用户决定是否重试
+            toast('保存结果未知：已重新读取插件当前配置，请核对后再决定是否重试。', 'err')
+            await loadConfigDraft()
+            return false
+          }
+          if (r.code === 'group_settings_conflict') {
+            setSaveConflict(r.message)
+            // 保留草稿供查看，同时让「撤销」能取到最新值。轮询不能替换草稿基线。
+            await reload()
+          }
+          toast(r.message || '保存失败', 'err'); return false
+        }
+        setSaveConflict('')
+        if (r.bootId === undefined) {
+          // 旧宿主响应（没有回执扩展）：沿用原行为，整份快照回灌
+          draftBaseRef.current = clone(r.config)
+          dirtyRef.current = false
+          setSt(r)
+          setDraft(clone(r.config))
+          toast(r.message || '保存好了', 'ok')
+          return true
+        }
+        if (bootRef.current && r.bootId && r.bootId !== bootRef.current.bootId) {
+          // 宿主已重启：本次回执失效，保留草稿并提示重新核对
+          toast('插件刚刚重启过：这次保存是否已生效需要重新核对（未保存的草稿已保留）。', 'err')
+          await reload()
+          await loadConfigDraft()
+          return false
+        }
+        // 新回执：基线整体推进到回执版本；已确认字段（committedPaths）以权威快照为准，
+        // unchangedPaths 只清脏标记（值本来就一致），其余本地草稿（含提交期间的新改动）原样保留。
+        if (r.configRevision != null) configRevRef.current = r.configRevision
+        const snap = clone(r.config || draftSnapRef.current || {})
+        const committed = (r.committedPaths || []).map(ptrToDots)
+        // #520：dirty 基线不能直接用脱敏 snap，否则草稿里填过的 secret 永远和它不相等，
+        // 「有改动还没保存」一直显示。基线用本次完整草稿，但已提交字段以服务端归一化快照为准，
+        // 并清空 secret 原文（保留 *Set 标志），避免明文留在草稿里、后续保存覆盖新密钥。
+        let savedDraft = maskSecretFields(clone(override || draft))
+        for (const dots of committed) savedDraft = setPath(savedDraft, dots, getPath(snap, dots))
+        maskSecretFields(savedDraft)
+        copySecretFlags(savedDraft, snap)
+        draftBaseRef.current = savedDraft
+        // 用新对象触发 useMemo（它的依赖只有 draft）；保存期间用户又改的部分原样保留，
+        // 已经提交的旧 secret 也要从 current 清掉，避免下次整段回传覆盖别处轮换的新 key。
+        setDraft((current) => {
+          if (current === draft) return clone(savedDraft)
+          const next = clone(current)
+          maskSecretFields(next, draft)
+          copySecretFlags(next, snap)
+          return next
+        })
+        dirtyRef.current = false
+        setSt((prev) => (prev ? { ...prev, config: clone(snap) } : prev))
         toast(r.message || '保存好了', 'ok')
+        // 不再立即 loadConfigDraft：它内部会用脱敏快照覆盖基线，再次把 dirty 钉死。
         return true
+      }
+      const savingRef = useRef(false)
+      const save = async (override) => {
+        if (savingRef.current) return false
+        savingRef.current = true
+        try { return await saveImpl(override) }
+        catch (error) { toast('保存失败：' + (error && error.message ? error.message : error), 'err'); return false }
+        finally { savingRef.current = false }
       }
       saveRef.current = save
       // 右上角的开关立刻生效；有没保存的改动时连同改动一起保存，不会把它们冲掉
       const quickToggle = async (path, v) => {
-        await save(setPath(dirtyRef.current ? draft : clone(st.config), path, v))
+        await save(setPath(dirtyRef.current ? draft : clone(draftBaseRef.current || st.config), path, v))
+      }
+      // 试运行 / 调试互斥：开一个就自动关另一个。
+      // 关掉「调试」退回「试运行」（而不是直接上线）—— 上线必须自己关掉「试运行」那个开关。
+      const toggleRun = async (which, v) => {
+        const base = clone(dirtyRef.current ? draft : (draftBaseRef.current || st.config))
+        const debug = which === 'debug' ? Boolean(v) : false
+        const dryRun = which === 'debug' ? !v : Boolean(v)
+        await save(setPath(setPath(base, 'debug', debug), 'dryRun', dryRun))
       }
       // Ctrl/⌘ + S 保存
       useEffect(() => {
@@ -5018,37 +10395,104 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         return () => window.removeEventListener('keydown', onKey)
       }, [])
 
-      if (!st || !draft) {
-        return h('div', { className: 'ab-root' }, h('div', { className: 'ab-wrap' }, err ? h('div', { className: 'ab-note err' }, '面板读不到插件：', err, '。如果刚装好插件，重启一次 DSH 试试。') : h(Empty, { icon: '🐋', text: '大肥鱼正在游过来…' })))
+      // 外壳先渲染：挂载即显示标题、基础导航、加载/失败提示与重试入口；bootstrap 返回前内容区只画中性骨架。
+      // 向导与上次页面（aurabot.navlast）都只在收到有效 setupDone 并完成水合后才挂载/恢复。
+      if (!ready || !st || !draft) {
+        const hintMap = {
+          TIMEOUT: '读取超时：插件 ' + Math.round(PANEL_READ_TIMEOUT / 1000) + ' 秒内没有应答。',
+          BOOTSTRAPPING: '插件正在启动：核心还没就绪，会自动重试。',
+          CONNECT: '暂时连不上插件：接口还没就绪或网络中断。',
+          AUTH: '权限受限：当前身份没有打开 Aurabot 面板的权限。',
+          STATE: '暂时读不到插件状态。',
+          CONFIG: '暂时读不到插件配置。',
+        }
+        const hint = bootErr ? (hintMap[bootErr.code] || bootErr.message || '暂时连不上插件') : ''
+        const canRetry = Boolean(bootErr && bootErr.code !== 'AUTH' && retryRef.current)
+        const shellTabs = TABS
+        const shellCur = shellTabs.find((t) => t.id === tab) || shellTabs[0]
+        return h('div', { className: 'ab-root' },
+          h('div', { className: 'ab-wrap' },
+            h('div', { className: 'ab-hero' },
+              h('div', { className: 'ab-avatar', style: { display: 'grid', placeItems: 'center', fontSize: 34 } }, '🐋'),
+              h('div', { className: 'ab-hero-main' },
+                h('h1', null, '大肥鱼'),
+                h('div', { className: 'ab-sub' }, boot && boot.version ? 'Aurabot v' + boot.version + ' · 正在读取面板…' : '正在读取面板…'),
+                h('div', { className: 'ab-pills' },
+                  h('span', { className: 'ab-pill' }, h('i', { className: 'ab-dot' }), bootErr ? '还没就绪' : '读取中'))),
+              h('div', { className: 'ab-hero-side' },
+                h('div', { className: 'ab-switch-row' }, h('span', null, '总开关'), h(Switch, { on: false, disabled: true, onChange: () => {} })),
+                h('div', { className: 'ab-switch-row' }, h('span', { className: 'ab-muted' }, '试运行'), h(Switch, { on: false, disabled: true, onChange: () => {} })),
+                h('div', { className: 'ab-switch-row' }, h('span', { className: 'ab-muted' }, '调试'), h(Switch, { on: false, disabled: true, onChange: () => {} })))),
+            h(NavBar, { tabs: shellTabs, cur: shellCur, go, dirtyOf: () => false, subRef: tabsRef, mark: () => null }),
+            h('div', { className: 'ab-boot-note' },
+              bootErr
+                ? h(Fragment, null, h('b', null, hint), h('div', { className: 'ab-spacer' }),
+                    canRetry ? h(Btn, { small: true, kind: 'primary', onClick: () => retryRef.current && retryRef.current() }, '重试') : null,
+                    h('span', { className: 'ab-muted ab-small' }, bootErr.code === 'AUTH' ? '请联系宿主管理员确认权限。' : '会自动重试，也可以点「重试」马上再试一次。'))
+                : h(Fragment, null, h('span', null, '大肥鱼正在游过来…'), h('i', { className: 'ab-spin' }),
+                    h('span', { className: 'ab-muted ab-small' }, boot && boot.setupDone === false ? '首次使用：读完就进设置向导。' : ''))),
+            h('div', { className: 'ab-card', style: { marginTop: 14, padding: '18px 20px', display: 'grid', gap: 10 } },
+              h('div', { className: 'ab-skel', style: { height: 18, width: '38%' } }),
+              h('div', { className: 'ab-skel', style: { height: 96 } }),
+              h('div', { className: 'ab-skel', style: { height: 96 } }))),
+          toastMsg ? h('div', { className: cx('ab-toast', toastMsg.kind), role: 'status' }, toastMsg.text) : null,
+        )
       }
       const cfg = st.config
       const conn = st.onebot.state === 'connected'
-      const status = !cfg.enabled ? { cls: '', text: '休息中（总开关关着）' } : !conn ? { cls: 'err', text: 'QQ 没连上' } : cfg.dryRun ? { cls: 'warn', text: '在线 · 试运行' } : { cls: 'ok', text: '在线' }
+      const status = !cfg.enabled ? { cls: '', text: '休息中（总开关关着）' } : !conn ? { cls: 'err', text: 'QQ 没连上' } : cfg.debug ? { cls: 'warn', text: '在线 · 调试' } : cfg.dryRun ? { cls: 'warn', text: '在线 · 试运行' } : { cls: 'ok', text: '在线' }
       const persona = st.personas.find((p) => p.id === cfg.persona.current)
-      const props = { st, draft, setDraft: setD, toast, reload, go, openWizard: () => setWizardOpen(true) }
+      const props = { st, boot, draft, setDraft: setD, toast, reload, go, openWizard: () => setWizardOpen(true), voiceView, setVoiceView: pickVoiceView, memoryView, setMemoryView: pickMemoryView, contentView, setContentView: pickContentView }
       const showWizard = !cfg.setupDone || wizardOpen
       // 标签页：内置的按模块在不在跑决定显示；自己写的模块有设置或面板的各占一页
       const mods = st.modules || []
       const running = (id) => { const m = mods.find((x) => x.id === id); return Boolean(m && m.running) }
-      const hasUi = (m) => m.running === 'user' && !m.builtin && !TABS.some((t) => t.id === m.id) && ((m.settings || []).length || m.panel)
+      // 哪些模块的界面已经有内置页：标签页自己的 id，或者在 TAB_MODS 里给某个内置页供内容的模块
+      // （memory 的界面就在「心情与记忆」「人物记忆」里，purpose 在「主动搭话」里）。
+      // 这些模块不再单独占一页，免得同一个东西出现两个标签。
+      const hasBuiltinPage = (id) => TABS.some((t) => t.id === id) || Object.values(TAB_MODS).some((ids) => ids.includes(id))
+      // 哪些模块单独占一页：自己写的模块有设置或面板就各占一页；内置模块只在声明了 panel 时单独占一页
+      // （设置照样在内置标签页里改）。为什么允许内置模块带面板：面板只按「有没有声明 panel」判断，
+      // 内置模块自己写了 panel.js 也应该能显示，不然那文件永远没入口。
+      const hasUi = (m) => !hasBuiltinPage(m.id) && (m.running === 'user' && !m.builtin
+        ? Boolean((m.settings || []).length || m.panel)
+        : m.running === 'builtin' && Boolean(m.panel))
       // 写了 tab 的模块嵌进那个内置标签页；没写（或写的页不存在）的单独一页
       // 旧模块的 tab: 'persona' 原本嵌在「人格」，继续放回原页。
-      const tabOf = (m) => m.tab === 'persona' ? 'character' : m.tab
+      const tabOf = (m) => {
+        if (navGroupById(m.navGroup) || NAV_GROUPS.some((group) => group.tabs.includes('ext:' + m.id))) return ''
+        return m.tab === 'persona' ? 'character' : m.tab
+      }
       const intoTab = (m) => Boolean(tabOf(m) && TABS.some((t) => t.id === tabOf(m)))
-      const extTabs = mods.filter((m) => hasUi(m) && !intoTab(m)).map((m) => ({ id: 'ext:' + m.id, label: m.name, ext: m.id, flag: m.flag ? `ext.${m.id}.${m.flag}` : '', flagDefault: getPath(m.defaults || {}, m.flag || '') }))
+      const extTabs = mods.filter((m) => hasUi(m) && !intoTab(m)).map((m) => ({
+        id: 'ext:' + m.id,
+        label: m.name,
+        ext: m.id,
+        navGroup: m.navGroup,
+        flag: m.flag ? `ext.${m.id}.${m.flag}` : '',
+        flagDefault: getPath(m.defaults || {}, m.flag || ''),
+      }))
       const tabs = TABS.filter((t) => !TAB_MODS[t.id] || TAB_MODS[t.id].some(running))
       tabs.splice(tabs.findIndex((t) => t.id === 'logs'), 0, ...extTabs)
       const curTab = tabs.find((t) => t.id === tab) || tabs[0]
+      const voiceExtensions = curTab.id === 'voice' ? mods.filter(m => hasUi(m) && tabOf(m) === 'voice') : []
       const body = curTab.ext ? ExtPage : {
-        overview: Overview, connect: Connect, character: Persona, access: Access, group: Group, model: Model, voice: Voice,
-        stickers: Stickers, imagegen: ImageGen, diary: Diary, speakup: SpeakUp, pet: PetPanel, mood: Mood, persona: PersonaMemory, song: Song, bili: Bili, douyin: Douyin, heybox: Heybox, local: LocalApi, security: Security, market: Market, modules: Modules, logs: Logs, about: About, backup: Backup,
+        overview: Overview, manage: Manage, connect: Connect, character: Persona, access: Access, group: Group, model: Model, voice: VoiceTab,
+        stickers: Stickers, imagegen: ImageGen, video: Video, diary: Diary, speakup: SpeakUp, autotelic: Autotelic, pet: PetPanel, mood: Mood, memory: MemoryTab, song: Song, content: ContentTab, local: LocalApi, browser: Browser, security: Security, market: Market, modules: Modules, logs: Logs, about: About, backup: Backup,
       }[curTab.id] || Overview
       // 哪些标签有没保存的改动
-      const TAB_KEYS = { connect: ['snowluma', 'botQQ'], access: ['ownerQQ', 'ownerName', 'ownerLevel', 'approvalNotify', 'approvalViaQQ', 'qqApi', 'longTasks', 'profilePerms', 'allow'], group: ['group', 'merge', 'titleFilter', 'chat'], model: ['model', 'chatModels'], voice: ['voice'], stickers: ['stickers'], imagegen: ['imageGen'], diary: ['diary', 'qzoneSocial'], speakup: ['speakUp'], pet: [], mood: ['mood', 'memory'], song: ['song'], bili: ['bili'], douyin: ['douyin'], heybox: ['heybox'], local: ['local'], security: ['security', 'update'] }
+      // group 键补上 files/forward：整理合并转发/发文件是聊天页的独立配置域，不补则改动不显示未保存标记
+      const TAB_KEYS = { character: ['personaLook'], connect: ['snowluma', 'botQQ'], access: ['ownerQQ', 'ownerName', 'ownerLevel', 'approvalNotify', 'approvalViaQQ', 'qqApi', 'longTasks', 'profilePerms', 'subagentBackground'], group: ['group', 'merge', 'titleFilter', 'memberFilter', 'chat', 'files', 'forward'], model: ['model', 'chatModels'], voice: ['voice'], stickers: ['stickers'], imagegen: ['imageGen'], video: ['video', 'local'], diary: ['diary', 'qzoneSocial'], speakup: ['speakUp', 'ext'], autotelic: [], pet: [], mood: ['mood', 'memory'], song: ['song'], content: ['bili', 'douyin', 'heybox'], local: ['local'], browser: ['browser'], security: ['security', 'update'] }
       const tabDirty = (id) => {
         if (!dirty) return false
-        if (id.startsWith('ext:')) { const k = id.slice(4); return JSON.stringify((draft.ext || {})[k]) !== JSON.stringify((cfg.ext || {})[k]) }
-        return (TAB_KEYS[id] || []).some((k) => JSON.stringify(draft[k]) !== JSON.stringify(cfg[k]))
+        // 对基线（/panel/config 快照）比对，不对比 st.config——pulse 只更新展示，不代表草稿基线
+        const base = draftBaseRef.current || cfg
+        if (id.startsWith('ext:')) { const k = id.slice(4); return JSON.stringify((draft.ext || {})[k]) !== JSON.stringify((base.ext || {})[k]) }
+        // 「聊天」页的旁听名单存于 memory，也需要显示未保存标记。
+        if (id === 'group' && (JSON.stringify(draft.memory?.groupExtraction) !== JSON.stringify(base.memory?.groupExtraction) || JSON.stringify(draft.memory?.passiveGroups) !== JSON.stringify(base.memory?.passiveGroups) || JSON.stringify(draft.allow?.groups) !== JSON.stringify(base.allow?.groups))) return true
+        // 「生图」页也管着 dsh-image 模块的设置。
+        if (id === 'imagegen' && JSON.stringify((draft.ext || {})['dsh-image']) !== JSON.stringify((base.ext || {})['dsh-image'])) return true
+        return (TAB_KEYS[id] || []).some((k) => JSON.stringify(draft[k]) !== JSON.stringify(base[k]))
       }
       return h('div', { className: 'ab-root' },
         h('div', { className: 'ab-wrap' },
@@ -5060,34 +10504,70 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
               h('div', { className: 'ab-pills' },
                 h('span', { className: 'ab-pill' }, h('i', { className: cx('ab-dot', status.cls) }), status.text),
                 h('span', { className: 'ab-pill' }, 'SnowLuma ' + (st.snowluma.installed ? (st.snowluma.running ? '运行中' : '没启动') : '未安装')),
-                h('span', { className: 'ab-pill' }, 'Aurabot v' + st.version))),
+                h('span', { className: 'ab-pill' }, 'Aurabot v' + st.version),
+                lastSyncAt ? h('span', { className: 'ab-pill', title: '面板状态上次成功刷新的时间' }, '状态 ' + timeAgo(lastSyncAt)) : null)),
             h('div', { className: 'ab-hero-side' },
               h('div', { className: 'ab-switch-row' }, h('span', null, '总开关'), h(Switch, { on: cfg.enabled, onChange: (v) => quickToggle('enabled', v) })),
-              h('div', { className: 'ab-switch-row' }, h('span', { className: 'ab-muted' }, '试运行'), h(Switch, { on: cfg.dryRun, onChange: (v) => quickToggle('dryRun', v), title: '开着时只写日志，不真的发到 QQ' })))),
+              h('div', { className: 'ab-switch-row' }, h('span', { className: 'ab-muted' }, '试运行'), h(Switch, { on: cfg.dryRun, onChange: (v) => toggleRun('dryRun', v), title: '开着时只写日志，不真的发到 QQ（记忆照写）' })),
+              h('div', { className: 'ab-switch-row' }, h('span', { className: 'ab-muted' }, '调试'), h(Switch, { on: cfg.debug, onChange: (v) => toggleRun('debug', v), title: '调试：不真发，也不写任何记忆和聊天流水，只在日志里看。开它会自动关掉试运行' })))),
           showWizard ? h(Wizard, { st, draft, setDraft: setD, save, toast, reload, onClose: () => setWizardOpen(false) }) : null,
           showWizard ? null : h(NavBar, {
             tabs, cur: curTab, go, dirtyOf: tabDirty, subRef: tabsRef,
             mark: (t) => {
               if (tabDirty(t.id)) return h('i', { className: 'dirty', title: '有没保存的改动' })
-              if (!t.flag) return null
-              const flag = t.flag === 'group' ? cfg.allow.groups.length > 0 : getPath(cfg, t.flag) ?? t.flagDefault
+              if (!t.flag && !t.flagFn) return null
+              const flag = t.flagFn ? t.flagFn(cfg) : t.flag === 'group' ? cfg.allow.groups.length > 0 : getPath(cfg, t.flag) ?? t.flagDefault
               return h('i', { className: cx('ab-dot', flag && 'ok'), title: flag ? '开着' : '关着' })
             },
           }),
-          showWizard ? null : h(TabBoundary, { key: curTab.id, onHome: () => go('overview') }, h(body, { ...props, mod: curTab.ext })),
-          showWizard || curTab.ext ? null : mods.filter((m) => hasUi(m) && tabOf(m) === curTab.id).map((m) => h('div', { key: 'embed-' + m.id, style: { marginTop: 14 } }, h(ExtPage, { ...props, mod: m.id, embedded: true }))),
+          showWizard ? null : h(SnowLumaCompatBanner, { st, go }),
+          saveConflict ? h('div', { className: 'ab-note err', role: 'alert' }, saveConflict, h(Btn, { small: true, onClick: discardDraft }, '读取最新设置')) : null,
+          showWizard ? null : h(TabBoundary, { key: curTab.id, onHome: () => go('overview') }, h(body, { ...props, mod: curTab.ext, extensions: voiceExtensions })),
+          // dsh-image 已经嵌进「生图」页的「接口格式」里了，这里再渲染一次就是同一张卡出现两遍。
+          showWizard || curTab.ext || curTab.id === 'voice' ? null : mods.filter((m) => hasUi(m) && tabOf(m) === curTab.id && !(curTab.id === 'imagegen' && m.id === 'dsh-image')).map((m) => h('div', { key: 'embed-' + m.id, style: { marginTop: 14 } }, h(ExtPage, { ...props, mod: m.id, embedded: true }))),
           dirty && !showWizard ? h('div', { className: 'ab-savebar' }, h('span', { className: 'msg' }, '有改动还没保存'),
             h('span', { className: 'ab-muted ab-small' }, h('span', { className: 'ab-kbd' }, 'Ctrl'), ' + ', h('span', { className: 'ab-kbd' }, 'S')),
-            h(Btn, { kind: 'ghost', onClick: () => setDraft(clone(st.config)) }, '撤销'),
+            h(Btn, { kind: 'ghost', onClick: discardDraft }, '撤销'),
             h(Btn, { kind: 'primary', onClick: () => save() }, '保存设置')) : null,
         ),
         toastMsg ? h('div', { className: cx('ab-toast', toastMsg.kind), role: 'status' }, toastMsg.text) : null,
       )
     }
 
+    function ReplyDraftStatus({ sessionId, turn }) {
+      const start = turn?.start?.seq, end = turn?.end?.seq
+      const [result, setResult] = useState(null)
+      const identity = JSON.stringify([sessionId, start, end])
+      useEffect(() => {
+        let alive = true
+        setResult(null)
+        if (!sessionId || start == null || end == null) return
+        get('/reply-status?sessionId=' + encodeURIComponent(sessionId) + '&startSeq=' + start + '&endSeq=' + end)
+          .then(r => { if (alive && r.ok && r.status) setResult({ identity, value: r.status }) })
+        return () => { alive = false }
+      }, [identity])
+      if (result?.identity !== identity) return null
+      const status = result.value
+      const reasons = {
+        edited: '已采用精简后的回复', 'below-threshold': '篇幅较短，无需精简',
+        timeout: '精简等待超时，保留原稿', cancelled: '精简被取消，保留原稿',
+        'editor-failed': '精简服务出错，保留原稿', incomplete: '未取得完整精简结果',
+        'not-shorter': '精简结果没有更短', empty: '精简结果为空', 'empty-delivery': '精简结果没有可发送内容',
+        'voice-lost': '精简结果未保留语音', 'media-changed': '精简结果改变了附件',
+        'reply-target-changed': '精简结果改变了引用对象', 'mention-target-changed': '精简结果改变了提醒对象',
+        'no-model': '没有可用的精简模型', 'not-edited': '本条未经过精简', 'not-applied': '精简结果未用于本条回复',
+      }
+      return h('details', { className: 'ab-reply-status', style: { marginTop: 6, fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' } },
+        h('summary', { style: { cursor: 'pointer' } }, status.state === 'edited' ? '精简稿' : '原稿'),
+        h('div', { style: { marginTop: 4 } }, reasons[status.reason] || '本条保留原稿', ' · ',
+          status.before === status.after ? status.after + ' 字符' : status.before + ' → ' + status.after + ' 字符',
+          Number.isFinite(status.elapsedMs) ? ' · ' + (status.elapsedMs / 1000).toFixed(1) + ' 秒' : ''))
+    }
+
     function apply(ctx) {
       const slots = ctx.get('slots')
       if (slots === undefined) return
+      slots.inject('conversation.chat.turnTail', () => slots.register({ name: 'conversation.chat.turnTail', id: 'aurabot-reply-status', order: 11, select: props => props }, ReplyDraftStatus))
       // 写法同 DSH 自带的「自动化任务」（order 10）和「插件」（order 0）：排在它们后面
       slots.inject('main', () => slots.register({ name: 'main', key: PANEL_ID }, AurabotPage))
       slots.inject('sidebar.panellist', () => slots.register({ name: 'sidebar.panellist', id: PANEL_ID, order: 20, label: () => 'Aurabot' }, WhaleIcon))

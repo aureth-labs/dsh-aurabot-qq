@@ -1,6 +1,7 @@
+import { rm } from 'node:fs/promises'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { cleanOutboundText, cleanOutboundSegments, parseReply } from '../src/chat/reply.js'
@@ -125,14 +126,14 @@ test('主人私聊仅拦整段复读，带解释的设定回答保留，工具�
   assert.equal(cleanOutboundText(`设定：${calls[0]}${PERSONA}`, owner), `设定：${PERSONA}`)
 })
 
-function setup(t, { hooks = {}, brain = async () => '', contextProviders, voice = false } = {}) {
+function setup(t, { hooks = {}, brain = async () => '', contextProviders, voice = false, chat = {} } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'aurabot-output-guard-'))
   const previous = process.env.AURABOT_DATA_DIR
   process.env.AURABOT_DATA_DIR = dir
   const fake = createFakeDsh({ brain })
   const calls = [], sent = [], warnings = [], activity = [], spoken = []
   const cfg = normalize({ enabled: true, dryRun: false, ownerQQ: '1', workspaceDir: dir,
-    voice: { enabled: voice, autoChance: 0 }, stickers: { enabled: false, faces: false } })
+    chat, voice: { enabled: voice, autoChance: 0 }, stickers: { enabled: false, faces: false } })
   const file = join(dir, 'voice.wav')
   writeFileSync(file, 'voice')
   const hub = createHub({ dsh: fake.ctx, getConfig: () => cfg,
@@ -152,11 +153,12 @@ function setup(t, { hooks = {}, brain = async () => '', contextProviders, voice 
     } },
   })
   fake.ctx.on('session/event', hub.onSessionEvent)
-  t.after(() => {
+  t.after(async () => {
     hub.dispose(); fake.dispose()
     if (previous === undefined) delete process.env.AURABOT_DATA_DIR
     else process.env.AURABOT_DATA_DIR = previous
-    rmSync(dir, { recursive: true, force: true })
+    // Allow pending Windows ACL work to release the temporary directory without blocking the event loop.
+    await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
   })
   return { hub, fake, cfg, calls, sent, warnings, activity, spoken, dir }
 }
@@ -318,4 +320,35 @@ test('发文件的显示名也过出站清洗，QQ 文件卡片上不会露出�
   assert.ok(up, '应该调用上传接口')
   assert.doesNotMatch(String(up.name), /invoke|内部参数/, '文件显示名不能带工具文字')
   assert.match(String(up.name), /前缀/)
+})
+
+
+test('卡住的轮次超过上限会被强制放开', async (t) => {
+  let release
+  const stuck = new Promise((resolve) => { release = resolve })
+  t.after(() => release())
+  // 0.05 分钟 = 3 秒，够测超时又不拖慢整套
+  const s = setup(t, { chat: { turnTimeoutMinutes: 0.05 }, brain: async () => { await stuck; return '终于回了' } })
+  const chat = { kind: 'private', chatId: 'private:9', userId: '9', nickname: '主人' }
+  // 不 await：这一轮会卡在 brain 上，模拟模型/工具挂住
+  void s.hub.pushToSession(chat, [{ type: 'text', text: '卡住试试' }], '1').catch(() => {})
+  await settle()
+  await new Promise((r) => setTimeout(r, 300))
+  assert.ok(!s.warnings.some((m) => m.includes('强制放开')), '刚满 0.3 秒不该放开')
+  await new Promise((r) => setTimeout(r, 3400))
+  assert.ok(s.warnings.some((m) => m.includes('强制放开')), '超过上限应强制放开：' + JSON.stringify(s.warnings))
+})
+
+
+test('turnTimeoutMinutes = 0 表示关掉兜底，不会超时放开', async (t) => {
+  let release
+  const stuck = new Promise((resolve) => { release = resolve })
+  t.after(() => release())
+  const s = setup(t, { chat: { turnTimeoutMinutes: 0 }, brain: async () => { await stuck; return '终于回了' } })
+  const chat = { kind: 'private', chatId: 'private:8', userId: '8', nickname: '主人' }
+  void s.hub.pushToSession(chat, [{ type: 'text', text: '卡住试试' }], '1').catch(() => {})
+  await settle()
+  // 对照组：0.05 分钟 = 3 秒。这里等 4 秒，如果 0 被误当成默认值就会冒出「强制放开」
+  await new Promise((r) => setTimeout(r, 4000))
+  assert.ok(!s.warnings.some((m) => m.includes('强制放开')), '0 = 关掉兜底，不该放开：' + JSON.stringify(s.warnings))
 })

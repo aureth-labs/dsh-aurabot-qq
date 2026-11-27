@@ -2,9 +2,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import net from 'node:net'
+import { startMockOneBot } from './helpers/mock-onebot.js'
 
 const { endpointHostPort, portOpen, gatewayHealthy, waitPortFree } = await import('../src/snowluma/manager.js')
-const { createOneBotClient, OneBotError } = await import('../src/onebot/client.js')
+const { createOneBotClient, OneBotError, messageDedupeKey } = await import('../src/onebot/client.js')
 
 const silent = { info () {}, warn () {}, debug () {}, error () {} }
 
@@ -209,4 +210,65 @@ test('连接建立后断开或回执无法解析：结果不确定，不自动�
       assert.equal(h.calls.length, 1)
     } finally { h.restore() }
   }
+})
+
+
+// ---------- C. 事件投递：重连/重复投递不能让一条命令执行两次 ----------
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+const until = async (fn, ms = 5000) => {
+  const t = Date.now()
+  while (Date.now() - t < ms) { if (await fn()) return true; await sleep(20) }
+  return false
+}
+const wsClient = (mock, events) => createOneBotClient({
+  endpoint: () => ({ httpUrl: mock.httpUrl, wsUrl: mock.wsUrl, httpToken: mock.token, wsToken: mock.token }),
+  onEvent: (ev) => events.push(ev),
+  onState: () => {},
+  log: silent,
+})
+
+test('messageDedupeKey：只在有真实 message_id 时按聊天去重', () => {
+  const priv = { post_type: 'message', message_type: 'private', user_id: 10001, message_id: 42 }
+  assert.equal(messageDedupeKey(priv), 'private:10001|42')
+  assert.equal(messageDedupeKey({ ...priv, message_id: '42' }), 'private:10001|42')
+  assert.equal(messageDedupeKey({ ...priv, message_type: 'group', group_id: 555 }), 'group:555|42')
+  assert.equal(messageDedupeKey({ ...priv, message_id: 0 }), '')
+  assert.equal(messageDedupeKey({ ...priv, message_id: '' }), '')
+  assert.equal(messageDedupeKey({ post_type: 'notice', message_id: 42 }), '')
+})
+
+test('restart 后只保留一条 WS 连接：同一事件不会投递两遍', { timeout: 15000 }, async () => {
+  const mock = await startMockOneBot({ selfId: '20000002' })
+  const events = []
+  const c = wsClient(mock, events)
+  try {
+    c.start()
+    assert.equal(await until(() => mock.connected() === 1), true, '第一次应该连上一条 WS')
+    c.restart()
+    // 旧连接关闭是异步的：旧实现会在 2 秒后再排一次 connect，挂出第二条 WS
+    await sleep(2600)
+    assert.equal(mock.connected(), 1, 'restart 后只能有一条 WS 连接')
+    mock.push({ message_type: 'private', user_id: 10001, message_id: 101, message: [{ type: 'text', data: { text: '/help' } }], sender: { user_id: 10001, nickname: '主人' } })
+    await sleep(300)
+    assert.equal(events.filter((e) => e.message_id === 101).length, 1, '同一条命令只应该交给上层一次')
+  } finally { c.stop(); await mock.close() }
+})
+
+test('同一 message_id 重复投递只处理一次；不同聊天的同号消息互不影响', { timeout: 10000 }, async () => {
+  const mock = await startMockOneBot({ selfId: '20000002' })
+  const events = []
+  const c = wsClient(mock, events)
+  try {
+    c.start()
+    assert.equal(await until(() => mock.connected() === 1), true)
+    const priv = { message_type: 'private', user_id: 10001, message_id: 202, message: [{ type: 'text', data: { text: '/help' } }], sender: { user_id: 10001, nickname: '主人' } }
+    mock.push(priv)
+    mock.push(priv)
+    await sleep(300)
+    assert.equal(events.filter((e) => e.message_id === 202).length, 1, '重复投递的 message_id 只算一次')
+    mock.push({ ...priv, message_type: 'group', group_id: 555, user_id: 10002 })
+    await sleep(300)
+    assert.equal(events.filter((e) => e.message_id === 202).length, 2, '不同聊天同号消息不能被误去重')
+  } finally { c.stop(); await mock.close() }
 })

@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createFakeDsh } from './helpers/fake-dsh.js'
-import { normalize } from '../src/core/config.js'
+import { normalize, ownerAuthorizationRevision, saveConfig } from '../src/core/config.js'
 import { OneBotError } from '../src/onebot/client.js'
 
 const root = mkdtempSync(join(tmpdir(), 'aurabot-lifecycle-'))
@@ -72,6 +72,37 @@ for (const stop of ['dispose', 'turn/end']) test(`慢工具在 ${stop} 后不再
   assert.equal(sent.some((x) => x.includes('进度探针')), false)
 })
 
+for (const [limitTagged, autoChance, sendsSticker, keywordExemption = false, notice = '等我一下，我去画张图 <sticker:开心>'] of [[false, 0, true], [true, 0, false], [true, 1, true], [true, 0, true, true], [true, 0, true, true, '<sticker:开心>'], [true, 0, false, false, '<sticker:开心>']]) test(`慢工具优先发她自己写的话，标签概率限制 ${limitTagged}/${autoChance}/关键词${keywordExemption}/纯表情${notice === '<sticker:开心>'}`, async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const work = deferred()
+  t.after(() => work.resolve({ ok: true }))
+  let fake
+  const sent = []
+  const s = setup(t, {
+    cfg: config({ stickers: { enabled: true, limitTagged, autoChance, keywordExemption } }),
+    brain: async ({ callTool }) => {
+      const agent = [...fake.agents.values()][0]
+      fake.emit('session/event', agent.session, { type: 'assistant/message', data: { turn: 1, message: { content: [
+        { type: 'text', text: notice },
+        { type: 'tool-call', id: 'slow-auto-1', name: 'slow-auto', arguments: '{}' },
+      ] } } })
+      await callTool('slow-auto', {})
+      return ''
+    },
+    hooks: { send: async (segments, info) => { sent.push(info.note); return segments } },
+    stickers: { match: () => ({ name: '开心', md5: 'stub' }), segmentFor: () => ({ type: 'text', data: { text: '[表情] 开心' } }), markUsed() {} },
+    buildTools: () => [{ name: 'slow-auto', slow: true, execute: () => work.promise }],
+  })
+  fake = s.fake
+  await s.hub.onMessage(event())
+  await settle()
+  t.mock.timers.tick(1501)
+  await settle()
+  assert.equal(sent.some((x) => x.includes('等我一下，我去画')), notice.includes('我去画'))
+  assert.equal(sent.some((x) => x.includes('[表情] 开心')), sendsSticker)
+  assert.equal(sent.some((x) => x.includes('sticker:开心')), false)
+})
+
 test('慢工具提示等待发送挂钩时轮次结束，不再投递到 QQ', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] })
   const work = deferred(), sending = deferred()
@@ -98,32 +129,69 @@ test('慢工具提示等待发送挂钩时轮次结束，不再投递到 QQ', as
   assert.equal(s.calls.some((x) => x.action === 'send_private_msg'), false)
 })
 
+// 生图 notice 已经自己发过「正在做」提示（qq_draw_image 里 markSlowNotice）：hub 的 1.5s 兜底
+// 要跳过，不能把她的当轮正文再发一遍——同样的话会重复两条（2026-11-18 主人私聊实测）。
+test('工具调 markSlowNotice 后，慢工具兜底不再发她当轮正文', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const work = deferred()
+  t.after(() => work.resolve({ ok: true }))
+  let fake
+  const s = setup(t, {
+    cfg: config({ dryRun: false }),
+    brain: async ({ callTool }) => {
+      const agent = [...fake.agents.values()][0]
+      // 她当轮正文写了「我去画」，同时工具先自己把 notice 发出去并登记 markSlowNotice
+      fake.emit('session/event', agent.session, { type: 'assistant/message', data: { turn: 1, message: { content: [
+        { type: 'text', text: '哟 憋半天是想要这款 行 给你画 别太兴奋' },
+        { type: 'tool-call', id: 'slow-mark-1', name: 'slow-mark', arguments: '{}' },
+      ] } } })
+      const [sid] = [...s.hub.sessions().values()].map((x) => x.sessionId)
+      s.hub.markSlowNotice(sid)
+      await callTool('slow-mark', {})
+      return ''
+    },
+    buildTools: () => [{ name: 'slow-mark', slow: true, execute: () => work.promise }],
+  })
+  fake = s.fake
+  await s.hub.onMessage(event())
+  await settle()
+  t.mock.timers.tick(1501)
+  await settle()
+  assert.equal(s.calls.some((x) => x.action === 'send_private_msg' && JSON.stringify(x.params.message).includes('憋半天')), false,
+    'notice 已发过时兜底不能把当轮正文再发一遍')
+})
+
 function config(patch = {}) {
   return normalize({ enabled: true, dryRun: true, setupDone: true, ownerQQ: OWNER, botQQ: BOT,
     allow: { private: [OTHER], groups: [] }, voice: { enabled: false }, merge: { enabled: false },
-    stickers: { collect: true, caption: false, autoChance: 0 },
+    stickers: { collect: true, collectMode: 'ask', caption: false, autoChance: 0 },
     snowluma: { autoStart: false, autoAttach: false, dir: join(root, 'no-snowluma') }, ...patch })
 }
 
-function setup(t, { cfg = config(), brain = async () => '', hooks, buildTools, onebot, onCommand, onActivity } = {}) {
+function setup(t, { cfg = config(), brain = async () => '', hooks, buildTools, stickers, onebot, outbox, onCommand, onActivity } = {}) {
   process.env.AURABOT_DATA_DIR = mkdtempSync(join(root, 'data-'))
   const fake = createFakeDsh({ brain })
   const calls = []
-  const hub = createHub({ dsh: fake.ctx, getConfig: () => cfg,
+  const hub = createHub({ dsh: fake.ctx, getConfig: () => cfg, outbox,
     log: Object.fromEntries(['info', 'warn', 'error', 'debug'].map((k) => [k, (...v) => fake.logs.push(v.join(' '))])),
     onebot: onebot || { connected: true, async call(action, params) { calls.push({ action, params }); return { message_id: calls.length } } },
-    hooks, buildTools, onCommand, onActivity })
+    stickers, hooks, buildTools, onCommand, onActivity })
   fake.ctx.effect(() => fake.ctx.on('session/event', hub.onSessionEvent))
   t.after(() => { try { hub.dispose?.() } finally { fake.dispose() } })
   return { hub, fake, calls }
 }
 
-test('同一会话连续重载两轮：旧工具、上下文、限制全部清理，重新挂新工具', { timeout: 5000 }, async (t) => {
+test('同一会话连续重载两轮：工具、上下文、限制全部清理，并读取新主人状态和新表情', { timeout: 5000 }, async (t) => {
   const data = mkdtempSync(join(root, 'host-'))
   process.env.AURABOT_DATA_DIR = data
   writeFileSync(join(data, 'config.json'), JSON.stringify(config({ bridge: { dshTools: true } })))
-  const fake = createFakeDsh({ brain: async ({ callTool }) => {
-    await callTool('qq_set_nickname', { name: '大肥鱼' })
+  const fake = createFakeDsh({ brain: async ({ text, callTool }) => {
+    if (text.includes('collect')) await callTool('qq_collect_sticker', { index: 1, name: '新表情' })
+    else {
+      await callTool('qq_set_nickname', { name: '大肥鱼' })
+      await callTool('qq_set_signature', { text: '新签名' })
+      await callTool('qq_whitelist', { action: 'add', kind: 'private', id: '30000003' })
+    }
     return ''
   } })
   t.after(() => fake.dispose())
@@ -145,7 +213,28 @@ test('同一会话连续重载两轮：旧工具、上下文、限制全部清�
     assert.ok(agent.denied.has('aurabot_qq_send'), '联动全局工具应在 QQ 会话中被屏蔽')
     assert.notEqual(agent.tools.get('qq_set_nickname'), previousTool, '每次加载应绑定新工具')
     previousTool = agent.tools.get('qq_set_nickname')
-    for (const call of fake.turns.at(-1).toolCalls) assert.equal(call.result.ok, true, `${call.name}: ${call.result.message || ''}`)
+    for (const call of fake.turns.at(-1).toolCalls) assert.equal(call.result.ok, true, `${call.name}: ${call.result.message}`)
+
+    // 从新中枢接收图片，再实际调用收表情工具，不能只检查暂存文件存在。
+    const turnCount = fake.turns.length
+    await api.hub.onMessage(event('collect', [image(round + 1)]))
+    for (let i = 0; fake.turns.length === turnCount && i < 100; i++) await new Promise((r) => setTimeout(r, 10))
+    assert.ok(fake.turns.length > turnCount)
+    const collected = fake.turns.at(-1).toolCalls.find((c) => c.name === 'qq_collect_sticker')
+    assert.equal(collected?.result.ok, true, collected?.result.message)
+    const library = JSON.parse(readFileSync(join(data, 'stickers', 'index.json'), 'utf8'))
+    assert.equal(library.items.length, round + 1, '应收下本轮的新图片，而非旧缓存图片')
+    const now = Date.now
+    try {
+      Date.now = () => now() + 31 * 60_000
+      assert.equal(api.hub.stickerOf(CHAT, 1), null, '原有过期规则仍有效')
+    } finally { Date.now = now }
+
+    await api.hub.pushToSession(ownerChat, [{ type: 'text', text: '非主人尝试修改' }], OTHER)
+    for (const call of fake.turns.at(-1).toolCalls) {
+      assert.equal(call.result.ok, false)
+      assert.match(call.result.message, /只有主人/)
+    }
     fake.dispose()
     assert.deepEqual([...agent.tools.keys()], ['external-tool'], '卸载后仅保留外部工具')
     assert.deepEqual([...agent.contexts.keys()], ['external-context'])
@@ -155,6 +244,7 @@ test('同一会话连续重载两轮：旧工具、上下文、限制全部清�
   }
   assert.equal(fake.logs.filter((line) => /already registered|dup aurabot_/.test(line)).length, 0)
 })
+
 test('会话恢复等待中卸载，恢复结果不能重新挂载工具或启动轮次', { timeout: 5000 }, async (t) => {
   const { hub, fake } = setup(t, { buildTools: () => [{ name: 'test-tool' }] })
   await hub.pushToSession(ownerChat, [{ type: 'text', text: '先建会话' }], OWNER)
@@ -369,3 +459,182 @@ test('卸载会结束后台回复等待，而不用等模型或超时', { timeou
   assert.equal(result.code, 'AURABOT_DISPOSED')
 })
 
+test('卸载会结束调试面板的回复等待', { timeout: 5000 }, async (t) => {
+  const { hub, fake } = setup(t, { cfg: config({ debug: true }) })
+  const followup = deferred()
+  const entered = deferred()
+  t.after(() => followup.resolve())
+  const create = fake.ctx.services.sessionController.create
+  fake.ctx.services.sessionController.create = async (args) => {
+    const result = await create(args)
+    fake.agents.get(result.sessionId).followup = () => { entered.resolve(); return followup.promise }
+    return result
+  }
+  const work = hub.debugSay('调试等待', { timeoutMs: 5000 })
+  await entered.promise
+  hub.dispose()
+  const result = await withDeadline(work)
+  assert.equal(result.ok, false)
+  assert.match(result.message, /已卸载/)
+})
+
+test('注销函数重复调用不会删掉后来注册的同名工具和上下文', async () => {
+  const fake = createFakeDsh({ brain: async () => '' })
+  const { sessionId } = await fake.ctx.services.sessionController.create({ agentPreset: 'test' })
+  const agent = fake.agents.get(sessionId)
+  const oldTool = agent.ctx.tools.register({ name: 'one' })
+  assert.throws(() => agent.ctx.tools.register({ name: 'one' }), /already registered/)
+  oldTool()
+  const newTool = { name: 'one' }
+  agent.ctx.tools.register(newTool)
+  oldTool()
+  assert.equal(agent.tools.get('one'), newTool)
+  const oldContext = agent.ctx.systemPrompt.context({ name: 'ctx' })
+  assert.throws(() => agent.ctx.systemPrompt.context({ name: 'ctx' }), /already registered/)
+  oldContext()
+  const newContext = { name: 'ctx' }
+  agent.ctx.systemPrompt.context(newContext)
+  oldContext()
+  assert.equal(agent.contexts.get('ctx'), newContext)
+  const first = agent.ctx.tools.restrict({ deny: ['shared'] })
+  const second = agent.ctx.tools.restrict({ deny: ['shared'] })
+  first()
+  first()
+  assert.equal(agent.denied.has('shared'), true)
+  second()
+  assert.equal(agent.denied.has('shared'), false)
+})
+test('网关明确没连上时，发送失败的消息进补发队列', { timeout: 5000 }, async (t) => {
+  const { createOutbox } = await import('../src/onebot/outbox.js')
+  const dir = mkdtempSync(join(root, 'outbox-'))
+  const outbox = createOutbox({ log: { info() {}, warn() {}, debug() {} }, file: join(dir, 'queue.json') })
+  let calls = 0
+  const onebot = {
+    connected: false,
+    async call() {
+      calls++
+      throw new OneBotError('send_private_msg', { message: '没连上 QQ 网关' }, { transport: true })
+    },
+  }
+  const { hub } = setup(t, { cfg: config({ dryRun: false }), onebot, outbox })
+  const r = await hub.sendText('private:' + OTHER, '测试补发')
+  assert.equal(r && r.queued, true, '确定没发出去的发送应返回 queued')
+  assert.equal(calls, 1)
+  assert.equal(outbox.status().count, 1, '消息应进补发队列')
+})
+
+test('LA-27 敏感命令发送失败时不记录参数、回执和网关错误，也不补发', async (t) => {
+  const { createOutbox } = await import('../src/onebot/outbox.js')
+  const dir = mkdtempSync(join(root, 'outbox-'))
+  const outbox = createOutbox({ log: { info() {}, warn() {}, debug() {} }, file: join(dir, 'queue.json') })
+  const onebot = {
+    connected: false,
+    async call(action) {
+      if (action !== 'send_private_msg') return []
+      throw new OneBotError(action, { message: '合成网关错误' }, { transport: true })
+    },
+  }
+  const { hub, fake } = setup(t, {
+    cfg: config({ dryRun: false }), onebot, outbox,
+    onCommand: async (_msg, markSensitive) => {
+      markSensitive('news')
+      return '合成回执'
+    },
+  })
+  await hub.onMessage(event('/news 合成查询地区'))
+  const logs = fake.logs.join('\n')
+  assert.match(logs, /主人命令 \/news/)
+  assert.match(logs, /敏感命令回执发送失败/)
+  assert.doesNotMatch(logs, /合成查询地区|合成回执|合成网关错误/)
+  assert.equal(outbox.status().count, 0)
+})
+
+for (const [label, owners, shouldSend] of [
+  ['同一主人保存普通配置', [OWNER], true],
+  ['切换主人', [OTHER], false],
+  ['切换主人再切回', [OTHER, OWNER], false],
+]) {
+  test(`敏感回执等待发送时${label}`, async (t) => {
+    const entered = deferred()
+    const resume = deferred()
+    t.after(() => resume.resolve())
+    const cfg = config({ dryRun: false })
+    const { hub, calls } = setup(t, {
+      cfg,
+      hooks: { send: async (message) => { entered.resolve(); await resume.promise; return message } },
+      onCommand: async (_msg, markSensitive) => {
+        assert.equal(markSensitive('events'), true)
+        return '合成回执'
+      },
+    })
+    Object.assign(cfg, saveConfig(cfg, cfg))
+    assert.ok(ownerAuthorizationRevision(cfg))
+    const work = hub.onMessage(event('/events'))
+    await entered.promise
+    for (const ownerQQ of owners) {
+      const previousRevision = ownerAuthorizationRevision(cfg)
+      const sameOwner = cfg.ownerQQ === ownerQQ
+      Object.assign(cfg, saveConfig({ ...cfg, ownerQQ, ownerName: '保存后的昵称' }, cfg))
+      assert.equal(ownerAuthorizationRevision(cfg) === previousRevision, sameOwner)
+    }
+    resume.resolve()
+    await work
+    assert.equal(calls.some(({ action }) => action === 'send_private_msg'), shouldSend)
+  })
+}
+
+test('敏感命令执行前发现授权代次已变化', async (t) => {
+  const entered = deferred()
+  const resume = deferred()
+  t.after(() => resume.resolve())
+  const cfg = config({ dryRun: false })
+  let executed = false
+  const { hub } = setup(t, {
+    cfg,
+    onebot: {
+      connected: true,
+      async call(action) {
+        assert.equal(action, 'get_friend_list')
+        entered.resolve()
+        await resume.promise
+        return []
+      },
+    },
+    onCommand: async (_msg, markSensitive) => {
+      if (!markSensitive('events')) return ''
+      executed = true
+      return '合成回执'
+    },
+  })
+  Object.assign(cfg, saveConfig(cfg, cfg))
+  const work = hub.onMessage(event('/events'))
+  await entered.promise
+  for (const ownerQQ of [OTHER, OWNER]) Object.assign(cfg, saveConfig({ ...cfg, ownerQQ }, cfg))
+  resume.resolve()
+  await work
+  assert.equal(executed, false)
+})
+
+
+test('用量接入：真实会话事件记一次，失败重试分别记，非 Aurabot 会话不记', async (t) => {
+  const s = setup(t)
+  const usage = await import('../src/core/usage.js')
+  usage.initUsage()
+  t.after(() => usage.closeUsage())
+  await s.hub.onMessage(event('建立用量测试会话'))
+  await settle()
+  const sid = s.hub.sessions()[CHAT]?.sessionId
+  assert.ok(sid)
+  const at = Date.now()
+  const e = { seq: 10000, time: at, type: 'assistant/attempt', data: { turn: 70, step: 0, usage: { inputTokens: 100, outputTokens: 10, cacheReadTokens: 800, cacheWriteTokens: 100 } } }
+  s.hub.onSessionEvent({ id: sid }, e)
+  s.hub.onSessionEvent({ id: sid }, e)
+  s.hub.onSessionEvent({ id: 'session-unrelated' }, e)
+  const read = () => usage.usageReport({ range: 'all' }).current
+  assert.equal(read().totalTokens, 1010)
+  assert.equal(read().byChat[0].key, CHAT)
+  s.hub.onSessionEvent({ id: sid }, { seq: 10001, time: at, type: 'llm/retry-started', data: { turn: 70, step: 0 } })
+  s.hub.onSessionEvent({ id: sid }, { ...e, seq: 10002 })
+  assert.equal(read().runs, 2)
+  assert.equal(read().totalTokens, 2020)
+})

@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { planDiaryTimes } from '../src/features/qzone.js'
-import { moodLabel, scoreText, decayed } from '../src/features/companion.js'
+import { moodLabel, scoreText, decayed } from '../src/features/mood.js'
 import { matchSticker, pickForReply } from '../src/features/stickers.js'
 import { pickBotProcess, readOneBotEndpoint } from '../src/snowluma/manager.js'
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
@@ -18,6 +18,21 @@ test('日记排期：窗口内、间隔够、按时间排序', () => {
     assert.ok(t[1] - t[0] >= 180)
   }
   assert.deepEqual(planDiaryTimes({ timesPerDay: 0, windowStart: '10:00', windowEnd: '23:30', minGapMinutes: 180 }), [])
+})
+
+test('日记排期：跨天窗口也排得出来，from==to 按全天处理', () => {
+  let seed = 7
+  const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647)
+  // 22:00–次日 02:00：每个点都得落在 22–24 或 0–2 点
+  for (let i = 0; i < 50; i++) {
+    const t = planDiaryTimes({ timesPerDay: 2, windowStart: '22:00', windowEnd: '02:00', minGapMinutes: 60 }, rand)
+    assert.equal(t.length, 2)
+    for (const m of t) assert.ok(m >= 1320 || m < 120, `跨天窗口排出了 ${m} 分钟`)
+  }
+  // from === to = 全天（与 proactive-policy 的约定一致），不再返回空
+  const full = planDiaryTimes({ timesPerDay: 2, windowStart: '08:00', windowEnd: '08:00', minGapMinutes: 60 }, rand)
+  assert.equal(full.length, 2)
+  for (const m of full) assert.ok(m >= 0 && m < 1440)
 })
 
 test('心情：关键词推动、半衰期回落', () => {
@@ -116,7 +131,7 @@ test('心情：对她说的话、主人的话影响更大；心情明显时每�
   const prev = process.env.AURABOT_DATA_DIR
   process.env.AURABOT_DATA_DIR = mkdtempSync(join(tmpdir(), 'aurabot-mood-'))
   try {
-    const { createMood, moodEffects } = await import('../src/features/companion.js')
+    const { createMood, moodEffects } = await import('../src/features/mood.js')
     const { normalize } = await import('../src/core/config.js')
     const m = createMood({ getConfig: () => normalize({}) })
     const v0 = m.current()
@@ -164,7 +179,7 @@ test('模型判心情：解析结果，没把握的不算，开了就不再按�
   const prev = process.env.AURABOT_DATA_DIR
   process.env.AURABOT_DATA_DIR = mkdtempSync(join(tmpdir(), 'aurabot-judge-'))
   try {
-    const { createMood, parseMoodJudge } = await import('../src/features/companion.js')
+    const { createMood, parseMoodJudge } = await import('../src/features/mood.js')
     const { normalize } = await import('../src/core/config.js')
     assert.deepEqual(parseMoodJudge('好的 {"delta": 30, "reason": "被夸了", "confidence": 0.9}'), { delta: 15, reason: '被夸了', confidence: 0.9 })
     assert.equal(parseMoodJudge('不是 JSON'), null)
@@ -196,15 +211,16 @@ test('语音：语速 / 音调只认 ±N% 和 ±NHz，写着玩的和超范围�
   assert.equal(v({ pitch: '-10hz' }).pitch, '-10Hz', '大小写不敏感')
   assert.equal(v({ pitch: '999Hz' }).pitch, '+80Hz', '超范围夹到 ±80Hz（滑条上限）')
   assert.equal(v({ pitch: '-999Hz' }).pitch, '-80Hz')
-  assert.equal(v({ pitch: '+0Hz' }).pitch, '+0Hz', '0 也要带正号，否则滑条/下拉框对不上')
-  assert.equal(v({ pitch: '0Hz' }).pitch, '+0Hz', '缺正号的补上')
+  assert.equal(v({ pitch: '+80Hz' }).pitch, '+80Hz', '边界值保留')
   assert.equal(v({ pitch: '大声点' }).pitch, '+0Hz', '乱写的回落默认')
   assert.equal(v({ pitch: '' }).pitch, '+0Hz')
-  // 语速（edge-tts 的 --rate）
+  assert.equal(v({ pitch: '+0Hz' }).pitch, '+0Hz', '0 也要带正号，否则下拉框对不上选项')
+  assert.equal(v({ pitch: '0Hz' }).pitch, '+0Hz', '缺正号的补上')
+  // 语速
   assert.equal(v({ rate: '+10%' }).rate, '+10%')
   assert.equal(v({ rate: '-5%' }).rate, '-5%')
   assert.equal(v({ rate: '999%' }).rate, '+50%')
+  assert.equal(v({ rate: '快一点' }).rate, '+0%')
   assert.equal(v({ rate: '+0%' }).rate, '+0%', '正常语速也要带正号')
   assert.equal(v({ rate: '0%' }).rate, '+0%')
-  assert.equal(v({ rate: '快一点' }).rate, '+0%')
 })

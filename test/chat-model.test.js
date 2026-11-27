@@ -178,3 +178,41 @@ test('聊天里的人说「换模型」换不了：只有主人的设置能改',
   assert.equal(JSON.stringify(JSON.parse(readFileSync(join(dataDir, 'config.json'), 'utf8')).chatModels), before)
   assert.equal(lastSel(`private:${FRIEND}`).model, 'fake-1')
 })
+
+test('/effort 读取当前 DSH 模型档位并用于下一轮，切换模型后更新选项', async () => {
+  const chatId = `private:${OWNER}`
+  let currentModel = 'fake-1'
+  fake.ctx.services.agentDefaultModel.currentSelection = () => ({ provider: 'fake', model: currentModel })
+  const probes = []
+  fake.ctx.llm.resolveModelInfo = async (_, model) => {
+    probes.push(model)
+    return { reasoning: model === 'fake-1'
+      ? { efforts: [{ id: 'minimal' }, { id: 'medium' }, { id: 'xhigh' }], defaultEffort: 'medium' }
+      : model === 'm-owner' ? { efforts: ['low', 'high', 'xhigh'], defaultEffort: 'low' } : undefined }
+  }
+  const command = async (text) => {
+    const { sent } = await api.hub.capture(() => api.hub.onMessage(privMsg(OWNER, text)))
+    return sent.flatMap((message) => message.message).map((segment) => segment.data?.text || '').join('\n')
+  }
+  assert.match(await command('/effort'), /2\. medium ← 当前[\s\S]*3\. xhigh/)
+  assert.deepEqual(probes, ['fake-1'])
+  assert.match(await command('/effort 3'), /已设为 xhigh/)
+  await fake.call('/save', { ownerName: '测试', chatEfforts: {} })
+  assert.deepEqual(api.getConfig().chatEfforts, { [chatId]: { '["fake","fake-1"]': 'xhigh' } })
+  assert.equal(api.getConfig().chatModels.privates[OWNER], undefined)
+  mock.push(privMsg(OWNER, '设置后下一句'))
+  await until(() => lastSel(chatId)?.reasoningEffort === 'xhigh')
+  currentModel = 'm-owner'
+  probes.length = 0
+  const next = await command('/effort')
+  assert.deepEqual(probes, ['m-owner'])
+  assert.match(next, /当前模型 m-owner[\s\S]*1\. low ← 当前[\s\S]*2\. high/)
+  assert.doesNotMatch(next, /xhigh ← 当前/)
+  assert.match(await command('/effort medium'), /可选 low、高|可选 low、high/)
+  currentModel = 'fake-1'
+  assert.match(await command('/effort'), /xhigh ← 当前/)
+  assert.match(await command('/effort 默认'), /已恢复跟随/)
+  assert.deepEqual(api.getConfig().chatEfforts, {})
+  currentModel = 'm-pdef'
+  assert.match(await command('/effort'), /没有可选的思考档位/)
+})

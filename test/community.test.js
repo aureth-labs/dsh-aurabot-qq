@@ -56,10 +56,26 @@ function setup(packs, { cfg = {}, revoked = [], status = [] } = {}) {
     return { ok: true, arrayBuffer: async () => p.buf }
   }
   const mods = { status: () => status, sync: async () => {}, stop: () => true }
-  const log = { info() {}, warn() {} }
+  const logs = []
+  const log = { info: (...args) => logs.push(args.join(' ')), warn() {} }
   const c = createCommunity({ mods, getConfig: () => config, setConfig: (n) => { config = n }, log, version: '1.2.0', registryUrl: 'https://x/index.json', fetcher })
-  return { c, cfg: () => config }
+  return { c, cfg: () => config, logs }
 }
+
+test('registry 地址：配置 ext.market.registryUrl 优先于内置，并暴露 registryUrl()', async () => {
+  const config = { ext: { market: { registryUrl: 'https://self-host.example.com/index.json' } } }
+  const seen = []
+  const fetcher = async (url) => { seen.push(url); if (url.endsWith('index.json')) return { ok: true, json: async () => ({ schema: 1, assetsBase: 'https://x/', modules: [] }) }; return { ok: true, arrayBuffer: async () => Buffer.from('') } }
+  const c = createCommunity({ mods: { status: () => [], sync: async () => {}, stop: () => true }, getConfig: () => config, setConfig() {}, log: { info() {}, warn() {} }, version: '1.2.0', fetcher })
+  assert.equal(c.registryUrl(), 'https://self-host.example.com/index.json')
+  await c.list()
+  assert.equal(seen[0], 'https://self-host.example.com/index.json')
+})
+
+test('registry 地址：配置为空时回落内置默认', async () => {
+  const c = createCommunity({ mods: { status: () => [], sync: async () => {}, stop: () => true }, getConfig: () => ({}), setConfig() {}, log: { info() {}, warn() {} }, version: '1.2.0', fetcher: async () => ({ ok: true, json: async () => ({ schema: 1, modules: [] }) }) })
+  assert.equal(c.registryUrl(), 'https://raw.githubusercontent.com/aureth-labs/dsh-aurabot-qq-mods/registry/index.json')
+})
 
 before(async () => {
   root = mkdtempSync(join(tmpdir(), 'aurabot-community-'))
@@ -172,17 +188,58 @@ test('版本、撤回、依赖不满足不让装；更新替换旧文件', async
   assert.equal(existsSync(join(userDir(), 'demo-g', 'old.txt')), false)
 })
 
-test('替换内置要确认；卸载默认保留设置，purge 才清', async () => {
+test('一键更新：可更新的都升上去，坏的那个不中断其它的', async () => {
+  await setup([pack('upd-a', '1.0.0')]).c.install('upd-a')
+  await setup([pack('upd-b', '1.0.0')]).c.install('upd-b')
+  // upd-b 的新版本安装包里没有入口文件 → 更新会失败，但 upd-a 应该照常升上去
+  const brokenBuf = zip({ 'module.json': JSON.stringify({ id: 'upd-b', version: '1.1.0' }) })
+  const broken = {
+    buf: brokenBuf,
+    entry: { id: 'upd-b', name: 'upd-b', version: '1.1.0', api: 1, minPluginVersion: '1.0.0', requires: [], capabilities: [], path: 'upd-b/upd-b.zip', sha256: createHash('sha256').update(brokenBuf).digest('hex') },
+  }
+  const s = setup([pack('upd-a', '1.1.0'), broken])
+  const r = await s.c.updateAll()
+  assert.equal(r.updated.length, 1, JSON.stringify(r))
+  assert.equal(r.updated[0].id, 'upd-a')
+  assert.equal(r.failed.length, 1, JSON.stringify(r))
+  assert.equal(r.failed[0].id, 'upd-b')
+  assert.match(r.failed[0].message, /入口文件|装好/)
+  assert.equal(JSON.parse(readFileSync(join(userDir(), 'upd-a', '.aurabot-source.json'), 'utf8')).version, '1.1.0')
+  assert.equal(s.c.progress(), null)
+})
+
+test('一键更新：没有可更新时说人话，不报错', async () => {
+  const s = setup([pack('upd-z', '1.0.0')])
+  const r = await s.c.updateAll()
+  assert.equal(r.ok, true)
+  assert.equal(r.updated.length, 0)
+  assert.match(r.message, /没有可更新/)
+})
+
+test('替换内置要确认；卸载保留源码改动，purge 才清数据和设置', async () => {
   const p = pack('demo-h', '1.0.0')
   p.entry.replacesBuiltin = true
   const s = setup([p], { cfg: { ext: { 'demo-h': { a: 1 } } } })
   assert.equal((await s.c.install('demo-h')).needConfirm, true)
   assert.equal((await s.c.install('demo-h', { confirmReplace: true })).ok, true)
-  await s.c.remove('demo-h')
+  const data = join(root, 'modules-data', 'demo-h')
+  mkdirSync(data, { recursive: true })
+  writeFileSync(join(data, 'state.json'), '{}')
+  writeFileSync(join(userDir(), 'demo-h', 'local.patch'), '我的改动')
+  const first = await s.c.remove('demo-h')
+  assert.equal(first.ok, true, first.message)
   assert.equal(existsSync(join(userDir(), 'demo-h')), false)
+  assert.match(first.archive, /^modules\/\.trash\/demo-h-/)
+  assert.equal(readFileSync(join(root, first.archive, 'local.patch'), 'utf8'), '我的改动')
+  assert.equal(existsSync(join(data, 'state.json')), true)
   assert.equal(s.cfg().ext['demo-h'].a, 1)
+  assert.ok(s.logs.some((line) => line.includes('面板卸载社区模块「demo-h」') && line.includes(first.archive)))
   await s.c.install('demo-h', { confirmReplace: true })
-  await s.c.remove('demo-h', { purge: true })
+  const second = await s.c.remove('demo-h', { purge: true })
+  assert.equal(second.ok, true, second.message)
+  assert.notEqual(second.archive, first.archive)
+  assert.equal(readFileSync(join(root, first.archive, 'local.patch'), 'utf8'), '我的改动')
+  assert.equal(existsSync(data), false)
   assert.equal(s.cfg().ext['demo-h'], undefined)
 })
 
@@ -218,11 +275,13 @@ test('测试版：版本比较、更新通道、市场最低版本', async () =>
   assert.equal(u.compareVersions('1.1.24', '1.1.24'), 0)
   assert.equal(compareVersions('1.2.0', '1.2.0-beta.1'), 0)
   const urls = []
-  const check = u.createUpdateChecker({ pkg: { version: '1.2.0-beta.1', repository: 'https://github.com/a/b' }, fetchImpl: async (url) => { urls.push(url); return { ok: true, json: async () => ({ version: '1.2.0-beta.2' }) } } })
+  const feed = '<feed><entry><updated>2026-11-01T00:00:00Z</updated><link rel="alternate" href="https://github.com/a/b/releases/tag/v1.2.0-beta.2"/><title>beta</title></entry></feed>'
+  const check = u.createUpdateChecker({ pkg: { version: '1.2.0-beta.1', repository: 'https://github.com/a/b' }, fetchImpl: async (url) => { urls.push(url); return { ok: true, text: async () => feed } } })
   const r = await check({ force: true })
-  assert.match(urls[0], /\/beta\/package\.json$/)
+  assert.match(urls[0], /releases\.atom$/)
   assert.equal(r.newer, true)
-  assert.match(r.command, /github:a\/b#beta$/)
+  assert.equal(r.latest, '1.2.0-beta.2')
+  assert.match(r.command, /#v1\.2\.0-beta\.2$/)
   assert.equal(u.channelOf('1.2.0'), 'main')
 })
 
@@ -240,11 +299,18 @@ test('安装：id 必须是白名单（防被篡改索引/调用方越目录写�
   }
 })
 
-test('安装：替换内置必须确认，索引 replacesBuiltin 漏填也拦（按真实内置目录判断）', async () => {
+test('安装：替换内置必须确认，索引 replacesBuiltin 漏填也拦（按已注册内置判断）', async () => {
   const p = pack('memory', '9.9.9')
-  const { c } = setup([p])
+  const { c } = setup([p], { status: [{ id: 'memory', builtin: true }] })
   const r = await c.install('memory')
   assert.equal(r.ok, false)
   assert.equal(r.needConfirm, true)
   assert.match(String(r.message), /替换内置/)
+})
+
+test('安装：内置目录残留但未注册（群管）不再要求确认', async () => {
+  const p = pack('group-admin', '1.0.0')
+  const { c } = setup([p])
+  const r = await c.install('group-admin')
+  assert.equal(r.ok, true)
 })

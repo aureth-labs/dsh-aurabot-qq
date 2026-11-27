@@ -54,7 +54,7 @@ test('收到的系统表情按名字给她看，认不出才写 [表情]', () =>
 })
 
 test('提示词：开着就教她写 <face:名字>，关了就不提', () => {
-  assert.match(rulesText('private', normalize({ ownerQQ: '1' })), /<face:捂脸>/)
+  assert.match(rulesText('private', normalize({ ownerQQ: '1' })), /<face:名字>/)
   assert.doesNotMatch(rulesText('private', normalize({ ownerQQ: '1', stickers: { faces: false } })), /<face:/)
 })
 test('语音文本拆分：表情不念出来，但要留着补发（<face:名字> 原文保留）', () => {
@@ -70,4 +70,50 @@ test('语音文本拆分：表情不念出来，但要留着补发（<face:名�
   assert.deepEqual(splitSpeakable('好<face:这是一个特别特别长的表情名字>呀'), { spoken: '好<face:这是一个特别特别长的表情名字>呀', extras: '' }, '超长名字不算 face 标签，和以前一样留在要念的字里')
   assert.deepEqual(splitSpeakable('普通的话'), { spoken: '普通的话', extras: '' })
   assert.equal(speakableText('<face:呲牙>晚安😁'), '晚安', '老接口行为不变')
+})
+
+test('语音文本拆分：颜文字和连着堆的符号不念（TTS 会把它们拉成怪声）', () => {
+  // 2026-11-06 真实事故：这句合成出 15.5 秒音频（同样长度正常句子 3 秒），后半段全是气声，群友听成乱码
+  assert.deepEqual(splitSpeakable('那可不 有人给续着 我就谢天谢地了 (￣▽￣)'), { spoken: '那可不 有人给续着 我就谢天谢地了', extras: '' }, '整个颜文字摘掉，前面的正经话一个字不少')
+  assert.deepEqual(splitSpeakable('等等……我还没说完'), { spoken: '等等 我还没说完', extras: '' }, '中文省略号是两个符号连着，同样会拖长')
+  assert.deepEqual(splitSpeakable('（￣▽￣）'), { spoken: '', extras: '' }, '一条语音只有颜文字，没得念，由调用方改发文字')
+  assert.deepEqual(splitSpeakable('好(´･ω･`)呀'), { spoken: '好 呀', extras: '' }, '字母打头的颜文字也要拆散（ω 是希腊字母，单列了才有这个结果）')
+  assert.deepEqual(splitSpeakable('打游戏还是你自己动手 我连手都没有 (￣▽￣)'), { spoken: '打游戏还是你自己动手 我连手都没有', extras: '' }, '句尾挂颜文字是最常见的形态，和事故那条同形')
+  // 下面几条是「别擦过头」的：符号单个出现都是正常标点，念得出来
+  assert.deepEqual(splitSpeakable('3.5 寸的盘'), { spoken: '3.5 寸的盘', extras: '' }, '小数点是单个符号，留着')
+  assert.deepEqual(splitSpeakable('32G 现在一千二三 到一千五，三千那价'), { spoken: '32G 现在一千二三 到一千五，三千那价', extras: '' }, '中文逗号句号都是单个，不动')
+  assert.deepEqual(splitSpeakable('Ciallo～吃饭啦'), { spoken: 'Ciallo～吃饭啦', extras: '' }, '单个波浪号念得出来，留着')
+  assert.deepEqual(splitSpeakable('<face:捂脸>……'), { spoken: '', extras: '<face:捂脸>' }, '表情照常补发')
+  assert.equal(speakableText('等等……我还没说完'), '等等 我还没说完', 'speakableText 是 splitSpeakable 的薄封装，清洗对它一样生效')
+})
+
+test('语音文本拆分：括号里的动作描写整段不念（TTS 会把「鳍耳竖起来」念出来）', () => {
+  assert.deepEqual(splitSpeakable('（鳍耳竖起来）好啦好啦，我这就去'), { spoken: '好啦好啦，我这就去', extras: '' }, '括号动作摘掉，正文一个字不少')
+  assert.deepEqual(splitSpeakable('晚安😁（尾巴啪地拍了下地面）'), { spoken: '晚安', extras: '😁' }, '括号里的动作和括号外的 emoji 各归各的')
+  assert.deepEqual(splitSpeakable('(๑•̀ㅂ•́)و✧冲了'), { spoken: '冲了', extras: '' }, '括号摘掉后剩下的颜文字尾巴也擦干净')
+  assert.deepEqual(splitSpeakable('（笑）好'), { spoken: '好', extras: '' })
+  assert.deepEqual(splitSpeakable('（未闭合括号 好'), { spoken: '未闭合括号 好', extras: '' }, '没有右括号时不整段摘，只擦括号符号，别吞正文')
+  assert.deepEqual(splitSpeakable('这是 3.5 秒的音频'), { spoken: '这是 3.5 秒的音频', extras: '' }, '没有括号时一个字不动')
+  assert.deepEqual(splitSpeakable('（' + '很长的说明'.repeat(10) + '）好'), { spoken: '很长的说明'.repeat(10) + ' 好', extras: '' }, '超过 40 字的括号不整段摘，只擦括号符号（防止误伤正文）')
+})
+
+test('语音文本拆分：Breeze 音频标签保持原样（句首 / 连续标签边界不能被符号清洗吃掉）', () => {
+  // Breeze 中文音频标签用方括号：[咯咯笑] / [叹气] / [打哈欠]…，必须原样传给 TTS；
+  // 之前 SYMBOL_RUN 会把「][」「]，」当成连着堆的符号擦掉，导致标签失效被照字念。
+  assert.deepEqual(splitSpeakable('[咯咯笑]你好'), { spoken: '[咯咯笑]你好', extras: '' }, '句首标签完整保留')
+  assert.deepEqual(splitSpeakable('[咯咯笑]，你好'), { spoken: '[咯咯笑]，你好', extras: '' }, '句首标签后面的逗号不能吃掉右括号')
+  assert.deepEqual(splitSpeakable('[叹气]！今天好累'), { spoken: '[叹气]！今天好累', extras: '' }, '句首标签后面的感叹号同理')
+  assert.deepEqual(splitSpeakable('你好[咯咯笑]。'), { spoken: '你好[咯咯笑]。', extras: '' }, '句尾标签的方括号不能被擦掉')
+  assert.deepEqual(splitSpeakable('[咯咯笑][叹气]你好'), { spoken: '[咯咯笑][叹气]你好', extras: '' }, '两个连续标签不能合并成 [咯咯笑 叹气]')
+  assert.deepEqual(splitSpeakable('[笑][偷笑][咯咯笑]你好呀'), { spoken: '[笑][偷笑][咯咯笑]你好呀', extras: '' }, '三个连续标签逐个保留')
+  assert.deepEqual(splitSpeakable('（鳍耳竖起来）[咯咯笑]好啦'), { spoken: '[咯咯笑]好啦', extras: '' }, '括号动作照常摘，音频标签不受影响')
+  assert.deepEqual(splitSpeakable('[笑]'), { spoken: '[笑]', extras: '' }, '只有音频标签的语音也要能念')
+})
+
+test('#6 语音不念 QQ 号和尖括号标签：@ 挪到单独发的文字里，长串号码不念', () => {
+  assert.deepEqual(splitSpeakable('好呀 <at:1234567890> 来了'), { spoken: '好呀 来了', extras: '<at:1234567890>' })
+  assert.equal(splitSpeakable('那个人叫 1234567890 你认识吗').spoken.includes('1234567890'), false)
+  assert.equal(splitSpeakable('<reply:3>好的</poke>').spoken, '好的')
+  assert.equal(splitSpeakable('今年 2026 年，价格 199 块').spoken, '今年 2026 年，价格 199 块')
+  assert.equal(splitSpeakable('[咯咯笑][叹气]你好').spoken, '[咯咯笑][叹气]你好')
 })

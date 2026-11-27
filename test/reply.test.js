@@ -1,0 +1,109 @@
+// 上下文插件给历史消息带的消息编号（m00896b 这种）偶尔会被模型抄进正文，
+// 得在解析入口剥掉，不然编号会当成正文发到 QQ。
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { parseReply } from '../src/chat/reply.js'
+
+const texts = (r) => r.items.filter((i) => i.kind === 'text').map((i) => i.value)
+
+test('整段只有一个消息编号：剥完是空的，按沉默处理，不发', () => {
+  assert.deepEqual(parseReply('m00896b'), { silent: true, items: [] })
+})
+
+test('编号 + [沉默]：只留下沉默判定，一条都不发', () => {
+  assert.deepEqual(parseReply('m00896b\n\n\n[沉默]'), { silent: true, items: [] })
+})
+
+test('编号在行首：剥掉编号，正文照发', () => {
+  assert.deepEqual(texts(parseReply('m00879b，两个 512 加起来本来就 1T')), ['两个 512 加起来本来就 1T'])
+  assert.deepEqual(texts(parseReply('m00884b 1T 玩游戏确实紧')), ['1T 玩游戏确实紧'])
+})
+
+test('编号在第二行：只剥那一行', () => {
+  assert.deepEqual(texts(parseReply('先说一句\nm00795b 这话有理')), ['先说一句', '这话有理'])
+})
+
+test('编号在行中 / 行尾：也要剥', () => {
+  assert.deepEqual(texts(parseReply('他说 m00896b 那条不算')), ['他说 那条不算'])
+  assert.deepEqual(texts(parseReply('这话有理 m00879b')), ['这话有理'])
+})
+
+test('同一行好几个编号：全剥', () => {
+  assert.deepEqual(texts(parseReply('m00879b m00884b 两条都看了')), ['两条都看了'])
+})
+
+test('多粘了字母的编号（m00879bb）整个吃掉，不留残字', () => {
+  assert.deepEqual(texts(parseReply('m00879bb 双后缀')), ['双后缀'])
+})
+
+test('4 位的打印机型号不是编号，不能误伤', () => {
+  assert.deepEqual(texts(parseReply('m1005 又卡纸了')), ['m1005 又卡纸了'])
+  assert.deepEqual(texts(parseReply('M1005 又卡纸了')), ['M1005 又卡纸了'])
+})
+
+test('普通英文词不能误伤', () => {
+  assert.deepEqual(texts(parseReply('markdown 和 mysql 还有 m416')), ['markdown 和 mysql 还有 m416'])
+})
+
+test('写坏的 <reply:编号> 引用标签本来就会被去掉，别把后面的正文一起吃掉', () => {
+  assert.deepEqual(texts(parseReply('<reply:m00896b>这句是引用')), ['这句是引用'])
+})
+
+test('合法的 <reply:4> 引用编号照旧生效', () => {
+  const r = parseReply('<reply:4>这脸 谁惹你了')
+  assert.equal(r.items[0].replyTo, '4')
+  assert.equal(r.items[0].value, '这脸 谁惹你了')
+})
+
+test('模型漏出工具调用的收尾标记：整段只有标记时不发', () => {
+  assert.deepEqual(parseReply('</｜｜DSML｜｜ invoke> </｜｜DSML｜｜ calls>'), { silent: true, items: [] })
+})
+
+test('收尾标记跟着正文一起漏出来：只留正文', () => {
+  assert.deepEqual(
+    texts(parseReply('炒菜可以 但我要先吃口饭\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>')),
+    ['炒菜可以 但我要先吃口饭'],
+  )
+})
+
+test('半角竖线的特殊 token 也认，普通尖括号文本不能误伤', () => {
+  assert.deepEqual(texts(parseReply('<|endoftext|>好')), ['好'])
+  assert.deepEqual(texts(parseReply('a > b 和 <b>粗体</b>')), ['a > b 和 <b>粗体</b>'])
+})
+
+test('isSilence：沉默标记重复/带空白/带标点仍算沉默，正文里出现“沉默”不误伤', async () => {
+  const { isSilence } = await import('../src/chat/reply.js')
+  for (const s of ['[沉默]', '[沉默][沉默]', '[沉默] [沉默]', '[沉默]\n[沉默]', '（沉默）', '', '  \n\t', '[沉默]。', '[沉默]……']) {
+    assert.equal(isSilence(s), true, `应判沉默: ${JSON.stringify(s)}`)
+  }
+  for (const s of ['[沉默]刚看视频呢', '好的', '我刚才[沉默]了', '沉默是今晚的康桥']) {
+    assert.equal(isSilence(s), false, `不应判沉默: ${JSON.stringify(s)}`)
+  }
+})
+
+test('方括号写「戳了戳你」：转成真戳，动作文字不发出去', () => {
+  const r = parseReply('[戳了戳你：尾巴往回一收] 又揉，都揉半天了。')
+  assert.ok(r.items.some((i) => i.kind === 'poke'), '要转成 poke 段')
+  const body = texts(r).join('')
+  assert.ok(!body.includes('戳了戳'), '动作描述不能当文字发出')
+  assert.ok(body.includes('又揉'), '后面的话要保留')
+})
+
+test('全角方括号 / 没写「你」的戳也认', () => {
+  assert.ok(parseReply('【戳了戳你：揉了揉头】哼').items.some((i) => i.kind === 'poke'))
+  assert.ok(parseReply('[戳了戳：尾巴一甩] 别闹').items.some((i) => i.kind === 'poke'))
+})
+
+test('普通方括号（[图片] 之类）不受影响', () => {
+  assert.deepEqual(texts(parseReply('[图片] 这张好看')), ['[图片] 这张好看'])
+  assert.deepEqual(texts(parseReply('[动画表情] 笑死')), ['[动画表情] 笑死'])
+})
+
+test('贴两张已有图片与只给来源网页走不同的回复类型', () => {
+  const a = 'https://example.org/scene.jpg?size=2&v=4', b = 'https://example.org/cover.png'
+  assert.deepEqual(parseReply(`![街景](${a})\n![封面](${b})`).items, [
+    { kind: 'image', value: a }, { kind: 'image', value: b },
+  ])
+  const page = 'https://example.org/gallery'
+  assert.deepEqual(parseReply(page).items, [{ kind: 'text', value: page }])
+})

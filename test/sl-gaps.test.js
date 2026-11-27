@@ -151,7 +151,7 @@ test('解析位置和联系人卡片，只提取核对到的字段，分享卡�
   assert.equal(cardText({ app: 'com.tencent.map', meta: { Location: { address: '北门' } } }), '[位置：北门]')
   assert.equal(cardText({ app: 'com.tencent.contact.lua', meta: { contact: { type: 'qq', id: '12345', name: '未核对' } } }), '[联系人：12345]')
   assert.equal(cardText({ app: 'com.tencent.contact.lua', meta: { contact: {} } }), '[联系人]')
-  assert.equal(cardText(JSON.stringify({ meta: { news: { title: '标题', jumpUrl: 'https://example.com/?x=1' } } })), '[分享卡片：标题 https://example.com/]')
+  assert.equal(cardText(JSON.stringify({ meta: { news: { title: '标题', jumpUrl: 'https://example.com/?x=1' } } })), '[分享卡片：标题 https://example.com/?x=1]')
   assert.equal(cardText('坏 JSON'), '[卡片消息]')
 })
 
@@ -218,7 +218,10 @@ test('卡片工具在群和普通私聊可用，按 SnowLuma 字段发送', asyn
     [{ type: 'rps' }, { type: 'rps', data: {} }],
   ]
   for (const [args, segment] of cases) {
-    assert.equal((await tool.execute(args)).ok, true, JSON.stringify(args))
+    const result = await tool.execute(args)
+    assert.equal(result.ok, true, JSON.stringify(args))
+    if (args.type === 'share') assert.match(result.message, /分享卡片.*没有作为单独的图片发送/)
+    else assert.equal(result.message, '卡片发出去了')
     assert.equal(s.sent.at(-1)[0], otherChat.chatId)
     assert.deepEqual(s.sent.at(-1)[1], [segment])
     assert.equal(s.sent.at(-1)[3].throwOnError, true)
@@ -380,7 +383,7 @@ test('跨聊天发消息：群里只有主人那一轮能发，别人私聊没�
   let owner = false
   let build
   mod.setup({
-    core: { hub: { turnSendersAllOwner: () => owner, deliver: async (id, text) => { sent.push([id, text]); return {} } }, onebot: { call: async () => ({}) } },
+    core: { hub: { turnSendersAllOwner: () => owner, deliver: async (id, text) => { sent.push([id, text]); return { sentTypes: ['text'], queuedTypes: [] } } }, onebot: { call: async () => ({}) } },
     config: () => ({ enabled: true, ownerQQ: '1', allow: { private: ['2'], groups: ['9', '8'] }, files: {} }),
     tool: (fn) => { build = fn },
   })

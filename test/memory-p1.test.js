@@ -45,7 +45,7 @@ function setup(t, answer = () => '[]', patch = {}) {
   return { cfg, hub, logs, calls, make, state, putState }
 }
 
-const row = (chatId, uid, text, t = Date.now() - 3600_000) => ({ chatId, uid, who: uid === BOT ? 'bot' : '小明', text, t })
+const row = (chatId, uid, text, t = Date.now() - 3600_000) => ({ chatId, uid, who: uid === BOT ? 'bot' : '小明', text, t, interaction: uid === BOT ? [] : [uid] })
 const extractCalls = (s) => s.calls.filter((x) => x.system.includes('整理长期记忆'))
 const reflectCalls = (s) => s.calls.filter((x) => x.system.includes('回顾自己和'))
 
@@ -233,6 +233,44 @@ test('主人说别人的事实可保留 fact，群聊和非主人不能把它挂
   assert.equal(item.status, 'fact')
 })
 
+test('主人确认第三人事实不形成直接交集，停记、猜测和聊天隔离仍生效', async (t) => {
+  const C = '30000003'
+  const s = setup(t, ({ system }) => system.includes('整理长期记忆') ? JSON.stringify([
+    ...['小明喜欢咖啡', '小明住在杭州', '小明学习钢琴'].map((text) => ({ text, about: '小明', about_qq: A, speaker: OWNER, status: 'fact' })),
+    { text: '已停记的人喜欢喝茶', about_qq: B, speaker: OWNER, status: 'fact' },
+    { text: '陌生人可能去上海', about_qq: C, speaker: OWNER, status: 'guess' },
+  ]) : '{"insights":[],"style":[]}' )
+  const mem = s.make()
+  mem.setNoMemory(B, true)
+  s.logs.set(dayKey(), [row(`private:${OWNER}`, OWNER, '小明喜欢咖啡，住在杭州，学习钢琴')])
+  assert.equal((await mem.consolidate({ includeToday: true })).ok, true)
+  assert.equal(mem.list('').filter((m) => m.about === A).length, 3)
+  assert.ok(mem.list('').every((m) => m.about === A && m.status === 'fact' && m.speaker === OWNER && m.chatId === `private:${OWNER}`))
+  assert.equal(mem.isAcquainted(A), false)
+  assert.equal(await mem.buildProfile(A), false, '事实足够也不能给没有交集的人建画像')
+  assert.equal(s.state().profiles[A], undefined)
+  assert.equal(s.state().items.some((m) => m.about === B || m.about === C), false)
+  assert.equal(mem.recallHint(privateChat(A), '小明喜欢咖啡'), '')
+  assert.equal(mem.recallHint(groupChat('777'), '小明喜欢咖啡', '', '', [A]), '')
+  assert.match(mem.recallHint(privateChat(OWNER), '小明喜欢咖啡'), /小明喜欢咖啡/)
+})
+
+test('主人私聊可修订第三人事实，不需要先与第三人互动', async (t) => {
+  let id
+  const s = setup(t, ({ system }) => system.includes('整理长期记忆') ? JSON.stringify([
+    { op: 'outdated', id, text: '小明住在上海', about: '小明', about_qq: A, speaker: OWNER, status: 'fact' },
+  ]) : '{"insights":[],"style":[]}' )
+  const mem = s.make()
+  id = mem.add({ text: '小明住在北京', about: A, speaker: OWNER, status: 'fact', source: 'auto', chatId: `private:${OWNER}` }).id
+  s.logs.set(dayKey(), [row(`private:${OWNER}`, OWNER, '小明搬到上海了')])
+  assert.equal((await mem.consolidate({ includeToday: true })).ok, true)
+  assert.ok(mem.list('').find((m) => m.id === id).invalidAt)
+  const current = mem.list('').find((m) => m.text === '小明住在上海')
+  assert.ok(current && !current.invalidAt)
+  assert.equal(current.chatId, `private:${OWNER}`)
+  assert.equal(mem.isAcquainted(A), false)
+})
+
 test('容量按来源单独淘汰低重要度、旧条目，手动来源不受限', (t) => {
   const s = setup(t, () => '[]', { memory: { capacity: { auto: 2, event: 1, diary: 1 } } })
   const mem = s.make()
@@ -411,3 +449,27 @@ test('跨会话感知默认关', (t) => {
   assert.equal(s.make().recallHint(privateChat(OWNER), '今天怎么样').includes('冷清群'), false)
 })
 
+test('清理前的流水不占提炼预算，当天仍可从新私聊生成事实和相处经验', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-11-12T14:00:00') })
+  const chatId = `private:${A}`
+  const resetAt = Date.now() - 5 * 60_000
+  const s = setup(t, ({ system }) => system.includes('整理长期记忆')
+    ? JSON.stringify([{ text: '小明最近在学习水彩', about_qq: A, speaker: A, importance: 0.7 }])
+    : '{"insights":["可以问问他最近画了什么"],"style":[]}',
+  { memory: { extractIdleMinutes: 1, extractMinLines: 2, extractDailyBatches: 1, gistEnabled: false, shortTerm: false } })
+  s.cfg.memory.consolidateTimes = []
+  s.hub.memoryResetAt = (qq) => qq === A ? resetAt : 0
+  s.putState({ items: [], reflectedAt: { [chatId]: resetAt - 1000 } })
+  const forgotten = (id, qq) => ({ ...row(id, qq, '不应再进入模型的旧内容', resetAt - 2000), forgottenAt: resetAt })
+  s.logs.set(dayKey(), [forgotten(`private:${B}`, B), forgotten(chatId, A), row(chatId, A, '我最近在学习水彩', resetAt + 1000)])
+  const mem = s.make()
+  await mem.tick()
+  assert.equal(extractCalls(s).length, 0, '清理前的行不算新聊天条数')
+  assert.equal((await mem.consolidate({ includeToday: true })).ok, true)
+  assert.equal(s.state().extractBatches.count, 1, '只有含新消息的批次占预算')
+  assert.equal(extractCalls(s).length, 1)
+  assert.match(extractCalls(s)[0].text, /学习水彩/)
+  assert.doesNotMatch(extractCalls(s)[0].text, /旧内容/)
+  assert.equal(mem.list('').find((item) => item.about === A)?.text, '小明最近在学习水彩')
+  assert.equal(reflectCalls(s).length, 1, '清理前当天整理过也可以重新写经验')
+})

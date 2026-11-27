@@ -1,19 +1,23 @@
 // 翻唱：点歌 → 下载（网易云）→ 分离人声和伴奏 → RVC 换成她的声音 → 混音 → 截成语音条发回去。
 // 推理引擎用 Applio（MIT，固定版本），人声分离用 audio-separator，都装在一个独立的 Python 环境里，不碰系统环境。
 
-import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readdirSync, statSync, statfsSync, writeFileSync, readFileSync, rmSync, copyFileSync, renameSync, openSync, readSync, closeSync } from 'node:fs'
-import { join, basename, dirname, isAbsolute } from 'node:path'
+import { spawn, execFileSync } from 'node:child_process'
+import { autoShift, medianF0, pcm16ToFloat, voiceKind } from './pitch.js'
+import { chmodSync, existsSync, mkdirSync, readdirSync, statSync, statfsSync, writeFileSync, readFileSync, rmSync, copyFileSync, renameSync, openSync, readSync, closeSync } from 'node:fs'
+import { join, basename, dirname, delimiter, posix, win32 } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 import { createHash } from 'node:crypto'
 import { dataDir, readJson, writeJson } from '../core/store.js'
 import { searchSongs, songUrl, account } from './netease.js'
 import { readZip } from './zip.js'
+import { installLinuxUv } from './linux-uv.js'
+import { SongClipError, validateSongClip, selectedWindow, clipCacheParts, clipLabel, clipFade } from './segment.js'
 
 export const APPLIO_REPO = 'https://github.com/IAHispano/Applio.git'
 export const APPLIO_COMMIT = 'c817f1f83f689ef72e0dfeb1c17ae990b9248506'
 const TORCH_INDEX = 'https://download.pytorch.org/whl/cu128'
+const TORCH_CPU_INDEX = 'https://download.pytorch.org/whl/cpu'
 // 国内镜像：PyPI 和 PyTorch 都用阿里云（PyTorch 那边是文件列表，用 --find-links；Applio 固定了 torch 版本，挑得到 cu128 的），Python 本体用 npmmirror
 const CN_PYPI = 'https://mirrors.aliyun.com/pypi/simple'
 const CN_TORCH = 'https://mirrors.aliyun.com/pytorch-wheels/cu128/'
@@ -37,11 +41,12 @@ export async function shouldUseCnMirror(mode, fetchImpl = fetch) {
 }
 const LEGACY_ROOT = 'C:\\Aurabot\\rvc'
 
-// RVC 推理要的预训练文件（Applio 放在 HuggingFace 上）：[远端相对路径, 本地相对 Applio 的路径]
+// RVC 推理要的预训练文件（Applio 放在 HuggingFace 上）：[远端相对路径, 本地相对 Applio 的路径, sha256]
+// 带上校验值：下完核对，镜像给错文件会换源；证书校验失败时也能安全地改用不校验证书的连接重下（#3）
 const PREREQS = [
-  ['predictors/rmvpe.pt', 'rvc/models/predictors/rmvpe.pt'],
-  ['embedders/contentvec/config.json', 'rvc/models/embedders/contentvec/config.json'],
-  ['embedders/contentvec/pytorch_model.bin', 'rvc/models/embedders/contentvec/pytorch_model.bin'],
+  ['predictors/rmvpe.pt', 'rvc/models/predictors/rmvpe.pt', '6d62215f4306e3ca278246188607209f09af3dc77ed4232efdd069798c4ec193'],
+  ['embedders/contentvec/config.json', 'rvc/models/embedders/contentvec/config.json', '2ddde063b795d38d9051a7215a092fecf4cfe148b54251e38de51d88d356898b'],
+  ['embedders/contentvec/pytorch_model.bin', 'rvc/models/embedders/contentvec/pytorch_model.bin', 'd8dd400e054ddf4e6be75dab5a2549db748cc99e756a097c496c099f65a4854e'],
 ]
 // 国内直连 HuggingFace 常常很慢：先试镜像，太慢或卡住再换官方
 const HF_HOSTS = ['https://hf-mirror.com', 'https://huggingface.co']
@@ -52,8 +57,8 @@ const FETCH_SCRIPT = fileURLToPath(new URL('./fetch_file.py', import.meta.url))
  * 下载一个预训练文件：已经有了就跳过。用翻唱环境里的 Python 下（会走系统代理），
  * 断了从断点接着下，卡住 30 秒就换下一个源，几轮都不行才算失败。
  */
-async function downloadWithMirror(python, rel, dest, note, log, onProgress) {
-  return fetchFile(python, dest, HF_HOSTS.map((host) => `${host}/IAHispano/Applio/resolve/main/Resources/${rel}`), note, log, onProgress, rel)
+async function downloadWithMirror(python, rel, dest, note, log, onProgress, sha256 = '') {
+  return fetchFile(python, dest, HF_HOSTS.map((host) => `${host}/IAHispano/Applio/resolve/main/Resources/${rel}`), note, log, onProgress, rel, sha256)
 }
 
 // uv 的下载源：PyPI 上的 uv 安装包（固定版本，里面带 uv.exe）走国内镜像，最后才试 GitHub。
@@ -145,8 +150,8 @@ export function dirSize(dir) {
 }
 
 /** 翻唱环境的根目录：老安装沿用 C:\Aurabot\rvc，新安装放用户目录下。 */
-export function defaultRoot() {
-  return existsSync(LEGACY_ROOT) ? LEGACY_ROOT : join(homedir(), 'Aurabot', 'rvc')
+export function defaultRoot(platform = process.platform) {
+  return platform === 'win32' && existsSync(LEGACY_ROOT) ? LEGACY_ROOT : join(homedir(), 'Aurabot', 'rvc')
 }
 
 /**
@@ -159,6 +164,7 @@ export function explainInstallError(msg) {
   if (/ENOENT/.test(m)) return `找不到需要的程序（${(m.match(/spawn (\S+)/) || [])[1] || '?'}）。点「重新检查 / 修复安装」再试一次；还不行就把报错发给作者`
   if (/ENOSPC|No space|磁盘空间|not enough space/i.test(m)) return '磁盘空间不够了。换一个空间大的盘（上面「装到哪里」），保存后再装'
   if (/timed? ?out|超时|30 秒没进度|operation timed/i.test(m)) return '网络太慢、超时了。打开「用国内镜像下载」或者开着代理，再点安装（已下好的不会重下）'
+  if (/CERTIFICATE_VERIFY_FAILED|unable to get local issuer certificate|self[- ]signed certificate|certificate verify failed/i.test(m)) return 'HTTPS 证书校验没通过（unable to get local issuer certificate）。通常是网络里有代理、加速器或安全软件在中间换了证书：先关掉它们再点安装；还不行就按手册「翻唱 → 手动放置预训练文件」把文件下好放进去，已下好的不会重下'
   if (/connection|connect|reset|TLS|SSL|dns|resolve|Failed to fetch|Failed to download|error sending request|无法连接|网络/i.test(m)) return '网络连接断了。打开「用国内镜像下载」或者开着代理，再点安装（已下好的不会重下）'
   if (/CUDA|nvidia|GPU/i.test(m)) return '和显卡驱动有关，可能需要更新 NVIDIA 驱动。' + m.slice(0, 160)
   return m.slice(0, 300)
@@ -210,7 +216,16 @@ export function importSeparator(dir, filename, buf) {
   return { ok: false, message: `「${filename}」不是插件要的人声分离模型（校验对不上），要下 ${BS_ROFORMER}.ckpt` }
 }
 // 分离工具每次运行都要的模型清单（缺了会去 raw.githubusercontent.com 拉，国内常常连不上）
-const SEPARATOR_LIST = ['download_checks.json', ['https://raw.githubusercontent.com/TRvlvr/application_data/main/filelists/download_checks.json', 'https://cdn.jsdelivr.net/gh/TRvlvr/application_data@main/filelists/download_checks.json']]
+// raw.githubusercontent.com 和 cdn.jsdelivr.net 在国内常被重置连接（#8），多给几个 jsDelivr 节点和 GitHub 代理
+const SEPARATOR_LIST_PATH = 'TRvlvr/application_data/main/filelists/download_checks.json'
+const SEPARATOR_LIST = ['download_checks.json', [
+  `https://fastly.jsdelivr.net/gh/TRvlvr/application_data@main/filelists/download_checks.json`,
+  `https://gcore.jsdelivr.net/gh/TRvlvr/application_data@main/filelists/download_checks.json`,
+  `https://testingcf.jsdelivr.net/gh/TRvlvr/application_data@main/filelists/download_checks.json`,
+  `https://ghfast.top/https://raw.githubusercontent.com/${SEPARATOR_LIST_PATH}`,
+  `https://raw.githubusercontent.com/${SEPARATOR_LIST_PATH}`,
+  `https://cdn.jsdelivr.net/gh/TRvlvr/application_data@main/filelists/download_checks.json`,
+]]
 
 /** 电脑上的盘和剩余空间，给面板「装到哪个盘」用：[{drive, root, freeGB, totalGB}] */
 export function listDrives() {
@@ -228,10 +243,12 @@ export function listDrives() {
   return out
 }
 
-export function checkRoot(path) {
+export function checkRoot(path, platform = process.platform) {
   const p = String(path || '').trim()
   if (!p) return { ok: true, path: '', message: '', warn: '', freeGB: null }
-  if (!isAbsolute(p) || !/^[A-Za-z]:\\/.test(p.replace(/\//g, '\\'))) return { ok: false, path: p, message: '要写完整路径，比如 D:\\Aurabot\\rvc', warn: '', freeGB: null }
+  const linux = platform === 'linux'
+  const valid = linux ? posix.isAbsolute(p) : win32.isAbsolute(p) && /^[A-Za-z]:\\/.test(p.replace(/\//g, '\\'))
+  if (!valid) return { ok: false, path: p, message: linux ? '要写完整路径，比如 /home/ubuntu/Aurabot/rvc' : '要写完整路径，比如 D:\\Aurabot\\rvc', warn: '', freeGB: null }
   const warn = /[^\x21-\x7e]/.test(p) ? '路径里有中文或空格，个别工具可能出问题，最好换成全英文、不带空格的路径' : ''
   let freeGB = null
   try {
@@ -244,16 +261,23 @@ export function checkRoot(path) {
   return { ok: true, path: p, message: '', warn: warn || (freeGB !== null && freeGB < 10 ? `这个盘只剩 ${freeGB} GB，装完要 8 GB 左右，安装时还要临时多占几 GB` : ''), freeGB }
 }
 
-export function pathsOf(root) {
+export function pathsOf(root, { platform = process.platform, allowLegacy = true } = {}) {
+  // 旧 Linux 手工部署可能已有 Scripts/*.exe 转发脚本，原生程序在位时优先用原生路径。
+  const binary = (windows, linux) => {
+    const legacy = join(root, ...windows)
+    if (platform !== 'linux') return legacy
+    const native = join(root, ...linux)
+    return allowLegacy && !existsSync(native) && existsSync(legacy) ? legacy : native
+  }
   return {
     root,
-    python: join(root, 'env', 'Scripts', 'python.exe'),
-    separatorExe: join(root, 'env', 'Scripts', 'audio-separator.exe'),
+    python: binary(['env', 'Scripts', 'python.exe'], ['env', 'bin', 'python']),
+    separatorExe: binary(['env', 'Scripts', 'audio-separator.exe'], ['env', 'bin', 'audio-separator']),
     applio: join(root, 'Applio'),
     models: join(root, 'models'),
     separatorModels: join(root, 'separator-models'),
     bin: join(root, 'bin'),
-    ffmpeg: join(root, 'bin', 'ffmpeg.exe'),
+    ffmpeg: binary(['bin', 'ffmpeg.exe'], ['bin', 'ffmpeg']),
     rmvpe: join(root, 'Applio', 'rvc', 'models', 'predictors', 'rmvpe.pt'),
     contentvec: join(root, 'Applio', 'rvc', 'models', 'embedders', 'contentvec', 'pytorch_model.bin'),
   }
@@ -323,9 +347,10 @@ export function deleteVoice(modelsDir, id) {
 /** 缓存目录只留最新的 keep 个文件。 */
 export function pruneCache(dir, keep) {
   let files = []
-  try { files = readdirSync(dir).map((n) => ({ n, t: statSync(join(dir, n)).mtimeMs })) } catch (error) { return 0 }
+  // 只按成品 mp3 计数；旁边记变调的 .json 跟着成品一起删（#10）
+  try { files = readdirSync(dir).filter((n) => !n.endsWith('.mp3.json')).map((n) => ({ n, t: statSync(join(dir, n)).mtimeMs })) } catch (error) { return 0 }
   const old = files.sort((a, b) => b.t - a.t).slice(keep)
-  for (const f of old) rmSync(join(dir, f.n), { force: true })
+  for (const f of old) { rmSync(join(dir, f.n), { force: true }); rmSync(join(dir, f.n + '.json'), { force: true }) }
   return old.length
 }
 
@@ -350,11 +375,123 @@ export function rankCandidates(list, query = '') {
   return [...list.filter((s) => !bad(s)), ...list.filter(bad)]
 }
 
-export function clipWindow(durationSec, maxSec, start = 'auto') {
+/** 截一段：歌比上限长时从自动定位的副歌入口开始（分析不出来回退全曲 30%），否则从头；head 从头。 */
+export function clipWindow(durationSec, maxSec, start = 'auto', chorusStart = null) {
   if (!(durationSec > maxSec)) return { start: 0, length: durationSec }
   if (start === 'head') return { start: 0, length: maxSec }
-  const s = Math.max(0, Math.min(Math.round(durationSec * 0.3), Math.floor(durationSec - maxSec)))
+  const latest = Math.max(0, Math.floor(durationSec - maxSec))
+  if (Number.isFinite(chorusStart) && chorusStart >= 0) return { start: Math.min(Math.round(chorusStart), latest), length: maxSec }
+  const s = Math.max(0, Math.min(Math.round(durationSec * 0.3), latest))
   return { start: s, length: maxSec }
+}
+
+/** 每 frameSec 秒一帧的 RMS 音量包络（0~1）。纯函数：pcm 是 16-bit 单声道小端 PCM。 */
+export function pcmEnergyEnvelope(pcm, sampleRate = 8000, frameSec = 0.25) {
+  if (!pcm || !pcm.length || !(sampleRate > 0) || !(frameSec > 0)) return []
+  const bytes = Buffer.isBuffer(pcm) ? pcm : Buffer.from(pcm)
+  const frameSamples = Math.max(1, Math.round(sampleRate * frameSec))
+  const totalSamples = Math.floor(bytes.length / 2)
+  const out = []
+  for (let start = 0; start + frameSamples <= totalSamples; start += frameSamples) {
+    let sum = 0
+    for (let i = 0; i < frameSamples; i++) {
+      const v = bytes.readInt16LE((start + i) * 2) / 32768
+      sum += v * v
+    }
+    out.push(Math.sqrt(sum / frameSamples))
+  }
+  return out
+}
+
+function correlation(a, b) {
+  const n = Math.min(a.length, b.length)
+  if (n < 4) return 0
+  let ma = 0, mb = 0
+  for (let i = 0; i < n; i++) { ma += a[i]; mb += b[i] }
+  ma /= n; mb /= n
+  let num = 0, da = 0, db = 0
+  for (let i = 0; i < n; i++) {
+    const x = a[i] - ma, y = b[i] - mb
+    num += x * y; da += x * x; db += y * y
+  }
+  return da > n * 1e-8 && db > n * 1e-8 ? num / Math.sqrt(da * db) : 0
+}
+
+/**
+ * 从 16-bit 单声道 PCM 估算副歌入口（秒）。
+ *
+ * 思路（离线、零依赖）：
+ *   1. 每 0.25 秒算 RMS 音量；按秒平均并做 3 秒平滑；
+ *   2. 找出持续高于「中位数~90 分位」阈值的响段（前奏/间奏通常太短会被滤掉）；
+ *   3. 对每个响段，用音量曲线和其他同时长片段做相关，重复度高的段落更像副歌；
+ *   4. 综合「平均能量 × (0.5 + 0.5 × 重复度)」挑第一段最强的副歌。
+ * 分析不出来（静音、太短、没有明显响段）返回 null，由 clipWindow 回退 30%。
+ */
+export function estimateChorusStart(pcm, { sampleRate = 8000, maxSec = 120, frameSec = 0.25 } = {}) {
+  const envelope = pcmEnergyEnvelope(pcm, sampleRate, frameSec)
+  const totalSec = envelope.length * frameSec
+  if (!(maxSec > 0) || !(totalSec > maxSec)) return null
+  const secCount = Math.floor(totalSec)
+  const energy = []
+  for (let s = 0; s < secCount; s++) {
+    const a = Math.floor(s / frameSec)
+    const b = Math.min(envelope.length, Math.floor((s + 1) / frameSec))
+    let sum = 0, n = 0
+    for (let i = a; i < b; i++) { sum += envelope[i]; n++ }
+    energy.push(n ? sum / n : 0)
+  }
+  if (energy.length < 8) return null
+  const smooth = energy.map((_, i) => {
+    let sum = 0, n = 0
+    for (let j = Math.max(0, i - 1); j <= Math.min(energy.length - 1, i + 1); j++) { sum += energy[j]; n++ }
+    return n ? sum / n : 0
+  })
+  const sorted = [...smooth].sort((a, b) => a - b)
+  const at = (p) => sorted[Math.min(sorted.length - 1, Math.max(0, Math.round(p * (sorted.length - 1))))]
+  const med = at(0.5), p90 = at(0.9), maxEnergy = sorted[sorted.length - 1]
+  if (!(maxEnergy > 0.005)) return null // 整首几乎是静音
+  const threshold = med + (p90 - med) * 0.4
+  const minRun = Math.max(3, Math.min(12, Math.round(maxSec * 0.2)))
+  const runs = []
+  let runStart = -1, lastLoud = -1
+  for (let i = 0; i < smooth.length; i++) {
+    if (smooth[i] >= threshold) {
+      if (runStart < 0) runStart = i
+      else if (i - runStart >= minRun && energy[i] > energy[i - 1] * 1.35) {
+        // 音量突然抬一大截（副歌接桥段之类）就在跳变处切开，别把两段合成一段
+        runs.push({ start: runStart, end: i - 1 })
+        runStart = i
+      }
+      lastLoud = i
+    } else if (runStart >= 0 && i - lastLoud > 2) {
+      // 允许中间有 1~2 秒的短暂回落，别把一个副歌切碎
+      if (lastLoud - runStart + 1 >= minRun) runs.push({ start: runStart, end: lastLoud })
+      runStart = -1
+    }
+  }
+  if (runStart >= 0 && lastLoud - runStart + 1 >= minRun) runs.push({ start: runStart, end: lastLoud })
+  if (!runs.length) return null
+  let best = null
+  for (const run of runs) {
+    let sum = 0
+    for (let i = run.start; i <= run.end; i++) sum += smooth[i]
+    const avg = sum / (run.end - run.start + 1)
+    // 用响段内部（去掉两端淡入淡出）的音量曲线做重复度，避免边界过渡造成假相似
+    const margin = run.end - run.start >= 8 ? 2 : 0
+    const len = Math.min(16, run.end - run.start + 1 - margin * 2)
+    const patternStart = run.start + margin
+    const pattern = energy.slice(patternStart, patternStart + len)
+    let repeat = 0
+    for (let t = 0; t + len <= smooth.length; t += 2) {
+      if (t + len > run.start - 2 && t < run.end + 3) continue // 跳过和自己重叠的片段
+      const c = correlation(pattern, energy.slice(t, t + len))
+      if (c > repeat) repeat = c
+    }
+    const score = avg * (0.5 + 0.5 * Math.max(0, repeat)) - run.start * 1e-6 // 同分时优先靠前的副歌
+    if (!best || score > best.score) best = { ...run, score }
+  }
+  const latest = Math.max(0, Math.floor(totalSec - maxSec))
+  return Math.max(0, Math.min(best.start, latest))
 }
 
 function run(cmd, args, { cwd, env, log, onLine, timeoutMs = 30 * 60_000 } = {}) {
@@ -386,7 +523,9 @@ function run(cmd, args, { cwd, env, log, onLine, timeoutMs = 30 * 60_000 } = {})
  * @param {() => object} deps.getConfig
  * @param {object} deps.log
  * @param {(chatId: string, file: string, note: string) => Promise<any>} deps.sendVoiceFile  把做好的语音发到聊天
- * @param {(chatId: string, text: string) => Promise<any>} [deps.sendText]
+ * @param {(chatId: string, text: string) => Promise<any>} [deps.sendText]  没接 say 时的兜底发送
+ * @param {(o: { chatId: string, title: string, query: string, why: string, error: string }) => Promise<any>} [deps.say]
+ *   翻唱失败时说的话由她本人决定（模块层接模型生成），失败提示不再是一句写死的模板
  */
 /** 翻唱出错翻译成人话（给点歌的人看）。 */
 export function explainSongError(message) {
@@ -401,9 +540,54 @@ export function explainSongError(message) {
   return m
 }
 
-export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, onSung, local }) {
+class SongDeliveryError extends Error {}
+
+/** 对聊天和模型只给固定的人话；报错原文留在日志和本机翻唱面板。 */
+export function songFailureReason(error) {
+  if (error instanceof SongClipError || error instanceof SongDeliveryError) return error.message
+  const m = String(error?.message || '')
+  if (/没有人声|都没有人声/.test(m)) return '这次没有检测到人声，请换个片段或歌曲版本。'
+  if (/网易云上没搜到/.test(m)) return '没搜到这首歌，请检查歌名或补上歌手。'
+  if (/会员|版权限制/.test(m)) return '这个歌曲版本暂时下载不了，请换一个版本，或请主人检查音乐账号设置。'
+  if (/没有可用的音色|没有导入音色/.test(m)) return '还没有可用音色，请主人在翻唱面板选择或导入音色。'
+  if (/No module named|ModuleNotFoundError|翻唱环境不完整|环境还没装好/.test(m)) return '翻唱环境不完整，请主人在翻唱面板检查安装。'
+  if (/out of memory|OutOfMemoryError|not enough memory/i.test(m)) return '处理这段歌的内存不够，请缩短片段或关闭占用较大的程序。'
+  if (/timeout|timed? out|超时|处理时间太长/i.test(m)) return '这次处理超时了，请缩短片段后再试。'
+  return '这次翻唱没完成，详细原因请主人查看翻唱面板。'
+}
+
+/**
+ * 截出要发的那一段（依赖可注入，测试不用真 ffmpeg/真音频）。
+ * auto 模式下先让 readPcm 读整首歌 PCM、分析副歌入口；分析失败/不可用回退全曲 30%。
+ * @returns {Promise<{file:string, cut:boolean, length:number}>}
+ */
+export async function cutFirstWith({
+  song, dir, clip = null, maxSec = 120, clipStart = 'auto',
+  probeDuration, readPcm, run, ffmpegPath, log,
+}) {
+  const dur = await probeDuration(song)
+  let chorusStart = null
+  if (!clip && clipStart !== 'head' && dur > maxSec) {
+    try {
+      const pcm = readPcm ? await readPcm(song) : null
+      chorusStart = pcm ? estimateChorusStart(pcm, { sampleRate: 8000, maxSec }) : null
+      if (Number.isFinite(chorusStart)) log?.info?.(`副歌定位：从第 ${chorusStart} 秒开始截（歌长 ${Math.round(dur)} 秒）`)
+    } catch (error) {
+      log?.debug?.('副歌定位分析失败：', error.message)
+      chorusStart = null
+    }
+  }
+  const w = clip ? selectedWindow(dur, clip) : clipWindow(dur, maxSec, clipStart, chorusStart)
+  if (!dur || (w.start === 0 && w.length >= dur)) return { file: song, cut: false, length: dur }
+  const out = join(dir, 'part.wav')
+  await run(ffmpegPath, ['-y', '-hide_banner', '-loglevel', 'error', '-ss', String(w.start), '-t', String(w.length), '-i', song, '-ar', '44100', out], { log })
+  return { file: out, cut: true, length: w.length }
+}
+
+export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, say, onSung, local, readPcm: readPcmInjected, platform = process.platform, runInstallCommand = run } = {}) {
   const cfg = () => getConfig().song
-  const P = () => pathsOf(cfg().root || defaultRoot())
+  const linux = platform === 'linux'
+  const P = () => pathsOf(cfg().root || defaultRoot(platform), { platform })
   const work = () => dataDir('songs')
   // 确认过没有人声的歌（网易云 id），下次直接跳过，不用再花几分钟分离一遍
   const noVocalFile = () => join(work(), 'no-vocals.json')
@@ -413,14 +597,38 @@ export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, onSu
   let current = null // 正在做的翻唱
   let history = [] // 最近做过的 [{at, title, voice, ok, message, file}]
   let install = { running: false, step: '', log: [], ok: null, message: '' }
+  // 失败提示的节流：同一个聊天 60 秒内只提示一次——连着点几首、同一原因反复失败时不刷屏
+  const failNoticed = new Map() // chatId → { at, why }
+  const FAIL_NOTICE_GAP = 60_000
+
+  // 光看 shim 文件在不在会骗人：env/Scripts/*.exe 在 Linux 上只是一行「转给真解释器」的脚本，
+  // 真解释器（venv）被删了文件还在，一跑就 127。所以真跑一次探针。
+  // status 是面板轮询接口，结果缓存 10 秒，免得每个请求都起进程。
+  let probe = { at: 0, root: '', python: false, separator: false }
+  function probeEnv(p) {
+    if (probe.root === p.root && Date.now() - probe.at < 10_000) return probe
+    let python = false
+    let separator = false
+    if (existsSync(p.python)) {
+      try {
+        // find_spec 只查包在不在，不真 import（audio_separator 会拖 torch，几秒）
+        const out = execFileSync(p.python, ['-c', 'import importlib.util as u;print(1 if u.find_spec("audio_separator") else 0)'], { encoding: 'utf8', timeout: 8000, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] })
+        python = true
+        separator = String(out).trim().endsWith('1') && existsSync(p.separatorExe)
+      } catch (error) {}
+    }
+    probe = { at: Date.now(), root: p.root, python, separator }
+    return probe
+  }
 
   function status() {
     const p = P()
+    const env = probeEnv(p)
     const voices = listVoices(p.models)
     const parts = {
-      python: existsSync(p.python),
+      python: env.python,
       applio: existsSync(join(p.applio, 'core.py')),
-      separator: existsSync(p.separatorExe),
+      separator: env.separator,
       ffmpeg: existsSync(p.ffmpeg),
       weights: existsSync(p.rmvpe) && existsSync(p.contentvec),
       separatorModel: separatorReady(p.separatorModels, cfg().separatorModel),
@@ -432,8 +640,8 @@ export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, onSu
       enabled: cfg().enabled,
       ready,
       root: p.root,
-      defaultRoot: defaultRoot(),
-      rootCheck: checkRoot(p.root),
+      defaultRoot: defaultRoot(platform),
+      rootCheck: checkRoot(p.root, platform),
       pypiMirror: cfg().pypiMirror || 'auto',
       parts,
       voices: voices.map((v) => ({ id: v.id, hasIndex: Boolean(v.index) })),
@@ -441,7 +649,7 @@ export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, onSu
       voice: cfg().voice,
       install: { ...install, log: install.log.slice(-30) },
       current: current ? { ...current } : null,
-      queue: queue.map((q) => ({ query: q.query, chatId: q.chatId })),
+      queue: queue.map((q) => ({ query: q.query, chatId: q.chatId, ...(q.clip ? { clip: q.clip } : {}) })),
       history: history.slice(0, 10),
       message: !voices.length ? '还没有音色：在下面「音色模型」里导入你有权使用的 RVC 模型（.pth 或 zip）' : ready ? (cfg().enabled ? '可以点歌了' : '准备好了，打开开关就能用') : '还差一些组件，点「一键安装」',
     }
@@ -450,7 +658,7 @@ export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, onSu
   // ---------- 一键安装（几个 GB，要十几分钟）----------
   async function runInstall() {
     if (install.running) return { ok: false, message: '已经在装了' }
-    const p = P()
+    let p = P()
     install = { running: true, step: '', stepIndex: -1, steps: INSTALL_STEPS, stepHint: '', stepAt: 0, startedAt: Date.now(), progress: null, log: [], ok: null, message: '' }
     const note = (s) => { install.log.push(s); if (install.log.length > 200) install.log.shift() }
     const step = async (name, hint, fn) => {
@@ -476,11 +684,13 @@ export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, onSu
       mkdirSync(p.root, { recursive: true })
       mkdirSync(p.models, { recursive: true })
       await step('创建 Python 环境', '第一次要下载 Python 3.12（约 30 MB）和安装工具，一般 1~3 分钟', async () => {
-        uv = await ensureUv(note)
-        if (existsSync(p.python)) return note('  已经有了，跳过')
+        uv = await ensureUv(p, note)
+        if (linux ? probeEnv(p).python : existsSync(p.python)) return note('  已经有了，跳过')
+        if (linux) p = pathsOf(p.root, { platform, allowLegacy: false })
         const stop = watchDownload(join(p.root, 'python'))
         try {
-          await run(uv, ['venv', '-q', join(p.root, 'env'), '--python', '3.12'], { log, onLine: note, env: uvEnv, timeoutMs: 30 * 60_000 })
+          const keepExisting = linux ? ['--allow-existing'] : []
+          await runInstallCommand(uv, ['venv', '-q', ...keepExisting, join(p.root, 'env'), '--python', '3.12'], { log, onLine: note, env: uvEnv, timeoutMs: 30 * 60_000 })
         } finally {
           stop()
         }
@@ -489,18 +699,35 @@ export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, onSu
         if (existsSync(join(p.applio, 'core.py'))) return note('  已经有了，跳过')
         // 直接下代码压缩包（固定版本），不需要电脑上装 git
         const zip = join(p.root, 'downloads', 'applio.zip')
-        // 用环境里的 Python 下（断了能接着下、走系统代理）；万一不行再用 PowerShell 下
-        try {
-          await fetchFile(p.python, zip, [`https://github.com/IAHispano/Applio/archive/${APPLIO_COMMIT}.zip`, `https://codeload.github.com/IAHispano/Applio/zip/${APPLIO_COMMIT}`], note, log, (done, total) => {
-            install.progress = { kind: 'file', name: 'Applio', done, total }
-          })
-        } catch (error) {
-          note('  换个方式再下一次')
-          await fetchWithProgress(`https://github.com/IAHispano/Applio/archive/${APPLIO_COMMIT}.zip`, zip)
-        }
         const tmp = join(p.root, 'downloads', 'applio-src')
+        const urls = [`https://github.com/IAHispano/Applio/archive/${APPLIO_COMMIT}.zip`, `https://codeload.github.com/IAHispano/Applio/zip/${APPLIO_COMMIT}`]
+        const downloadApplio = async () => {
+          // 以前中断留下的同名 zip 可能能过 existsSync，但内容不完整；先按 zip 头判断，坏包直接丢掉。
+          try {
+            if (existsSync(zip) && (!statSync(zip).size || readFileSync(zip).subarray(0, 2).toString() !== 'PK')) rmSync(zip, { force: true })
+          } catch { try { rmSync(zip, { force: true }) } catch {} }
+          try {
+            await fetchFile(p.python, zip, urls, note, log, (done, total) => {
+              install.progress = { kind: 'file', name: 'Applio', done, total }
+            })
+          } catch (error) {
+            if (linux) throw error
+            note('  换个方式再下一次')
+            await fetchWithProgress(urls[0], zip)
+          }
+        }
+        await downloadApplio()
         rmSync(tmp, { recursive: true, force: true })
-        await expandZip(zip, tmp)
+        try {
+          await expandZip(p.python, zip, tmp)
+        } catch (error) {
+          // 解压失败通常是下载不完整或镜像返回了 HTML，清掉坏包重下一次。
+          rmSync(tmp, { recursive: true, force: true })
+          rmSync(zip, { force: true })
+          note('  压缩包不完整，已清理并重新下载')
+          await downloadApplio()
+          await expandZip(p.python, zip, tmp)
+        }
         const inner = readdirSync(tmp).find((n) => existsSync(join(tmp, n, 'core.py')))
         if (!inner) throw new Error('下载的 Applio 压缩包不完整')
         rmSync(p.applio, { recursive: true, force: true })
@@ -510,18 +737,20 @@ export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, onSu
       await step('安装 PyTorch、RVC 和人声分离（最大的一步）', '要下载约 3~4 GB，看网速一般 10~40 分钟；下面的「已下载」在涨就说明没卡住', async () => {
         const stop = watchDownload(cacheDir)
         try {
-          await run(uv, ['pip', 'install', '--python', p.python, '-r', join(p.applio, 'requirements-engine.txt'), 'audio-separator[gpu]', 'imageio-ffmpeg',
-            ...mirror, ...(cn ? ['--find-links', CN_TORCH] : ['--extra-index-url', TORCH_INDEX]), '--index-strategy', 'unsafe-best-match'], { log, onLine: note, env: uvEnv, timeoutMs: 120 * 60_000 })
+          const separator = linux ? 'audio-separator[cpu]' : 'audio-separator[gpu]'
+          const torch = linux ? ['--extra-index-url', TORCH_CPU_INDEX] : cn ? ['--find-links', CN_TORCH] : ['--extra-index-url', TORCH_INDEX]
+          await runInstallCommand(uv, ['pip', 'install', '--python', p.python, '-r', join(p.applio, 'requirements-engine.txt'), separator, 'imageio-ffmpeg',
+            ...mirror, ...torch, '--index-strategy', 'unsafe-best-match'], { log, onLine: note, env: uvEnv, timeoutMs: 120 * 60_000 })
         } finally {
           stop()
         }
       })
-      await step('准备 ffmpeg', '几秒钟', async () => setupFfmpeg())
+      await step('准备 ffmpeg', '几秒钟', async () => setupFfmpeg(p))
       await step('下载 RVC 需要的预训练文件（音高、音色特征）', '约 560 MB，看网速几分钟', async () => {
-        for (const [rel, dest] of PREREQS) {
+        for (const [rel, dest, sha] of PREREQS) {
           await downloadWithMirror(p.python, rel, join(p.applio, dest), note, log, (done, total) => {
             install.progress = { kind: 'file', name: rel.split('/').pop(), done, total }
-          })
+          }, sha)
         }
       })
       await step('下载人声分离模型', '约 640 MB，看网速几分钟；下好以后第一次点歌就不用再等', async () => {
@@ -543,6 +772,7 @@ export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, onSu
       install = { ...install, running: false, ok: false, progress: null, message: `「${install.step}」这步失败了：${explainInstallError(error.message)}`, error: String(error.message).slice(0, 2000) }
       log.warn('翻唱安装失败：', install.message)
     }
+    probe.at = 0
     return { ok: install.ok, message: install.message }
   }
 
@@ -563,23 +793,29 @@ export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, onSu
     if (!existsSync(dest) || !statSync(dest).size) throw new Error('下载失败：' + url)
   }
 
-  /** 解压 zip（用 Windows 自带的 Expand-Archive）。 */
-  async function expandZip(zip, dir) {
+  /** Linux 用翻唱环境的 zipfile，Windows 沿用 Expand-Archive。 */
+  async function expandZip(python, zip, dir) {
     mkdirSync(dir, { recursive: true })
-    await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Expand-Archive -LiteralPath $env:AB_ZIP -DestinationPath $env:AB_DIR -Force'],
+    if (linux) return runInstallCommand(python, ['-m', 'zipfile', '-e', zip, dir], { log, timeoutMs: 10 * 60_000 })
+    await runInstallCommand('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Expand-Archive -LiteralPath $env:AB_ZIP -DestinationPath $env:AB_DIR -Force'],
       { log, env: { AB_ZIP: zip, AB_DIR: dir }, timeoutMs: 10 * 60_000 })
   }
 
   /** 准备 uv（装 Python 和各种包的工具）：电脑上有就用，没有就下一个放进安装目录。 */
-  async function ensureUv(note) {
+  async function ensureUv(p, note) {
     if (process.env.AURABOT_UV) return process.env.AURABOT_UV
-    const p = P()
-    const local = join(p.bin, 'uv.exe')
+    const local = join(p.bin, linux ? 'uv' : 'uv.exe')
     if (existsSync(local)) return local
     try {
-      await run('uv', ['--version'], { log, timeoutMs: 15_000 })
+      await runInstallCommand('uv', ['--version'], { log, timeoutMs: 15_000 })
       return 'uv'
     } catch (error) {}
+    if (linux) {
+      const installed = [join(homedir(), '.local', 'bin', 'uv'), join(homedir(), '.cargo', 'bin', 'uv')].find(existsSync)
+      if (installed) return installed
+      note('  电脑上没有 uv，下载一个放进安装目录')
+      return installLinuxUv(local, { note })
+    }
     note('  电脑上没有 uv，下载一个放进安装目录')
     const zip = join(p.root, 'downloads', 'uv.zip')
     const tmp = join(p.root, 'downloads', 'uv')
@@ -589,7 +825,7 @@ export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, onSu
         await fetchWithProgress(src.url, zip, 5 * 60)
         if (src.sha256 && createHash('sha256').update(readFileSync(zip)).digest('hex') !== src.sha256) throw new Error('下载的文件校验对不上')
         rmSync(tmp, { recursive: true, force: true })
-        await expandZip(zip, tmp)
+        await expandZip(p.python, zip, tmp)
         const exe = findFile(tmp, 'uv.exe')
         if (!exe) throw new Error('里面没找到 uv.exe')
         mkdirSync(p.bin, { recursive: true })
@@ -619,20 +855,20 @@ export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, onSu
     return () => clearInterval(t)
   }
 
-  /** 把 imageio-ffmpeg 带的 ffmpeg 复制成 bin\ffmpeg.exe（人声分离要在 PATH 里找到 ffmpeg）。 */
-  async function setupFfmpeg() {
-    const p = P()
+  /** 把 imageio-ffmpeg 带的程序放到翻唱目录的 bin，供人声分离使用。 */
+  async function setupFfmpeg(p) {
     if (existsSync(p.ffmpeg)) return
-    const out = await run(p.python, ['-c', 'import imageio_ffmpeg;print(imageio_ffmpeg.get_ffmpeg_exe())'], { log })
+    const out = await runInstallCommand(p.python, ['-c', 'import imageio_ffmpeg;print(imageio_ffmpeg.get_ffmpeg_exe())'], { log })
     const src = out.trim().split(/\r?\n/).pop()
     mkdirSync(p.bin, { recursive: true })
     copyFileSync(src, p.ffmpeg)
+    if (linux) chmodSync(p.ffmpeg, 0o755)
   }
 
   // ---------- 做一首 ----------
   const pyEnv = () => {
     const p = P()
-    return { PATH: p.bin + ';' + process.env.PATH, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' }
+    return { PATH: p.bin + delimiter + process.env.PATH, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' }
   }
 
   async function ffprobeDuration(file) {
@@ -649,7 +885,45 @@ export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, onSu
     })
   }
 
+  /** 用 ffmpeg 离线读整首歌的单声道 PCM（8kHz s16le），给副歌定位用；失败返回 null。 */
+  async function readPcm(file, sampleRate = 8000) {
+    return new Promise((resolve) => {
+      const chunks = []
+      let total = 0
+      let stderr = ''
+      const c = spawn(P().ffmpeg, ['-hide_banner', '-loglevel', 'error', '-i', file, '-vn', '-ac', '1', '-ar', String(sampleRate), '-f', 's16le', '-'], { windowsHide: true })
+      // 分析只是锦上添花：ffmpeg 卡住 30 秒就放弃，按失败回退 30%
+      const timer = setTimeout(() => { try { c.kill() } catch (error) {}; resolve(null) }, 30_000)
+      c.stdout.on('data', (buf) => {
+        // 正常一首歌几分钟也就几 MB；超过 64MB 不收了，避免异常文件把内存吃满
+        if (total < 64 * 1024 * 1024) { chunks.push(buf); total += buf.length }
+      })
+      // 必须消费 stderr：-loglevel error 也可能有输出，不读会把子进程管道塞满卡死
+      c.stderr.on('data', (buf) => { stderr = (stderr + buf.toString()).slice(-2000) })
+      c.on('error', () => { clearTimeout(timer); resolve(null) })
+      c.on('exit', (code) => {
+        clearTimeout(timer)
+        if (code !== 0 && stderr) log?.debug?.('副歌定位读 PCM 失败：', stderr.split(/\r?\n/).filter(Boolean).slice(-2).join(' | '))
+        resolve(code === 0 && total ? Buffer.concat(chunks) : null)
+      })
+    })
+  }
+
   /** 人声轨的平均音量（dB）；纯音乐分出来的人声几乎是静音。 */
+  /** 原唱人声的中位基频（#10）：最多分析 90 秒，转成 8 kHz 单声道裸数据交给 YIN；失败返回 null。 */
+  async function probeF0(file) {
+    return new Promise((resolve) => {
+      const c = spawn(P().ffmpeg, ['-hide_banner', '-loglevel', 'error', '-i', file, '-t', '90', '-ac', '1', '-ar', '8000', '-f', 's16le', '-'], { windowsHide: true })
+      const chunks = []
+      c.stdout.on('data', (b) => chunks.push(b))
+      c.on('exit', (code) => {
+        if (code !== 0) return resolve(null)
+        try { resolve(medianF0(pcm16ToFloat(Buffer.concat(chunks)), 8000)) } catch (error) { resolve(null) }
+      })
+      c.on('error', () => resolve(null))
+    })
+  }
+
   async function meanVolume(file) {
     return new Promise((resolve) => {
       const c = spawn(P().ffmpeg, ['-hide_banner', '-i', file, '-af', 'volumedetect', '-f', 'null', '-'], { windowsHide: true })
@@ -763,21 +1037,26 @@ export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, onSu
   }
 
   /** 先截出要发的那一段再处理：分离和换声都只算这一段，快一倍多。返回 {file, cut, length}。 */
-  async function cutFirst(song, dir) {
+  async function cutFirst(song, dir, clip) {
     const c = cfg()
-    const dur = await ffprobeDuration(song)
-    const w = clipWindow(dur, Number(c.maxVoiceSec) || 120, c.clipStart)
-    if (!dur || (w.start === 0 && w.length >= dur)) return { file: song, cut: false, length: dur }
-    const out = join(dir, 'part.wav')
-    await run(P().ffmpeg, ['-y', '-hide_banner', '-loglevel', 'error', '-ss', String(w.start), '-t', String(w.length), '-i', song, '-ar', '44100', out], { log })
-    return { file: out, cut: true, length: w.length }
+    const readPcmForAnalysis = typeof readPcmInjected === 'function' ? readPcmInjected : readPcm
+    return cutFirstWith({
+      song, dir, clip,
+      maxSec: Number(c.maxVoiceSec) || 120,
+      clipStart: c.clipStart,
+      probeDuration: ffprobeDuration,
+      readPcm: readPcmForAnalysis,
+      run,
+      ffmpegPath: P().ffmpeg,
+      log,
+    })
   }
 
   /** 截过的段落首尾加淡入淡出，听起来不突兀。 */
   async function fade(mixed, dir, length) {
     const out = join(dir, 'voice.mp3')
     await run(P().ffmpeg, ['-y', '-hide_banner', '-loglevel', 'error', '-i', mixed,
-      '-af', `afade=t=in:d=1.5,afade=t=out:st=${Math.max(0, length - 3)}:d=3`, '-b:a', '128k', out], { log })
+      '-af', clipFade(length), '-b:a', '128k', out], { log })
     return out
   }
 
@@ -785,34 +1064,51 @@ export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, onSu
     const c = cfg()
     const voice = listVoices(P().models).find((v) => v.id === (job.voice || c.voice)) || listVoices(P().models)[0]
     if (!voice && !local?.active('song')) throw new Error('还没有可用的音色模型')
-    const pitch = Number.isFinite(Number(job.pitch)) ? Math.max(-24, Math.min(24, Math.round(Number(job.pitch)))) : Number(c.pitch) || 0
+    // 没指定变调、开着自动定变调时（默认），分离出人声后按原唱男声 / 女声和她的声线定 0 / +12 / -12（#10）
+    const manual = Number.isFinite(Number(job.pitch))
+    const auto = !manual && c.autoPitch !== false
+    let pitch = manual ? Math.max(-24, Math.min(24, Math.round(Number(job.pitch)))) : Number(c.pitch) || 0
     const dir = join(work(), Date.now().toString(36))
     mkdirSync(dir, { recursive: true })
+    job.workDir = dir
     current.stage = '下载歌曲'
     const song = job.file || (await download(job, dir))
+    current.title = job.title || job.query
     // 同一首歌、同一个音色、音高和截取方式做过的，直接复用
+    // v3：副歌定位从固定 30% 改成音频分析，旧缓存（可能截在非副歌处）一律不用
     // v2：0.6.2 起才检查有没有人声，之前缓存的可能是只有伴奏的成品，一律不用
-    const key = createHash('md5').update(['v2', job.songKey || song, local?.active('song') ? 'local:' + (voice?.id || '') : voice.id, pitch, c.maxVoiceSec, c.clipStart, ...(job.acapella ? ['acapella'] : [])].join('|')).digest('hex').slice(0, 16)
+    const key = createHash('md5').update(['v3', job.songKey || song, local?.active('song') ? 'local:' + (voice?.id || '') : voice.id, auto ? `auto:${c.selfVoice === 'male' ? 'male' : 'female'}` : pitch, ...clipCacheParts(job.clip, c), ...(job.acapella ? ['acapella'] : [])].join('|')).digest('hex').slice(0, 16)
     const cached = join(work(), 'cache', key + '.mp3')
     if (existsSync(cached)) {
       log.info(`翻唱：「${job.title}」做过了，直接用缓存`)
-      return { file: cached, voice: voice.id, pitch, dir }
+      // 自动定的变调记在旁边，复用缓存时照实报出来
+      try { const meta = JSON.parse(readFileSync(cached + '.json', 'utf8')); if (Number.isFinite(meta.pitch)) pitch = meta.pitch } catch (error) {}
+      return { file: cached, voice: voice?.id, pitch, dir }
     }
     current.stage = '截取要唱的那一段'
-    const part = await cutFirst(song, dir)
+    const part = await cutFirst(song, dir, job.clip)
     current.stage = '分离人声和伴奏'
     const { vocals, inst } = await separate(part.file, dir)
     // 纯音乐 / 伴奏版分不出人声：换下一首候选重做，不然发出去只有伴奏
     const vol = await meanVolume(vocals)
     if (vol < VOCAL_MIN_DB) {
       log.info(`翻唱：「${job.title}」几乎没有人声（${vol.toFixed(0)} dB），像是纯音乐`)
-      try { rmSync(dir, { recursive: true, force: true }) } catch (error) {}
-      if (!job.file) markNoVocals(job.songKey)
+      if (!c.keepWork) try { rmSync(dir, { recursive: true, force: true }) } catch (error) {}
+      if (job.clip) throw new SongClipError('这段没有检测到人声，可能是前奏或间奏；请换个开始位置或增加时长。')
+      // 仅凭一个片段不能认定整首歌没有人声。
+      if (!job.file && !part.cut) markNoVocals(job.songKey)
       if (job.file || job.songId) throw new Error('这首没有人声（像是纯音乐或伴奏版），换一首吧')
       job.skip = [...(job.skip || []), job.songKey]
       if (job.skip.length >= 3) throw new Error(`搜到的几版「${job.query}」都没有人声，换个说法试试（比如带上歌手名）`)
       current.stage = '换一版重下'
       return process1(job)
+    }
+    if (auto) {
+      current.stage = '听原唱定变调'
+      const f0 = await probeF0(vocals)
+      const shift = autoShift(f0, c.selfVoice === 'male' ? 'male' : 'female')
+      if (shift !== null) pitch = shift
+      log.info(`翻唱：原唱人声中位音高 ${f0 ? Math.round(f0) + ' Hz（' + (voiceKind(f0) === 'male' ? '男声' : '女声') + '）' : '测不出来'}，变调 ${pitch > 0 ? '+' : ''}${pitch}`)
     }
     current.stage = '换成她的声音'
     const converted = await convert(vocals, dir, voice, pitch)
@@ -821,29 +1117,60 @@ export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, onSu
     const out = part.cut ? await fade(mixed, dir, part.length) : mixed
     mkdirSync(join(work(), 'cache'), { recursive: true })
     copyFileSync(out, cached)
+    try { writeFileSync(cached + '.json', JSON.stringify({ pitch, auto })) } catch (error) {}
     pruneCache(join(work(), 'cache'), 40)
-    return { file: cached, voice: voice.id, pitch, dir }
+    return { file: cached, voice: voice?.id, pitch, dir }
+  }
+
+  /** 翻唱失败：让她自己说一句（say 由模块层接模型生成），同一聊天 60 秒内只提示一次。 */
+  function noticeFail(job, error, why) {
+    const title = job.title || job.query
+    const now = Date.now()
+    for (const [id, item] of failNoticed) if (now - item.at >= FAIL_NOTICE_GAP) failNoticed.delete(id)
+    const last = failNoticed.get(job.chatId)
+    if (last && now - last.at < FAIL_NOTICE_GAP) {
+      log.info(`翻唱失败提示刚发过（${Math.round((now - last.at) / 1000)} 秒前），这次不重复：「${title}」`)
+      return
+    }
+    failNoticed.set(job.chatId, { at: now, why })
+    // 模型那边彻底挂了也得让人听到一句，不能一声不吭；这句只是兜底，不是原来的模板
+    const plain = `「${title}」：${songFailureReason(error)}`
+    if (!say || error instanceof SongClipError || error instanceof SongDeliveryError) {
+      Promise.resolve(sendText?.(job.chatId, plain)).catch(() => {})
+      return
+    }
+    Promise.resolve()
+      .then(() => say({ chatId: job.chatId, title, query: job.query, why: songFailureReason(error), error: songFailureReason(error) }))
+      .catch((e) => {
+        log.warn('翻唱失败提示没说出来，退回一句短的：', e?.message || e)
+        Promise.resolve(sendText?.(job.chatId, plain)).catch(() => {})
+      })
   }
 
   async function pump() {
     if (current || !queue.length) return
     const job = queue.shift()
-    current = { query: job.query, title: job.query, chatId: job.chatId, stage: '排队', startedAt: Date.now() }
+    current = { query: job.query, title: job.query, chatId: job.chatId, stage: '排队', startedAt: Date.now(), ...(job.clip ? { clip: job.clip } : {}) }
     log.info(`翻唱开始：「${job.query}」→ ${job.chatId}`)
     try {
       const r = await process1(job)
       current.stage = '发送'
-      await sendVoiceFile(job.chatId, r.file, `[${job.acapella ? '清唱' : '翻唱'}] ${job.title || job.query}`)
-      history.unshift({ at: Date.now(), title: job.title || job.query, voice: r.voice, pitch: r.pitch, ok: true, message: `用时 ${Math.round((Date.now() - current.startedAt) / 1000)} 秒` })
-      log.info(`翻唱完成：「${job.title || job.query}」`)
-      onSung?.(job.title || job.query, job.chatId)
-      if (!cfg().keepWork) try { rmSync(r.dir, { recursive: true, force: true }) } catch (error) {}
+      const delivery = await sendVoiceFile(job.chatId, r.file, `[${job.acapella ? '清唱' : '翻唱'}] ${job.title || job.query}`)
+      // 老的自定义发送回调可不返回值；显式未发出和等待补发不能记成已送达。
+      if (delivery === null || delivery === false) throw new SongDeliveryError('翻唱已制作，但语音发送未确认，请先查看目标聊天，避免重复点歌。')
+      const queued = delivery?.queued === true
+      history.unshift({ at: Date.now(), title: job.title || job.query, voice: r.voice, pitch: r.pitch, ...(job.clip ? { clip: job.clip } : {}), ok: true, ...(queued ? { queued: true } : {}), message: queued ? '已制作并交给补发队列；请在目标聊天确认送达' : `用时 ${Math.round((Date.now() - current.startedAt) / 1000)} 秒` })
+      log.info(`翻唱${queued ? '等待补发' : '完成'}：「${job.title || job.query}」`)
+      if (!queued) onSung?.(job.title || job.query, job.chatId)
     } catch (error) {
       const why = explainSongError(error.message)
-      history.unshift({ at: Date.now(), title: job.title || job.query, ok: false, message: why })
+      history.unshift({ at: Date.now(), title: job.title || job.query, ...(job.clip ? { clip: job.clip } : {}), ok: false, message: why })
       log.warn(`翻唱失败：「${job.query}」：`, error.message)
-      sendText?.(job.chatId, `唱不了「${job.title || job.query}」：${why}`).catch(() => {})
+      // 说什么由她自己定：原来那句固定文案对谁、什么原因都一样，听着不像她说的
+      noticeFail(job, error, why)
     } finally {
+      // 下载、分离、换声或发送失败也释放本次工作文件；不碰原文件和成品缓存。
+      try { if (job.workDir && !cfg().keepWork) rmSync(job.workDir, { recursive: true, force: true }) } catch (error) { log.warn('翻唱临时文件未清理：', error.message) }
       history = history.slice(0, 20)
       current = null
       pump()
@@ -851,17 +1178,27 @@ export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, onSu
   }
 
   /** 点一首：马上返回，做好了自己发到聊天里。 */
-  function request({ song, songId, file, pitch, voice, chatId, acapella }) {
+  function request(options) {
+    try { return enqueue(options) }
+    catch (error) {
+      log.warn('翻唱点歌未完成：', error?.message || error)
+      return { ok: false, message: '点歌未完成，请先查看翻唱面板的任务状态再重试；详细原因已记录在本机日志。' }
+    }
+  }
+
+  function enqueue({ song, songId, file, pitch, voice, chatId, acapella, startSec, durationSec }) {
     const c = cfg()
     if (!c.enabled) return { ok: false, message: '翻唱还没打开（面板「翻唱」标签里开）' }
+    const selection = validateSongClip({ startSec, durationSec }, c.maxVoiceSec)
+    if (!selection.ok) return selection
     const st = status()
     if (!st.ready) return { ok: false, message: '翻唱环境还没装好：' + st.message }
     if (!song && !songId && !file) return { ok: false, message: '要说唱哪首歌' }
     if (queue.length >= 5) return { ok: false, message: '排队的歌太多了，等会儿再点' }
-    queue.push({ query: song || basename(file || ''), songId, file, pitch, voice, chatId, acapella: Boolean(acapella) })
+    queue.push({ query: song || basename(file || ''), songId, file, pitch, voice, chatId, acapella: Boolean(acapella), clip: selection.clip })
     const ahead = queue.length - 1 + (current ? 1 : 0)
     pump()
-    return { ok: true, message: `开始准备「${song || basename(file || '')}」，大概要两三分钟${ahead ? `（前面还有 ${ahead} 首）` : ''}，做好了会直接发语音` }
+    return { ok: true, message: `已接下「${song || basename(file || '')}」${selection.clip ? `（${clipLabel(selection.clip)}）` : ''}${ahead ? `，前面还有 ${ahead} 首` : ''}。制作时间取决于片段长度和电脑性能，做好会发语音。` }
   }
 
   return {

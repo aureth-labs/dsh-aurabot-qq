@@ -1,8 +1,9 @@
 // 内置模块：基础 QQ 工具。翻聊天记录；主人私聊里还能让她主动给别人发消息、发文件。
 
-import { defineTool, str, int } from '../../tools/tools.js'
+import { defineTool, str, int, bool } from '../../tools/tools.js'
 import { readQqFile } from '../../features/qq-file.js'
 import { parseMessageEvent } from '../../chat/inbound.js'
+import { hasInvalidVoiceMarkup } from '../../chat/reply.js'
 
 /** 真实网关对不在群里的人也回成功、角色写 member，只有 join_time 是空的：没有它就不算成员。 */
 async function isGroupMember(onebot, groupId, userId) {
@@ -113,7 +114,10 @@ export default {
           const r = groupId
             ? await onebot.call('get_group_msg_history', { group_id: Number(groupId), ...page }, { timeoutMs: 15000 })
             : await onebot.call('get_friend_msg_history', { user_id: Number(chat.userId), ...page }, { timeoutMs: 15000 })
-          const msgs = (r?.messages || []).filter((m) => !anchor || String(m.message_id) !== String(Number(anchor))).slice(-n)
+          const history = Array.isArray(r) ? r : (r?.messages || [])
+          const historyChatId = groupId ? 'group:' + groupId : 'private:' + chat.userId
+          const visible = hub.filterHistory?.(historyChatId, history) ?? history
+          const msgs = visible.filter((m) => !anchor || String(m.message_id) !== String(Number(anchor))).slice(-n)
           if (!msgs.length) return { ok: true, message: '没翻到聊天记录' }
           const self = String(api.config().botQQ)
           const lines = msgs.map((m) => {
@@ -130,7 +134,7 @@ export default {
       })]
       tools.push(defineTool({
         name: 'qq_send_card',
-        description: '向当前聊天发送分享、音乐、位置、联系人、骰子或猜拳。音乐的 music_type、联系人的 contact_type 对应卡片里的 type。',
+        description: '向当前聊天发送网页分享卡片、音乐、位置、联系人、骰子或猜拳。对方要的是图片时，在回复里用 ![说明](图片直链) 贴图；只有来源网页就发网页链接。音乐的 music_type、联系人的 contact_type 对应卡片里的 type。',
         properties: {
           type: str('share / music / location / contact / dice / rps'),
           url: str('分享或自定义音乐的链接'), title: str('分享、音乐或位置的标题'),
@@ -148,28 +152,32 @@ export default {
             const cfg = api.config()
             return { ok: false, message: !cfg.enabled ? '总开关关着，没发' : cfg.dryRun ? '试运行，只记了日志，没真发' : '卡片没发出去' }
           }
-          return { ok: true, message: '卡片发出去了' }
+          return { ok: true, message: card.segment.type === 'share' && card.segment.data.image
+            ? '已发送网页分享卡片，封面没有作为单独的图片发送。' : '卡片发出去了' }
         },
       }))
       // 跨天搜聊天流水：只读。qq_chat_history 只能翻当前聊天最近 50 条，
       // 想找几天前说过的一句话没有入口，这里按关键词翻本地流水（按天存的那份）。
       tools.push(defineTool({
         name: 'qq_search_chatlog',
-        description: '在本地聊天流水里按关键词跨天搜旧对话（只读）。记不清以前说过什么、对方提过的人名约定梗，先搜这个再答；想找「几天前那句话」时比 qq_chat_history 管用。',
+        description: '在本地聊天流水里按关键词跨天搜旧对话（只读）。记不清以前说过什么、对方提过的人名约定梗，先搜这个再答；想找「几天前那句话」时比 qq_chat_history 管用；记得是哪天的就填 date 定点翻。',
         properties: {
           query: str('要搜的关键词，空格分隔表示每个词都要出现'),
           days: int('往回搜多少天，默认 30；0 表示全部'),
+          date: str('可选：只搜这一天，填 2026-03-05 这种日期；填了就忽略 days'),
           chat: str('主人私聊里才能用：只看某个聊天，填 private:QQ号 或 group:群号，不填就是全部；其他场合只搜当前聊天'),
         },
         required: ['query'],
-        execute: async ({ query, days, chat: wanted }) => {
+        execute: async ({ query, days, date, chat: wanted }) => {
           // 跨聊天搜只给主人（full）：群友不能借她翻主人的私聊或别的群
           const only = level === 'full' ? wanted : chat.chatId
           const words = String(query || '').trim().split(/\s+/).filter(Boolean)
           if (!words.length) return { ok: false, message: '关键词是空的' }
+          const wantedDay = String(date || '').trim()
+          if (wantedDay && !/^\d{4}-\d{2}-\d{2}$/.test(wantedDay)) return { ok: false, message: 'date 要填 YYYY-MM-DD 格式的日期' }
           const all = hub.chatLogDays?.() || []
           const n = Number(days)
-          const from = Number.isFinite(n) && n > 0 ? all.slice(-n) : all
+          const from = wantedDay ? all.filter((d) => d === wantedDay) : Number.isFinite(n) && n > 0 ? all.slice(-n) : all
           const hits = []
           for (const day of from) {
             for (const l of hub.chatLogOf?.(day) || []) {
@@ -180,7 +188,7 @@ export default {
               hits.push(`${day.slice(5)} ${hhmm} [${l.chatId}] ${l.who}：${t.slice(0, 120)}`)
             }
           }
-          if (!hits.length) return { ok: true, message: `搜了 ${from.length} 天的流水，没找到「${words.join(' ')}」。` }
+          if (!hits.length) return { ok: true, message: wantedDay && !from.length ? `流水里没有 ${wantedDay} 这天。` : `搜了 ${from.length} 天的流水，没找到「${words.join(' ')}」。` }
           const tail = hits.slice(-40)
           return { ok: true, message: `找到 ${hits.length} 条，最近 ${tail.length} 条：\n${tail.join('\n')}` }
         },
@@ -188,9 +196,13 @@ export default {
       // 读文件：别人发来的内容不可信，只有主人开口才读
       tools.push(defineTool({
         name: 'qq_read_file',
-        description: '读这个聊天里别人发来的文本文件（txt、md、json、日志、代码等，2MB 以内）。只有主人让你看的时候才用。name 填文件名，不填就读最新的一个。',
+        description: '读取当前聊天的文本文件，或查看以文件形式发送的 JPG、PNG 图片（2MB 以内）。只有主人让你看的时候才用。name 填文件名，不填就读最新的一个。',
         properties: { name: str('可选：文件名，不填就读最新的') },
         required: [],
+        render: (_args, value) => {
+          const text = { type: 'text', text: (value.ok ? '' : '✗ ') + value.message }
+          return value.ok && value.image?.attachment ? [text, value.image] : [text]
+        },
         execute: async ({ name }) => {
           if (level !== 'full' && !hub.turnSendersAllOwner?.(sessionId)) return { ok: false, message: '只有主人让看时才能读文件' }
           const list = hub.recentFiles(chat.chatId)
@@ -198,7 +210,7 @@ export default {
           const want = String(name || '').trim()
           const file = want ? list.findLast((f) => f.name === want) || list.findLast((f) => f.name.includes(want)) : list.at(-1)
           if (!file) return { ok: false, message: `没找到「${want}」，最近的文件有：${list.map((f) => f.name).join('、')}` }
-          return readQqFile({ onebot, chat, file })
+          return readQqFile({ onebot, chat, file, dsh: api.dsh, canPreview: () => hub.canSeeImages(chat) })
         },
       }))
       // 发文件/发图：主人私聊（full）和群聊都挂；群里只有「这一轮说话的人全是主人」才放行（#169）。
@@ -251,19 +263,36 @@ export default {
       if (level === 'full' || chat.kind === 'group') tools.push(defineTool({
         name: 'qq_send_message',
         description: '主动给另一个 QQ 好友或群发一条消息（不是回复当前聊天时用）。主人让你去别的私聊或群说几句时用。target 写 private:QQ号 或 group:群号；只能发给白名单里的人和群。',
-        properties: { target: str('private:QQ号 或 group:群号'), text: str('要发的话，可以用 ||| 分多条、<voice>…</voice> 发语音、<sticker:名字> 发表情') },
+        properties: { target: str('private:QQ号 或 group:群号'), text: str('要发的话；voice=true 时只填要念的正文，不写标签或 |||。普通消息仍支持 |||、<voice>…</voice>、<sticker:名字>'), voice: bool('目标聊天要语音时填 true；省略或 false 保留原有标签和语音设置。只控制这次发送，不改变当前聊天回复；以回执确认实际发送类型') },
         required: ['target', 'text'],
-        execute: async ({ target, text }) => {
+        execute: async ({ target, text, voice }) => {
           if (chat.kind === 'group' && !hub.turnSendersAllOwner(sessionId)) return { ok: false, message: '只有主人开口时才能往别的聊天发，这一轮不是。' }
           const cfg = api.config()
           const [kind, id] = String(target || '').split(':')
           const okList = kind === 'group' ? cfg.allow.groups : kind === 'private' ? [cfg.ownerQQ, ...cfg.allow.private] : []
           if (!okList.map(String).includes(String(id))) return { ok: false, message: '不在白名单里，不能发' }
           if (`${kind}:${id}` === chat.chatId) return { ok: false, message: '这就是当前聊天，直接回话就行，别用这个工具' }
-          const r = await hub.deliver(`${kind}:${id}`, String(text || ''))
+          if (voice !== undefined && typeof voice !== 'boolean') return { ok: false, message: 'voice 要填 true 或 false；还没有发送。' }
+          const body = String(text || '')
+          if (voice === true && (/<\/?(?:voice|sticker|reply|at|poke|face)\b/i.test(body) || body.includes('|||'))) return { ok: false, message: 'voice=true 时 text 只填要念的正文，不写标签或 |||；请修改后再试，还没有发送。' }
+          if (hasInvalidVoiceMarkup(body)) return { ok: false, message: '语音标签没有正确配对，还没有发送。请改用 voice=true 并在 text 中只填正文，或修正为 <voice>正文</voice> 后再试。' }
+          let r
+          try { r = await hub.deliver(`${kind}:${id}`, body, voice === true ? { voice: true } : {}) }
+          catch (error) {
+            api.log?.warn?.('跨聊天发送未确认：', error?.message || error)
+            return { ok: false, message: '发送结果未确认，请先查看目标聊天；不要自动重发整条消息。详细原因请主人查看本机日志。' }
+          }
           if (!r) return { ok: false, message: '没发出去：这条被拦下了，或者内容是空的' }
-          if (r.failed) return { ok: false, message: `没发出去（${r.failed} 条失败）：${r.errors[0]}。别说发过了，照实告诉对方` }
-          return r?.missedAt?.length ? { ok: true, message: `发出去了，但 ${r.missedAt.map((n) => '@' + n).join('、')} 没对上群里的人（群名片和昵称里没有），只是文字、对方收不到提醒。要真 @ 得写 <at:QQ号>，不知道就问主人要他的群名片或 QQ 号` } : { ok: true, message: '发出去了' }
+          const sentTypes = r.sentTypes || [], queuedTypes = r.queuedTypes || []
+          const labels = { record: '语音', text: '文字', image: '图片', face: '表情', poke: '戳一戳' }
+          const sent = sentTypes.length ? '已发送：' + [...new Set(sentTypes.map((t) => labels[t] || '其他消息'))].join('、') + '。' : ''
+          if (r.failed) return { ok: false, sentTypes, queuedTypes, message: sent + (queuedTypes.length ? '还有消息在等待补发。' : '') + '部分发送失败或结果未确认；不要宣称全部成功，也不要自动重发整条消息，以免重复。' }
+          if (queuedTypes.length) return { ok: true, sentTypes, queuedTypes, message: sent + '还有消息已排队等待补发，尚未确认送达，请勿重复发送。' }
+          if (!sentTypes.length) return { ok: false, message: '没有确认发出的消息；可能被拦下、处于试运行或总开关关闭，不能说已发送。' }
+          const expectedVoice = voice === true || /<voice>/.test(body)
+          const fallback = expectedVoice && !sentTypes.includes('record') ? '本次没有发出语音；若已发文字，不要称为语音成功。' : ''
+          const mentions = r.missedAt?.length ? `但 ${r.missedAt.map((n) => '@' + n).join('、')} 没对上群里的人，只是文字、对方收不到提醒；真 @ 需要 <at:QQ号>。` : ''
+          return { ok: true, sentTypes, queuedTypes, message: sent + fallback + mentions }
         },
       }))
       return tools

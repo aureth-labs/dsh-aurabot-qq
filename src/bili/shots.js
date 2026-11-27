@@ -148,12 +148,23 @@ export function createShotStore({ max = 300 } = {}) {
     return loadShots().items.map((i) => ({ ...i, clock: clockOf(i.sec), limit: cap() }))
   }
 
+  /** 面板分页：trim 后按 offset/limit 切片，只给当前页补 clock。 */
+  function panelPage({ limit = 25, offset = 0 } = {}) {
+    trim()
+    const all = loadShots().items
+    const start = Math.max(0, Math.trunc(Number(offset) || 0))
+    const take = Math.min(200, Math.max(1, Math.trunc(Number(limit) || 25)))
+    const items = all.slice(start, start + take).map((i) => ({ ...i, clock: clockOf(i.sec), limit: cap() }))
+    return { items, total: all.length, hasMore: start + items.length < all.length }
+  }
+
   return {
     put,
     list,
     trim,
     remove,
     panel,
+    panelPage,
     pick: (query) => pickShot(list(), query),
     count: () => loadShots().items.length,
     exists: (item) => Boolean(item && existsSync(shotPath(item))),

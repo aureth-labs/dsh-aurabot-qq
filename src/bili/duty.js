@@ -2,17 +2,37 @@
 // 定时看别人回她的评论并接着回；你在 QQ 里发链接，她也能点进去看完再聊。看过的、评过的都记成她的经历。
 
 import { dataDir, readJson, writeJson } from '../core/store.js'
+import { isPeak } from '../core/offpeak.js'
 import { createBiliApi, findVideoId, parseCookie } from './api.js'
 import { loginSessionKey, recoverLoginPause } from './login-pause.js'
+import { isSessionBackoff } from '../chat/session-backoff.js'
 import { lookWithVision, visionState } from './vision.js'
 import { createShotStore, shotPath, clockOf } from './shots.js'
+import { inHourWindow } from '../core/time-window.js'
 
 // 这些错误说明今天别再发了：没登录 / Cookie 过期、csrf 不对、风控、要验证码、太频繁
 const PAUSE_CODES = { '-101': 'B 站没登录或 Cookie 过期了', '-111': 'Cookie 里的 bili_jct 不对', '-352': '被 B 站风控了', '-509': '发得太频繁', '12015': 'B 站要求验证码' }
 import { isSilence, cleanOutboundText } from '../chat/reply.js'
+import { reallySent } from '../chat/hub.js'
 
+const FACE_MAX = 2 * 1024 * 1024 // B 站头像上限（api.js 里也有一份，这里给缩图判断用）
 const dayKey = (d = new Date()) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-const link = (bvid) => `https://www.bilibili.com/video/${bvid}`
+export const link = (bvid) => `https://www.bilibili.com/video/${bvid}`
+// QQ 里点得开的是网页播放器：点开直接播；video/ 普通链接常被拦去外部浏览器或要重新登录（#334）。
+// 记忆/流水里仍存 link() 的正式地址，便于回溯与去重。
+export const playerLink = (bvid, p = 1) =>
+  `https://www.bilibili.com/blackboard/webplayer/mbplayer.html?bvid=${bvid}&p=${p}&autoplay=true`
+
+/**
+ * 「只在谷时刷」的跳过原因（纯函数，测试友好）。
+ * 开关关着 → ''（照常跑）；开着且现在是 DeepSeek 峰时 → 返回中文原因。
+ * 峰谷口径同 src/core/offpeak.js：北京时间工作日 09:00–12:00、14:00–18:00 为峰时，周末和法定节假日全天谷价。
+ */
+export function offpeakSkipReason(cfg, now = new Date()) {
+  if (cfg?.bili?.offpeak !== true) return ''
+  const holidays = Array.isArray(cfg?.cost?.offPeakHolidays) ? cfg.cost.offPeakHolidays : []
+  return isPeak(now, { holidays }) ? '峰时（北京时间工作日 09:00–12:00、14:00–18:00），等谷时再刷' : ''
+}
 
 /** 从模型输出里取 JSON（对象或数组），取不到返回 fallback。 */
 export function pickJson(out, fallback) {
@@ -40,14 +60,14 @@ export function digestOf(v, { subtitle = '', comments = [], vision = '' } = {}) 
   ].filter(Boolean).join('\n')
 }
 
-export function createBili({ getConfig, hub, memory, log, dsh, api: injected, vision: see = lookWithVision, afterBrowse }) {
+export function createBili({ getConfig, hub, memory, log, dsh, api: injected, vision: see = lookWithVision, afterBrowse, groupShare }) {
   const cfg = () => getConfig().bili
   const api = injected || createBiliApi({ getCookie: () => cfg().cookie, log })
   const shots = createShotStore({ max: () => getConfig().bili.shotLibrary })
   const file = () => dataDir('bili.json')
-  const load = () => readJson(file(), () => ({ day: '', runs: 0, comments: 0, replies: 0, lastRun: 0, lastReplyCheck: 0, seen: [], repliedFeed: [], history: [] }))
+  const load = () => readJson(file(), () => ({ day: '', runs: 0, comments: 0, replies: 0, lastRun: 0, lastReplyCheck: 0, lastSkipReason: '', lastSkipAt: 0, seen: [], repliedFeed: [], history: [] }))
   const save = (s) => writeJson(file(), s)
-  const today = (s) => { if (s.day !== dayKey()) Object.assign(s, { day: dayKey(), runs: 0, comments: 0, replies: 0 }) ; return s }
+  const today = (s) => { if (s.day !== dayKey()) Object.assign(s, { day: dayKey(), runs: 0, comments: 0, replies: 0, lastSkipReason: '', lastSkipAt: 0 }) ; return s }
   let busy = false
   let stopped = false
   let login = { at: 0, key: '', value: { isLogin: false, uname: '' } }
@@ -97,6 +117,7 @@ export function createBili({ getConfig, hub, memory, log, dsh, api: injected, vi
       const arr = pickJson(out, []).map((k) => String(k).trim()).filter(Boolean)
       if (arr.length) return arr.slice(0, 3)
     } catch (error) {
+      if (isSessionBackoff(error)) throw error
       log.debug('挑关键词失败：', error.message)
     }
     return interests.sort(() => Math.random() - 0.5).slice(0, 3)
@@ -129,6 +150,30 @@ export function createBili({ getConfig, hub, memory, log, dsh, api: injected, vi
       }
     }
     return { info, subtitle, comments, vision, shotIds, digest: digestOf(info, { subtitle, comments, vision }) }
+  }
+
+  /** 补一张截图：攒待批时没抽到画面，发群前再拉一次视频、抽帧存进库。失败返回 ''，纯文字发。 */
+  async function captureShot(bvid) {
+    const c = cfg()
+    if (!c.vision) return ''
+    try {
+      const info = await api.view({ bvid })
+      // 只要一张补图，别按 visionFrames 抽一整套：覆盖成 1 帧，省两次抽帧和视觉调用的输入
+      const r = await see({
+        dsh, api, info, log,
+        getConfig: () => {
+          const g = getConfig()
+          return { ...g, bili: { ...(g.bili || {}), visionFrames: 1 } }
+        },
+      })
+      const f = (r.frames || [])[0]
+      if (!f) return ''
+      const it = shots.put(f.buf, { bvid, title: info.title, sec: f.sec, note: String(r.text || '').slice(0, 120) })
+      return it ? shotPath(it) : ''
+    } catch (error) {
+      log.debug(`补截图失败（${bvid}）：`, error.message)
+      return ''
+    }
   }
 
   /** 挑一张存下来的截图发到指定会话（主人让她发 / 她刷完顺手发）。 */
@@ -166,9 +211,9 @@ export function createBili({ getConfig, hub, memory, log, dsh, api: injected, vi
       : { ok: false, list: [], message: query ? `没有和「${query}」对得上的截图` : '还没有截图' }
   }
 
-  /** 面板用：截图库全量列表（按当前上限先裁一遍）。 */
-  function libraryShots() {
-    return { ok: true, items: shots.panel() }
+  /** 面板用：截图库分页（默认首屏 25 张）。 */
+  function libraryShots({ limit = 25, offset = 0 } = {}) {
+    return { ok: true, ...shots.panelPage({ limit, offset }) }
   }
 
   /** 面板用：某张截图在本机的绝对路径；文件不在就返回 ''。 */
@@ -196,8 +241,12 @@ export function createBili({ getConfig, hub, memory, log, dsh, api: injected, vi
     const c = cfg()
     if (busy) return { ok: false, message: '正在刷' }
     if (!c.enabled && !force) return { ok: false, message: 'B 站没打开' }
+    const cooldown = hub.systemSessionCooldown?.('bili')
+    if (cooldown) return { ok: false, skipped: true, retryAt: cooldown.retryAt, message: '后台会话冷却中' }
     busy = true
     const s = today(load())
+    s.lastSkipReason = ''
+    s.lastSkipAt = 0
     try {
       const seen = new Set(s.seen)
       const kws = await chooseKeywords()
@@ -222,12 +271,18 @@ export function createBili({ getConfig, hub, memory, log, dsh, api: injected, vi
       s.seen = [...seen].slice(-500)
       if (!looked.length) return { ok: false, message: '视频都打不开' }
       const commentLeft = c.comment && canPost(s) ? Math.max(0, c.maxCommentsPerDay - s.comments) : 0
+      // 群分享开着才让她想群里的话（关着就不往提示词里塞，省 token）
+      const groupShareOn = Boolean(groupShare && c.groupShare && c.groupShare.enabled && c.groupShare.groupId && !getConfig().dryRun)
       const out = await think(`你在 B 站刷到了这几个视频：\n\n${looked.map((x, i) => `【${i + 1}】${x.digest}`).join('\n\n')}\n\n` +
-        `看完说说你的想法。对每个视频给一个对象：{"i":序号, "feeling":"一句你的真实感受", "comment":"想在视频下发的评论（像普通观众，一两句、别打广告，不想评就空字符串）", "share":"想私聊分享给${owner()}的话（觉得${owner()}会喜欢才写，不然空字符串）", "remember":"值得记住的一件事（没有就空字符串）"}。` +
+        `看完说说你的想法。对每个视频给一个对象：{"i":序号, "feeling":"一句你的真实感受", "comment":"想在视频下发的评论（像普通观众，一两句、别打广告，不想评就空字符串）", "share":"想私聊分享给${owner()}的话（觉得${owner()}会喜欢才写，不然空字符串；不要自己贴 bilibili.com/video 链接，系统会自动附上能在 QQ 里直接播放的播放器链接）"` +
+        (groupShareOn ? `, "shareGroup":"想发到群里跟群友一起看的话（群里说话的口吻，一两句；没什么值得说就空字符串）"` : '') +
+        `, "remember":"值得记住的一件事（没有就空字符串）"}。` +
         `这次最多评论 ${commentLeft} 个。只输出 JSON 数组。`)
       const decisions = pickJson(out, [])
       let commented = 0
       let shared = 0
+      let awaiting = 0
+      const groupWanted = [] // 想发到群里的：先攒着问主人，批准了才真发
       const felt = new Map() // bvid → 她自己的一句感受，发截图时配着用
       for (const d of Array.isArray(decisions) ? decisions : []) {
         const x = looked[(Number(d.i) || 0) - 1]
@@ -255,11 +310,24 @@ export function createBili({ getConfig, hub, memory, log, dsh, api: injected, vi
         if (c.like && !getConfig().dryRun) api.likeVideo(v.aid).catch(() => {})
         const share = cleanOutboundText(d.share, { warn: (message) => log.warn(`B 站分享：${message}`) }).trim()
         if (share && !isSilence(share) && c.shareToOwner && getConfig().ownerQQ) {
-          await hub.sendText(`private:${getConfig().ownerQQ}`, `${share}\n${link(v.bvid)}`)
-          shared++
-          record(s, { kind: 'share', title: v.title, bvid: v.bvid, text: share })
+          // proactive：真发出去才记账（聊天流水 + 她下次在私聊里认得出自己发过什么）；试运行/排队补发不算
+          const r = await hub.sendText(`private:${getConfig().ownerQQ}`, `${share}\n${playerLink(v.bvid)}`, undefined, undefined, undefined, { proactive: true, proactiveCause: 'bili' })
+          if (reallySent(r)) {
+            shared++
+            record(s, { kind: 'share', title: v.title, bvid: v.bvid, text: share })
+          }
+        }
+        if (groupShareOn) {
+          const toGroup = cleanOutboundText(d.shareGroup, { warn: (message) => log.warn(`B 站群分享：${message}`) }).trim()
+          if (toGroup && !isSilence(toGroup)) groupWanted.push({ bvid: v.bvid, title: v.title, text: toGroup, shotIds: x.shotIds || [] })
         }
         record(s, { kind: 'watch', title: v.title, bvid: v.bvid, text: feeling })
+      }
+      // 想发进群的先攒成待批，问主人一次；没批准一条都不发（试运行下连攒都不攒）
+      if (groupWanted.length) {
+        const asked = await groupShare.submit(groupWanted)
+        if (asked.ok) awaiting = asked.n
+        log.info(`B 站群分享：${asked.ok ? `${asked.n} 条等主人批准` : `没攒（${asked.why}）`}`)
       }
       // 刷完按概率顺手甩一张截图给主人：默认概率和发一张表情包一样，0 = 从不
       let shotSent = 0
@@ -271,12 +339,12 @@ export function createBili({ getConfig, hub, memory, log, dsh, api: injected, vi
           const file = x.shotIds[Math.floor(Math.random() * x.shotIds.length)]
           try {
             const line = felt.get(x.info.bvid) || ''
-            const r = await hub.sendImage(shotTo, shotPath({ file }))
-            if (r?.message_id !== undefined && !String(r.message_id).startsWith('sim-')) {
+            const r = await hub.sendImage(shotTo, shotPath({ file }), undefined, undefined, { proactive: true, proactiveCause: 'bili' })
+            if (reallySent(r)) {
               shotSent = 1
               record(s, { kind: 'shot', title: x.info.title, bvid: x.info.bvid, text: line })
               log.info(`刷完顺手发了张截图《${x.info.title}》`)
-              if (line) await hub.sendText(shotTo, line)
+              if (line) await hub.sendText(shotTo, line, undefined, undefined, undefined, { proactive: true, proactiveCause: 'bili' })
             }
           } catch (error) {
             log.warn('顺手发截图失败：', error.message)
@@ -289,9 +357,10 @@ export function createBili({ getConfig, hub, memory, log, dsh, api: injected, vi
         try { await afterBrowse(looked.map(({ info }) => ({ bvid: info.bvid, title: info.title, text: felt.get(info.bvid) || '' }))) }
         catch (error) { log.debug('本轮弹幕未完成：', error.message) }
       }
-      log.info(`刷了一轮 B 站：看了 ${looked.length} 个，评论 ${commented} 条，分享 ${shared} 个，截图 ${shotSent} 张`)
-      return { ok: true, message: `看了 ${looked.length} 个视频，评论 ${commented} 条，分享给你 ${shared} 个${shotSent ? '，还发了张截图' : ''}`, watched: looked.length, commented, shared, shots: shotSent }
+      log.info(`刷了一轮 B 站：看了 ${looked.length} 个，评论 ${commented} 条，分享 ${shared} 个，截图 ${shotSent} 张${awaiting ? `，群分享待批 ${awaiting} 条` : ''}`)
+      return { ok: true, message: `看了 ${looked.length} 个视频，评论 ${commented} 条，分享给你 ${shared} 个${awaiting ? `，${awaiting} 条等你批准发群` : ''}${shotSent ? '，还发了张截图' : ''}`, watched: looked.length, commented, shared, shots: shotSent, awaitingGroup: awaiting }
     } catch (error) {
+      if (isSessionBackoff(error)) return { ok: false, skipped: true, retryAt: error.retryAt, message: error.message }
       log.warn('刷 B 站出错：', error.message)
       return { ok: false, message: error.message }
     } finally {
@@ -304,6 +373,8 @@ export function createBili({ getConfig, hub, memory, log, dsh, api: injected, vi
   async function checkReplies() {
     const c = cfg()
     if (!c.reply) return { ok: false, message: '回复没打开' }
+    const cooldown = hub.systemSessionCooldown?.('bili')
+    if (cooldown) return { ok: false, skipped: true, retryAt: cooldown.retryAt, message: '后台会话冷却中' }
     const s = today(load())
     s.lastReplyCheck = Date.now()
     let n = 0
@@ -338,6 +409,7 @@ export function createBili({ getConfig, hub, memory, log, dsh, api: injected, vi
       s.repliedFeed = [...done].slice(-300)
       return { ok: true, message: `回了 ${n} 条`, replied: n }
     } catch (error) {
+      if (isSessionBackoff(error)) return { ok: false, skipped: true, retryAt: error.retryAt, message: error.message }
       return { ok: false, message: error.message }
     } finally {
       save(s)
@@ -383,13 +455,24 @@ export function createBili({ getConfig, hub, memory, log, dsh, api: injected, vi
     return { ok: true, message: `B 站签名改好了：${sign}` }
   }
 
-  /** 换 B 站头像。file 是已经过 avatarSource 校验的 http(s) 网址。 */
+  /** 换 B 站头像。file 可以是 http(s) 网址，也可以是图片 Buffer（她画的图 / 聊天里收到的图）。 */
   async function setAvatar(file) {
-    if (!/^https?:\/\//i.test(String(file || ''))) return { ok: false, message: '头像只能用网址图片，或者刚才发的那张图' }
-    if (getConfig().dryRun) return { ok: true, message: `试运行：本来要把 B 站头像换成：${file}` }
+    const isBuf = Buffer.isBuffer(file)
+    if (!isBuf && !/^https?:\/\//i.test(String(file || ''))) return { ok: false, message: '头像只能用网址图片、「刚才那张图」或「画作 #1」' }
+    if (getConfig().dryRun) {
+      return { ok: true, message: isBuf ? `试运行：本来要用这张图（${Math.round(file.length / 1024)} KB）换 B 站头像` : `试运行：本来要把 B 站头像换成：${file}` }
+    }
     if (!parseCookie(cfg().cookie).bili_jct) return { ok: false, message: '没登录 B 站，换不了头像' }
     try {
-      await api.setFace(file)
+      if (isBuf) {
+        // B 站头像上限 2MB：她画的图经常 2MB 出头，先缩到 1024 以内的 JPEG
+        let buf = file
+        if (buf.length > FACE_MAX) buf = await shrinkFace(file)
+        if (!buf) return { ok: false, message: `这张图太大（${Math.round(file.length / 1024)} KB），B 站头像最多 2MB，本机也没缩成` }
+        await api.setFace(buf)
+      } else {
+        await api.setFace(String(file))
+      }
     } catch (error) {
       return { ok: false, message: `B 站头像没换成：${error.message}` }
     }
@@ -397,25 +480,46 @@ export function createBili({ getConfig, hub, memory, log, dsh, api: injected, vi
     return { ok: true, message: 'B 站头像换好了（B 站可能要审核一会儿才显示）' }
   }
 
-  /** 每分钟调一次：醒着的时候按间隔刷、看回复。 */
+  /** 太大就缩到 1024 以内、JPEG；缩不了返回 null。 */
+  async function shrinkFace(buf) {
+    const { findFfmpeg, findSharp, shrinkImage, shrinkWithSharp } = await import('../core/img.js')
+    const ffmpeg = findFfmpeg(cfg().bili && cfg().bili.ffmpegPath)
+    let small = ffmpeg ? await shrinkImage(buf, 1024, ffmpeg) : null
+    if (!small) small = await shrinkWithSharp(await findSharp(), buf, 1024)
+    return small && small.length <= FACE_MAX ? small : null
+  }
+
+  /** 每分钟调一次：醒着的时候按间隔刷、看回复；顺手清掉过期的群分享待批。 */
   async function tick() {
+    try { groupShare?.expire?.() } catch (error) { log.debug('清理群分享待批失败：', error.message) }
     const g = getConfig()
     const c = g.bili
-    if (!g.enabled || !c.enabled) return
-    const h = new Date().getHours()
-    if (h < g.speakUp.awakeFrom || h >= g.speakUp.awakeTo) return
+    if (!g.enabled || !c.enabled || hub.systemSessionCooldown?.('bili')) return
+    if (!inHourWindow(Date.now(), g.speakUp.awakeFrom, g.speakUp.awakeTo)) return
     const s = today(load())
+    // 只在谷时刷：峰时跳过整个定时流程（刷视频 + 看回复），把原因记进状态给面板看，不占额度
+    const skipReason = offpeakSkipReason(g)
+    if (skipReason) {
+      if (s.lastSkipReason !== skipReason) {
+        s.lastSkipReason = skipReason
+        s.lastSkipAt = Date.now()
+        save(s)
+        log.info(`B 站定时刷跳过：${skipReason}`)
+      }
+      return
+    }
+    if (s.lastSkipReason) { s.lastSkipReason = ''; s.lastSkipAt = 0; save(s) }
     if (c.reply && Date.now() - (s.lastReplyCheck || 0) > 20 * 60_000 && (await account()).isLogin) await checkReplies()
-    if (c.autoBrowse && s.runs < c.maxRunsPerDay && Date.now() - (s.lastRun || 0) > c.intervalHours * 3600_000) await run()
+    if (!hub.systemSessionCooldown?.('bili') && c.autoBrowse && s.runs < c.maxRunsPerDay && Date.now() - (s.lastRun || 0) > c.intervalHours * 3600_000) await run()
   }
 
   return {
     run, checkReplies, watch, comment, setSign, setAvatar, tick, account, sendShot, listShots,
-    libraryShots, shotFileOf, deleteShot,
+    libraryShots, shotFileOf, deleteShot, captureShot,
     dispose() { stopped = true },
     state: () => {
       const s = today(load())
-      return { runs: s.runs, comments: s.comments, replies: s.replies, lastRun: s.lastRun, history: s.history.slice(0, 20), canPost: canPost(s), pauseReason: s.pauseDay === dayKey() ? s.pauseReason : '', vision: visionState(cfg()), shots: { count: shots.count() } }
+      return { runs: s.runs, comments: s.comments, replies: s.replies, lastRun: s.lastRun, lastSkipReason: s.lastSkipReason || '', lastSkipAt: s.lastSkipAt || 0, history: s.history.slice(0, 20), canPost: canPost(s), pauseReason: s.pauseDay === dayKey() ? s.pauseReason : '', vision: visionState(cfg()), shots: { count: shots.count() } }
     },
   }
 }

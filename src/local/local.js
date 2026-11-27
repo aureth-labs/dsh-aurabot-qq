@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, copyFileSync, statSync, readFileSync } from 'nod
 import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { dataDir } from '../core/store.js'
+import { selfName } from '../persona/personas.js'
 
 const TEMPLATES = fileURLToPath(new URL('./templates/', import.meta.url))
 const README = 'README-本地接口.md'
@@ -47,16 +48,31 @@ export function createLocal({ getConfig, log }) {
     return Boolean(getConfig().local?.[slot]) && existsSync(pathOf(slot))
   }
 
+  const load = (slot) => {
+    const file = pathOf(slot)
+    return import(pathToFileURL(file).href + '?v=' + statSync(file).mtimeMs)
+  }
+
+  /** 只读取脚本的能力声明，不执行生成函数。 */
+  async function referenceLimit() {
+    if (!active('image')) return 0
+    const mod = await load('image')
+    if (mod.supportsImages === true) return Number.isInteger(mod.maxReferenceImages) && mod.maxReferenceImages > 0 ? Math.min(8, mod.maxReferenceImages) : 8
+    return mod.supportsImage === true ? 1 : 0
+  }
+  const supportsImage = async () => await referenceLimit() > 0
+
   async function call(slot, args) {
     const spec = SLOTS[slot]
-    const file = pathOf(slot)
     const t = Date.now()
     // 生视频比别的慢得多，超时可以在面板单独调
     const timeoutMs = slot === 'video' ? (Number(getConfig().local?.videoTimeoutMin) || 20) * 60_000 : spec.timeoutMs
     try {
       // 带上修改时间：脚本改了就重新加载
-      const mod = await import(pathToFileURL(file).href + '?v=' + statSync(file).mtimeMs)
-      if (slot === 'image' && args?.image && mod.supportsImage !== true) throw new Error('这个生图服务不支持参考图')
+      const mod = await load(slot)
+      if (slot === 'image' && args?.image && mod.supportsImage !== true && mod.supportsImages !== true) throw new Error('这个生图服务不支持参考图')
+      if (slot === 'image' && args?.images?.length && mod.supportsImages !== true) throw Object.assign(new Error('这个生图服务仅支持单张参考图'), { code: 'SINGLE_REFERENCE_ONLY' })
+      if (slot === 'image' && mod.supportsImages === true && args?.image && !args.images) args = { ...args, images: [args.image] }
       const fn = mod.default || mod.run
       if (typeof fn !== 'function') throw new Error(`${spec.file} 里没有 export default 的函数`)
       mkdirSync(outDir(), { recursive: true })
@@ -70,7 +86,9 @@ export function createLocal({ getConfig, log }) {
       return result
     } catch (error) {
       last[slot] = { ok: false, at: Date.now(), message: String(error.message || error).slice(0, 300) }
-      log.warn(`本地接口「${spec.title}」出错：`, last[slot].message)
+      // 传进来的可能是根 logger（只有 child，没有 warn），直接调会把真实错误盖成 TypeError
+      const say = typeof log.warn === 'function' ? log : log.child('local')
+      say.warn(`本地接口「${spec.title}」出错：`, last[slot].message)
       throw error
     }
   }
@@ -88,7 +106,7 @@ export function createLocal({ getConfig, log }) {
   /** 复制给 DSH 的话：让它读说明、改脚本。 */
   function promptFor(slot) {
     const s = SLOTS[slot]
-    return `帮我修改 Aurabot（大肥鱼 QQ 插件）的本地接口脚本：${pathOf(slot)}\n`
+    return `帮我修改 Aurabot（${selfName(getConfig())} QQ 插件）的本地接口脚本：${pathOf(slot)}\n`
       + `先读同一个文件夹里的「${README}」了解参数和返回值的约定，再把这个脚本改成调用我电脑上的${s.title}：\n`
       + `【这里写你用的是什么、地址、模型和关键参数，例如：${s.example}】\n`
       + '只改这一个脚本，不要动插件本身的代码；改完告诉我怎么测试。'
@@ -102,5 +120,5 @@ export function createLocal({ getConfig, log }) {
     }))
   }
 
-  return { active, call, template, status, dir, pathOf }
+  return { active, call, supportsImage, referenceLimit, template, status, dir, pathOf }
 }

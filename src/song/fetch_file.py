@@ -7,6 +7,7 @@
 import hashlib
 import os
 import socket
+import ssl
 import sys
 import time
 import urllib.request
@@ -62,6 +63,18 @@ def fetch(opener, url, part, want, can_switch):
     return not want or have >= want
 
 
+def is_cert_error(e):
+    """是不是证书校验失败（urllib 会把它包在 URLError 里）。"""
+    seen = e
+    for _ in range(3):
+        if isinstance(seen, ssl.SSLCertVerificationError) or 'CERTIFICATE_VERIFY_FAILED' in str(seen):
+            return True
+        seen = getattr(seen, 'reason', None)
+        if seen is None:
+            return False
+    return False
+
+
 def sha256_of(path):
     h = hashlib.sha256()
     with open(path, 'rb') as f:
@@ -77,7 +90,16 @@ def main():
         expect, args = args[1].lower(), args[2:]
     dest, urls = args[0], args[1:]
     socket.setdefaulttimeout(STALL)
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler(urllib.request.getproxies()))
+    proxies = urllib.request.ProxyHandler(urllib.request.getproxies())
+    opener = urllib.request.build_opener(proxies)
+    # 证书校验失败（代理、加速器、安全软件换了证书）时，只有给了 sha256 的文件才改用不校验证书的连接：
+    # 内容下完照样按 sha256 核对，对不上就删掉，所以不会把被换掉的文件留下来（#3）
+    insecure = None
+    if expect:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        insecure = urllib.request.build_opener(proxies, urllib.request.HTTPSHandler(context=ctx))
     part = dest + '.download'
     os.makedirs(os.path.dirname(dest) or '.', exist_ok=True)
     want = 0
@@ -100,6 +122,9 @@ def main():
                     print('done', os.path.getsize(dest), flush=True)
                     return 0
             except Exception as e:  # 断了、卡住、太慢、地址不行：换下一个地址，已下载的部分保留
+                if insecure is not None and opener is not insecure and is_cert_error(e):
+                    print('retry', url.split('/')[2], 'CertificateError', '证书校验没通过，改用不校验证书的连接重下（下完按 sha256 核对）', flush=True)
+                    opener = insecure
                 last_err = e
                 print('retry', url.split('/')[2], type(e).__name__, str(e)[:120], flush=True)
     print('failed', last_err, flush=True)

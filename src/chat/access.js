@@ -23,17 +23,53 @@ export function checkAllowed(cfg, msg) {
     : { allowed: false, reason: '不在群白名单' }
 }
 
-/** 这个会话用哪一档权限。群聊永远不超过 social。 */
+/** 群消息入口：白名单仍控制模块；仅模块名单只关闭群消息触发的 AI 接话。 */
+export function groupResponseMode(cfg, groupId) {
+  const id = String(groupId)
+  if (!(cfg.allow?.groups || []).map(String).includes(id)) return 'off'
+  return (cfg.group?.moduleOnlyGroups || []).map(String).includes(id) ? 'modules' : 'chat'
+}
+export const GROUP_RESPONSE_LABELS = { off: '不响应群消息', modules: '仅模块', chat: '允许 AI 聊天' }
+
+/** 只旁听指定的非白名单群：不开放回复、命令、工具或媒体下载。 */
+export function shouldObserveGroup(cfg, msg) {
+  return cfg.enabled === true && !cfg.debug && cfg.memory?.enabled === true &&
+    msg.kind === 'group' && !checkAllowed(cfg, msg).allowed &&
+    Array.isArray(cfg.memory.passiveGroups) && cfg.memory.passiveGroups.includes(String(msg.groupId))
+}
+
+/** 群聊里给不给本机工具：off = 不给；owner = 只有主人说话那一轮给。
+ * 没有「谁问都给」这一档——群里任何人都能驱动本机读写，权限面太大，明确不做。 */
+export const GROUP_OWNER_TOOLS = ['off', 'owner']
+
+/**
+ * 这个群当前该给哪一档。ownerToolsGroups 非空时只在列出的群里生效（留空 = 所有群）。
+ * @returns {'off'|'owner'}
+ */
+export function groupOwnerTools(cfg, chat) {
+  if (!chat || chat.kind !== 'group') return 'off'
+  const mode = cfg?.group?.ownerTools
+  if (mode !== 'owner') return 'off'
+  const list = (cfg?.group?.ownerToolsGroups || []).map(String).filter(Boolean)
+  if (list.length && !list.includes(String(chat.groupId || ''))) return 'off'
+  return mode
+}
+
+/** 这个会话用哪一档权限。群聊默认不超过 social，除非主人给这个群开了本机工具。 */
 export function levelFor(cfg, chat) {
   const owner = String(cfg.ownerQQ || '')
   if (chat.kind === 'private' && chat.userId === owner) {
     return LEVELS.includes(cfg.ownerLevel) ? cfg.ownerLevel : 'full'
   }
+  // group-full 不叫 full：插件自己的工具还要按 social 语义挂（模块里到处是 level === 'full' 判主人私聊），
+  // 真正的开关由 hub 按这一轮说话的人做（tools.restrict 收走核心工具）。
+  if (chat.kind === 'group' && groupOwnerTools(cfg, chat) !== 'off') return 'group-full'
   return 'social'
 }
 
 /** 档位 → agent preset id。 */
 export function presetFor(level, cfg) {
+  if (level === 'group-full') return 'aurabot-group-owner'
   if (level !== 'full') return 'aurabot-social'
   return cfg && cfg.longTasks ? 'aurabot-private-long' : 'aurabot-private'
 }
@@ -41,6 +77,14 @@ export function presetFor(level, cfg) {
 /** 只有主人能做的事（群管、点歌、写文件……）。 */
 export function isOwner(cfg, userId) {
   return String(userId || '') !== '' && String(userId) === String(cfg.ownerQQ || '')
+}
+
+/** 授权名单只作用于已获准聊天的私聊对象。 */
+export function privateCapabilityAllowed(cfg, chat, capability) {
+  if (chat?.kind !== 'private') return false
+  const userId = String(chat.userId || '')
+  if (!userId || !(cfg.allow?.private || []).map(String).includes(userId)) return false
+  return (cfg.capabilityAllow?.[capability] || []).map(String).includes(userId)
 }
 
 /** 改资料类操作（改昵称 / 签名 / 头像、改 B 站签名），以及处理好友申请、改白名单的三档权限。 */

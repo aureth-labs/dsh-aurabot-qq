@@ -56,3 +56,41 @@ test('带文字说明的 sub_type 7 算表情，没说明的不算', () => {
   assert.equal(isStickerSegment(image({ sub_type: 7 })), false)
   assert.equal(isStickerSegment(image({ sub_type: 0, summary: '[图片]' })), false)
 })
+
+test('图片文件只在确认能看图时下载；大小、地址和文件内容均受限', async () => {
+  const image = file({ name: '原图.JPG' })
+  let reads = 0
+  const get = async () => { reads++; return Buffer.from('not a JPEG') }
+  for (const over of [{ canPreview: () => false }, { canPreview: () => null },
+    { file: { ...image, size: 2 ** 21 + 1 } }, { file: { ...image, url: 'file:///some/image.jpg' } }]) {
+    const r = await readQqFile({ chat, file: image, canPreview: () => true, download: get, ...over })
+    assert.equal(r.ok, false)
+  }
+  assert.equal(reads, 0)
+  const broken = await readQqFile({ chat, file: image, canPreview: () => true, download: get })
+  assert.equal(reads, 1)
+  assert.equal(broken.ok, false)
+  assert.equal(broken.image, undefined)
+})
+
+test('群内 JPEG 和 PNG 文件生成有尺寸上限的真实预览，只返回已登记附件', async (t) => {
+  const { findSharp } = await import('../src/core/img.js')
+  const sharp = await findSharp()
+  if (!sharp) return t.skip('需要桌面宿主的 sharp 图片解码器')
+  for (const format of ['jpeg', 'png']) {
+    const buf = await sharp({ create: { width: 1400, height: 800, channels: 3, background: '#5a4b2c' } })[format]().toBuffer()
+    const group = { kind: 'group', groupId: '9' }
+    const input = file({ name: `群文件.${format}`, size: buf.length, url: '' })
+    const onebot = { call: async (action, args) => { assert.equal(action, 'get_group_file_url'); assert.equal(args.group_id, 9); return { url: 'https://cdn.example/image' } } }
+    const base = { chat: group, onebot, file: input, canPreview: () => true,
+      download: async (url, opts) => { assert.equal(url, 'https://cdn.example/image'); assert.deepEqual(opts, { maxBytes: 2 ** 21, allowLocal: false }); return buf } }
+    const dsh = { attachments: { admitPromptContent: async ([item]) => {
+      const m = await sharp(Buffer.from(item.data, 'base64')).metadata()
+      assert.equal(m.format, 'jpeg'); assert.equal(m.width, 1024); assert.ok(m.height < m.width)
+      return [{ ...item, attachment: { attachmentId: 'preview' } }]
+    } } }
+    const result = await readQqFile({ ...base, dsh })
+    assert.equal(result.ok, true); assert.equal(result.image.attachment.attachmentId, 'preview'); assert.equal(result.image.data, undefined)
+    assert.equal((await readQqFile({ ...base, dsh: {} })).ok, false)
+  }
+})

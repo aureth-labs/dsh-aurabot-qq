@@ -55,6 +55,17 @@ test('开关打开就接管；脚本改完不用重启；出错有记录', async
   cfg.local.tts = false
 })
 
+test('根 logger 只有 child、没有 warn 时，真实错误照常抛出，日志走子 logger', async () => {
+  const warns = []
+  const root = { child: () => ({ info() {}, warn: (...a) => warns.push(a.join(' ')), error() {} }) }
+  const local = L.createLocal({ getConfig: () => cfg, log: root })
+  cfg.local.tts = true
+  writeFileSync(local.pathOf('tts'), 'export default async () => { throw new Error("服务没开") }')
+  await assert.rejects(local.call('tts', { text: 'x' }), /服务没开/, '不能把真实错误盖成 logger 的 TypeError')
+  assert.match(warns.join('\n'), /语音合成.*服务没开/)
+  cfg.local.tts = false
+})
+
 test('生图：脚本返回 Buffer / base64 / 文件都认；接管后不需要在线生图服务', async () => {
   const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3])
   assert.deepEqual(await L.toImageBuffer(png), png)

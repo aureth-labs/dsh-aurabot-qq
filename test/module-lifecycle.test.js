@@ -180,6 +180,32 @@ test('异步 setup 停止后，迟到的写操作不能发送消息或修改配�
   })
 })
 
+test('运行和同步收尾的 core.setConfig 合并配置，迟到的回调不得再写', async (t) => {
+  const core = { hub: { subagentFor: () => {} }, setConfig: (next) => f.setConfig(next) }
+  const f = fixture(t, { core })
+  const initial = {
+    ...f.config(), botQQ: '10000001', ownerQQ: '10000002', enabled: true,
+    dryRun: false, setupDone: true, voice: { enabled: true, speed: 1.2 },
+  }
+  f.setConfig(initial)
+  f.write('config-writer', `
+    export default { id: 'config-writer', setup(api) {
+      api.core.setConfig({ voice: { enabled: false } })
+      api.onDispose(() => api.core.setConfig({ voice: { enabled: true } }))
+      return { write: () => api.core.setConfig({ voice: { speed: 0.5 } }) }
+    } }
+  `)
+  await f.modules.boot()
+  const expected = { ...initial, voice: { ...initial.voice, enabled: false } }
+  assert.deepEqual(f.config(), expected)
+
+  const lateWrite = f.modules.use('config-writer').write
+  assert.equal(f.modules.stop('config-writer'), true)
+  assert.deepEqual(f.config(), initial)
+  assert.throws(lateWrite, /已停止，不能调用 core.setConfig/)
+  assert.deepEqual(f.config(), initial)
+})
+
 test('导入途中关闭模块、开启安全模式或停止模块，导入结束后不执行 setup', async (t) => {
   for (const action of ['disable', 'safeMode', 'stop']) await t.test(action, async (t) => {
     const f = fixture(t)
@@ -368,4 +394,38 @@ test('异步清理拒绝被处理，正常和迟到清理均不影响其他资�
     assert.equal(f.warnings.filter((text) => text.includes('expected async callback rejection')).length, 1)
     assert.equal(f.warnings.filter((text) => text.includes('expected async cleanup rejection')).length, 1)
   })
+})
+
+test('模块声明 proactive 时把留痕标记透给 hub，不声明就不加（chatlog 丢档回归）', async (t) => {
+  const calls = []
+  const hub = {
+    sendText: (...args) => { calls.push(['sendText', args]); return { message_id: '1' } },
+    sendSegments: (...args) => { calls.push(['sendSegments', args]); return { message_id: '2' } },
+  }
+  const f = fixture(t, { core: { hub } })
+  await f.modules.boot()
+  f.write('say-log', `
+    export default { id: 'say-log', api: 1, async setup(api) {
+      await api.sendText('group:1', '没声明')
+      await api.sendText('group:1', '声明了', { proactive: true, proactiveCause: 'qq_say_in_group' })
+      await api.sendText('group:1', '默认 cause')
+      await api.sendText('group:1', '默认 cause', { proactive: true })
+      await api.sendSegments('group:1', [{ type: 'text', data: { text: 'seg' } }], 'note', { proactive: true })
+      await api.sendSegments('group:1', [{ type: 'text', data: { text: 'seg2' } }])
+      return {}
+    } }
+  `)
+  await f.modules.sync()
+  assert.equal(calls.length, 6)
+  // hub.sendText(chatId, text, replyId, missed, userId, opts)：模块快捷 API 一律传 5 个占位 + opts
+  assert.equal(calls[0][1][5].proactive, undefined, '不声明时不能凭空造 proactive')
+  assert.equal(calls[1][1][5].proactive, true)
+  assert.equal(calls[1][1][5].proactiveCause, 'qq_say_in_group')
+  assert.equal(calls[3][1][5].proactiveCause, 'module:say-log', '没给 cause 时用 module:<id> 兜底')
+  assert.equal(calls[2][1][5].proactive, undefined)
+  // hub.sendSegments(chatId, segs, note, opts)
+  assert.equal(calls[4][1][3].proactive, true)
+  assert.equal(calls[4][1][3].proactiveCause, 'module:say-log')
+  assert.equal(calls[4][1][2], 'note', 'note 原样传下去')
+  assert.equal(calls[5][1][3].proactive, undefined)
 })

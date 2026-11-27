@@ -190,7 +190,8 @@ test('安全模式：自己写的一个都不加载，内置的回来', async ()
 })
 
 test('复制内置模块来改：复制出来的能直接跑（连翻唱这种带数据文件的）', async () => {
-  for (const id of ['speakup', 'song']) {
+  // P4：speakup 模块已退场（能力并入 purpose），fork 用例不再覆盖它
+  for (const id of ['song']) {
     const r = (await fake.call('/modules/fork', { id })).json()
     assert.equal(r.ok, true, r.message)
     const code = readdirSync(modDir(id), { withFileTypes: true }).filter((e) => e.isFile()).map((e) => readFileSync(join(modDir(id), e.name), 'utf8')).join('\n')
@@ -229,6 +230,21 @@ test('复制 B 站模块：抽帧 / 截图库文件一起复制，用户模块�
     const shots = (await fake.call('/bili/shots')).json()
     assert.equal(shots.ok, true)
     assert.deepEqual(shots.items, [])
+    // 旧用户模块和内置模块共用同一图库索引；切换来源不能删除旧源码或截图。
+    const shotDir = join(dataDir, 'bili-shots')
+    mkdirSync(shotDir, { recursive: true })
+    const legacyShot = { file: '0123456789ab.jpg', md5: '0123456789ab', at: Date.now(), sec: 12, title: '旧截图', bvid: 'BV1aaaaaaaaa', bytes: 3 }
+    writeFileSync(join(shotDir, legacyShot.file), 'old')
+    writeFileSync(join(shotDir, 'index.json'), JSON.stringify({ items: [legacyShot] }))
+    await fake.call('/save', { modules: { bili: { useBuiltin: true } } })
+    await until(async () => (await mod('bili')).running === 'builtin')
+    assert.equal(existsSync(join(modDir('bili'), 'index.mjs')), true, '旧用户模块保留为回退入口')
+    const migrated = (await fake.call('/bili/shots')).json()
+    assert.equal(migrated.items[0].file, legacyShot.file)
+    assert.equal(readFileSync(join(shotDir, legacyShot.file), 'utf8'), 'old')
+    const preview = await fake.call('/bili/shot/image?file=' + legacyShot.file)
+    assert.equal(preview.status, 200)
+    assert.equal(preview.raw().toString(), 'old')
   } finally {
     await fake.call('/save', { modules: { bili: { enabled: false } } })
   }
@@ -360,6 +376,19 @@ test('模拟测试：消息、命令、她的回复都走一遍模块，但不�
   assert.ok(existsSync(join(dataDir, 'modules', 'aurabot.d.ts')), '类型提示放好了')
 })
 
+test('模拟测试不写真实聊天流水：不会凭空产生 10001 人物记忆', async () => {
+  const rows = () => {
+    const dir = join(dataDir, 'chatlog')
+    if (!existsSync(dir)) return []
+    return readdirSync(dir).filter((name) => name.endsWith('.jsonl')).flatMap((name) =>
+      readFileSync(join(dir, name), 'utf8').split('\n').filter((line) => line.includes('private:10001')))
+  }
+  assert.deepEqual(rows(), [], '测试开始前不应有 10001 流水')
+  await fake.call('/modules/simulate', { as: 'other', kind: 'private', text: 'ping', reply: '在呢' })
+  await sleep(80)
+  assert.deepEqual(rows(), [], '模拟测试不能写进真实聊天流水')
+})
+
 test('只看 API.md 从零写出来的模块（查天气）能直接加载：命令、工具、设置都挂上了', async () => {
   mkdirSync(modDir('weather'), { recursive: true })
   writeFileSync(join(modDir('weather'), 'index.mjs'), readFileSync(new URL('./fixtures/weather/index.mjs', import.meta.url)))
@@ -462,5 +491,61 @@ test('模块状态带标签状态点：写了 flag 用它，有 enabled 设置�
   assert.equal((await mod('flagged')).flag, 'loggedIn')
   assert.equal((await mod('switchy')).flag, 'enabled')
   assert.equal((await mod('plain')).flag, '')
+})
+
+test('删除自己写的模块：源码归档到 .trash，默认保留数据和设置', async () => {
+  writeMod('delete-keep', `export default { id: 'delete-keep', name: '待删模块', api: 1, setup(api) {
+    api.route('/alive', async () => ({ ok: true }))
+  } }`)
+  await until(async () => (await mod('delete-keep'))?.running === 'user')
+  const data = join(dataDir, 'modules-data', 'delete-keep')
+  mkdirSync(data, { recursive: true })
+  writeFileSync(join(data, 'state.json'), '{}')
+  await fake.call('/save', { ext: { 'delete-keep': { keep: 'yes' } } })
+
+  const r = (await fake.call('/modules/remove', { id: 'delete-keep' })).json()
+  assert.equal(r.ok, true, r.message)
+  assert.match(r.archive, /^modules\/\.trash\/delete-keep-/)
+  assert.equal(existsSync(modDir('delete-keep')), false, '模块目录已移走')
+  assert.equal(existsSync(join(data, 'state.json')), true, '数据默认保留')
+  assert.equal(api.getConfig().ext['delete-keep'].keep, 'yes', '设置默认保留')
+  assert.equal((await mod('delete-keep')), undefined, '状态列表里不再有它')
+})
+
+test('删除模块 purge：模块数据和设置一起清掉', async () => {
+  writeMod('delete-purge', `export default { id: 'delete-purge', name: '清数据模块', api: 1, setup() {} }`)
+  await until(async () => (await mod('delete-purge'))?.running === 'user')
+  const data = join(dataDir, 'modules-data', 'delete-purge')
+  mkdirSync(data, { recursive: true })
+  writeFileSync(join(data, 'state.json'), '{}')
+  await fake.call('/save', { modules: { 'delete-purge': { enabled: true } }, ext: { 'delete-purge': { x: 1 } } })
+
+  const r = (await fake.call('/modules/remove', { id: 'delete-purge', purge: true })).json()
+  assert.equal(r.ok, true, r.message)
+  assert.equal(existsSync(modDir('delete-purge')), false)
+  assert.equal(existsSync(data), false, 'modules-data 已清掉')
+  assert.equal(api.getConfig().ext['delete-purge'], undefined)
+  assert.equal(api.getConfig().modules['delete-purge'], undefined)
+})
+
+test('删除内置模块的用户副本：删掉后自动回到内置版本', async () => {
+  const before = await mod('diary')
+  assert.equal(before.builtin, true)
+  assert.equal(before.hasUser, true)
+  const r = (await fake.call('/modules/remove', { id: 'diary', purge: true })).json()
+  assert.equal(r.ok, true, r.message)
+  assert.equal(existsSync(modDir('diary')), false, '用户副本目录已移走')
+  const after = await until(async () => {
+    const m = await mod('diary')
+    return m?.running === 'builtin' ? m : null
+  })
+  assert.equal(after.builtin, true)
+  assert.equal(after.hasUser, false)
+})
+
+test('删除模块接口拒绝路径穿越和非法 id', async () => {
+  const r = (await fake.call('/modules/remove', { id: '../evil' })).json()
+  assert.equal(r.ok, false)
+  assert.match(r.message, /id 不对/)
 })
 

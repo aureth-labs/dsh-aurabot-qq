@@ -4,6 +4,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { isPeak, isOffPeak, nextChange, shouldDeferBackground } from '../src/core/offpeak.js'
+import { offpeakSkipReason } from '../src/bili/duty.js'
 import { normalize } from '../src/core/config.js'
 
 // 2026-11-02 是周一，2026-11-06 周五，2026-11-07 周六，2026-11-08 周日。
@@ -101,4 +102,28 @@ test('config normalize：cost 默认关、老配置不受影响、脏值清洗',
   assert.deepEqual(c2.cost.offPeakHolidays, ['2026-10-01', '2026-10-02'])
   // 其它配置不受影响
   assert.equal(normalize({ cost: { offPeak: true } }).enabled, false)
+})
+
+test('B 站「只在谷时刷」：只在开关打开且峰时跳过（纯函数）', () => {
+  const cfg = (offpeak, holidays = []) => ({ bili: { offpeak }, cost: { offPeakHolidays: holidays } })
+  // 开关关着：全天都不跳过
+  assert.equal(offpeakSkipReason(cfg(false), new Date(utc(...MON, 2, 0))), '')
+  assert.equal(offpeakSkipReason(cfg(false), new Date(utc(...SAT, 2, 0))), '')
+  // 开着：工作日峰时跳过，给面板/日志留原因
+  assert.match(offpeakSkipReason(cfg(true), new Date(utc(...MON, 2, 0))), /峰时/)
+  assert.match(offpeakSkipReason(cfg(true), new Date(utc(...MON, 6, 0))), /峰时/)
+  // 谷时 / 周末 / 节假日照常跑
+  assert.equal(offpeakSkipReason(cfg(true), new Date(utc(...MON, 4, 0))), '')
+  assert.equal(offpeakSkipReason(cfg(true), new Date(utc(...SAT, 2, 0))), '')
+  assert.equal(offpeakSkipReason(cfg(true, ['2026-11-02']), new Date(utc(...MON, 2, 0))), '')
+  // 配置缺失不炸
+  assert.equal(offpeakSkipReason(undefined, new Date(utc(...MON, 2, 0))), '')
+})
+
+test('config normalize：bili.offpeak 默认关、只认 boolean', () => {
+  assert.equal(normalize({}).bili.offpeak, false, '默认关，现有行为不变')
+  assert.equal(normalize({ bili: { offpeak: true } }).bili.offpeak, true)
+  assert.equal(normalize({ bili: { offpeak: 'yes' } }).bili.offpeak, false)
+  assert.equal(normalize({ bili: { offpeak: 1 } }).bili.offpeak, false)
+  assert.equal(normalize({ bili: { offpeak: false, autoBrowse: true } }).bili.offpeak, false)
 })

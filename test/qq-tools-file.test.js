@@ -93,3 +93,13 @@ test('target 不在白名单里：拒绝', async () => {
   assert.match(r.message, /不在白名单里/)
   assert.deepEqual(s.sent, [])
 })
+
+test('群里只有主人当轮可读图片文件；拒绝时不取文件、不查视觉', async () => {
+  let build, reads = 0
+  qqTools.setup({ core: { hub: { turnSendersAllOwner: () => false, recentFiles: () => { reads++; return [] } }, onebot: {} }, config: () => ({}), tool: (fn) => { build = fn } })
+  const read = build({ chat: { kind: 'group', chatId: 'group:9' }, level: 'social', sessionId: 's' }).find((x) => x.name === 'qq_read_file')
+  const r = await read.execute({ name: 'a.jpg' }); assert.equal(r.ok, false); assert.equal(reads, 0)
+  assert.match(read.output.render({}, r)[0].text, /只有主人/)
+  const image = { type: 'image', attachment: { attachmentId: 'preview' } }
+  assert.deepEqual(read.output.render({}, { ok: true, message: '预览', image }), [{ type: 'text', text: '预览' }, image])
+})

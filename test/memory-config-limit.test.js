@@ -14,7 +14,9 @@ function panelHarness(initial = {}) {
   const marker = '    exports.apply = apply'
   assert.ok(source.includes(marker))
   let loader
-  new Script(source.replace(marker, '    exports.capacityTest = { Mood, resizeMemoryCapacity }\n' + marker)).runInNewContext({
+  // 1.3-beta 把「记忆」从心情页拆出去但没单独导出 MemoryPage，直接写进对象字面量
+  // 会 ReferenceError。用 typeof 兜底成 undefined，再按 CANDIDATES 逐个试。
+  new Script(source.replace(marker, '    exports.capacityTest = { Mood, MemoryPage: typeof MemoryPage === "function" ? MemoryPage : undefined, resizeMemoryCapacity }\n' + marker)).runInNewContext({
     window: { __ModuleLoader__: { load: (value) => { loader = value } } },
   })
   let hook = 0
@@ -36,9 +38,17 @@ function panelHarness(initial = {}) {
   }
   const panel = loader.factory(() => React).capacityTest
   let draft = normalize(initial)
+  // 容量输入框跟着「记忆」页走：面板曾经把它和心情合并在同一页（Mood），
+  // 也可能拆成独立的记忆页（MemoryPage）。这里不写死组件名，逐个试，
+  // 哪个渲染出了「自动记忆容量」就用哪个——两种布局下测试都能跑。
+  const CANDIDATES = ['MemoryPage', 'Mood'].filter((name) => typeof panel[name] === 'function')
   const render = () => {
-    hook = 0
-    return panel.Mood({ st: { modules: [{ id: 'memory', running: true }] }, draft, setDraft: (value) => { draft = value }, toast() {} })
+    for (const name of CANDIDATES) {
+      hook = 0
+      const node = panel[name]({ st: { modules: [{ id: 'memory', running: true }] }, draft, setDraft: (value) => { draft = value }, toast() {} })
+      if (node) return node
+    }
+    return null
   }
   const findInput = (node) => {
     if (!node || typeof node !== 'object') return null
@@ -46,7 +56,17 @@ function panelHarness(initial = {}) {
     if (node.type === 'input' && node.props['aria-label'] === '自动记忆容量') return node
     return findInput(node.children)
   }
-  return { panel, input: () => findInput(render()), draft: () => draft }
+  // 逐个候选找到能出的那个；都不出就给个明确报错，而不是让它变成 null 解引用
+  const pick = () => {
+    for (const name of CANDIDATES) {
+      hook = 0
+      const node = panel[name]({ st: { modules: [{ id: 'memory', running: true }] }, draft, setDraft: (value) => { draft = value }, toast() {} })
+      const input = findInput(node)
+      if (input) return input
+    }
+    throw new Error('面板里找不到「自动记忆容量」输入框（试过: ' + CANDIDATES.join(', ') + '）')
+  }
+  return { panel, input: () => pick(), draft: () => draft }
 }
 
 function isolatedDir(t) {
@@ -103,9 +123,12 @@ for (const backend of ['sqlite', 'json']) {
     const dir = isolatedDir(t)
     const now = Date.now()
     const items = Array.from({ length: 2000 }, (_, i) => ({ id: `auto-${i}`, text: `自动记忆 ${i}`, about: 'existing', source: 'auto', at: now - i, importance: 0.5 }))
+    const seedLog = { info() {}, warn() {}, debug() {} }
+    // 回退标记只在「库还在」时有效：先建一个已初始化的空库，再写 JSON 和标记，模拟真实的写失败回退状态
+    if (backend === 'json') createMemoryStorage({ directory: dir, log: seedLog }).load()
     writeFileSync(join(dir, 'memories.json'), JSON.stringify({ items }))
     if (backend === 'json') writeFileSync(join(dir, 'memory-json-fallback.json'), '{}')
-    const storage = createMemoryStorage({ directory: dir, log: { info() {}, warn() {}, debug() {} } })
+    const storage = createMemoryStorage({ directory: dir, log: seedLog })
     t.after(() => storage.close())
     assert.equal(storage.status().backend, backend)
     const cfg = normalize({ memory: { capacity: { auto: 4000, event: 1200, diary: 800 } } })

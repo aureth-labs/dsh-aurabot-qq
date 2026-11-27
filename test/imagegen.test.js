@@ -1,5 +1,5 @@
 // 生图的「自定义接口」：GET/POST、URL 模板占位、自定义参数名、两种返回形态。
-import { test } from 'node:test'
+import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 
 const { customRequest, createImageGen } = await import('../src/features/imagegen.js')
@@ -133,13 +133,18 @@ test('接口回了别的东西：报错而不是发一张坏图', async () => {
   } finally { globalThis.fetch = orig }
 })
 
-test('enabled()：自定义模式看地址有没有填', () => {
-  const cfg = (custom) => ({ imageGen: { enabled: true, provider: 'custom', custom } })
-  const gen = (custom) => createImageGen({ getConfig: () => cfg(custom), log, local: null })
-  assert.equal(gen({ url: 'https://x.test/{prompt}' }).enabled(), true)
-  assert.equal(gen({ url: '' }).enabled(), false, '没填地址就当没开')
-  assert.equal(gen({}).enabled(), false)
-  // 关掉总开关时不管填没填都不行
-  const off = createImageGen({ getConfig: () => ({ imageGen: { enabled: false, provider: 'custom', custom: { url: 'https://x.test/{prompt}' } } }), log, local: null })
-  assert.equal(off.enabled(), false)
+test('画完不再额外调模型写描述：createImageGen 没有 look 了', () => {
+  const gen = createImageGen({ getConfig: () => ({ imageGen: baseGen({ url: 'https://x.test/{prompt}' }) }), log, local: null })
+  assert.equal(typeof gen.look, 'undefined', '「让她画完自己看一眼」只控制传不传图，不再多调一次模型')
 })
+
+test('enabled()：自定义模式看地址有没有填', () => {
+  const mk = (custom) => createImageGen({ getConfig: () => ({ imageGen: baseGen(custom) }), log, local: null }).enabled()
+  assert.equal(mk({ method: 'GET', url: 'https://x.test/{prompt}' }), true)
+  assert.equal(mk({ method: 'GET', url: '' }), false)
+  assert.equal(mk({}), false)
+  const off = createImageGen({ getConfig: () => ({ imageGen: baseGen({ url: 'https://x.test/{prompt}' }, { enabled: false }) }), log, local: null })
+  assert.equal(off.enabled(), false, '关掉总开关后不能生图')
+})
+
+after(() => {})

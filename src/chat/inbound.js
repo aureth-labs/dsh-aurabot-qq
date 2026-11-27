@@ -40,6 +40,7 @@ export function parseMessageEvent(event, selfId, { faceName } = {}) {
   const sourceGroupId = kind === 'private' && event.sub_type === 'group' && /^\d+$/.test(String(sender.group_id ?? '')) && Number(sender.group_id) > 0 ? String(sender.group_id) : ''
   let mentioned = false
   let atOthers = false // 这一条 @ 了别人（既不是她，也不是全体）
+  const atTargets = [] // 被别人 @ 的账号，给群聊提示词标明「@的是谁」
   let replyId = ''
   const texts = []
   const atAllIndexes = new Set()
@@ -59,6 +60,7 @@ export function parseMessageEvent(event, selfId, { faceName } = {}) {
         else if (self && String(d.qq) === self) mentioned = true
         else {
           atOthers = true
+          atTargets.push({ qq: String(d.qq || ''), name: String(d.name || d.qq || '') })
           texts.push(`@${d.name || d.qq} `)
         }
         break
@@ -105,9 +107,13 @@ export function parseMessageEvent(event, selfId, { faceName } = {}) {
         texts.push('[戳一戳]')
         break
       case 'forward': {
-        // 合并转发：先放个占位，收到后再去拉里面的聊天记录展开
+        // 合并转发：先放个占位，收到后再去拉里面的聊天记录展开。
+        // #526：私聊送达时段内的 res_id 调 get_forward_msg 必失败，外层 message_id 才解析；
+        // 部分网关还会在事件里直接带 content。三个都带下去，readForward 按「content → outerId → id」回退。
         const id = String(d.id ?? d.res_id ?? d.forward_id ?? '')
-        if (id) forwards.push(id)
+        const outerId = String(event.message_id ?? '')
+        const content = Array.isArray(d.content) && d.content.length ? d.content : null
+        if (id || outerId || content) forwards.push({ id, outerId, content })
         texts.push('[合并转发]')
         break
       }
@@ -130,6 +136,7 @@ export function parseMessageEvent(event, selfId, { faceName } = {}) {
     wakeText,
     mentioned,
     atOthers,
+    atTargets,
     replyId,
     images,
     stickers,
@@ -195,7 +202,7 @@ export function cardText(raw) {
     }
     const m = meta.detail_1 || meta.news || meta.music || Object.values(meta)[0] || {}
     const title = String(m.desc || m.title || j.prompt || '').trim()
-    const url = String(m.qqdocurl || m.jumpUrl || m.url || '').split('?')[0]
+    const url = String(m.qqdocurl || m.jumpUrl || m.url || '').trim()
     const from = String(m.title && m.desc ? m.title : m.tag || '').trim()
     if (!title && !url) return '[卡片消息]'
     return `[分享卡片${from ? '（' + from + '）' : ''}：${title}${url ? ' ' + url : ''}]`

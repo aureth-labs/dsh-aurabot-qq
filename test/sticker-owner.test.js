@@ -107,12 +107,12 @@ test('切回「她挑」后又不拦了（owner 模式才有这道闸）', async
   assert.equal(library().length, 2)
 })
 
-test('配置归一化：owner 是合法值，乱写回落 auto（保持原行为）', async () => {
+test('配置归一化：owner 是合法值，乱写回落 ask', async () => {
   const { normalize } = await import('../src/core/config.js')
   assert.equal(normalize({ stickers: { collectMode: 'owner' } }).stickers.collectMode, 'owner')
   assert.equal(normalize({ stickers: { collectMode: 'ask' } }).stickers.collectMode, 'ask')
   assert.equal(normalize({ stickers: { collectMode: 'auto' } }).stickers.collectMode, 'auto')
-  assert.equal(normalize({ stickers: { collectMode: '乱写' } }).stickers.collectMode, 'auto')
+  assert.equal(normalize({ stickers: { collectMode: '乱写' } }).stickers.collectMode, 'ask')
 })
 
 after(() => fake.dispose())

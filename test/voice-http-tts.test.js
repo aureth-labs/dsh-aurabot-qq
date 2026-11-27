@@ -10,8 +10,9 @@ import { join } from 'node:path'
 // 生成的音频别落到主人真实的语音缓存里
 const dataDir = mkdtempSync(join(tmpdir(), 'aurabot-http-tts-'))
 process.env.AURABOT_DATA_DIR = dataDir
+process.env.AURABOT_PYENV = join(dataDir, 'no-edge-installed')
 
-const { httpSynth } = await import('../src/voice/tts.js')
+const { httpSynth, textToSpeech } = await import('../src/voice/tts.js')
 const { normalize } = await import('../src/core/config.js')
 
 const wav = Buffer.alloc(800)
@@ -182,4 +183,19 @@ test('归一化之后再发请求：手写成对象的 headers 和 body 也能�
   assert.equal(hits[0].method, 'POST')
   assert.equal(hits[0].headers.authorization, 'Bearer;abc')
   assert.equal(JSON.parse(hits[0].body).request.text, '你好')
+})
+
+// Explicit policies must not fall through to the system voice, even on Windows.
+test('HTTP 失败选择 text：保留原错误，不调用其他语音引擎', async () => {
+  respond = res => { res.writeHead(502); res.end('fixture-upstream-failure') }
+  await assert.rejects(() => textToSpeech('测试', { engine: 'http', http: { urlTemplate: `${base}/?text={text}`, fallback: 'text' } }), /502.*fixture-upstream-failure/s)
+})
+
+test('HTTP 失败选择 Edge 但未安装：报缺少组件，不调用 Windows 语音', async () => {
+  respond = res => { res.writeHead(502); res.end('fixture-upstream-failure') }
+  await assert.rejects(() => textToSpeech('测试', { engine: 'http', http: { urlTemplate: `${base}/?text={text}`, fallback: 'edge' } }), error => {
+    assert.match(error.message, /Edge.*未安装/)
+    assert.match(error.cause.message, /502.*fixture-upstream-failure/s)
+    return true
+  })
 })

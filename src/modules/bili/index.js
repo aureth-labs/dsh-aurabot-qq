@@ -2,10 +2,15 @@
 
 import { readFileSync } from 'node:fs'
 import { createBili } from '../../bili/duty.js'
+import { createGroupShare } from '../../bili/group-share.js'
 import { defineTool, str } from '../../tools/tools.js'
 import { permOf, profileToolVisible, profilePermits } from '../../chat/access.js'
 import { avatarSource } from '../profile/index.js'
+import { resolvePainting } from '../../features/paintings.js'
+import { segmentBytes } from '../../core/net.js'
 import { createDanmaku, danmakuPanelRequest } from './danmaku.js'
+import { createQrLogin } from '../../bili/qr-login.js'
+import { dataDir } from '../../core/store.js'
 
 export default {
   id: 'bili',
@@ -13,21 +18,30 @@ export default {
   version: '1.1.0',
   description: '看别人发的 B 站视频；定时自己刷、评论、回评论；可选发弹幕；抽帧看画面、发截图；按权限改自己的头像 / 签名（bili_watch / bili_comment / bili_danmaku / qq_send_shot / bili_set_avatar / bili_set_sign）',
   tab: 'bili',
-  files: ['bili/duty.js', 'bili/api.js', 'bili/vision.js', 'bili/shots.js', 'bili/danmaku.js', 'bili/login-pause.js'],
+  files: ['bili/duty.js', 'bili/group-share.js', 'bili/api.js', 'bili/vision.js', 'bili/shots.js', 'bili/danmaku.js', 'bili/login-pause.js', 'bili/qr-login.js'],
   setup(api) {
     const { hub } = api.core
     const lastImage = new Map() // chatId → 最近一张图的网址（给 bili_set_avatar 的 last 用）
+    // 想发到群里的视频先攒成待批，主人在私聊里回「发 1」才真发
+    const groupShare = createGroupShare({
+      getConfig: api.config, hub, log: api.log,
+      // 截图库和「补一张」都在 createBili 里：用闭包延迟取，建完之后才真的被调用
+      shotPathOf: (name) => bili.shotFileOf(name),
+      captureShot: (bvid) => bili.captureShot(bvid),
+      // 群名：缓存命中直接用，没命中由 hub 走一次 get_group_info（拿不到就退回群号）
+      groupNameOf: (gid) => hub.groupName(gid),
+    })
     api.on('message', (msg) => {
       const url = (msg.images || []).slice(-1)[0]?.data?.url
       if (url && /^https?:\/\//i.test(url)) lastImage.set(msg.chatId, url)
-      return false
+      return groupShare.handleReply(msg.chatId, msg.userId, msg.text)
     })
     const danmaku = createDanmaku(api)
     const bili = createBili({
       getConfig: api.config, hub, memory: api.lazy('memory'), log: api.log, dsh: api.dsh,
-      afterBrowse: danmaku.afterBrowse,
+      afterBrowse: danmaku.afterBrowse, groupShare,
     })
-    api.every(60_000, () => bili.tick(), '刷B站')
+    api.every(60_000, () => (api.core.onebot?.state && api.core.onebot.state !== 'connected' ? undefined : bili.tick()), '刷B站')
 
     // 看视频谁发的链接都能看，评论要主人开口
     api.tool(({ chat, sessionId }) => {
@@ -84,20 +98,47 @@ export default {
       const tools = []
       if (profileToolVisible(cfg, 'biliAvatar', chat)) tools.push(defineTool({
         name: 'bili_set_avatar',
-        description: '换你自己 B 站账号的头像。image 填图片网址；填 last 就用这个聊天里刚才别人发的那张图（最大 2MB）。',
-        properties: { image: str('图片网址（http/https），或 last 表示刚才发的那张图') },
+        description: '换你自己 B 站账号的头像。image 填图片网址；填 last 就用这个聊天里刚才别人发的那张图；填「画作 #1」就用你自己刚画的那张（画完时会告诉你编号）。图超过 2MB 会自动缩小。',
+        properties: { image: str('图片网址（http/https）／last（刚才那张图）／画作编号（如 #1）') },
         required: ['image'],
         execute: async ({ image }) => {
           const c = api.config()
           if (!c.bili.enabled) return { ok: false, message: 'B 站没打开' }
           const p = profilePermits(c, 'biliAvatar', chat, hub.turnSendersAllOwner(sessionId))
           if (!p.ok) return p
+          const chatId = hub.chatOfSession?.(sessionId) || chat.chatId
           const raw = String(image || '').trim()
-          const useLast = !raw || /^(last|刚才|上一张|最近)/i.test(raw)
-          const previous = lastImage.get(hub.chatOfSession?.(sessionId) || chat.chatId)
-          if (useLast && !previous) return { ok: false, message: '这个聊天里还没人发过可用的图片网址' }
-          // QQ 头像模块现在只校验网址；B站的 last 在这里解析，避免与画作编号混用。
-          const src = avatarSource(useLast ? previous : raw)
+          // ① 自己画的图：按编号取文件（不让她接触路径）
+          const looksLikePath = /^https?:\/\//i.test(raw) || /^[a-zA-Z]:[\\/]|^\/(?!\/)|^file:|^base64:/i.test(raw)
+          const pref = /^画作/i.test(raw) ? (raw.replace(/^画作\s*[:：#]?\s*/i, '').trim() || '画作') : raw
+          const isPainting = !looksLikePath && (/^#?\d{1,2}$/.test(pref) || /^画作$/i.test(pref) || /\.(png|jpe?g|webp|gif)$/i.test(pref))
+          if (isPainting) {
+            const painting = resolvePainting(chatId, pref)
+            if (!painting) return { ok: false, message: `找不到画作 ${raw}（编号可能过期了，先让我画一张？）` }
+            let buf
+            try {
+              buf = readFileSync(painting.path)
+            } catch (error) {
+              return { ok: false, message: '这张画的文件读不到了：' + error.message }
+            }
+            return bili.setAvatar(buf)
+          }
+          // ② 刚才那张图：优先取图片字节，拿不到再退回记下的网址
+          if (!raw || /^(last|刚才|上一张|最近)/i.test(raw)) {
+            const media = hub.recentMedia?.(chatId) || []
+            const pick = media.filter((x) => !x.sticker).at(-1) || media.at(-1)
+            if (pick) {
+              try {
+                const buf = await segmentBytes(pick.seg, api.core.onebot, { maxBytes: 10 * 1024 * 1024 })
+                if (buf && buf.length) return bili.setAvatar(buf)
+              } catch (error) { /* 退回网址 */ }
+            }
+            const previous = lastImage.get(chatId)
+            if (!previous) return { ok: false, message: '最近半小时这个聊天里没人发过图片，先把图发过来' }
+            return bili.setAvatar(previous)
+          }
+          // ③ 显式网址
+          const src = avatarSource(raw)
           if (!src.ok) return src
           return bili.setAvatar(src.file)
         },
@@ -148,14 +189,45 @@ export default {
         },
       })
     })
-    // 截图库（面板里看全部、手动删）
-    api.route('/bili/shots', async () => ({ ...bili.libraryShots(), limit: api.config().bili.shotLibrary }))
+    // 截图库（面板分页、手动删）
+    api.route('/bili/shots', async (req) => {
+      const q = req ? api.core.http.query(req) : {}
+      const limit = Math.min(200, Math.max(1, Math.trunc(Number(q.limit) || 25)))
+      const offset = Math.max(0, Math.trunc(Number(q.offset) || 0))
+      return { ...bili.libraryShots({ limit, offset }), limit: api.config().bili.shotLibrary }
+    })
     api.route('/bili/shot/image', async (req, res) => {
       const p = bili.shotFileOf(api.core.http.query(req).file)
       if (!p) return api.core.http.send(res, 404, '')
       return api.core.http.send(res, 200, readFileSync(p), 'image/jpeg')
     })
     api.route('/bili/shot/delete', async (req) => bili.deleteShot(String((await api.core.http.body(req)).file || '')))
+
+    // 扫码登录：机器人自己起浏览器拿一张只属于它的票，拿到后自动写配置（只写一次）
+    const qr = createQrLogin({ log: api.log, dataDir })
+    const savedQr = new Set()
+    api.route('/bili/qr/start', async () => qr.start())
+    api.route('/bili/qr/status', async (req) => {
+      const id = String(api.core.http.query(req).id || '')
+      const r = await qr.poll(id)
+      if (r.state !== 'done') return { ok: r.state !== 'error', state: r.state, message: r.message }
+      if (!r.creds) return { ok: false, state: 'error', message: '票没拿到，重新生成一个' }
+      if (savedQr.has(id)) return { ok: true, state: 'done', account: r.account }
+      try {
+        const { sessdata, biliJct, buvid3, buvid4, dedeUserId } = r.creds
+        api.setConfig({ bili: { sessdata, biliJct, buvid3, buvid4, dedeUserId } })
+        savedQr.add(id)
+        return { ok: true, state: 'done', account: r.account }
+      } catch (e) {
+        return { ok: false, state: 'error', message: '票拿到了但保存失败：' + e.message }
+      }
+    })
+    api.route('/bili/qr/cancel', async (req) => {
+      const id = String((await api.core.http.body(req)).id || '')
+      savedQr.delete(id)
+      return qr.cancel(id)
+    })
+    api.onDispose(() => qr.dispose())
     return bili
   },
 }

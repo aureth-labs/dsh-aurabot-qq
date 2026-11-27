@@ -121,13 +121,13 @@ export default {
       return [
         defineTool({
           name: 'qq_api_find',
-          description: '查 QQ 能做的事。用关键词找接口（比如 精华、公告、撤回、荣誉、群文件），返回接口名、参数和说明。',
+          description: '检索本轮权限范围内可用的 QQ 接口（比如 精华、公告、撤回、荣誉、群文件），返回接口名、参数和说明。无匹配不代表 QQ 账号没有该功能，也不代表已查询好友关系或账号状态。',
           properties: { keyword: str('关键词，中文或接口名的一部分') },
           required: ['keyword'],
           execute: async ({ keyword }) => {
             const key = String(keyword || '').trim()
             const hits = Object.entries(QQ_API).filter(([name, e]) => (isOwner() || e[0] === 'open') && (name.includes(key) || e[2].includes(key))).slice(0, 12)
-            if (!hits.length) return { ok: true, message: '没找到，换个说法' }
+            if (!hits.length) return { ok: true, scope: 'current-turn', matched: false, message: '当前会话的可用接口中没有匹配项。这不是 QQ 账号状态或功能是否存在的查询结果；不能据此判断好友关系、申请设置或账号是否支持某功能。同一需求不要反复换同义词重查；无法核实时如实说明，需要定位加好友问题可询问具体错误提示。' }
             return { ok: true, message: hits.map(([name, e]) => `${name}(${e[1]})：${e[2]}`).join('\n') }
           },
           render: (_args, value) => [{ type: 'text', text: value?.message || '' }],

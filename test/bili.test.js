@@ -57,7 +57,7 @@ test('解析：Cookie 只取有用的、认出视频号和短链、QQ 分享卡�
   assert.equal(api.findVideoId('没有链接'), null)
   const { cardText } = await import('../src/chat/inbound.js')
   const card = JSON.stringify({ meta: { detail_1: { title: '哔哩哔哩', desc: '猫猫做饭', qqdocurl: 'https://b23.tv/xyz?share=1' } } })
-  assert.equal(cardText(card), '[分享卡片（哔哩哔哩）：猫猫做饭 https://b23.tv/xyz]')
+  assert.equal(cardText(card), '[分享卡片（哔哩哔哩）：猫猫做饭 https://b23.tv/xyz?share=1]')
   assert.equal(cardText('不是 json'), '[卡片消息]')
 })
 
@@ -124,7 +124,8 @@ test('刷一轮：看视频、按每天上限评论、分享给主人、记成�
   assert.equal(posted[0].message, '看饿了')
   assert.equal(sent.length, 1)
   assert.equal(sent[0].chatId, 'private:10000001')
-  assert.match(sent[0].text, /会做饭！\nhttps:\/\/www\.bilibili\.com\/video\/BV1/)
+  // #334：私聊分享改成 QQ 里点得开的网页播放器链接
+  assert.match(sent[0].text, /会做饭！\nhttps:\/\/www\.bilibili\.com\/blackboard\/webplayer\/mbplayer\.html\?bvid=BV1[^&]*&p=1&autoplay=true$/)
   const seen = eventRecords.filter((e) => e.kind === 'seen')
   assert.equal(seen.length, 2)
   assert.equal(seen[0].meta.title, '米饭大赛')
@@ -184,7 +185,7 @@ test('B 站 Cookie 分两个框填：纯值、带前缀、整串都认；老配�
   const { splitBiliCookie, publicConfig, mergeFromPanel } = await import('../src/core/config.js')
   assert.equal(splitBiliCookie({ sessdata: 'aaa', biliJct: 'bbb' }).cookie, 'SESSDATA=aaa; bili_jct=bbb')
   assert.equal(splitBiliCookie({ sessdata: 'SESSDATA=aaa', biliJct: 'bili_jct=bbb' }).cookie, 'SESSDATA=aaa; bili_jct=bbb')
-  assert.deepEqual(splitBiliCookie({ sessdata: 'buvid3=z; SESSDATA=a%2C1; bili_jct=b; x=1' }), { sessdata: 'a%2C1', biliJct: 'b', cookie: 'SESSDATA=a%2C1; bili_jct=b' })
+  assert.deepEqual(splitBiliCookie({ sessdata: 'buvid3=z; SESSDATA=a%2C1; bili_jct=b; x=1' }), { sessdata: 'a%2C1', biliJct: 'b', buvid3: 'z', buvid4: '', dedeUserId: '', cookie: 'SESSDATA=a%2C1; bili_jct=b; buvid3=z' })
   const cur = normalize({ bili: { cookie: 'SESSDATA=old1234; bili_jct=jct9876' } })
   assert.equal(cur.bili.sessdata, 'old1234')
   const pub = publicConfig(cur).bili
@@ -257,9 +258,20 @@ test('#6 换 B 站头像：先下载图片再 multipart 上传到 face/update；
   assert.equal(api.sniffImageType(new Uint8Array([0x52,0x49,0x46,0x46,0,0,0,0,0x57,0x45,0x42,0x50])), 'image/webp')
   await assert.rejects(api.createBiliApi({ getCookie: () => '', log: {} }).setFace('https://img.example/a.png'), /没登录/)
 
+  // 直接给图片字节（她画的图 / 聊天里收到的图）：不下载，直接 multipart 上传
+  reqs.length = 0
+  await real.setFace(Buffer.from(png))
+  assert.equal(reqs.length, 1, '图片字节不用再下载')
+  assert.equal(reqs[0].url, 'https://api.bilibili.com/x/member/web/face/update?csrf=tok')
+  assert.equal(reqs[0].body.get('face').size, png.length)
+  assert.equal(reqs[0].body.get('face').type, 'image/png')
+  await assert.rejects(real.setFace(Buffer.alloc(2 * 1024 * 1024 + 1, 1)), /2MB/)
+  await assert.rejects(real.setFace(Buffer.from('hello')), /不是图片/)
+
   const sent = []
   const mkDuty = (cfg) => duty.createBili({ getConfig: () => cfg, hub: {}, log: { info() {}, warn() {}, debug() {} }, api: { setFace: async (f) => sent.push(f) } })
   assert.match((await mkDuty(normalize({ dryRun: true, bili: { enabled: true, cookie: 'bili_jct=y' } })).setAvatar('https://x/a.png')).message, /试运行/)
+  assert.match((await mkDuty(normalize({ dryRun: true, bili: { enabled: true, cookie: 'bili_jct=y' } })).setAvatar(Buffer.alloc(2048, 1))).message, /试运行.*KB/)
   assert.equal((await mkDuty(normalize({ dryRun: false, bili: { enabled: true, cookie: '' } })).setAvatar('https://x/a.png')).ok, false)
   assert.equal((await mkDuty(normalize({ dryRun: false, bili: { enabled: true, cookie: 'bili_jct=y' } })).setAvatar('C:\\a.png')).ok, false)
   assert.equal(sent.length, 0)

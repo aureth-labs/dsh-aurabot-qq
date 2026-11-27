@@ -36,7 +36,8 @@ const { createFakeDsh } = await import(`file:///${REPO}/test/helpers/fake-dsh.js
 const fake = createFakeDsh({
   brain: async ({ text, callTool }) => {
     if (text.includes('收下吧收下')) {
-      const r = await callTool('qq_collect_sticker', { index: 1, name: '偷偷笑' })
+      const source = text.includes('普通图片') ? { latest_image: true } : { index: 1 }
+      const r = await callTool('qq_collect_sticker', { ...source, name: '偷偷笑' })
       return '收好了：' + (r && r.message)
     }
     return '嗯'
@@ -49,14 +50,14 @@ await new Promise((r) => setTimeout(r, 400))
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms))
 const library = () => (existsSync(LIB) ? JSON.parse(readFileSync(LIB, 'utf8')).items || [] : [])
-const send = async (text, buf) => {
+const send = async (text, buf, data = { sub_type: 1 }) => {
   await api.hub.onMessage({
     post_type: 'message', message_type: 'private', sub_type: 'friend',
     self_id: Number(BOT), user_id: Number(OWNER), time: Math.floor(Date.now() / 1000),
     message_id: Math.floor(Math.random() * 1e6),
     message: [
       { type: 'text', data: { text } },
-      { type: 'image', data: { sub_type: 1, file: 'base64://' + buf.toString('base64') } },
+      { type: 'image', data: { ...data, file: 'base64://' + buf.toString('base64') } },
     ],
     sender: { user_id: Number(OWNER), nickname: '主人' },
   })
@@ -132,6 +133,21 @@ test('4:3 的表情收得下（以前会被「尺寸不像表情」误拦）', a
   assert.ok(call, '应该调用了 qq_collect_sticker')
   assert.equal(call.result.ok, true, '310x224 是 QQ 最常见的一档，不能挡：' + JSON.stringify(call.result))
   assert.ok(!/尺寸不像表情/.test(String(call.result.message || '')), '不该再报尺寸问题')
+})
+
+test('普通图片段只在明确指定时收藏，宽图仍会被拒绝', async () => {
+  const before = library().length
+  const data = { summary: '[图片]' }
+  await send('随便看看', png(6, 1024, 1024), data)
+  assert.equal(library().length, before)
+  assert.doesNotMatch(String(fake.turns.at(-1).userText), /qq_collect_sticker/)
+  await send('普通图片收下吧收下', png(6, 1024, 1024), data)
+  const call = () => fake.turns.at(-1).toolCalls.find((c) => c.name === 'qq_collect_sticker')?.result
+  assert.equal(call()?.ok, true, JSON.stringify(call()))
+  assert.equal(library().length, before + 1)
+  await send('普通图片收下吧收下', png(7, 1024, 320), data)
+  assert.equal(call()?.ok, false)
+  assert.equal(library().length, before + 1)
 })
 
 after(() => fake.dispose())

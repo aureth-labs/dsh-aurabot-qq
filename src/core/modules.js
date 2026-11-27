@@ -8,12 +8,15 @@
 //
 // 接口说明给写模块的人看：src/modules/API.md（每次启动复制到数据目录 modules/ 里）。
 
-import { existsSync, readdirSync, statSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
-import { join, dirname, relative, resolve, sep } from 'node:path'
+import { existsSync, readdirSync, statSync, lstatSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, rmSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import { join, dirname, relative, resolve, sep, isAbsolute } from 'node:path'
 import { pathToFileURL, fileURLToPath } from 'node:url'
 import { dataDir } from './store.js'
 import { registerSecretField } from './config.js'
 import { defineTool } from '../tools/tools.js'
+import { selfName, personaScope, personaNow } from '../persona/personas.js'
+import { PERSONA_MEMORY_MODULE } from './persona-memory-bridge.js'
 
 /** 扩展接口版本：只加不改。哪天不得不改已有的东西才升到 2，并在更新说明里写清楚怎么迁移。 */
 export const API_VERSION = 1
@@ -161,15 +164,333 @@ export function rewriteImports(code, fromKey, keep = new Set()) {
  * @param {string} o.version     插件版本
  * @param {object[]} o.builtins  内置模块定义（按启动顺序）
  */
+// ── 出站治理（主动发言策略的模块侧接线，见 docs/OUTBOUND-POLICY-DESIGN.md / CONTRACT §5）──
+// 第一道判定放在**模块包装层**：模块的每次发送都带上宿主绑定的 moduleId 去问策略，
+// 放行才真的调 hub；hub 侧的 setOutboundGuard 是第二道保险（覆盖任何绕过包装层的直调）。
+// 未注入服务（core.outbound 缺失：旧环境 / 纯测试）时全部返回放行 —— 完全惰性、零开销。
+
+// 日志兜底：出站治理的日志是「锦上添花」，绝不能因为它把发送链路炸了。
+// 全等级 NOOP + safeLog：log 缺失 / 某个等级不是函数 / 日志器自己抛错，都只当没记上。
+const NOOP_LOG = { debug() {}, info() {}, warn() {}, error() {} }
+
+function safeLog(level, log, ...args) {
+  const l = log || NOOP_LOG
+  const fn = typeof l?.[level] === 'function' ? l[level] : NOOP_LOG[level]
+  try { fn(...args) } catch {}
+}
+
+/** 取宿主注入的出站服务；没有或者面不对就当没注入。 */
+function outboundOf(core) {
+  const svc = core && core.outbound
+  return svc && typeof svc.admit === 'function' ? svc : null
+}
+
+/** 模块包装层用的日志口（core.logger 由宿主注入；没有就静默）。 */
+function outboundLogOf(core) {
+  try {
+    const l = core && core.logger
+    return l && typeof l.child === 'function' ? l.child('出站策略') : NOOP_LOG
+  } catch (error) {
+    return NOOP_LOG
+  }
+}
+
+/**
+ * 模块发送的第一道判定。返回 { allow, verdict }。
+ * 判定口径与 hub 门闸完全一致（同一个 svc.admit），只是身份由宿主绑定、模块伪造不了。
+ * 治理故障按放行处理：策略源的问题不该把模块的正常发送全卡死（与 hub 门闸同一口径）。
+ */
+function admitModuleCall(core, id, ask, log) {
+  const svc = outboundOf(core)
+  if (!svc) return { allow: true, verdict: null }
+  try {
+    const verdict = svc.admit({
+      to: ask.chatId,
+      moduleId: id,
+      origin: 'module',
+      cause: ask.cause || null,
+      itemId: ask.itemId || null,
+      at: Date.now(),
+      // 模块快捷发送没有排队执行器：broker 档也不排进账本，直接按判定结果走
+      allowDefer: false,
+    })
+    const action = verdict && verdict.action
+    // defer 只会在 broker 档出现，没有排队执行器时按 deny 处理（宁可不发，也不越过预算）
+    const allow = action === 'allow'
+    if (!allow) safeLog('warn', log, `模块「${id}」这次主动发送被策略拦下（${(verdict && verdict.reason) || action || 'deny'}）`)
+    return { allow, verdict: verdict || null }
+  } catch (error) {
+    safeLog('warn', log, `出站判定出错，模块「${id}」这条按放行处理：`, error && error.message)
+    return { allow: true, verdict: null }
+  }
+}
+
+/** 结算一次模块发送的预占：发出去记 sent，没发出去 / 抛错记 failed（退款口径交给策略源自定）。 */
+function settleModuleCall(core, verdict, outcome, log) {
+  const svc = outboundOf(core)
+  if (!svc || typeof svc.commit !== 'function' || !verdict || !verdict.reserveId) return
+  try {
+    svc.commit(verdict.reserveId, { deliveryId: verdict.deliveryId, outcome })
+  } catch (error) {
+    safeLog('warn', log, `出站结算失败（${outcome}）：`, error && error.message)
+  }
+}
+
+/**
+ * 带治理地执行一次模块发送：
+ *   放行 → 调 run(opts)；按结果结算（真值 → sent，假值 → failed）；
+ *   拦下 → 直接返回 null（铁律：旧调用口的真值语义不变，CONTRACT §4）。
+ * opts 里的 outboundDone 告诉 hub「这条已经判过了，别再判一次」，避免同一条消息扣两份额度。
+ *
+ * 未注入服务（旧环境 / 纯测试）时**不设** outboundDone：让 hub 的第二道保险（若宿主挂了）
+ * 仍然生效；两道都没有时就是原样直发，与改造前逐字节等价。
+ */
+ /**
+ * 带治理地执行一次模块发送：
+ *   放行 → 调 run(opts)；按结果结算（真值 → sent，假值 → failed）；
+ *   拦下 → 直接返回 null（铁律：旧调用口的真值语义不变，CONTRACT §4）。
+ * opts 里的 outboundDone 告诉 hub「这条已经判过了，别再判一次」，避免同一条消息扣两份额度。
+ *
+ * broker 档 + 发往主人私聊的纯文本 → **改走宿主代发**（api.proactive.submit 的
+ * hostDelegate 路径）：内容先进「目的引擎（代发决断）」会话过目，再由宿主统一投递。
+ * 这样普通模块（douyin / tophub / bili……）不改一行代码，也会被引擎审查并留下会话记录；
+ * 只有 broker 档这样走，gate 档与 pass 档行为不变。
+ *
+ * broker 档 + 发往主人私聊的**非文本**（图片 / 文件 / 语音 / 纯消息段，无可审文本）→
+ * 「识别不了就直发」口径（2026-11-05 少爷定）：策略源看不了这类内容，再让它们过
+ * 安静时段 / 额度 / 在途串行，只会出现「文字发得出、图片老被拦」的失衡——
+ * 所以与代发同口径：不占额度、不经决断，直接发（outboundDone 防 hub 二次判定）。
+ *
+ * 未注入服务（旧环境 / 纯测试）时**不设** outboundDone：让 hub 的第二道保险（若宿主挂了）
+ * 仍然生效；两道都没有时就是原样直发，与改造前逐字节等价。
+ */
+// 模块显式声明「这条是我说的话」（调用时带 `{ proactive: true }`）时，把留痕标记透给 hub：
+// hub.sendText / hub.sendSegments 只有看到 opts.proactive 才走 noteProactive() → chatlog 记一条 bot 发言，
+// 而模块捷径以前只转 (chatId, text)，标记根本传不进去 —— 于是模块发的消息在 chatlog 里零命中
+// （qq-peek 的 qq_say_in_group 就这么丢档，2026-11-22 修）。不声明就不加键：
+// 日报、画前提示这类本来不该进记忆的发送保持改造前的行为。
+function logAsModuleSpeech(extra, opts, id) {
+  if (!opts || opts.proactive !== true) return extra
+  return { ...extra, proactive: true, proactiveCause: String(opts.proactiveCause || `module:${id}`) }
+}
+
+function governedSend(core, id, ask, run, log) {
+  const svc = outboundOf(core)
+  if (!svc) return run({ sourceModule: id })
+  // 「回合内提示」直发（2026-11-18 生图画前提示重复回归）。
+  //
+  // 只在**调用方显式声明**这条发送是回合内提示时才放行：她回合里的画前/进度提示是对话的一部分，
+  // 走代发决断要等一轮模型，慢工具兜底（1.5s）会先把同一句发出去 → 同一句话发两遍。
+  //
+  // 为什么必须显式声明、不能按 `hub.turnRunning(chatId)` 一刀切：那等于在**任意模块**的回合窗口内
+  // 把外发闸门整体旁路——抖音日报这类「模块主动找主人」的发送只要撞上回合就会绕过代发决断。
+  // 闸门的语义是「谁在说」，不是「什么时候说」，所以判定依据只能是发送侧的意图声明。
+  //
+  // 声明方式（三重条件，缺一不可）：
+  //   1. 调用方带 `turnNotice`（scoped hub 发送方法的第 6 个参数，或模块快捷 API 的 opts）；
+  //   2. 该模块在 TURN_NOTICE_MODULES 白名单里（宿主侧把关，模块自己写不算）；
+  //   3. 此刻这个聊天确实有回合在跑（防止回合结束后有人借标记绕过）。
+  const declaresNotice = Boolean(ask?.turnNotice) && TURN_NOTICE_MODULES.has(id)
+  const inTurn = declaresNotice && typeof core.hub?.turnRunning === 'function'
+    && ask?.chatId && core.hub.turnRunning(ask.chatId)
+  if (inTurn) {
+    safeLog('info', log, `模块「${id}」这条发送声明为回合内提示（画前/进度），直发不经代发决断`)
+    return run({ sourceModule: id, outboundDone: true })
+  }
+  // broker 档无可审文本（图片/文件/语音/消息段）发主人私聊：识别不了就直发，不进门闸
+  if (unreviewableBrokerSend(core, ask)) {
+    safeLog('info', log, `模块「${id}」这条主动发送没有可审文本（图片/文件等），按「识别不了就直发」口径直接发出`)
+    return run({ sourceModule: id, outboundDone: true })
+  }
+  const gate = admitModuleCall(core, id, ask, log)
+  if (!gate.allow) return null
+  // broker 档的纯文本私聊主人：交给宿主代发（引擎决断 + 宿主投递 + 会话记录）
+  const verdict = gate.verdict
+  const delegate = brokerDelegable(core, verdict, ask)
+  if (delegate) {
+    // 代发是异步的（引擎决断要走一轮模型），返回 Promise：
+    // 发出去了 → { message_id }，引擎决断不发 / 投递失败 → null（旧调用口语义不变）
+    return delegateToHost(core, id, ask, verdict, delegate, log)
+  }
+  const done = (value) => {
+    settleModuleCall(core, gate.verdict, value ? 'sent' : 'failed', log)
+    return value
+  }
+  let r
+  try {
+    r = run({ sourceModule: id, outboundDone: true })
+  } catch (error) {
+    settleModuleCall(core, gate.verdict, 'failed', log)
+    throw error
+  }
+  if (r && typeof r.then === 'function') {
+    return r.then(done, (error) => {
+      settleModuleCall(core, gate.verdict, 'failed', log)
+      throw error
+    })
+  }
+  return done(r)
+}
+
+/**
+ * 这次发送里有没有能拿给引擎过目的文本。
+ * 图片 / 文件 / 语音 / 纯消息段的 ask 不带文本（或只有空白），策略源识别不了它们的内容。
+ */
+function reviewableTextOf(ask) {
+  const text = ask && ask.text !== undefined ? String(ask.text) : ''
+  return text.trim()
+}
+
+/**
+ * 该不该按「识别不了就直发」口径跳过门闸直接发？
+ * 条件：broker 档 + 发往治理范围（主人私聊）+ 这次发送没有可审文本。
+ * 纯文本仍走门闸 + 代发决断；gate / pass 档与非 owner 目标行为一律不变。
+ * tier 从服务 status() 读（deny 的 verdict 不带 tier），读不到就按不适用处理。
+ */
+function unreviewableBrokerSend(core, ask) {
+  const svc = outboundOf(core)
+  if (!svc) return false
+  if (reviewableTextOf(ask)) return false
+  const to = String((ask && ask.chatId) || '')
+  if (typeof svc.isGoverned !== 'function' || !svc.isGoverned(to)) return false
+  try {
+    const tier = typeof svc.status === 'function' ? svc.status().tier : null
+    return tier === 'broker'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 这条模块发送该不该改交宿主代发？
+ * 条件：broker 档 + admit 放行 + 发往主人私聊 + 有纯文本 + 宿主服务开了 submit。
+ * 图片/文件/语音/群消息一律不走（代发决断只针对「一句话」，其余附件的语义不同）。
+ */
+function brokerDelegable(core, verdict, ask) {
+  const svc = outboundOf(core)
+  if (!svc || typeof svc.submit !== 'function') return null
+  if (!verdict || verdict.action !== 'allow' || verdict.tier !== 'broker') return null
+  const text = ask && ask.text !== undefined ? String(ask.text) : ''
+  if (!text.trim()) return null
+  const to = String((ask && ask.chatId) || '')
+  // 只代发「主动私聊主人」；群聊、朋友私聊均按原路径。
+  // 治理范围由服务自己判（它的 getConfig 里有 ownerQQ），模块层不必依赖 core.getConfig。
+  const governed = typeof svc.isGoverned === 'function' ? svc.isGoverned(to) : false
+  if (!governed) return null
+  return svc
+}
+
+/**
+ * 改交宿主代发：条目进账本、由宿主投递器（host.js 的 send）完成
+ * 「审查预占 → 目的引擎（代发决断）会话 → hub.deliver 投递 → 结算」全过程。
+ * 返回值语义与旧调用口保持一致：真发出去 → 真值（模块据此 `if (sent)` 判断）；
+ * 引擎决断不发 / 投递失败 → null（旧调用方认得的失败值）。
+ * 旧预占由宿主投递器内部的 reserveReview 接管，这里先把它释放掉，避免额度被重复占用。
+ */
+async function delegateToHost(core, id, ask, verdict, svc, log) {
+  // 门闸已经放行并预占了额度，但代发路径不用这份预占（宿主内部走 review 预占）——
+  // 立刻释放，保证「代发不占引擎说话额度」。
+  if (verdict && verdict.reserveId && typeof svc.release === 'function') {
+    try { svc.release(verdict.reserveId, { reason: 'delegated-to-host' }) } catch {}
+  }
+  try {
+    const r = await svc.submit(
+      { moduleId: id, itemId: ask.itemId || '', to: String(ask.chatId), channel: 'qq', text: String(ask.text ?? ''), at: Date.now() },
+      { hostDelegate: true },
+    )
+    const state = r && typeof r === 'object' ? String(r.state || '') : ''
+    if (state === 'sent' || state === 'pending' || state === 'queued') {
+      return { message_id: 'delegated-' + r.deliveryId }
+    }
+    safeLog('warn', log, `模块「${id}」这条代发没发出去（${state || 'unknown'}）`)
+    return null
+  } catch (error) {
+    safeLog('warn', log, `模块「${id}」代发出错：`, error && error.message)
+    return null
+  }
+}
+
+/**
+ * scopedHub 上这 6 个函数要过治理（CONTRACT §5）。
+ * 其余名字照旧直接转发：hub 的内部入口（stats / sessions / chatOfSession……）与发送无关。
+ */
+const GOVERNED_HUB_METHODS = new Set(['sendText', 'sendSegments', 'sendImage', 'sendFile', 'sendVoiceFile', 'deliver'])
+
+/**
+ * 允许声明「回合内提示」的模块（宿主侧白名单，模块自己声明不到）。
+ *
+ * 只有这类模块的发送才**可能**在回合内直发：它们发的是「我这就去做」的进度提示，
+ * 与正在进行的回合是同一件事，走代发决断反而会被慢工具兜底抢先、导致同一句发两遍。
+ * 其余模块（抖音日报、RSS、主动私聊等）无论何时都照旧走代发决断——闸门管的是「谁在说」。
+ */
+const TURN_NOTICE_MODULES = new Set(['imagegen'])
+
+/**
+ * 按方法名把一次 scopedHub 调用翻译成「治理问题 + 真正执行」。
+ * 返回 null 表示这个方法不走治理（按原样转发）。
+ *
+ * 说明：每个分支的 ask 只取发送目标与文本，**身份一律由宿主绑定的 id 决定**，
+ * 模块即使在自己参数里塞 moduleId / sourceModule 也覆盖不了（防止冒充别的模块）。
+ */
+function governScopedCall(core, id, name, args, log) {
+  const [chatId, a, b, c] = args
+  // 回合内提示的声明：模块只能在 opts 里写 `turnNotice: true`（第 6 个参数对 sendText、第 4 个对
+  // sendSegments、第 5 个对 sendImage……统一从「最后一个对象参数」里取）。是否真的放行由
+  // governedSend 结合 TURN_NOTICE_MODULES 与 turnRunning 三重判定，模块单方面声明无效。
+  const optsOf = (...idxs) => { for (const i of idxs) { const v = args[i]; if (v && typeof v === 'object') return v } return null }
+  const turnNotice = (opts) => Boolean(opts && opts.turnNotice === true)
+  switch (name) {
+    case 'sendText':
+      // sendText(chatId, text, replyId, missed, userId, opts)
+      return governedSend(core, id, { chatId, text: a, turnNotice: turnNotice(optsOf(5)) }, (extra) => {
+        const last = args[5]
+        const opts = last && typeof last === 'object' ? { ...last, ...extra } : extra
+        return core.hub.sendText(chatId, a, args[2], args[3], args[4], opts)
+      }, log)
+    case 'sendSegments':
+      // sendSegments(chatId, segments, note, opts)
+      return governedSend(core, id, { chatId, text: '', turnNotice: turnNotice(optsOf(3)) }, (extra) => {
+        const last = args[3]
+        const opts = last && typeof last === 'object' ? { ...last, ...extra } : extra
+        return core.hub.sendSegments(chatId, a, b, opts)
+      }, log)
+    case 'sendImage':
+      // sendImage(chatId, src, replyId, userId, opts)
+      return governedSend(core, id, { chatId, turnNotice: turnNotice(optsOf(4)) }, (extra) => {
+        const last = args[4]
+        const opts = last && typeof last === 'object' ? { ...last, ...extra } : extra
+        return core.hub.sendImage(chatId, a, args[2], args[3], opts)
+      }, log)
+    case 'sendFile':
+      // sendFile(chatId, file, name)
+      return governedSend(core, id, { chatId }, () => core.hub.sendFile(chatId, a, b), log)
+    case 'sendVoiceFile':
+      // sendVoiceFile(chatId, file, note)
+      return governedSend(core, id, { chatId }, () => core.hub.sendVoiceFile(chatId, a, b), log)
+    case 'deliver': {
+      // deliver(chatId, text, opts)：第三个参数是 b，不能丢掉 voice / enginePolicy 等发送选项
+      const opts = b && typeof b === 'object' ? b : {}
+      if (opts.enginePolicy) return core.hub.deliver(chatId, a, opts)
+      return governedSend(core, id, { chatId, text: a, turnNotice: turnNotice(opts) }, (extra) => core.hub.deliver(chatId, a, { ...opts, ...extra }), log)
+    }
+    default:
+      return null
+  }
+}
+
 /**
  * 给单个模块的 core：hub 下发「白名单副本」，原始委派入口不下发、也不可经原型链摸回（三审 #177）。
  * - scopedHub：平面对象，只转发 hub 的函数/取值器（跳过原始 runSubagentTurn / subagentFor），
  *   再补一个固定模块 id 的 runSubagentTurn；原型就是 Object.prototype，没有可逃逸的入口。
+ * - 6 个发送函数额外过一层出站治理（moduleId 由宿主绑定，模块伪造不了；未注入服务时完全惰性）。
  * - scopedCore：Proxy 转发 core 的其余属性（bridge / modules 后挂的也可见），
  *   但 getPrototypeOf 掐成 null —— Object.getPrototypeOf(api.core).hub 也绕不回去。
  */
-export function scopeCoreForModule(core, id) {
-  if (!core || !core.hub || typeof core.hub.subagentFor !== 'function') return core || {}
+export function scopeCoreForModule(core, id, setCoreConfig, compat = null) {
+  if (!core || !core.hub || typeof core.hub.subagentFor !== 'function') {
+    return setCoreConfig ? { ...core, setConfig: setCoreConfig } : core || {}
+  }
+  const obLog = outboundLogOf(core)
   const scopedHub = {}
   for (const name of Object.getOwnPropertyNames(core.hub)) {
     if (name === 'runSubagentTurn' || name === 'subagentFor') continue
@@ -179,7 +500,15 @@ export function scopeCoreForModule(core, id) {
       Object.defineProperty(scopedHub, name, { enumerable: true, configurable: true, get: () => core.hub[name] })
     } else if (typeof d.value === 'function') {
       const fn = d.value
-      Object.defineProperty(scopedHub, name, { enumerable: true, configurable: true, value: (...args) => fn.apply(core.hub, args) })
+      // 发送类入口走治理：拦下返回 null，放行才真的调 hub（旧真值语义不变）
+      if (GOVERNED_HUB_METHODS.has(name)) {
+        Object.defineProperty(scopedHub, name, {
+          enumerable: true, configurable: true,
+          value: (...args) => governScopedCall(core, id, name, args, obLog),
+        })
+      } else {
+        Object.defineProperty(scopedHub, name, { enumerable: true, configurable: true, value: (...args) => fn.apply(core.hub, args) })
+      }
     } else {
       Object.defineProperty(scopedHub, name, { enumerable: true, configurable: true, get: () => core.hub[name], set: (v) => { core.hub[name] = v } })
     }
@@ -191,13 +520,18 @@ export function scopeCoreForModule(core, id) {
   return new Proxy(core, {
     get(target, key, recv) {
       if (key === 'hub') return scopedHub
+      if (key === 'setConfig' && setCoreConfig) return setCoreConfig
+      if (key === 'personaMemoryBridge') return id === PERSONA_MEMORY_MODULE ? compat?.personaMemoryBridge : undefined
+      // 出站治理服务不下发给模块：模块能拿到原始 svc 就能自己填 moduleId 冒充别人，
+      // 也会绕过 api.proactive 的身份绑定。模块只能走 api.proactive（见 makeApi）。
+      if (key === 'outbound') return undefined
       return Reflect.get(target, key, recv)
     },
     getPrototypeOf() { return null }, // 摸原型拿回原始 hub 的路也堵死（三审 #177）
   })
 }
 
-export function createModules({ ctx, core, getConfig, setConfig, logger, version, builtins }) {
+export function createModules({ ctx, core, getConfig, setConfig, logger, version, builtins, personaMemoryRuntime }) {
   const log = logger.child('modules')
   const builtinDefs = new Map(builtins.map((d) => [d.id, d]))
   const live = new Map() // id → 运行中的模块（见 start）
@@ -207,6 +541,10 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
   const revisions = new Map() // id → 停止次数，取消在途 import
   // 模块每次（重）启动都递增一次「代际」：hub 用它判断会话里挂的工具是不是旧模块实例的闭包。
   let generation = 0
+  // 导航版本：模块安装/启停/失败/重载（含可用平台随定义变化）时递增；
+  // 面板首屏轮询 /panel/pulse 拿它判断要不要重新拉导航摘要（方案 §二/§2.1）。
+  let navigationRevisionCounter = 0
+  const bumpNavigation = () => { navigationRevisionCounter++ }
   let userSeen = new Map() // id → { dir, file, stamp }
   let watching = null
   let disposed = false
@@ -214,13 +552,16 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
   const modCfg = (id) => getConfig().modules?.[id] || {}
   const isEnabled = (id) => modCfg(id).enabled !== false
   const isUserOn = () => !getConfig().safeMode
+  // 接口挂在哪：内置模块（以及从内置搬到社区库的那几个）沿用原来的根路径，别的模块挂在自己的 /ext/<id>/ 下。
+  // 面板里的 call('/x') 要用同一份判断决定基址（见 status().routesAtRoot），两边不能各算各的。
+  const routesAtRoot = (id) => builtinDefs.has(id) || STABLE_ROUTES.has(id)
 
   // ---------- 给模块的 api ----------
   function makeApi(id, source, rec) {
     const mlog = logger.child(id)
     const active = () => !disposed && !rec.stopped && live.get(id) === rec
-    const writable = (label, fn) => (...args) => {
-      if (!active()) {
+    const writable = (label, fn, allowed = active) => (...args) => {
+      if (!allowed()) {
         const error = new Error(`模块「${id}」已停止，不能调用 ${label}`)
         mlog.warn(error.message)
         throw error
@@ -246,12 +587,28 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       return off
     }
     // 内置模块和替换它的版本用原来的路径（内置的面板页照常能用）；新模块放在 /ext/模块id/ 下
-    const prefix = builtinDefs.has(id) || STABLE_ROUTES.has(id) ? '' : `/ext/${id}`
+    const prefix = routesAtRoot(id) ? '' : `/ext/${id}`
     const def = rec.def
+    const setModuleConfig = writable('setConfig', (patch) => setConfig(typeof patch === 'function' ? patch(getConfig()) : deepMerge(getConfig(), patch)))
+    // 兼容在同步收尾里恢复设置的模块；迟到的回调和旧实例不能再写。
+    const setCoreConfig = writable('core.setConfig', (patch) => {
+      if (!isObj(patch)) throw new TypeError('core.setConfig 需要配置对象')
+      return setConfig(deepMerge(getConfig(), patch))
+    }, () => active() || (rec.cleaning && !live.has(id)))
     // 模块拿到的 core：hub 换成「宿主按模块身份封装」的白名单副本（三审 #177：原型链斩断，
     // 模块摸不到原始 runSubagentTurn / subagentFor）；core 本体用 Proxy 转发，
     // getPrototypeOf 也掐断，防 getPrototypeOf(api.core).hub 绕回原始入口。
-    const scopedCore = scopeCoreForModule(core, id)
+    const bridgeActive = () => active() && isUserOn() && isEnabled(id)
+    const personaMemoryBridge = id === PERSONA_MEMORY_MODULE && bridgeActive()
+      ? personaMemoryRuntime?.forModule(bridgeActive, track)
+      : undefined
+    const scopedCore = scopeCoreForModule(core, id, setCoreConfig, {
+      get personaMemoryBridge() {
+        return bridgeActive() ? personaMemoryBridge : undefined
+      },
+    })
+    // 出站治理的日志口（模块快捷发送层的判定/结算都往这里记；未注入服务时不会用到）
+    const obLog = outboundLogOf(core)
     const api = {
       id,
       source,
@@ -262,7 +619,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       log: mlog,
       // ---- 配置 ----
       config: () => getConfig(),
-      setConfig: writable('setConfig', (patch) => setConfig(typeof patch === 'function' ? patch(getConfig()) : deepMerge(getConfig(), patch))),
+      setConfig: setModuleConfig,
       settings: () => ({ ...(def.defaults || {}), ...(getConfig().ext?.[id] || {}) }),
       saveSettings: writable('saveSettings', (patch) => {
         const cfg = getConfig()
@@ -298,44 +655,74 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
         return off
       },
       emit: writable('emit', (event, ...args) => emit(event, ...args)),
+      // 每次触发都按当时的当前人格固定（不沿用 setup 时的上下文）：这一趟写的记忆、流水、会话都归这个人格
       every: (ms, fn, label = '定时任务') => {
         const t = setInterval(() => {
-          if (!active()) return
-          Promise.resolve().then(() => { if (active()) return fn() }).catch((error) => note(id, label, error))
+          // 调试模式不跑定时任务：刷 B 站、逛空间、主动搭话、整理记忆这些都别在调试里自己动
+          if (!active() || getConfig().debug) return
+          personaScope.run(personaNow(getConfig()), () => Promise.resolve().then(() => { if (active()) return fn() }).catch((error) => note(id, label, error)))
         }, Math.max(1000, Number(ms) || 60_000))
         t.unref?.()
         return track(() => clearInterval(t))
       },
       later: (ms, fn) => {
-        const t = setTimeout(() => { Promise.resolve().then(() => { if (active()) return fn() }).catch((error) => note(id, '延时任务', error)) }, Math.max(0, Number(ms) || 0))
+        const t = setTimeout(() => { personaScope.run(personaNow(getConfig()), () => Promise.resolve().then(() => { if (active()) return fn() }).catch((error) => note(id, '延时任务', error))) }, Math.max(0, Number(ms) || 0))
         t.unref?.()
         return track(() => clearTimeout(t))
       },
-      route: (path, handler) => {
+      route: (path, handler, options = {}) => {
         if (!active()) return () => {}
+        if (options.access != null && options.access !== 'panel') throw new Error('路由 access 只支持 panel')
         const full = '/aurabot/api' + prefix + (String(path).startsWith('/') ? path : '/' + path)
         const cur = routes.get(full)
         if (cur && cur.id !== id && live.has(cur.id)) throw new Error(`接口 ${full} 已经被模块「${cur.id}」占了`)
-        const route = { id, handler: guard(`接口 ${path}`, handler) }
+        const route = { id, handler: guard(`接口 ${path}`, handler), access: options.access || null }
         routes.set(full, route)
         return track(() => { if (routes.get(full) === route) routes.delete(full) })
       },
       onDispose: (fn) => track(fn),
       // ---- 常用操作的捷径（都是 core 里的东西包了一层）----
-      send: writable('send', (chatId, text) => core.hub.deliver(String(chatId), String(text ?? ''))),
-      sendText: writable('sendText', (chatId, text) => core.hub.sendText(String(chatId), String(text ?? ''))),
+      // 发送类捷径先过一层出站治理（CONTRACT §5）：moduleId 由宿主绑定，模块伪造不了；
+      // 拦下返回 null（旧真值语义不变），放行才真的调 hub 并由这里结算预占。
+      // 未注入 core.outbound（旧环境 / 纯测试）时 admitModuleCall 直接放行，行为与改造前一致。
+      // 注意 reply 不参与：那是「回某一条消息」的回合内响应，由 hub 自己的回复链路负责，
+      // 不是模块自发的主对话（治理对象只有主动私聊主人）。
+      send: writable('send', (chatId, text) => governedSend(core, id, { chatId: String(chatId), text: String(text ?? '') }, (extra) => core.hub.deliver(String(chatId), String(text ?? ''), extra), obLog)),
+      // 第三个参数可选：`{ proactive: true, proactiveCause: 'qq_say_in_group' }` —— 声明「这条是我说的话」，
+      // hub 会在目标聊天 chatlog 里补一条 bot 记录（否则模块发的消息不落档）。
+      sendText: writable('sendText', (chatId, text, opts) => governedSend(core, id, { chatId: String(chatId), text: String(text ?? '') }, (extra) => core.hub.sendText(String(chatId), String(text ?? ''), undefined, undefined, undefined, logAsModuleSpeech(extra, opts, id)), obLog)),
       // 回某一条消息：群里以「引用回复」发出，私聊直接发
       reply: writable('reply', (msg, text) => core.hub.sendText(String(msg.chatId), String(text ?? ''), msg.kind === 'group' ? msg.messageId : undefined)),
       isOwner: (userId) => String(userId) === String(getConfig().ownerQQ),
-      sendImage: writable('sendImage', (chatId, src) => core.hub.sendImage(String(chatId), src)),
-      sendSegments: writable('sendSegments', (chatId, segs, note) => core.hub.sendSegments(String(chatId), segs, note || `[${id}]`)),
+      sendImage: writable('sendImage', (chatId, src) => governedSend(core, id, { chatId: String(chatId) }, (extra) => core.hub.sendImage(String(chatId), src, undefined, undefined, extra), obLog)),
+      // sendSegments(chatId, segs, note, opts)：opts 同上，供带 @ / 引用 / 图片段的发送声明留痕。
+      sendSegments: writable('sendSegments', (chatId, segs, note, opts) => governedSend(core, id, { chatId: String(chatId) }, (extra) => core.hub.sendSegments(String(chatId), segs, note || `[${id}]`, logAsModuleSpeech(extra, opts, id)), obLog)),
       // 发任意文件（文档 / 压缩包 / 音频 / 视频……）：本机绝对路径，或网关能取到的网址 / base64://
-      sendFile: writable('sendFile', (chatId, file, name) => core.hub.sendFile(String(chatId), file, name)),
+      sendFile: writable('sendFile', (chatId, file, name) => governedSend(core, id, { chatId: String(chatId) }, () => core.hub.sendFile(String(chatId), file, name), obLog)),
       // 把一个音频文件当语音条发出去（不走念文字）
-      sendVoiceFile: writable('sendVoiceFile', (chatId, file, note) => core.hub.sendVoiceFile(String(chatId), file, note || `[${id}] 语音`)),
-      ask: writable('ask', (opts) => core.ask(typeof opts === 'string' ? { text: opts } : opts)),
+      sendVoiceFile: writable('sendVoiceFile', (chatId, file, note) => governedSend(core, id, { chatId: String(chatId) }, () => core.hub.sendVoiceFile(String(chatId), file, note || `[${id}] 语音`), obLog)),
+      // module: id —— 这次模型调用的用量记到哪个模块名下（面板「概览」的 token 明细）
+      ask: writable('ask', (opts) => core.ask(typeof opts === 'string' ? { text: opts, module: id } : { ...opts, module: id })),
       think: writable('think', (prompt, opts = {}) => core.hub.runSystemTurn(`ext-${id}`, opts.title || def.name || id, String(prompt), opts)),
       onebot: writable('onebot', (action, params, opts) => core.onebot.call(action, params, opts)),
+      // 出站治理面（主动发言策略，见 docs/OUTBOUND-POLICY-DESIGN.md）。
+      // 宿主注入 core.outbound 才有；旧环境/纯测试下 available=false，模块据此降级，
+      // 绝不因此抛错。moduleId 由宿主闭包绑定，模块无法伪造他人身份。
+      proactive: {
+        // 用取值器而不是一次性求值：宿主可能晚于模块加载才注入 core.outbound，
+        // 写成普通属性会导致 available 永远为 false（而 submit 实际可用）。
+        get available() { return Boolean(core.outbound && typeof core.outbound.submit === 'function') },
+        submit: writable('proactive.submit', (input = {}) => {
+          const svc = core.outbound
+          if (!svc || typeof svc.submit !== 'function') return { deliveryId: null, state: 'unsupported' }
+          return svc.submit({ ...(input || {}), moduleId: id })
+        }),
+        statusOf: writable('proactive.statusOf', (deliveryId) => {
+          const svc = core.outbound
+          if (!svc || typeof svc.statusOf !== 'function') return null
+          return svc.statusOf(deliveryId)
+        }),
+      },
       dshTool: (tool) => { if (!active()) return () => {}; rec.dshTools.push(tool); core.bridge?.refresh(); return () => { remove(rec.dshTools, tool); core.bridge?.refresh() } },
     }
     return api
@@ -393,11 +780,13 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       }
       rec.exports = exports
       log.info(`模块「${def.name || id}」${source !== 'user' ? '' : existsSync(join(rec.dir, '.aurabot-source.json')) ? '（模块市场）' : '（自己写的）'}已启动`)
+      bumpNavigation() // 新实例进了注册表：导航摘要可能变（新增/替换）
       emit('module/start', id)
     } catch (error) {
       if (disposed || rec.stopped || live.get(id) !== rec) return null
       stop(id, { quiet: true })
       errors.set(id, { message: String(error && error.message ? error.message : error).slice(0, 800), at: Date.now(), source })
+      bumpNavigation() // 启动失败也进导航（availability=error）
       log.warn(`模块「${def.name || id}」启动失败：`, error.message)
     }
     return live.get(id)
@@ -412,12 +801,17 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     generation++ // 内置模块（重）启动也换代际：会话里的工具要在下一轮重挂
     if (errors.get(id)?.source !== 'user') errors.delete(id) // 替换版的报错留着给面板看
     try {
-      const r = def.setup(makeApi(id, 'builtin', rec))
+      const api = makeApi(id, 'builtin', rec)
+      const r = id === 'memory' && personaMemoryRuntime
+        ? def.setup(api, { registerNativePreview: read => api.onDispose(personaMemoryRuntime.registerNativePreview(read)) })
+        : def.setup(api)
       if (r && typeof r.then === 'function') throw new Error('内置模块的 setup 要同步返回')
       rec.exports = r ?? {}
+      bumpNavigation() // 内置模块（重）启动：导航摘要可能变
     } catch (error) {
       stop(id, { quiet: true })
       errors.set(id, { message: String(error.message || error).slice(0, 800), at: Date.now(), source: 'builtin' })
+      bumpNavigation() // 启动失败也进导航（availability=error）
       log.error(`内置模块「${def.name || id}」启动失败：`, error.message)
     }
   }
@@ -428,9 +822,15 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     if (!rec) return false
     live.delete(id)
     generation++ // 停止或替换也使会话工具缓存失效
+    bumpNavigation() // 模块停了/被替换：导航摘要可能变
     rec.stopped = true
-    for (const off of rec.offs.splice(0).reverse()) cleanup(off)
-    cleanup(() => rec.exports?.dispose?.())
+    rec.cleaning = true
+    try {
+      for (const off of rec.offs.splice(0).reverse()) cleanup(off)
+      cleanup(() => rec.exports?.dispose?.())
+    } finally {
+      rec.cleaning = false
+    }
     rec.exports = null
     // 路由和监听器由各自的 off 按实例撤销，清理期间可能已经启动了同名新实例。
     if (rec.dshTools.length) core.bridge?.refresh()
@@ -479,6 +879,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
       if (disposed || (revisions.get(u.id) || 0) !== revision) return null
       if (!stillWanted()) { resyncRequested = true; return null }
       errors.set(u.id, { message: String(error.message || error).slice(0, 800), at: Date.now(), source: 'user', fallback: builtinDefs.has(u.id) })
+      bumpNavigation() // 加载失败也进导航（availability=error）
       log.warn(`模块「${u.id}」加载失败：`, error.message)
       userSeen.set(u.id, { ...u, stamp: stampOf(u.dir) })
       return null
@@ -561,7 +962,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
         if (back) { back.fallback = true; log.warn(`模块「${id}」：你的版本没加载成功，先用内置的`) }
       }
     }
-    for (const id of [...userSeen.keys()]) if (!users.some((u) => u.id === id)) { userSeen.delete(id); if (errors.get(id)?.source === 'user') errors.delete(id) }
+    for (const id of [...userSeen.keys()]) if (!users.some((u) => u.id === id)) { userSeen.delete(id); if (errors.get(id)?.source === 'user') errors.delete(id); bumpNavigation() /* 安装的模块被删了：导航摘要要变 */ }
   }
 
   function sync() {
@@ -597,7 +998,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
 
   // ---------- 事件 ----------
   function emit(event, ...args) {
-    if (disposed) return
+    if (disposed || event === 'chat/delivery') return
     for (const { fn } of listeners.get(event) || []) {
       try { const r = fn(...args); if (r && typeof r.catch === 'function') r.catch(() => {}) } catch (error) {}
     }
@@ -738,8 +1139,14 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
         routes: [...routes].filter(([, r]) => r.id === id).map(([p]) => p.replace('/aurabot/api', '')),
         settings: rec?.source === 'user' || (!rec && u) ? (def.settings || []) : [],
         defaults: def.defaults || {},
-        panel: Boolean(rec?.source === 'user' && def.panel),
+        // 内置模块也能带面板：内置和用户模块走同一条加载链路，面板只按「定义里有没有声明 panel」判断。
+        // 不再要求 rec.source === 'user'，否则内置模块写了 panel.js 也永远显示不出来。
+        // 仍然要求模块在跑（rec 存在），没跑起来的模块没有面板代码可读。
+        panel: Boolean(rec && def.panel),
+        // 接口是不是挂在根路径（内置模块的老路径）；面板里的 call() 靠它决定加不加 /ext/<id> 前缀
+        routesAtRoot: routesAtRoot(id),
         tab: def.tab || '',
+        navGroup: typeof def.navGroup === 'string' ? def.navGroup : '',
         flag: typeof def.flag === 'string' ? def.flag : (def.settings || []).some((f) => f?.key === 'enabled') ? 'enabled' : '',
         keepPanel: Boolean(def.keepPanel),
         startedAt: rec?.startedAt || 0,
@@ -757,13 +1164,68 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     return names
   }
 
-  /** 自己写的模块的面板代码（panel.js），面板拿去执行。 */
+  // ---------- 面板首屏：导航摘要（方案 §二/§2.1） ----------
+  /**
+   * 从内存注册表生成导航摘要：内置定义（builtinDefs）+ 用户模块扫描缓存（userSeen）+
+   * 运行记录（live）+ 错误表（errors）+ 配置（modCfg）。**绝不调 scanUser() 重扫模块目录，
+   * 也不执行工具构造器**（toolNames 那套不走）——首屏读取只准碰内存。
+   * 每项：id/name/tab/navGroup/hasSettings/hasPanel/enabled/running/platforms/availability。
+   */
+  function summarizeModules() {
+    const ids = new Set([...builtinDefs.keys(), ...userSeen.keys(), ...live.keys()])
+    const modules = [...ids].sort().map((id) => {
+      const b = builtinDefs.get(id)
+      const seen = userSeen.get(id)
+      const rec = live.get(id)
+      const def = rec?.def || b || {}
+      const m = modCfg(id)
+      const err = errors.get(id)
+      const enabled = m.enabled !== false
+      const availability = rec ? 'ready'
+        : err ? 'error'
+        : !enabled ? 'disabled'
+        : (b || seen) ? 'stopped' // 有定义/有安装记录但没在跑（被关、被替换、等待加载）
+        : 'unloaded' // 只有扫描缓存残影，定义还没拿到
+      return {
+        id,
+        name: def.name || id,
+        tab: def.tab || '',
+        navGroup: typeof def.navGroup === 'string' ? def.navGroup : '',
+        hasSettings: Array.isArray(def.settings) && def.settings.length > 0,
+        hasPanel: Boolean(rec && def.panel),
+        enabled,
+        running: rec ? rec.source : null, // 'builtin' | 'user' | null
+        platforms: Array.isArray(def.platforms) ? def.platforms.map(String) : [],
+        availability, // ready | error | disabled | stopped | unloaded
+        error: err && !rec ? err.message : '',
+      }
+    })
+    return { navigationRevision: navigationRevisionCounter, modules }
+  }
+
+  /** file 是不是在 root 目录里面（root 自己不算；越过 root 的 ../ 一律不算）。 */
+  function inside(root, file) {
+    const rel = relative(resolve(root), resolve(file))
+    return Boolean(rel) && !rel.startsWith('..') && !isAbsolute(rel)
+  }
+
+  /**
+   * 模块的面板代码（panel.js），面板拿去执行。
+   * 内置模块也允许带面板：两者本来就是同一条加载链路，面板只需要「定义里声明了 panel」。
+   * 面板文件从模块自己的文件夹读：用户模块在数据目录 modules/<id>，内置模块在 src/modules/<id>；
+   * 两边都要求落在各自的根目录里，防止 panel 写成 ../../xxx 去读根目录外面的文件。
+   */
   function panelSource(id) {
     const rec = live.get(id)
-    if (!rec || rec.source !== 'user' || !rec.def.panel) return null
-    const u = userSeen.get(id)
-    const file = typeof rec.def.panel === 'string' ? resolve(u.dir, rec.def.panel) : join(u.dir, 'panel.js')
-    if (!file.startsWith(u.dir) || !existsSync(file)) return null
+    if (!rec || !rec.def.panel) return null
+    // 内置模块的根目录是 src/modules/<id>；id 先按 ID_RE 校验，别让奇怪的名字把根目录带到外面去。
+    const builtin = rec.source !== 'user'
+    const root = builtin
+      ? (ID_RE.test(String(id)) ? join(BUILTIN_DIR, id) : '')
+      : (rec.dir || userSeen.get(id)?.dir || '')
+    if (!root) return null
+    const file = resolve(root, typeof rec.def.panel === 'string' ? rec.def.panel : 'panel.js')
+    if (!inside(root, file) || !existsSync(file)) return null
     return readFileSync(file, 'utf8')
   }
 
@@ -804,6 +1266,38 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     return { ok: true, dir, message: `复制好了：${dir}。改完保存，几秒内就会换成你的版本` }
   }
 
+  /** 删除用户模块：先停掉，再把源码和本地改动归档到 modules/.trash；默认保留数据和设置，purge 才清掉。 */
+  async function removeModule(id, { purge = false } = {}) {
+    if (typeof id !== 'string' || !ID_RE.test(id)) return { ok: false, message: 'id 不对' }
+    const dir = join(userDir(), id)
+    if (!inside(userDir(), dir)) return { ok: false, message: 'id 不对' }
+    if (!existsSync(dir)) return { ok: false, message: `modules/${id} 不存在` }
+    if (!lstatSync(dir).isDirectory()) return { ok: false, message: `modules/${id} 不是文件夹` }
+    const trash = join(userDir(), '.trash')
+    mkdirSync(trash, { recursive: true })
+    if (!lstatSync(trash).isDirectory()) return { ok: false, message: 'modules/.trash 不是文件夹，没法归档' }
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const folder = `${id}-${stamp}-${randomUUID().slice(0, 8)}`
+    const archive = `modules/.trash/${folder}`
+    stop(id)
+    try {
+      renameSync(dir, join(trash, folder))
+      log.info(`面板删除模块「${id}」，源码归档到 ${archive}`)
+      if (purge) {
+        rmSync(dataDir('modules-data', id), { recursive: true, force: true })
+        const cfg = getConfig()
+        const { [id]: _ext, ...ext } = cfg.ext || {}
+        const { [id]: _mod, ...modules } = cfg.modules || {}
+        setConfig({ ...cfg, ext, modules })
+      }
+    } finally {
+      await sync()
+    }
+    const dataStatus = purge ? '数据和设置已清除' : '数据和设置已保留'
+    const fallback = builtinDefs.has(id) ? '内置版本会继续运行。' : ''
+    return { ok: true, archive, message: `删掉了，源码和本地改动已移到 ${archive}。${dataStatus}。${fallback}` }
+  }
+
   /** 接口说明和类型提示放进 modules/（插件的东西，每次启动都覆盖成当前版本）。 */
   function installDocs() {
     try {
@@ -820,7 +1314,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
 
   function promptFor(id) {
     const dir = id ? join(userDir(), id) : userDir()
-    return `帮我修改 Aurabot（大肥鱼 QQ 插件）的扩展模块：${dir}\n`
+    return `帮我修改 Aurabot（${selfName(getConfig())} QQ 插件）的扩展模块：${dir}\n`
       + `先完整读一遍「${join(userDir(), DOC)}」了解模块怎么写、能用哪些接口，再按我的要求改：\n`
       + '【这里写你想让她多会什么、改成什么样】\n'
       + `只改 ${userDir()} 里的文件，不要动插件本身的代码；改完保存会自动重新加载，到面板「已安装」页看有没有报错，再告诉我怎么试。`
@@ -829,13 +1323,16 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
   const publicHandle = { use: exportsOf, has: (id) => live.has(id), list: () => status().map(({ id, name, running }) => ({ id, name, running })), emit }
 
   return {
-    boot, sync, reload, stop, dispose, status, create, fork, promptFor, panelSource,
+    boot, sync, reload, stop, dispose, status, create, fork, remove: removeModule, promptFor, panelSource,
     use: exportsOf, has: (id) => live.has(id), running: (id) => live.get(id)?.source || null, generation: () => generation,
     capabilitiesOf,
+    // 面板首屏提速：导航摘要（纯内存）与导航版本号（安装/启停/失败/重载时递增）
+    summarizeModules, navigationRevision: () => navigationRevisionCounter,
     emit, claim, filter, filterSync, buildTools,
     // 插件核心自己听事件（不属于任何模块，不会被撤掉）
     listen: (event, fn) => { const item = { id: '@core', fn }; listeners.set(event, [...(listeners.get(event) || []), item]); return () => listeners.set(event, (listeners.get(event) || []).filter((x) => x !== item)) }, contextFor, rules, commands, dshTools, builtinOff, handle,
     hasRoute: (path) => routes.has(path),
+    routeAccess: (path) => routes.get(path)?.access || null,
     dir: userDir,
   }
 }
