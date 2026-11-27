@@ -171,12 +171,12 @@ test('网易云：weapi 加密格式、Cookie 只取 MUSIC_U', () => {
   assert.equal(netease.musicU(''), '')
 })
 
-test('点歌前置检查：没打开、没装好、没说歌名', () => {
+test('点歌前置检查：没打开、没装好、没说歌名', async () => {
   let cfg = normalize({ song: { enabled: false, root: mkdtempSync(join(tmpdir(), 'rvc-')) } })
   const s = studio.createSongStudio({ getConfig: () => cfg, log: { info() {}, warn() {}, debug() {} }, sendVoiceFile: async () => {} })
-  assert.match(s.request({ song: '小幸运', chatId: 'private:1' }).message, /还没打开/)
+  assert.match((await s.request({ song: '小幸运', chatId: 'private:1' })).message, /还没打开/)
   cfg = normalize({ song: { ...cfg.song, enabled: true } })
-  const r = s.request({ song: '小幸运', chatId: 'private:1' })
+  const r = await s.request({ song: '小幸运', chatId: 'private:1' })
   assert.equal(r.ok, false)
   assert.match(r.message, /还没装好/)
   const st = s.status()
@@ -196,22 +196,22 @@ function makeShim(root, body) {
   return shim
 }
 
-test('翻唱环境：shim 在、转发到的解释器没了，不能算装好', { skip: process.platform === 'win32' }, () => {
+test('翻唱环境：shim 在、转发到的解释器没了，不能算装好', { skip: process.platform === 'win32' }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'rvc-'))
   const shim = makeShim(root, '#!/bin/bash\nexec /nonexistent/sep-venv/bin/python "$@"\n')
   const cfg = normalize({ song: { enabled: true, root } })
   const s = studio.createSongStudio({ getConfig: () => cfg, log: { info() {}, warn() {}, debug() {} }, sendVoiceFile: async () => {} })
-  const st = s.status()
+  const st = await s.refreshStatus()
   assert.equal(st.parts.python, false, `${dirname(shim)} 里的 shim 转发到的解释器不存在，不能报就绪`)
   assert.equal(st.ready, false)
 })
 
-test('翻唱环境：解释器真能跑才算 python 就绪，包缺了分离器仍不算', { skip: process.platform === 'win32' }, () => {
+test('翻唱环境：解释器真能跑才算 python 就绪，包缺了分离器仍不算', { skip: process.platform === 'win32' }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'rvc-'))
   makeShim(root, '#!/bin/bash\necho 1\n')
   const cfg = normalize({ song: { enabled: true, root } })
   const s = studio.createSongStudio({ getConfig: () => cfg, log: { info() {}, warn() {}, debug() {} }, sendVoiceFile: async () => {} })
-  const st = s.status()
+  const st = await s.refreshStatus()
   assert.equal(st.parts.python, true)
   assert.equal(st.parts.separator, false, '没放 audio-separator.exe，分离器不能报就绪')
   assert.equal(st.ready, false)

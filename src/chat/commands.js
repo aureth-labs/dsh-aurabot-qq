@@ -244,7 +244,7 @@ export async function runCommand(cmd, msg, deps) {
       const request = parseSingRequest(cmd.arg)
       if (request.error) return request.error
       if (!request.song) return '唱哪首？比如 /sing 小幸运 田馥甄；只唱一段可加 开始=60 时长=30（秒）'
-      return deps.song.request({ ...request, chatId: msg.chatId }).message
+      return (await deps.song.request({ ...request, chatId: msg.chatId }, deps.ownerStillCurrent)).message
     }
     case 'mood':
       return mood ? `现在${mood.label()}` : '心情模块关着'

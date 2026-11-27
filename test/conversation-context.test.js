@@ -179,3 +179,21 @@ test('忘了某人之后切块缓存要整份重建', () => {
   assert.equal(archive.recall(chat, '火锅').text.includes('火锅'), false, '忘了的人的原话不该再被召回')
   assert.equal(archive.recall(chat, '爬山').text.includes('爬山'), true, '别人的话还在')
 })
+
+test('历史尾部有界，退出缓存的事件依然按持久档案去重', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'aurabot-archive-retention-'))
+  const chat = 'private:fixture'
+  const key = createHash('sha256').update('default\0' + chat).digest('hex')
+  const file = join(directory, key + '.jsonl')
+  const text = '有界快照'.repeat(800)
+  const rows = Array.from({ length: 400 }, (_, i) => ({
+    id: 'row-' + i, role: 'user', text, at: 1700000000000 + i,
+  }))
+  writeFileSync(file, rows.map(row => JSON.stringify(row)).join('\n') + '\n')
+  const archive = createConversationArchive({ directory })
+  assert.equal(archive.recent(chat, 1)[0].id, 'row-399')
+  assert.equal(archive.append(chat, { id: 'row-0', role: 'user', text: '重复' }), false)
+  assert.equal(archive.append(chat, { id: 'new', role: 'user', text: '追加' }), true)
+  assert.equal(archive.recent(chat, 1)[0].id, 'new')
+  assert.equal(JSON.parse(readFileSync(join(directory, key + '.json'), 'utf8')).messages, 401)
+})

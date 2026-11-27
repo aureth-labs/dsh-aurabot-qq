@@ -19,7 +19,7 @@ test('publicConfig 回传可枚举的 vector.mode（在线服务不会回退本�
 
 test('保存回执的 dirty 基线用完整草稿而不是脱敏快照', () => {
   const src = CLIENT()
-  assert.match(src, /let savedDraft = maskSecretFields\(clone\(override \|\| draft\)\)/, '基线用完整草稿并清空 secret 原文')
+  assert.match(src, /let savedDraft = maskSecretFields\(clone\(hasNewerConfig \? snap : override \|\| draft\)\)/, '当前回执用完整草稿；过期回执保留较新的配置')
   assert.match(src, /draftBaseRef\.current = savedDraft/, '基线指向完整草稿')
   assert.match(src, /for \(const dots of committed\) savedDraft = setPath/, '已提交字段以服务端归一化快照为准')
   assert.match(src, /不再立即 loadConfigDraft/, '保存后不能马上用脱敏快照覆盖基线')

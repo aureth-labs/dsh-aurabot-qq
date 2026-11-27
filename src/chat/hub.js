@@ -312,14 +312,17 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   }
   const conversationArchive = (namespace = String(getConfig().persona?.current || 'default')) => {
     // visibleKey：忘了谁 / 清了谁的记忆都会改变可见性，切块缓存要跟着整份重建。
-    if (!archives.has(namespace)) archives.set(namespace, createConversationArchive({
+    const archive = archives.get(namespace) || createConversationArchive({
       directory: dataDir('conversation-context'),
       namespace,
       visible: conversationVisible,
       aliasesFor: archiveAliasesFor,
       visibleKey: () => conversationRules().length + '|' + JSON.stringify(memoryCutoffs(namespace)),
-    }))
-    return archives.get(namespace)
+    })
+    archives.delete(namespace)
+    archives.set(namespace, archive)
+    while (archives.size > 4) archives.delete(archives.keys().next().value)
+    return archive
   }
   // 心情对行为的影响（表情 / 语音概率、回复快慢、插话积极程度），没接就是 1
   const mood = () => (typeof moodEffects === 'function' ? moodEffects() : null) || { sticker: 1, voice: 1, delay: 1, chatty: 1 }
@@ -327,7 +330,44 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   const pnow = () => personaNow(getConfig())
   const mapFile = (pid = pnow()) => personaDataDir(getConfig(), pid, 'sessions.json')
   const map = (pid) => readJson(mapFile(pid), () => ({ chats: {} }))
-  const saveMap = (m, pid) => writeJson(mapFile(pid), m)
+  let storedSessionIndex = null
+  let storedSessionIndexAt = 0
+  const SESSION_INDEX_REFRESH_MS = 5_000
+  let sharedMapSnapshot = null
+  const saveMap = (m, pid, { mappingChanged = true } = {}) => {
+    const file = mapFile(pid)
+    writeJson(file, m)
+    if (mappingChanged) storedSessionIndex = null
+    if (sharedMapSnapshot?.file === file) sharedMapSnapshot = null
+  }
+
+  // External writes use atomic replacement. Check the high-resolution stamp even
+  // on a hit so a stale authorization cannot outlive a persisted revocation.
+  function sharedMapStamp(file) {
+    try {
+      const stat = statSync(file, { bigint: true, throwIfNoEntry: false })
+      return stat?.isFile() ? [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':') : ''
+    } catch {
+      return ''
+    }
+  }
+
+  function readSharedMap() {
+    const file = mapFile()
+    const stamp = sharedMapStamp(file)
+    if (!stamp) {
+      sharedMapSnapshot = null
+      return null
+    }
+    if (sharedMapSnapshot?.file === file && sharedMapSnapshot.stamp === stamp) return sharedMapSnapshot.data
+    const data = readJson(file, null)?.multiPrivate ?? null
+    if (sharedMapStamp(file) !== stamp) {
+      sharedMapSnapshot = null
+      return null
+    }
+    sharedMapSnapshot = { file, stamp, data }
+    return data
+  }
   const chatDir = (pid = pnow()) => personaDataDir(getConfig(), pid, 'chatlog')
   const sessionPersona = new Map() // sessionKey → 这个 DSH 会话属于哪个人格
   // 清理某人记忆的截止时间存在各人格自己的会话表里：在哪个人格下清理，就只清这个人格的
@@ -355,6 +395,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   const sharedAuditPriority = new Set()
   let sharedAuditTimer
   const sharedPending = []
+  const SHARED_PENDING_LIMIT = 64
+  const SHARED_PENDING_TTL_MS = 120_000
   let sharedRunning = false
   let sharedActiveTurn
   function indexSharedOwnership(data) {
@@ -369,7 +411,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   }
   if (resolveSharedPrimary) indexSharedOwnership(map().multiPrivate)
   const sharedSessions = createSharedPrivateSessions({
-    read: map, write: data => { saveMap(data); indexSharedOwnership(data.multiPrivate) }, log,
+    read: map, readSharedMap,
+    write: data => { saveMap(data, undefined, { mappingChanged: false }); indexSharedOwnership(data.multiPrivate) }, log,
     onRetired: sid => {
       sharedLiveCheckpoints.delete(sid)
       sharedDeliveryFailures.delete(sid)
@@ -875,7 +918,33 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   const RECENT_INBOUND_TTL_MS = 24 * 60 * 60 * 1000
   const RECENT_MAX_PARTS = 20
   const RECENT_MAX_TEXT = 2000
+  const RECENT_MEDIA_BYTES = 8 * 1024 * 1024
+  const RECENT_INLINE_IMAGE_CHARS = 256 * 1024
+  let recentInboundBytes = 0
+
+  function removeRecentMessage(key) {
+    const entry = recentInbound.get(key)
+    if (!entry) return
+    recentInboundBytes -= entry.bytes
+    recentInbound.delete(key)
+  }
+
+  function sweepRecentMessages(now) {
+    for (const [key, entry] of recentInbound) {
+      if (now - entry.cachedAt > RECENT_INBOUND_TTL_MS) removeRecentMessage(key)
+    }
+  }
+
+  function boundedMediaRef(value, allowInlineImage) {
+    if (typeof value !== 'string' || !value) return undefined
+    if (/^(?:base64:\/\/|data:)/i.test(value)) {
+      return allowInlineImage && value.length <= RECENT_INLINE_IMAGE_CHARS ? value : undefined
+    }
+    return value.length <= 4096 ? value : undefined
+  }
   const recentInbound = new Map() // `${normChatId}\0${messageId}` -> normalized FetchedMessage-like record (no raw / bytes)
+  const recentCacheSweep = setInterval(() => sweepRecentMessages(Date.now()), 60_000)
+  recentCacheSweep.unref?.()
   // #254：概览「今日统计」重启后归零。计数按日期落盘，同一天重启继续累计，跨天自动重置。
   // 只在脏了的时候节流写盘（默认 5 秒），不占收发主链路。
   const statsFile = dataDir('stats.json')
@@ -967,13 +1036,15 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       if (part.name !== undefined) clean.name = String(part.name)
       if (part.value !== undefined) clean.value = String(part.value)
       if (part.title !== undefined) clean.title = String(part.title).slice(0, 200)
-      if (part.url !== undefined) clean.url = String(part.url)
+      if (part.url !== undefined) clean.url = boundedMediaRef(part.url, false)
       if (part.label !== undefined) clean.label = String(part.label).slice(0, 100)
-      if (part.id !== undefined) clean.id = String(part.id)
+      if (part.id !== undefined) clean.id = boundedMediaRef(String(part.id), false)
       if (part.media && typeof part.media === 'object') {
         const m = {}
-        if (part.media.id) m.id = String(part.media.id)
-        if (part.media.url) m.url = String(part.media.url)
+        // 音频引用只需语音占位，图片仍可通过短引用或平台消息 ID 取回。
+        const image = clean.type === 'image' || clean.type === 'sticker'
+        if (part.media.id) m.id = boundedMediaRef(String(part.media.id), image)
+        if (part.media.url) m.url = boundedMediaRef(String(part.media.url), image)
         if (part.media.mime) m.mime = String(part.media.mime)
         if (part.media.name) m.name = String(part.media.name)
         if (part.media.messageId) m.messageId = String(part.media.messageId)
@@ -1010,10 +1081,19 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       sender: safeSender,
       parts: sanitizePartsForCache(parts),
     }
-    if (recentInbound.has(key)) recentInbound.delete(key)
+    for (const part of entry.parts) {
+      if ((part.type === 'image' || part.type === 'sticker') && part.media && !part.media.id && !part.media.url) {
+        part.media.messageId ||= sid
+      }
+    }
+    // UTF-16 上界同时覆盖文本、引用与短 Base64 图片，避免仅按条数限制内存。
+    entry.bytes = 2 * JSON.stringify(entry).length
+    removeRecentMessage(key)
+    if (entry.bytes > RECENT_MEDIA_BYTES) return
     recentInbound.set(key, entry)
-    while (recentInbound.size > RECENT_INBOUND_MAX) {
-      recentInbound.delete(recentInbound.keys().next().value)
+    recentInboundBytes += entry.bytes
+    while (recentInbound.size > RECENT_INBOUND_MAX || recentInboundBytes > RECENT_MEDIA_BYTES) {
+      removeRecentMessage(recentInbound.keys().next().value)
     }
   }
   function lookupRecentMessage(chatId, messageId) {
@@ -1025,11 +1105,11 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const item = recentInbound.get(key)
     if (!item) return null
     if (Date.now() - (item.cachedAt || item.at || 0) > RECENT_INBOUND_TTL_MS) {
-      recentInbound.delete(key)
+      removeRecentMessage(key)
       return null
     }
     if (!historyVisible(norm, item.sender?.account || '', item.at)) {
-      recentInbound.delete(key)
+      removeRecentMessage(key)
       return null
     }
     recentInbound.delete(key)
@@ -1041,13 +1121,13 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (!sid) return
     const norm = chatIdOrHint ? (normalizeChatId(String(chatIdOrHint)) || String(chatIdOrHint)) : ''
     if (norm) {
-      recentInbound.delete(`${norm}\u0000${sid}`)
+      removeRecentMessage(`${norm}\u0000${sid}`)
       quoteCache.delete(`${norm}|${sid}`)
       quoteCache.delete(`${chatIdOrHint}|${sid}`)
       return
     }
     for (const k of [...recentInbound.keys()]) {
-      if (k.endsWith(`\u0000${sid}`)) recentInbound.delete(k)
+      if (k.endsWith(`\u0000${sid}`)) removeRecentMessage(k)
     }
     for (const k of [...quoteCache.keys()]) {
       if (k.endsWith(`|${sid}`)) quoteCache.delete(k)
@@ -1721,7 +1801,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         changed = true
       }
     }
-    if (changed) saveMap(data)
+    if (changed) saveMap(data, undefined, { mappingChanged: false })
   }
 
   function sharedScope(primary = resolveSharedPrimary?.(), { reconcile = true } = {}) {
@@ -1749,7 +1829,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
 
   function sharedAuthorized(turn) {
     if (disposed || turn.revoked || !sharedSenderCurrent(turn.task)) return false
-    return sharedSessions.read().sessions[turn.scope.mode].generation === turn.branch.generation
+    const branch = readSharedMap()?.sessions?.[turn.scope.mode]
+    return branch?.state === 'active' && branch.generation === turn.branch.generation
+      && branch.sessionId === turn.branch.sessionId
   }
 
   function canSendToSharedPlatform(sessionId, sourceChatId) {
@@ -1875,7 +1957,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       ]))
       changed = true
     }
-    if (changed) saveMap(data)
+    if (changed) saveMap(data, undefined, { mappingChanged: false })
     refreshSharedConfig()
   }
 
@@ -2006,7 +2088,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       sessionId: ticket.legacy.sessionId, ownerPersonId: ticket.scope.ownerPersonId,
       ownerAuthorizationRevision: ticket.scope.ownerAuthorizationRevision, legacyPrefix: ticket.prefix,
     } }
-    saveMap(data)
+    saveMap(data, undefined, { mappingChanged: false })
     resetShared([mode], 'inherit')
     return { ok: true, message: '已登记核对结果，下一轮将继承这段旧历史' }
   }
@@ -2179,8 +2261,20 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   }
 
   function enqueueSharedTask(task, run) {
+    const deferred = () => task.proactive
+      ? deferredProactive('shared-queue-busy', '共享会话正在处理其他消息，本次主动搭话已暂缓')
+      : { ok: false, status: 'deferred', reason: 'shared-queue-busy' }
+    if (sharedPending.length >= SHARED_PENDING_LIMIT) return Promise.resolve(deferred())
     return new Promise((resolve, reject) => {
-      sharedPending.push({ task, run, resolve, reject })
+      const entry = { task, run, resolve, reject, timer: null }
+      entry.timer = setTimeout(() => {
+        const index = sharedPending.indexOf(entry)
+        if (index < 0) return
+        sharedPending.splice(index, 1)
+        resolve(deferred())
+      }, SHARED_PENDING_TTL_MS)
+      entry.timer.unref?.()
+      sharedPending.push(entry)
       if (sharedActiveTurn) void drainSharedLane(sharedActiveTurn)
       kickSharedScheduler()
     })
@@ -2190,6 +2284,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     if (disposed || sharedRunning) return
     const entry = sharedPending.shift()
     if (!entry) return
+    clearTimeout(entry.timer)
     sharedRunning = true
     void Promise.resolve().then(entry.run).then(entry.resolve, error => {
       log.warn('共享私聊任务失败：', error.message)
@@ -2233,6 +2328,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
             return
           }
           sharedPending.splice(index, 1)
+          clearTimeout(entry.timer)
           entry.resolve()
         } catch (error) {
           turn.rejectedEntry = entry
@@ -2993,7 +3089,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
           log.debug(`会话 ${sid.slice(-8)} 改标题失败：${error.message}`)
         }
       }
-      mm.chats[storageKey] = {
+      const next = {
         ...rec,
         sessionId: sid,
         mode,
@@ -3002,7 +3098,10 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
         level,
         title: rec.title || wantedTitle,
       }
-      saveMap(mm)
+      if (!isDeepStrictEqual(rec, next)) {
+        mm.chats[storageKey] = next
+        saveMap(mm, undefined, { mappingChanged: rec.sessionId !== sid })
+      }
     }
     assertActive()
     // 模型 / 思考强度和设置不一致就切过去（面板改了模型，下一条消息起生效）
@@ -3015,7 +3114,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       applyModel(agent, target)
       if (m.chats[storageKey].model !== want) {
         m.chats[storageKey].model = want
-        saveMap(m)
+        saveMap(m, undefined, { mappingChanged: false })
         log.info(`${storageKey} 的模型切到 ${want}`)
       }
     }
@@ -4760,7 +4859,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     const chatId = sessionToChat.get(key) || found?.chatId
     if (!chatId || !event) return
     try { recordSessionUsage(key, chatId, event, sessionTarget.get(key)) } catch {}
-    return personaScope.run(sessionPersona.get(key) || pnow(), () => onPersonaSessionEvent(key, chatId, event))
+    return personaScope.run(sessionPersona.get(key) || found?.persona || pnow(), () => onPersonaSessionEvent(key, chatId, event))
   }
   function onPersonaSessionEvent(key, chatId, event) {
     const st = turnState.get(key) || { lastTurn: -1, text: '', senders: new Set() }
@@ -7602,12 +7701,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       current.archived = true
     }
     assertActive()
-    const rec = mounted.get(key)
-    if (rec) { unmount(rec); mounted.delete(key) }
-    sessionToChat.delete(key)
-    turnState.delete(key)
-    clearSlowNotices(key)
-    slowNoticeSent.delete(key)
+    releaseSessionBindings(key)
     const m = map()
     if (m.chats[chatId]?.sessionId === sessionId) {
       delete m.chats[chatId]
@@ -7826,17 +7920,39 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
 
   // 重启后会话还没被第一条消息唤醒时，内存映射是空的：退回持久化的 聊天→会话 映射（#90 兜底要用）。
   // 各人格的会话表都要找：主人可能直接在 DSH 窗口里给不是当前人格的会话打字。
-  function findSession(key) {
+  function buildSessionIndex() {
+    const next = new Map()
     for (const { id } of personaDataRoots(getConfig())) {
-      try {
-        for (const [chatId, entry] of Object.entries(map(id).chats || {})) {
-          if (!entry?.sessionId || sessionKey(entry.sessionId) !== key) continue
-          sessionPersona.set(key, id)
-          return { chatId, persona: id }
-        }
-      } catch (error) {}
+      for (const [chatId, entry] of Object.entries(map(id).chats || {})) {
+        const key = sessionKey(entry?.sessionId)
+        if (key && !next.has(key)) next.set(key, { chatId, persona: id })
+      }
     }
-    return null
+    storedSessionIndex = next
+    storedSessionIndexAt = Date.now()
+  }
+
+  function findSession(key) {
+    if (!key) return null
+    if (!storedSessionIndex || Date.now() - storedSessionIndexAt >= SESSION_INDEX_REFRESH_MS) buildSessionIndex()
+    return storedSessionIndex.get(key) || null
+  }
+
+  /** Host-side import/restore and persona layout changes may replace files outside saveMap. */
+  function invalidateSessionIndex() {
+    storedSessionIndex = null
+    cutoffCache.clear()
+    sharedMapSnapshot = null
+    if (resolveSharedPrimary) {
+      const data = readSharedMap()
+      if (data) indexSharedOwnership(data)
+    }
+    if (!sessionToChat.size) return
+    buildSessionIndex()
+    for (const [key, chatId] of sessionToChat) {
+      const entry = storedSessionIndex.get(key)
+      if (entry?.chatId !== chatId || entry.persona !== sessionPersona.get(key)) releaseSessionBindings(key)
+    }
   }
 
   /** 这个 DSH 会话属于哪个人格（不是 aurabot 的会话时为空）。 */
@@ -7862,6 +7978,30 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     return mounted.has(sessionKey(sessionId))
   }
 
+  function releaseSessionBindings(sessionId) {
+    const key = sessionKey(sessionId)
+    const rec = mounted.get(key)
+    if (rec) unmount(rec)
+    mounted.delete(key)
+    sessionToChat.delete(key)
+    sessionPersona.delete(key)
+    sessionTarget.delete(key)
+    turnState.delete(key)
+    historySeeded.delete(key)
+    clearSlowNotices(key)
+    slowNoticeSent.delete(key)
+    stopTyping(key)
+  }
+
+  function onSessionDisposed(session) {
+    const key = sessionKey(session?.id)
+    if (!key) return
+    const rec = mounted.get(key)
+    if (rec && rec.agent?.session !== session) return
+    if (sharedLiveCheckpoints.get(key)?.session === session) sharedLiveCheckpoints.delete(key)
+    releaseSessionBindings(key)
+  }
+
   /** 只让一个聊天重新开始：归档它的会话，下一条消息开新会话。 */
   function resetChat(chatId, { memoryResetAt: cutoff = 0 } = {}) {
     const reg = dsh.workspaceRegistry || dsh.get('workspaceRegistry')
@@ -7877,20 +8017,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       memoryCutoffs()[qq] = cutoff
       chatLogRevision++
     }
-    const sessions = new Set([entry?.sessionId, ...(cutoff ? Object.values(entry?.sessions || {}) : [])].filter(Boolean))
+    const sessions = new Set([entry?.sessionId, ...Object.values(entry?.sessions || {})].filter(Boolean))
     for (const sessionId of sessions) {
-      const key = sessionKey(sessionId)
-      sessionToChat.delete(key)
-      turnState.delete(key)
-      if (cutoff) {
-        const rec = mounted.get(key)
-        if (rec) unmount(rec)
-        mounted.delete(key)
-        sessionTarget.delete(key)
-        historySeeded.delete(key)
-        clearSlowNotices(key)
-        stopTyping(key)
-      }
+      releaseSessionBindings(sessionId)
       try {
         Promise.resolve(reg?.archiveSession?.(sessionId)).catch((error) => log.debug('归档会话失败：', error.message))
       } catch (error) { log.debug('归档会话失败：', error.message) }
@@ -7923,7 +8052,7 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
       if (key.startsWith(chatId + '|') || key.startsWith(normClear + '|')) quoteCache.delete(key)
     }
     for (const key of [...recentInbound.keys()]) {
-      if (key.startsWith(chatId + '\u0000') || key.startsWith(normClear + '\u0000')) recentInbound.delete(key)
+      if (key.startsWith(chatId + '\u0000') || key.startsWith(normClear + '\u0000')) removeRecentMessage(key)
     }
     for (const [groupId, entries] of groupBuf) {
       groupBuf.set(groupId, entries.filter((entry) => entry.uid !== qq || entry.t > cutoff))
@@ -7955,15 +8084,16 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   function resetMap(reg, pid) {
     const m = map(pid)
     let n = 0
-    for (const [chatId, e] of Object.entries(m.chats)) {
-      try {
-        // 可能返回 Promise：必须接住 rejection，未处理的 rejection 会让 DSH 宿主退出
-        Promise.resolve(reg?.archiveSession?.(e.sessionId)).catch((error) => log.debug('归档会话失败：', error.message))
-      } catch (error) {
-        log.debug('归档会话失败：', error.message)
+    for (const [chatId, entry] of Object.entries(m.chats)) {
+      const sessions = new Set([entry?.sessionId, ...Object.values(entry?.sessions || {})].filter(Boolean))
+      for (const sessionId of sessions) {
+        releaseSessionBindings(sessionId)
+        try {
+          Promise.resolve(reg?.archiveSession?.(sessionId)).catch((error) => log.debug('归档会话失败：', error.message))
+        } catch (error) {
+          log.debug('归档会话失败：', error.message)
+        }
       }
-      sessionToChat.delete(sessionKey(e.sessionId))
-      turnState.delete(sessionKey(e.sessionId))
       outputSources.delete(chatId)
       delete m.chats[chatId]
       n++
@@ -8138,7 +8268,10 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     sharedDeliveryFailures.clear()
     sharedProactiveDeliveries.clear()
     sharedAuditPriority.clear()
-    for (const entry of sharedPending.splice(0)) entry.resolve()
+    for (const entry of sharedPending.splice(0)) {
+      clearTimeout(entry.timer)
+      entry.resolve()
+    }
     for (const turn of sharedTurns.values()) turn.agent.cancel({ kind: 'user' })
     for (const off of sharedListeners.splice(0)) off()
     // 卸载前把没落盘的今日统计补一次，别让最后几秒的计数白丢（#254）。
@@ -8162,6 +8295,11 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     mounted.clear()
     toolDisposers.clear()
     sessionToChat.clear()
+    sessionPersona.clear()
+    sessionTarget.clear()
+    historySeeded.clear()
+    storedSessionIndex = null
+    sharedMapSnapshot = null
     turnState.clear()
     outputSources.clear()
     systemTurns.clear()
@@ -8171,7 +8309,9 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     sessionCreating.clear()
     privateSources.clear()
     quoteCache.clear()
+    clearInterval(recentCacheSweep)
     recentInbound.clear()
+    recentInboundBytes = 0
     sentIdsByScope.clear()
     busy.clear()
     running.clear()
@@ -8251,6 +8391,8 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
   return {
     dispose,
     refreshSharedConfig,
+    invalidateSessionIndex,
+    onSessionDisposed,
     invalidateSharedSource,
     resetShared,
     sharedStatus,

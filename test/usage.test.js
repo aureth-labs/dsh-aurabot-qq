@@ -1,6 +1,8 @@
 import { test, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import fsPromises from 'node:fs/promises'
+import { syncBuiltinESMExports } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as u from '../src/core/usage.js'
@@ -271,3 +273,133 @@ test('按聊天只列群聊和私聊，后台归入独立的模块和后台小�
   assert.ok(modules.includes('刷 B 站（后台）'))
   assert.ok(modules.includes('其他后台任务'))
 })
+
+test('异步用量汇总让出执行权并复用同一范围的在途快照', async () => {
+  const stamp = Date.now() - 100
+  for (let n = 0; n < 600; n++) u.recordUsage({ at: stamp, chat: 'private:1', usage: { inputTokens: 1 } })
+  let yielded = false
+  setImmediate(() => { yielded = true })
+  const job = u.usageReportAsync({ range: 'all' })
+  assert.equal(u.usageReportAsync({ range: 'all' }), job)
+  u.recordUsage({ at: stamp, chat: 'private:1', usage: { inputTokens: 9 } })
+  const snapshot = await job
+  assert.equal(yielded, true)
+  assert.equal(snapshot.current.totalTokens, 600)
+  assert.equal((await u.usageReportAsync({ range: 'all' })).current.totalTokens, 609)
+})
+
+// 只手动触发用量的写盘定时器，异步迭代、磁盘写入和原子改名仍走真实路径。
+function controlUsageWrite(t) {
+  u.closeUsage()
+  const nativeSetTimeout = globalThis.setTimeout
+  const nativeClearTimeout = globalThis.clearTimeout
+  let pending = null
+  t.mock.method(globalThis, 'setTimeout', (callback, delay, ...args) => {
+    if (delay !== 1500 && delay !== 5000) return nativeSetTimeout(callback, delay, ...args)
+    assert.equal(pending, null, '同一时间只应安排一次用量写盘')
+    pending = { callback, delay, unref() {} }
+    return pending
+  })
+  t.mock.method(globalThis, 'clearTimeout', handle => {
+    if (handle === pending) pending = null
+    else nativeClearTimeout(handle)
+  })
+  u.initUsage()
+  return {
+    fire(delay) {
+      assert.equal(pending?.delay, delay)
+      const { callback } = pending
+      pending = null
+      return callback()
+    },
+    hasPending: () => Boolean(pending),
+    read: () => JSON.parse(readFileSync(join(dir, 'usage.json'), 'utf8')),
+  }
+}
+
+function afterUsageTempWrite(t, callback) {
+  const prefix = join(dir, 'usage.json.tmp-')
+  const writeFile = fsPromises.writeFile
+  const mock = t.mock.method(fsPromises, 'writeFile', async (file, ...args) => {
+    await writeFile(file, ...args)
+    if (String(file).startsWith(prefix)) await callback(file)
+  })
+  syncBuiltinESMExports()
+  return () => {
+    mock.mock.restore()
+    syncBuiltinESMExports()
+  }
+}
+
+const persistedRows = state => Object.values(state.days).flat()
+
+test('用量的 1.5 秒后台写盘保留所有批次和会话游标', async t => {
+  const timer = controlUsageWrite(t)
+  for (let n = 0; n < 270; n++) u.recordUsage({ at: now, usage: { inputTokens: n + 1 } })
+  u.recordSessionUsage('s', 'private:1', { seq: 4, type: 'model/selection', time: now, data: { provider, model } })
+  assert.deepEqual(persistedRows(timer.read()), [])
+  await timer.fire(1500)
+  const snapshot = timer.read()
+  assert.equal(snapshot.version, 2)
+  assert.deepEqual(persistedRows(snapshot).map(row => row.in), Array.from({ length: 270 }, (_, n) => n + 1))
+  assert.equal(snapshot.sessions.s.seq, 4)
+  assert.equal(snapshot.sessions.s.model, model)
+  assert.equal(report().writeFailed, false)
+  assert.equal(timer.hasPending(), false)
+})
+
+test('用量后台写盘失败后保留旧文件及待写数据，无需新事件即可重试成功', async t => {
+  const timer = controlUsageWrite(t)
+  let failedFile
+  const restore = afterUsageTempWrite(t, file => {
+    if (failedFile) return
+    failedFile = file
+    throw Object.assign(new Error('模拟临时文件写入失败'), { code: 'EIO' })
+  })
+  try {
+    u.recordUsage({ at: now, usage: { inputTokens: 17 } })
+    await timer.fire(1500)
+    assert.equal(report().writeFailed, true)
+    assert.deepEqual(persistedRows(timer.read()), [])
+    assert.equal(existsSync(failedFile), false)
+    await timer.fire(5000)
+    assert.equal(report().writeFailed, false)
+    assert.deepEqual(persistedRows(timer.read()).map(row => row.in), [17])
+    assert.equal(timer.hasPending(), false)
+  } finally {
+    restore()
+  }
+})
+
+for (const [label, flush] of [['手动刷新', u.flushUsage], ['关闭', u.closeUsage]]) {
+  test(`用量${label}保留最后一批，旧后台写盘不能覆盖同步提交`, { timeout: 10000 }, async t => {
+    const timer = controlUsageWrite(t)
+    const staged = Promise.withResolvers()
+    const release = Promise.withResolvers()
+    const restore = afterUsageTempWrite(t, async file => {
+      staged.resolve(file)
+      await release.promise
+    })
+    u.recordUsage({ at: now, usage: { inputTokens: 12 } })
+    const background = timer.fire(1500)
+    try {
+      const temp = await Promise.race([
+        staged.promise,
+        background.then(() => { throw new Error('后台写盘未生成临时快照') }),
+      ])
+      assert.deepEqual(persistedRows(JSON.parse(readFileSync(temp, 'utf8'))).map(row => row.in), [12])
+      u.recordUsage({ at: now, usage: { inputTokens: 99 } })
+      flush()
+      assert.deepEqual(persistedRows(timer.read()).map(row => row.in), [12, 99])
+      release.resolve()
+      await background
+      assert.equal(existsSync(temp), false)
+      assert.deepEqual(persistedRows(timer.read()).map(row => row.in), [12, 99])
+      assert.equal(timer.hasPending(), false)
+    } finally {
+      release.resolve()
+      try { await background }
+      finally { restore() }
+    }
+  })
+}

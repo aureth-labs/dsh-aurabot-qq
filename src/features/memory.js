@@ -1121,10 +1121,30 @@ export function checkAbstractText (text, sourceTexts = []) {
   return { ok: true, text: t }
 }
 
+const SCAN_CHUNK = 32
+const yieldScan = () => new Promise(resolve => setImmediate(resolve))
+
+function finishScan(scan) {
+  let step = scan.next()
+  while (!step.done) step = scan.next()
+  return step.value
+}
+
+async function finishScanAsync(scan, isCurrent = () => true) {
+  let step = scan.next()
+  while (!step.done) {
+    await yieldScan()
+    if (!isCurrent()) { scan.return(); return null }
+    step = scan.next()
+  }
+  return step.value
+}
+
 // 对单日流水做只读选择。返回原始下标的掩码；整理进度、聊天缓冲沿用物理行号。
-export function extractionMask(rows, cfg, ownerAccountOf = () => '') {
+function* scanExtractionMask(rows, cfg, ownerAccountOf) {
   const keep = new Uint8Array(rows.length), groups = new Map()
   for (let i = 0; i < rows.length; i++) {
+    if (i && i % SCAN_CHUNK === 0) yield
     const r = rows[i], id = r.chatId || ''
     const addr = addrOf(id)
     if (addr?.kind !== 'group') { keep[i] = 1; continue }
@@ -1151,6 +1171,22 @@ export function extractionMask(rows, cfg, ownerAccountOf = () => '') {
     if (g.prev.length > 5) g.prev.shift()
   }
   return keep
+}
+
+export function extractionMask(rows, cfg, ownerAccountOf = () => '') {
+  return finishScan(scanExtractionMask(rows, cfg, ownerAccountOf))
+}
+
+function extractionMaskAsync(rows, cfg, ownerAccountOf) {
+  return finishScanAsync(scanExtractionMask(rows, cfg, ownerAccountOf))
+}
+
+function memoizeScan(resolve) {
+  const values = new Map()
+  return key => {
+    if (!values.has(key)) values.set(key, resolve(key))
+    return values.get(key)
+  }
 }
 
 /**
@@ -1243,14 +1279,25 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     }
     return ids.length === 1 ? ids[0] : ids
   }
-  const memoryScopeOf = (row) => {
-    const raw = String(row?.chatId || '')
-    if (!raw || raw.startsWith('system:')) return ''
-    if (ownerSharedEnabled() && isOwnerChat(raw)) {
-      const own = ownerOf()
-      return own ? `owner:${own}` : raw
+  // 扫描中按唯一平台和会话解析身份，不随流水行数重复访问 SQLite。
+  function historyScan() {
+    let owner
+    const currentOwner = () => owner ??= ownerOf()
+    const ownerAccount = memoizeScan((platform) => {
+      const person = currentOwner()
+      return person && String(identity?.accountOn?.(person, platform) || '')
+    })
+    const scopeOf = memoizeScan((chatId) => {
+      if (!chatId || chatId.startsWith('system:')) return ''
+      if (getConfig().multiPlatformPrivateSession === true && isPrivateAddr(chatId) && currentOwner() && isOwnerChat(chatId)) {
+        return `owner:${currentOwner()}`
+      }
+      return chatId
+    })
+    return {
+      ownerAccountOf: (chatId) => ownerAccount(parseChatId(chatId)?.platform || defPlatform()),
+      scopeOf: (row) => scopeOf(String(row?.chatId || '')),
     }
-    return raw
   }
   const isPrivateAddrFor = (chat) => {
     if (!chat || chat.kind !== 'private' || !chat.userId) return false
@@ -1333,13 +1380,16 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
   // 「不再记住」的 QQ 集合。rememberedItem/Row 会按聊天流水的每一行调用；
   // 默认参数如果每次都 load()，就会在热路径里反复整库读 SQLite（几百上千行 = 几百上千次读库）。
   let noMemoryCache = null
-  const index = () => {
-    const s = load()
+  const index = (state = null) => {
     const cfg = getConfig()
+    const stamp = transaction ? null : JSON.stringify([storage.revision(), cfg.memory.gistEnabled !== false, ownerOf(), cfg.ownerName])
+    if (stamp && cache?.stamp === stamp) return cache.idx
+    const s = state || load()
     const gists = cfg.memory.gistEnabled === false ? [] : (s.gists || []).filter((g) => g.kind === 'gist' && safeGistText(g.text, g.chatId))
-    const stamp = JSON.stringify([s.items.length, s.items.at(-1)?.id || '', s.rev || 0, gists.length, cfg.memory.gistEnabled !== false, ownerOf(), cfg.ownerName])
-    if (!cache || cache.stamp !== stamp) cache = { stamp, idx: buildIndex([...s.items, ...gists].filter((m) => rememberedItem(m, s))) }
-    return cache.idx
+    const check = memoizeScan((person) => remembers(person, s))
+    const idx = buildIndex([...s.items, ...gists].filter((m) => rememberedItem(m, s, check)))
+    if (stamp) cache = { stamp, idx }
+    return idx
   }
 
   const isOwner = (qq) => ownerIs(qq)
@@ -1359,35 +1409,59 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     }
     return !noMemory && !blocked?.(String(qq))
   }
-  function rememberedItem(item, state = null) {
+  function rememberedItem(item, state = null, check = remembers) {
     const addr = addrOf(item.chatId)
-    return remembers(item.about, state) && (addr?.kind !== 'private' || remembers(addr.id, state))
+    return check(item.about, state) && (addr?.kind !== 'private' || check(addr.id, state))
   }
-  function rememberedRow(row, state = null) {
+  function rememberedRow(row, state = null, check = remembers) {
     const interaction = Array.isArray(row.interaction) ? row.interaction : []
-    return rememberedItem(row, state) && (row.who === 'bot' ? interaction.every((qq) => remembers(qq, state)) : remembers(row.uid, state))
+    return rememberedItem(row, state, check) && (row.who === 'bot' ? interaction.every((qq) => check(qq, state)) : check(row.uid, state))
   }
 
   // 直接互动只从现有流水读取，画像、活跃时间和消息里的名字都不能冒充互动。
   let historyCache = null
+  let historyFlight = null
+  const historyMatches = (revision) => revision !== undefined && historyCache?.revision === revision && historyCache.version === forgetVersion
   function socialHistory() {
     const revision = hub?.chatLogRevision?.()
-    if (revision !== undefined && historyCache?.revision === revision && historyCache.version === forgetVersion) return historyCache.people
+    if (historyMatches(revision)) return historyCache.people
+    const people = finishScan(scanSocialHistory())
+    historyCache = { revision, version: forgetVersion, people }
+    return people
+  }
+  async function socialHistoryAsync() {
+    const revision = hub?.chatLogRevision?.(), version = forgetVersion
+    if (historyMatches(revision)) return historyCache.people
+    if (!historyFlight) {
+      const isCurrent = () => version === forgetVersion && revision === hub?.chatLogRevision?.()
+      historyFlight = {
+        revision, version,
+        result: finishScanAsync(scanSocialHistory(), isCurrent).then(people => {
+          if (!people || !isCurrent()) return null
+          historyCache = { revision, version, people }
+          return people
+        }).finally(() => { historyFlight = null }),
+      }
+    }
+    if (historyFlight.revision !== revision || historyFlight.version !== version) return null
+    return historyFlight.result
+  }
+  function* scanSocialHistory() {
     const people = new Map()
     const ensure = (qq) => {
       if (!people.has(qq)) people.set(qq, { at: 0, groups: new Set(), interactions: 0, lastInteraction: 0 })
       return people.get(qq)
     }
     // 流水的 chatId 私聊段和旧写法的 interaction 里可能是平台账号而非 PersonId；优先归一化到 PersonId，并保留未迁入身份库的存量数字 QQ。
-    const resolveLogId = (raw, plat) => {
-      const id = String(raw || '').trim()
-      if (!id) return ''
-      if (isPersonId(id)) return id
-      const mapped = plat && typeof identity?.lookup === 'function' ? identity.lookup(plat, id) : null
-      if (mapped) return mapped
-      return defaultIsPersonId(id) ? id : ''
-    }
+    const idsOn = memoizeScan(plat => memoizeScan(id => {
+      if (!id || isPersonId(id)) return id
+      const mapped = plat && identity?.lookup?.(plat, id)
+      return mapped || (defaultIsPersonId(id) ? id : '')
+    }))
+    const resolveLogId = (raw, plat) => idsOn(plat)(String(raw || '').trim())
+    let scanned = 0
     for (const day of hub?.chatLogDays?.() || []) for (const row of hub?.chatLogOf?.(day) || []) {
+      if (scanned++ % SCAN_CHUNK === 0) yield
       if (!row || row.kind === 'seen' || row.forgottenAt || String(row.text || '').startsWith('【系统')) continue
       const rowAddr = addrOf(row.chatId)
       const plat = rowAddr?.platform || ''
@@ -1408,7 +1482,6 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
         p.lastInteraction = Math.max(p.lastInteraction, at)
       }
     }
-    historyCache = { revision, version: forgetVersion, people }
     return people
   }
   function isAcquainted(qq) {
@@ -2278,7 +2351,7 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
   function dislikes(qq) { return personTags(qq).includes('讨厌') }
 
   /** 面板上的人物墙：画像、个人事实和个人梗概都可以让一个人出现在列表里。 */
-  function personaOverview() {
+  function personaOverview(history = null) {
     const s = load()
     const people = new Map()
     const spoken = new Map()
@@ -2294,7 +2367,7 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
       return people.get(id)
     }
     for (const qq of Object.keys(s.profiles || {})) ensure(qq)
-    for (const qq of Object.keys(s.shortTerm || {})) if (shortTermOf(qq)) ensure(qq)
+    for (const qq of Object.keys(s.shortTerm || {})) if (shortTermOf(qq, s)) ensure(qq)
     for (const r of s.relations || []) {
       for (const [qq, name] of [[r.subjQq, r.subj], [r.objQq, r.obj]]) {
         const p = ensure(qq)
@@ -2305,7 +2378,7 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
       const p = key.startsWith('qq:') ? ensure(key.slice(3)) : null
       if (p && !p.name) p.name = (s.insightNames || {})[key] || ''
     }
-    for (const m of list('')) {
+    for (const m of prepare('', undefined, s).raw) {
       const speaker = String(m.speaker || '')
       if (speaker) {
         spoken.set(speaker, Math.max(spoken.get(speaker) || 0, Number(saidTime(m)) || 0))
@@ -2323,7 +2396,7 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     for (const g of s.gists || []) if (g.kind === 'gist') ensure(g.about)
     for (const [qq, at] of spoken) if (people.has(qq)) people.get(qq).lastActive = at
     // 画像的 at 是整理时间，不是发言时间；用仍保留的聊天流水补上最近活跃时间。
-    if (people.size) for (const [qq, activity] of socialHistory()) {
+    if (people.size) for (const [qq, activity] of history || socialHistory()) {
       const p = people.get(qq)
       if (!p) continue
       p.interactions = activity.interactions
@@ -2332,13 +2405,12 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
       p.lastActive = Math.max(p.lastActive, activity.at)
       for (const id of activity.groups) { if (!rememberedGroups.has(qq)) rememberedGroups.set(qq, new Set()); rememberedGroups.get(qq).add(id) }
     }
-    return [...people.values()].map((p) => ({ ...p, tags: personTags(p.qq), groups: [...(rememberedGroups.get(p.qq) || [])].map((id) => ({ id, name: hub?.groupNames?.get?.(id) || id })), hasRelations: (s.relations || []).some((r) => relationHas(r, p.qq, [p.name, p.alias].filter(Boolean))), hasInsights: Boolean((s.insights || {})[`qq:${p.qq}`]?.length), isOwner: ownerIs(p.qq) }))
+    return [...people.values()].map((p) => ({ ...p, tags: personTags(p.qq, s), groups: [...(rememberedGroups.get(p.qq) || [])].map((id) => ({ id, name: hub?.groupNames?.get?.(id) || id })), hasRelations: (s.relations || []).some((r) => relationHas(r, p.qq, [p.name, p.alias].filter(Boolean))), hasInsights: Boolean((s.insights || {})[`qq:${p.qq}`]?.length), isOwner: ownerIs(p.qq) }))
       .sort((a, b) => Number(b.isOwner) - Number(a.isOwner) || (b.closeness || 0) - (a.closeness || 0) || a.qq.localeCompare(b.qq))
   }
 
   /** 星图只是现有人物、关系和互动亲疏的投影，不另存节点和边。 */
-  function personaGraph() {
-    const people = personaOverview()
+  function personaGraph(people = personaOverview()) {
     const nodes = people.filter((p) => remembers(p.qq))
       .map((p) => ({ qq: p.qq, name: personName(p), closeness: p.closeness || 0, interactions: p.interactions || 0, isOwner: p.isOwner }))
     const ids = new Set(nodes.map((p) => p.qq))
@@ -2547,16 +2619,54 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     return via.length ? { via } : {}
   }
 
-  function timeline({ kind = '', platform = '', chatId = '', level = '', about = '' } = {}) {
-    const seen = list('').filter((m) => m.source === 'event' && m.kind === 'seen')
-    return [...gists({ chatId, level, about }), ...seen.filter((m) => (!chatId || m.chatId === chatId) && !level && (!about || m.about === about))]
-      .map((m) => ({ ...m, displayText: eventText(m), platforms: memoryPlatforms(m) }))
-      .filter((m) => (!kind || m.kind === kind) && (!platform || m.platforms.includes(platform)))
-      .sort((a, b) => (saidTime(b) || 0) - (saidTime(a) || 0))
+  function timeline({ kind = '', platform = '', chatId = '', level = '', about = '', includeFacets = false } = {}, { offset = 0, limit = Infinity } = {}) {
+    const state = load()
+    const seen = state.items.filter((m) => m.source === 'event' && m.kind === 'seen')
+    const summaries = (state.gists || []).filter((g) => g.kind === 'gist')
+    const sources = [...summaries, ...seen].map(m => ({ item: m, platforms: memoryPlatforms(m) }))
+      .sort(({ item: a }, { item: b }) => {
+        const time = (saidTime(b) || 0) - (saidTime(a) || 0)
+        if (time) return time
+        if (a.kind !== b.kind) return a.kind === 'gist' ? -1 : 1
+        if (a.kind === 'seen') {
+          const current = Number(!isCurrent(a)) - Number(!isCurrent(b))
+          if (current) return current
+        }
+        return (Number(b.at) || 0) - (Number(a.at) || 0)
+      })
+    const matched = sources.filter(({ item, platforms }) => {
+      if ((kind && item.kind !== kind) || (platform && !platforms.includes(platform))) return false
+      return item.kind === 'seen' ? (!chatId || item.chatId === chatId) && !level && (!about || item.about === about)
+        : (!chatId || sameChat(item.chatId, chatId)) && (level === '' || level == null || String(item.level) === String(level))
+          && (!about || String(item.about || '') === String(about))
+    })
+    const page = offset || limit !== Infinity ? matched.slice(offset, offset + limit) : matched
+    // 先切片，只为当前页的见闻准备关联索引和展示字段。
+    const withBy = page.some(({ item }) => item.kind === 'seen') ? prepare('', undefined, state, false).withBy : null
+    const items = page.map(({ item, platforms }) => item.kind === 'seen'
+      ? { ...withBy(item), platforms }
+      : { ...item, displayText: eventText(item), platforms })
+    if (!includeFacets) return items
+    return { items, total: matched.length, facets: {
+      chats: [...new Set(sources.map(({ item }) => item.chatId).filter(Boolean))],
+      platforms: [...new Set(sources.flatMap(source => source.platforms))].sort(),
+    } }
   }
 
   /** 按现有可用记录计数；多来源梗概在每个来源各计一次，总数不用于相加。 */
-  function platformStats() {
+  const platformStats = () => finishScan(scanPlatformStats())
+  let platformStatsFlight = null
+  function platformStatsAsync() {
+    if (!platformStatsFlight) {
+      const revision = hub?.chatLogRevision?.(), version = forgetVersion, stateRevision = storage.revision()
+      const isCurrent = () => version === forgetVersion && revision === hub?.chatLogRevision?.()
+      platformStatsFlight = finishScanAsync(scanPlatformStats(), isCurrent).then(result =>
+        isCurrent() && stateRevision === storage.revision() ? result : null
+      ).finally(() => { platformStatsFlight = null })
+    }
+    return platformStatsFlight
+  }
+  function* scanPlatformStats() {
     const counts = new Map()
     const count = (item, kind) => {
       for (const platform of memoryPlatforms(item)) {
@@ -2565,12 +2675,21 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
       }
     }
     const state = load()
+    const check = memoizeScan((person) => remembers(person, state))
+    let scanned = 0
     for (const day of new Set(hub?.chatLogDays?.() || [])) for (const row of hub?.chatLogOf?.(day) || []) {
-      if (row.kind === 'seen' || row.forgottenAt || !rememberedRow(row, state) || !String(row.text || '').trim() || String(row.text).startsWith('【系统')) continue
+      if (scanned++ % SCAN_CHUNK === 0) yield
+      if (row.kind === 'seen' || row.forgottenAt || !String(row.text || '').trim() || String(row.text).startsWith('【系统') || !rememberedRow(row, state, check)) continue
       count(row, 'episodes')
     }
-    for (const gist of state.gists || []) if (gist.kind === 'gist' && rememberedItem(gist, state)) count(gist, 'gists')
-    for (const item of state.items) if (item.kind === 'seen' && isCurrent(item) && rememberedItem(item, state)) count(item, 'seen')
+    for (const gist of state.gists || []) {
+      if (scanned++ % SCAN_CHUNK === 0) yield
+      if (gist.kind === 'gist' && rememberedItem(gist, state, check)) count(gist, 'gists')
+    }
+    for (const item of state.items) {
+      if (scanned++ % SCAN_CHUNK === 0) yield
+      if (item.kind === 'seen' && isCurrent(item) && rememberedItem(item, state, check)) count(item, 'seen')
+    }
     return [...counts.values()].sort((a, b) => a.platform.localeCompare(b.platform))
   }
 
@@ -3584,7 +3703,7 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     return digest({ rows, owner: ownerOf(), ownerName, botQQ, selfName: selfName(getConfig()) })
   }
   function gistRows(rows) {
-    const keep = extractionMask(rows, getConfig(), ownerAccOn)
+    const keep = extractionMask(rows, getConfig(), historyScan().ownerAccountOf)
     return rows.filter((_, i) => keep[i])
   }
   const compressGroupKey = (rawChatId) => (ownerSharedEnabled() && isOwnerChat(rawChatId) ? `owner:${ownerOf()}` : rawChatId)
@@ -3954,7 +4073,7 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
   }
 
   // 将当前窗口中已由旧版 per-chat 游标处理过的主人私聊物理行号合并进 idle 区间（幂等迁移，不引入 scope 级游标）。
-  function migrateOwnerWindowChats(progress, rows) {
+  function migrateOwnerWindowChats(progress, rows, scopeOf) {
     if (!ownerSharedEnabled() || !progress || typeof progress !== 'object') return false
     const offset = progress.offset || 0
     const end = Math.min(rows.length, progress.end || 0)
@@ -3964,7 +4083,7 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     const ownerRawIds = new Set()
     for (let i = offset; i < end; i++) {
       const rawId = String(rows[i]?.chatId || '')
-      if (!rawId || rawId.startsWith('system:') || !isOwnerScopeKey(memoryScopeOf(rows[i]))) continue
+      if (!rawId || rawId.startsWith('system:') || !isOwnerScopeKey(scopeOf(rows[i]))) continue
       ownerRawIds.add(rawId)
       const n = seen.get(rawId) || 0
       seen.set(rawId, n + 1)
@@ -3985,19 +4104,29 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
   }
 
   // 只在面板请求时读取。沿用本人格的流水和整理进度；不碰模型、配额、进度或记忆内容。
-  async function backlog() {
+  let backlogFlight = null
+  function backlog() {
+    if (!backlogFlight) backlogFlight = scanBacklog().finally(() => { backlogFlight = null })
+    return backlogFlight
+  }
+
+  async function scanBacklog() {
     const state = load(), cfg = getConfig().memory, today = dayKey()
+    const version = forgetVersion
+    const check = memoizeScan((person) => remembers(person, state))
+    const scan = historyScan()
     const sessions = hub.sessions?.() || {}, chats = new Map()
     let total = 0, pending = 0, outOfScope = 0, oldest = '', batches = 0
     for (const day of hub.chatLogDays().filter(d => d <= today).sort()) {
-      await new Promise(resolve => setImmediate(resolve))
+      await yieldScan()
       const rows = hub.chatLogOf(day), progress = state.processed?.[day]
-      const keep = extractionMask(rows, getConfig(), ownerAccOn)
+      const keep = await extractionMaskAsync(rows, getConfig(), scan.ownerAccountOf)
       // 旧版纯数字进度和整理器一样从头算。chats 的序号包括后来忘掉的行。
       const offset = progress?.offset || 0, end = progress?.end || 0
       const seen = new Map(), windowCounts = new Map(), idle = progress?.idle || []
       let range = 0, windowEnd = end > offset ? end : offset + EXTRACT_WINDOW
       for (let i = 0; i < rows.length; i++) {
+        if (i && i % SCAN_CHUNK === 0) await yieldScan()
         if (i >= windowEnd) { windowCounts.clear(); windowEnd += EXTRACT_WINDOW }
         const row = rows[i], id = row.chatId
         if (!id || id.startsWith('system:')) continue
@@ -4007,14 +4136,14 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
           seen.set(id, n + 1)
           done = n < (progress.chats?.[id] || 0)
         }
-        if (row.forgottenAt || !rememberedRow(row, state)) continue
+        if (row.forgottenAt || !rememberedRow(row, state, check)) continue
         if (!keep[i]) { outOfScope++; continue }
         total++
         while (range < idle.length && idle[range][1] <= i) range++
         if (done || (range < idle.length && idle[range][0] <= i)) continue
         pending++
         if (!oldest) oldest = day
-        const scopeKey = memoryScopeOf(row) || id
+        const scopeKey = scan.scopeOf(row) || id
         const ownerAgg = isOwnerScopeKey(scopeKey)
         const n = windowCounts.get(scopeKey) || 0
         if (n % EXTRACT_LINES === 0) batches++
@@ -4039,6 +4168,7 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
         chat.pending++
       }
     }
+    if (version !== forgetVersion) throw new Error('流水隐私设置已变更，请重新查询')
     const list = [...chats.values()].map((c) => (c.scope ? { id: c.id, scope: c.scope, name: c.name, sources: c.sources, pending: c.pending } : c))
       .sort((a, b) => b.pending - a.pending || a.id.localeCompare(b.id))
     return { at: Date.now(), total, pending, outOfScope, oldest, batches, used: state.extractBatches?.day === today ? state.extractBatches.count : 0,
@@ -4067,9 +4197,11 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
       await hub?.refreshFriends?.()
       for (const day of hub.chatLogDays()) {
         if (day > today || (day === today && !o.includeToday)) continue
+        if (o.background && turnInProgress()) { noteTurnYield(); return { ok: true, incomplete: true, yielded: true } }
         const snapshotVersion = forgetVersion
         const all = structuredClone(hub.chatLogOf(day))
-        const keep = extractionMask(all, getConfig(), ownerAccOn)
+        const keep = await extractionMaskAsync(all, getConfig(), historyScan().ownerAccountOf)
+        if (snapshotVersion !== forgetVersion) throw new Error('聊天中有新的忘记请求，稍后重新提炼')
         const saved = (load().processed || {})[day]
         // 旧版只记全天行数，无法知道其中哪些内容被跳过；保守地从头补提炼。
         let done = saved && typeof saved === 'object' ? saved.offset : 0
@@ -4078,11 +4210,12 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
         while (done < all.length) {
           // 记录每个聊天已完成的批次，失败后不重复提炼。
           if (typeof progress === 'number' || progress.end <= progress.offset) progress = { offset: done, end: Math.min(all.length, done + EXTRACT_WINDOW), chats: {}, idle: progress?.idle || [] }
-          migrateOwnerWindowChats(progress, all)
+          const { scopeOf } = historyScan()
+          migrateOwnerWindowChats(progress, all, scopeOf)
           const byScope = new Map()
           for (let i = progress.offset; i < progress.end; i++) {
             const l = all[i]
-            const scopeKey = memoryScopeOf(l)
+            const scopeKey = scopeOf(l)
             if (!scopeKey) continue
             if (!byScope.has(scopeKey)) byScope.set(scopeKey, [])
             byScope.get(scopeKey).push({ line: l, index: i })
@@ -4298,6 +4431,9 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
    */
   async function auditShared({ now = Date.now(), limit = 50 } = {}) {
     const state = load()
+    const version = forgetVersion
+    const stateRevision = storage.revision()
+    const chatRevision = hub?.chatLogRevision?.()
     const memCfg = getConfig().memory || {}
     const cap = Math.min(200, Math.max(1, Math.trunc(Number(limit) || 50)))
     const own = ownerOf()
@@ -4334,6 +4470,8 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     }
     candidates.sort((a, b) => (Number(b.at) || 0) - (Number(a.at) || 0) || String(a.id).localeCompare(String(b.id)))
     const bl = await backlog()
+    const stats = await platformStatsAsync()
+    if (!stats || version !== forgetVersion || stateRevision !== storage.revision() || chatRevision !== hub?.chatLogRevision?.()) return null
     const mergesRaw = planMergeGroups(state)
     const afterDays = Number.isFinite(Number(memCfg.compressAfterDays)) ? Number(memCfg.compressAfterDays) : 14
     const clustersRaw = compressionClusters(rememberedItems, { now, afterDays, ownerCluster: ownerClusterConfig() })
@@ -4353,7 +4491,7 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
         }))
         .sort((a, b) => b.count - a.count || a.chatId.localeCompare(b.chatId)),
       factsByPlatform: [...byPlatform.values()].sort((a, b) => a.platform.localeCompare(b.platform)),
-      platformStats: platformStats(),
+      platformStats: stats,
       backlogSummary: {
         total: bl.total,
         pending: bl.pending,
@@ -4465,19 +4603,25 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
       const pending = new Map()
       const latest = new Map()
       const state = load()
+      const scanVersion = forgetVersion
+      const scan = historyScan()
+      // 在分片读取前取代次，避免把扫描期间的新消息误当成已经计入活跃时间。
+      let lastActivityRevision = hub?.chatLogRevision?.()
       for (const day of hub.chatLogDays()) {
         if (day > dayKey()) continue
+        if (turnInProgress()) { noteTurnYield(); return { ok: true, batches, yielded: true } }
         const all = hub.chatLogOf(day)
-        const keep = extractionMask(all, getConfig(), ownerAccOn)
+        const keep = await extractionMaskAsync(all, getConfig(), scan.ownerAccountOf)
         const saved = state.processed?.[day]
         const progress = saved && typeof saved === 'object' ? saved : { offset: 0, end: 0, chats: {} }
         const seen = {}
         for (let i = 0; i < all.length; i++) {
+          if (i && i % SCAN_CHUNK === 0) await yieldScan()
           const l = all[i]
           const chatId = String(l.chatId || '')
           const addr = addrOf(chatId)
           if (!addr || !['private', 'group'].includes(addr.kind)) continue
-          const scopeKey = memoryScopeOf(l)
+          const scopeKey = scan.scopeOf(l)
           if (!scopeKey) continue
           if (!l.forgottenAt && Number(l.t) > (latest.get(scopeKey) || 0)) latest.set(scopeKey, Number(l.t))
           if (i < (progress.offset || 0)) continue
@@ -4490,6 +4634,9 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
           if (!days.has(day)) days.set(day, [])
           days.get(day).push({ line: l, index: i })
         }
+      }
+      if (scanVersion !== forgetVersion || lastActivityRevision !== hub?.chatLogRevision?.()) {
+        return { ok: true, batches, yielded: true }
       }
       const idleMs = (getConfig().memory.extractIdleMinutes ?? 30) * 60_000
       const minLines = getConfig().memory.extractMinLines ?? 20
@@ -4511,20 +4658,24 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
         .sort((a, b) => compareExtractRank(extractRank(a.scopeKey, a.count, a.lastAt), extractRank(b.scopeKey, b.count, b.lastAt)))
 
       // 每个来源一轮只发一批，轮着来：私聊再少也先轮到，大群再大也不能一次把 12 批吃光。
-      let lastActivityRevision = hub?.chatLogRevision?.()
-      const lastActivity = (scopeKey) => {
+      const lastActivity = async (scopeKey) => {
         const revision = hub?.chatLogRevision?.()
         if (revision !== undefined && revision === lastActivityRevision) return latest.get(scopeKey) || 0
         // 提炼期间流水有变化（或宿主没提供 revision）：重扫最近发言时间，聊天刚又热闹起来就先放下它。
         latest.clear()
-        for (const d of hub.chatLogDays()) for (const l of hub.chatLogOf(d)) {
-          const id = String(l.chatId || '')
-          const addr = addrOf(id)
-          if (!addr || !['private', 'group'].includes(addr.kind) || l.forgottenAt) continue
-          const sk = memoryScopeOf(l)
-          if (!sk) continue
-          const t = Number(l.t) || 0
-          if (t > (latest.get(sk) || 0)) latest.set(sk, t)
+        const { scopeOf } = historyScan()
+        for (const d of hub.chatLogDays()) {
+          const rows = hub.chatLogOf(d)
+          for (let i = 0; i < rows.length; i++) {
+            if (i && i % SCAN_CHUNK === 0) await yieldScan()
+            const l = rows[i]
+            const addr = addrOf(l.chatId)
+            if (!addr || !['private', 'group'].includes(addr.kind) || l.forgottenAt) continue
+            const sk = scopeOf(l)
+            if (!sk) continue
+            const t = Number(l.t) || 0
+            if (t > (latest.get(sk) || 0)) latest.set(sk, t)
+          }
         }
         lastActivityRevision = revision
         return latest.get(scopeKey) || 0
@@ -4535,13 +4686,17 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
         for (const q of queues) {
           if (batches >= EXTRACT_LIMIT) break
           while (!q.stopped && q.cursor < q.chunks.length) {
-            const last = lastActivity(q.scopeKey)
+            const last = await lastActivity(q.scopeKey)
+            if (scanVersion !== forgetVersion || lastActivityRevision !== hub?.chatLogRevision?.()) {
+              return { ok: true, batches, yielded: true }
+            }
             if (!last || Date.now() - last < idleMs) { q.stopped = true; break }
             const task = q.chunks[q.cursor++]
             const current = hub.chatLogOf(task.day)
+            const { scopeOf } = historyScan()
             const part = task.rows.flatMap(({ index }) => {
               const line = current[index]
-              return line && !line.forgottenAt && memoryScopeOf(line) === q.scopeKey ? [{ index, line }] : []
+              return line && !line.forgottenAt && scopeOf(line) === q.scopeKey ? [{ index, line }] : []
             })
             if (!part.length) { progressed = true; continue }
             // issue #376：空闲提炼同样要给交互回合让路（之前已 checkpoint 的进度保留）。
@@ -4681,11 +4836,11 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
    * vectorHits：面板「翻一翻」的搜索也走向量 —— 只按字面找的话，
    * 用户搜「最近老是睡不好」是找不到「主人经常熬夜」这条的。
    */
-  function prepare(q, vectorHits) {
-    const items = load().items
+  function prepare(q, vectorHits, state = load(), sort = true) {
+    const { items } = state
     // 面板里过时的也列出来（排在后面），能看到被哪条取代、能恢复
     const byId = new Map(items.map((m) => [m.id, m]))
-    const assoc = load().assoc && typeof load().assoc === 'object' ? load().assoc : {}
+    const assoc = state.assoc && typeof state.assoc === 'object' ? state.assoc : {}
     const withBy = (m) => ({
       ...m,
       validFrom: validFromOf(m),
@@ -4705,9 +4860,9 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     // 搜索：关键词 + 向量双路（向量命中先过权限/有效性过滤）
     let raw
     if (!q) {
-      raw = items.slice().sort((a, b) => (Number(!isCurrent(a)) - Number(!isCurrent(b))) || b.at - a.at)
+      raw = sort ? items.slice().sort((a, b) => (Number(!isCurrent(a)) - Number(!isCurrent(b))) || b.at - a.at) : items
     } else {
-      const idx = index()
+      const idx = index(state)
       const valid = Array.isArray(vectorHits) && vectorHits.length && vector && typeof vector.validIds === 'function'
         ? new Set(vector.validIds(idx.docs.map((d) => d.it)))
         : null
@@ -4749,13 +4904,16 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
   }
 
   /** 面板分页：先排序/搜索，再切片，只给当前页构造派生字段。 */
-  function page(q, { limit = 60, offset = 0 } = {}, vectorHits) {
-    const { raw, withBy } = prepare(q, vectorHits)
+  function page(q, { limit = 60, offset = 0, includeStats = false } = {}, vectorHits) {
+    const state = load()
+    const { raw, withBy } = prepare(q, vectorHits, state)
     const start = Math.max(0, Math.trunc(Number(offset) || 0))
     // 上限 1000：面板「翻一翻」一页 300 条，卡在 200 会让「加载更多」永远拿不满
     const take = Math.max(0, Math.min(1000, Math.trunc(Number(limit) || 0)))
     const slice = take ? raw.slice(start, start + take) : raw
-    return { items: slice.map(withBy), total: raw.length, hasMore: start + slice.length < raw.length }
+    const result = { items: slice.map(withBy), total: raw.length, hasMore: start + slice.length < raw.length }
+    if (includeStats) result.stats = stats(state)
+    return result
   }
 
   // 换平台时允许下一次 tick 不等空闲；流水仍然只写入这个人的私聊记录。
@@ -4778,38 +4936,59 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     const canon = normalizeChatId(chat.chatId) || ''
     return (pid && shortTermOf(pid)) || (uid && uid !== pid && shortTermOf(uid)) || (canon && shortTermOf(canon)) || null
   }
-  function shortRows(now = Date.now()) {
-    const since = now - (getConfig().memory.shortTermHours ?? 2) * 3600_000
+  function shortLogDays(since, now) {
     const first = dayKey(new Date(since))
     const last = dayKey(new Date(now))
     return (hub?.chatLogDays?.() || []).filter((day) => day >= first && day <= last)
-      .flatMap((day) => hub.chatLogOf(day)).filter((row) => {
-        const t = Number(row.t)
-        return rememberedRow(row) && row.kind !== 'seen' && isPrivateAddr(row.chatId) && !row.forgottenAt && t >= since && t <= now && !String(row.text || '').startsWith('【系统') && !parseMemoryCommand(row.text)
-      }).map((row) => ({ ...row, text: stripMemoryHints(row.text) })).filter((row) => row.text)
-      .sort((a, b) => Number(a.t) - Number(b.t))
+  }
+  function shortRow(row, since, now, check) {
+    const t = Number(row.t)
+    if (!(t >= since && t <= now) || row.kind === 'seen' || row.forgottenAt || !isPrivateAddr(row.chatId) ||
+      String(row.text || '').startsWith('【系统') || parseMemoryCommand(row.text) || !rememberedRow(row, null, check)) return null
+    const text = stripMemoryHints(row.text)
+    return text ? { ...row, text } : null
   }
   async function updateShortTerms() {
+    if (turnInProgress()) { noteTurnYield(); return }
     const now = Date.now()
+    const since = now - (getConfig().memory.shortTermHours ?? 2) * 3600_000
+    const scanVersion = forgetVersion
     const defPlat = defPlatform()
     const groups = new Map()
-    for (const row of shortRows(now)) {
-      const addr = addrOf(row.chatId)
+    const check = memoizeScan((person) => remembers(person))
+    const subjectFor = memoizeScan((chatId) => {
+      const addr = addrOf(chatId)
       const acc = addr?.id || ''
-      const pid = (addr?.platform && acc && typeof identity?.lookup === 'function' ? identity.lookup(addr.platform, acc) : '')
-        || (addr?.platform === defPlat ? acc : normalizeChatId(row.chatId) || acc)
-      if (!pid) continue
-      if (!groups.has(pid)) groups.set(pid, { rows: [], altKeys: [acc, normalizeChatId(row.chatId)].filter((k) => k && k !== pid) })
-      groups.get(pid).rows.push(row)
+      const canon = normalizeChatId(chatId)
+      const mapped = addr?.platform && acc ? identity?.lookup?.(addr.platform, acc) : ''
+      const pid = mapped || (addr?.platform === defPlat ? acc : canon || acc)
+      return { pid, altKeys: [acc, canon].filter((k) => k && k !== pid) }
+    })
+    for (const day of shortLogDays(since, now)) {
+      const rows = hub.chatLogOf(day)
+      for (let i = 0; i < rows.length; i++) {
+        if (i && i % SCAN_CHUNK === 0) {
+          await yieldScan()
+          if (scanVersion !== forgetVersion || turnInProgress()) return
+        }
+        const row = shortRow(rows[i], since, now, check)
+        if (!row) continue
+        const { pid, altKeys } = subjectFor(row.chatId)
+        if (!pid) continue
+        if (!groups.has(pid)) groups.set(pid, { rows: [], altKeys })
+        groups.get(pid).rows.push(row)
+      }
     }
     let calls = 0
     for (const [qq, { rows, altKeys }] of groups) {
+      if (scanVersion !== forgetVersion || calls >= EXTRACT_LIMIT || busy || shouldDeferBackground(getConfig()) || !getConfig().memory.enabled || getConfig().memory.shortTerm === false) break
       if (!canProfile(qq)) continue
-      if (calls >= EXTRACT_LIMIT || busy || shouldDeferBackground(getConfig())) break
       // issue #376：短期印象也是模型调用，同样不能跟交互回合抢。
       if (turnInProgress()) { noteTurnYield(); break }
+      rows.sort((a, b) => Number(a.t) - Number(b.t))
       const last = Number(rows.at(-1).t)
-      const old = shortTermOf(qq) || altKeys.map((k) => shortTermOf(k)).find(Boolean) || null
+      const state = load()
+      const old = shortTermOf(qq, state) || altKeys.map((k) => shortTermOf(k, state)).find(Boolean) || null
       const switched = shortSwitch.has(qq) || altKeys.some((k) => shortSwitch.has(k)) || rows.some((row, i) => i > 0 && Number(row.t) > (old?.through || 0) && (row.via || '') !== (rows[i - 1].via || ''))
       if (old && last <= old.through) { shortSwitch.delete(qq); continue }
       if (!switched && now - last < (getConfig().memory.shortTermIdleMinutes ?? 3) * 60_000) continue
@@ -4843,7 +5022,13 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     const id = String(qq ?? '')
     if (!/^\d+$/.test(id) || typeof via !== 'string' || !via.trim() || typeof text !== 'string' || !text.trim() || !['user', 'bot'].includes(who) || typeof hub?.logChat !== 'function') return { ok: false }
     const name = who === 'bot' ? 'bot' : (checkOwnerIdentity(identity, id, 'qq') ? (getConfig().ownerName || '主人') : id)
-    const previous = shortRows().filter((row) => row.chatId === `private:${id}`).at(-1)
+    const now = Date.now(), since = now - (getConfig().memory.shortTermHours ?? 2) * 3600_000
+    let previous
+    const check = memoizeScan((person) => remembers(person))
+    for (const day of shortLogDays(since, now)) for (const row of hub.chatLogOf(day)) {
+      if (row.chatId !== `private:${id}` || Number(row.t) < Number(previous?.t || 0)) continue
+      previous = shortRow(row, since, now, check) || previous
+    }
     const ok = hub.logChat(`private:${id}`, name, text, who === 'user' ? id : '', { via: via.trim(), at }) === true
     if (ok && previous && (previous.via || '') !== via.trim() && (Number(at) || Date.now()) >= Number(previous.t)) shortSwitch.set(id, (shortSwitch.get(id) || 0) + 1)
     return { ok }
@@ -4862,7 +5047,7 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
     /** 记忆继承时交给另一个人格的完整记忆状态（只读）。 */
     inheritState: () => load(),
     /** 设了「不再记住」的 QQ 号：别的人格据此也不记这些人。 */
-    noMemoryIds: () => Object.entries(load().profiles || {}).filter(([, p]) => p?.noMemory === true).map(([qq]) => qq),
+    noMemoryIds: () => Object.entries((transaction ? transaction.profiles : storage.field('profiles')) || {}).filter(([, p]) => p?.noMemory === true).map(([qq]) => qq),
     /** 关掉记忆库文件（删除人格数据前要先关，不然 Windows 上删不掉打开着的 SQLite）。 */
     close: () => storage.close(),
     dueFollowUp, markFollowUpAsked,
@@ -4899,13 +5084,22 @@ export function createMemoryStore({ dsh, getConfig, hub, log, fetchImpl, setConf
       shortSwitch.clear()
       cache = tailCache = crossCache = historyCache = null
     },
-    personaOverview, personaGraph, platformStats, recommendations, personaPerson, personaNotes, savePersonaPerson, personTags, dislikes, chats, saveChat, gists, timeline, deleteGist, saveRelation, deleteRelation, lookupPerson, lookupChat,
+    personaOverview, personaGraph, platformStats, platformStatsAsync, recommendations, personaPerson, personaNotes, savePersonaPerson, personTags, dislikes, chats, saveChat, gists, timeline, deleteGist, saveRelation, deleteRelation, lookupPerson, lookupChat,
+    personaOverviewAsync: async () => {
+      const history = await socialHistoryAsync()
+      return history && personaOverview(history)
+    },
+    personaGraphAsync: async () => {
+      const history = await socialHistoryAsync()
+      return history && personaGraph(personaOverview(history))
+    },
     profiles: () => { const s = load(); return Object.entries(s.profiles || {}).map(([qq, p]) => ({ qq, ...p })).sort((a, b) => b.at - a.at) },
     setProfile, buildProfile,
     recalls: () => recallLog.slice(),
     styles: () => load().styles || {},
     setStyle: (key, list) => setStyle(key, (list || []).map(String)),
-    lastConsolidate: () => load().lastConsolidate || null,
+    graphRevision: () => `${storage.revision()}:${forgetVersion}`,
+    lastConsolidate: () => (transaction ? structuredClone(transaction.lastConsolidate) : storage.field('lastConsolidate')) || null,
     insights: () => {
       const s = load()
       return Object.entries(s.insights || {}).map(([key, list]) => ({ key, name: (s.insightNames || {})[key] || '', list }))

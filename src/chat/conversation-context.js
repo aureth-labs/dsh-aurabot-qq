@@ -2,8 +2,9 @@
 // Source-grounded conversation recall. Generated replies remain labelled replies,
 // never promoted to facts about a person. This module makes no model/network calls.
 import { randomUUID, createHash } from 'node:crypto'
-import { existsSync, readFileSync, mkdirSync, appendFileSync, writeFileSync, renameSync } from 'node:fs'
+import { existsSync, closeSync, openSync, readSync, mkdirSync, appendFileSync, writeFileSync, renameSync } from 'node:fs'
 import { join } from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 
 const POINTER = /然后|后来|那个|这个|那件|这件|当时|刚才|继续|上次|之前|还记得|接着|\b(it|that|then|continue|previous|earlier)\b/i
 const RESET = /^(换个话题|另一个问题|不说这个|先不聊|new topic\b)/i
@@ -114,28 +115,88 @@ const CHAT_ID_RE = /^(?:[a-z][a-z0-9-]*(?:#[a-zA-Z0-9_-]+)?:)?(private|group):[^
 export function createConversationArchive({ directory, namespace = 'default', now = Date.now, visible = () => true, visibleKey = null, aliasesFor = () => [] } = {}) {
   if (!directory) throw new Error('Conversation archive directory required')
   const cache = new Map()
+  const MAX_CACHED_CHATS = 4
+  const MAX_MESSAGE_BYTES = 2 * 1024 * 1024
+  const EPISODE_SCAN_MAX = 20_000
+  // Fixed-size hint for IDs ever seen. A hit outside the tail is verified
+  // against the journals, so deduplication remains exact after eviction.
+  const ID_WORDS = 1 << 14
+  let generation = 0
   const keyFor = chatId => createHash('sha256').update(namespace + '\0' + String(chatId)).digest('hex')
-  function readJournal(filePath) {
-    const messages = []
-    if (!existsSync(filePath)) return messages
-    const raw = readFileSync(filePath, 'utf8'), lines = raw.split('\n')
-    for (let i = 0; i < lines.length; i++) {
-      if (!lines[i].trim()) continue
-      try { messages.push(JSON.parse(lines[i])) }
-      catch {
-        if (i !== lines.length - 1) throw new Error('Conversation journal is corrupt; preserving source')
-        throw new Error('Conversation journal has an incomplete tail; preserving source for recovery')
+
+  function* readJournal(filePath) {
+    let fd
+    try { fd = openSync(filePath, 'r') }
+    catch (error) { if (error.code === 'ENOENT') return; throw error }
+    const decoder = new StringDecoder('utf8')
+    const buffer = Buffer.allocUnsafe(64 * 1024)
+    let pending = ''
+    try {
+      for (;;) {
+        const count = readSync(fd, buffer, 0, buffer.length, null)
+        pending += count ? decoder.write(buffer.subarray(0, count)) : decoder.end()
+        const lines = pending.split('\n')
+        pending = lines.pop()
+        for (const line of lines) {
+          if (!line.trim()) continue
+          try { yield JSON.parse(line) }
+          catch { throw new Error('Conversation journal is corrupt; preserving source') }
+        }
+        if (!count) break
       }
-    }
-    return messages
+      if (pending.trim()) {
+        try { yield JSON.parse(pending) }
+        catch { throw new Error('Conversation journal has an incomplete tail; preserving source for recovery') }
+      }
+    } finally { closeSync(fd) }
   }
+
+  function indexId(words, id, add = false) {
+    const digest = createHash('sha256').update(String(id)).digest()
+    let found = true
+    for (let i = 0; i < 16; i += 4) {
+      const bit = digest.readUInt32LE(i) % (words.length * 32)
+      const mask = 1 << (bit & 31)
+      if ((words[bit >>> 5] & mask) === 0) found = false
+      if (add) words[bit >>> 5] |= mask
+    }
+    return found
+  }
+
+  function rememberTail(value, message) {
+    const bytes = 2 * String(message.text || '').length + 2 * String(message.id || '').length
+      + 2 * String(message.speakerId || '').length + 128
+    value.messages.push(message)
+    value.sizes.push(bytes)
+    value.bytes += bytes
+    if (message.id) value.tailIds.add(message.id)
+    if (value.bytes <= MAX_MESSAGE_BYTES && value.messages.length <= EPISODE_SCAN_MAX) return
+    let remove = 0
+    const batch = Math.min(value.messages.length - 1, 64)
+    while (remove < batch || (remove < value.messages.length && value.bytes > MAX_MESSAGE_BYTES)) {
+      value.bytes -= value.sizes[remove]
+      value.tailIds.delete(value.messages[remove].id)
+      remove++
+    }
+    value.messages.splice(0, remove)
+    value.sizes.splice(0, remove)
+    value.start += remove
+  }
+
   function state(chatId) {
     const cid = String(chatId)
     if (!CHAT_ID_RE.test(cid)) throw new Error('Invalid conversation identity')
     const key = keyFor(cid)
-    if (cache.has(key)) return cache.get(key)
+    if (cache.has(key)) {
+      const hit = cache.get(key)
+      cache.delete(key); cache.set(key, hit)
+      return hit
+    }
     const journal = join(directory, key + '.jsonl'), checkpoint = join(directory, key + '.json')
-    const value = { journal, checkpoint, messages: [], revision: 0 }
+    const value = {
+      journal, checkpoint, messages: [], sizes: [], bytes: 0, start: 0, count: 0,
+      generation: ++generation, hint: new Uint32Array(ID_WORDS), tailIds: new Set(), sources: [],
+    }
     const aliasIds = []
     const seenAliases = new Set([cid])
     if (typeof aliasesFor === 'function') {
@@ -146,48 +207,70 @@ export function createConversationArchive({ directory, namespace = 'default', no
         aliasIds.push(alias)
       }
     }
-    const seenIds = new Set()
-    let loadedSources = 0
-    // Recover from the journal (plus optional read-only alias journals),
-    // rejecting malformed committed lines rather than resetting.
-    for (const sourcePath of [...aliasIds.map(a => join(directory, keyFor(a) + '.jsonl')), journal]) {
-      const items = readJournal(sourcePath)
-      if (existsSync(sourcePath)) loadedSources++
-      for (const item of items) {
-        if (item?.id && seenIds.has(item.id)) continue
-        if (item?.id) seenIds.add(item.id)
-        value.messages.push(item)
+    value.sources = [...aliasIds.map(a => join(directory, keyFor(a) + '.jsonl')), journal]
+    const sources = value.sources.filter(existsSync)
+    const seenIds = sources.length > 1 ? new Set() : null
+    // Retain only a bounded tail per source, then sort the alias tails by
+    // time. The journal remains authoritative for older IDs and history.
+    const merged = []
+    for (const source of sources) {
+      const tail = sources.length > 1 ? { messages: [], sizes: [], tailIds: new Set(), bytes: 0, start: 0 } : value
+      for (const item of readJournal(source)) {
+        if (item?.id && seenIds?.has(item.id)) continue
+        if (item?.id) {
+          seenIds?.add(item.id)
+          indexId(value.hint, item.id, true)
+        }
+        value.count++
+        rememberTail(tail, item)
       }
+      if (tail !== value) merged.push(...tail.messages)
     }
-    if (loadedSources > 1) value.messages.sort((a, b) => (Number(a.at) || 0) - (Number(b.at) || 0))
-    cache.set(key, value); return value
+    if (merged.length) {
+      merged.sort((a, b) => (Number(a.at) || 0) - (Number(b.at) || 0))
+      for (const item of merged) rememberTail(value, item)
+    }
+    cache.set(key, value)
+    while (cache.size > MAX_CACHED_CHATS) cache.delete(cache.keys().next().value)
+    return value
   }
   function append(chatId, { role, text, id = randomUUID(), speakerId = '', at = now(), contextAt = at }) {
     if (!['user', 'assistant'].includes(role)) throw new Error('Invalid conversation role')
     const value = state(chatId), body = String(text || '').trim()
-    if (!body || value.messages.some(m => m.id === id)) return false
+    if (!body || value.tailIds.has(id)) return false
+    if (indexId(value.hint, id)) {
+      for (const source of value.sources) {
+        for (const item of readJournal(source)) if (item.id === id) return false
+      }
+    }
     const message = { id, role, text: body, speakerId: String(speakerId), at: Number(at) || now(), contextAt: Number(contextAt) || Number(at) || now() }
     mkdirSync(directory, { recursive: true })
     appendFileSync(value.journal, JSON.stringify(message) + '\n', { encoding: 'utf8', mode: 0o600 })
-    value.messages.push(message); value.revision++
+    indexId(value.hint, id, true)
+    value.count++
+    rememberTail(value, message)
     // Checkpoint is inspectable metadata, not a second source of truth.
     const temp = value.checkpoint + '.' + process.pid + '.tmp'
-    writeFileSync(temp, JSON.stringify({ version: 1, namespace, chatId, messages: value.messages.length, lastId: id }), { encoding: 'utf8', mode: 0o600 })
+    writeFileSync(temp, JSON.stringify({ version: 1, namespace, chatId, messages: value.count, lastId: id }), { encoding: 'utf8', mode: 0o600 })
     renameSync(temp, value.checkpoint)
     return true
   }
-  const available = chatId => state(chatId).messages.filter(m => visible(chatId, m))
   function recent(chatId, limit = 32) {
     const count = Math.max(0, Math.min(256, Math.trunc(Number(limit) || 0)))
-    return count ? available(chatId).slice(-count).map(m => ({ ...m })) : []
+    if (!count) return []
+    const rows = state(chatId).messages
+    const result = []
+    for (let i = rows.length - 1; i >= 0 && result.length < count; i--) {
+      if (visible(chatId, rows[i])) result.push({ ...rows[i] })
+    }
+    return result.reverse()
   }
   // 群聊每轮都会重算「相关较早片段」，语密的群历史能到几万条：整份重切要逐条 JSON.stringify，
   // 卡在回合开头（#520 之后群里一开口就慢）。这里按聊天缓存切块结果，只补追加的尾部；
   // 可见性规则或清理记忆截止时间一变就整份重建（visibleKey 由宿主给）。
   // 窗口设上限：超过后只保留最近 EPISODE_SCAN_MAX 条参与召回，避免历史越长每轮越慢。
   const episodeCache = new Map() // `${chatId}|${maxCharacters}` → { vis, start, consumed, list, block, serializedSize }
-  const EPISODE_CACHE_MAX = 16
-  const EPISODE_SCAN_MAX = 20_000
+  const EPISODE_CACHE_MAX = 6
   // 窗口起点按步长对齐：否则每来一条消息窗口就滑动一格，缓存全废、整份重切。
   const EPISODE_WINDOW_STEP = 2_000
   const viewStamp = (chatId) => {
@@ -210,8 +293,9 @@ export function createConversationArchive({ directory, namespace = 'default', no
     const start = overflow <= 0 ? 0 : Math.floor(overflow / EPISODE_WINDOW_STEP) * EPISODE_WINDOW_STEP
     let entry = episodeCache.get(key)
     episodeCache.delete(key) // 命中与否都重插到队尾，当 LRU 用
-    if (!entry || entry.vis !== vis || entry.start !== start || entry.consumed > value.messages.length) {
-      entry = { vis, start, consumed: start, list: [], block: [], serializedSize: 0 }
+    if (!entry || entry.vis !== vis || entry.start !== start || entry.base !== value.start
+      || entry.generation !== value.generation || entry.consumed > value.messages.length) {
+      entry = { vis, start, base: value.start, generation: value.generation, consumed: start, list: [], block: [], serializedSize: 0 }
     }
     const emit = () => {
       if (!entry.block.length) return

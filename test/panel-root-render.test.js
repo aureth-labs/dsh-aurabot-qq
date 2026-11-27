@@ -45,7 +45,7 @@ function loadPanel() {
   const source = CLIENT()
   const marker = '    exports.apply = apply'
   assert.ok(source.includes(marker), 'client.js 的导出锚点变了，测试要跟着改')
-  const inject = '    exports.panelTest = { AurabotPage, TABS }\n' + marker
+  const inject = '    exports.panelTest = { AurabotPage, TABS, pollPanel }\n' + marker
   const script = new Script(source.replace(marker, inject), { filename: 'client/client.js' })
   const store = new Map()
   const calls = []
@@ -200,5 +200,79 @@ test('TABS 每个 id 都在 body 映射里有落点（防「映射到不存在�
   const mapBody = m[0]
   for (const t of p.panelTest.TABS) {
     assert.match(mapBody, new RegExp(`\\b${t.id}: [A-Za-z]+`), `TABS 里的 ${t.id} 在 body 映射里没有落点`)
+  }
+})
+
+async function renderWithPendingDetails(setupDone, check) {
+  const p = loadPanel()
+  let resolveState
+  const pending = new Promise(resolve => { resolveState = resolve })
+  let overviewRequested = false
+  p.env.fetch = async url => {
+    if (url.endsWith('/panel/bootstrap')) return { ok: true, json: async () => ({ ...minimalBoot, setupDone }) }
+    if (url.endsWith('/panel/config')) return { ok: true, json: async () => ({
+      ok: true, bootId: minimalBoot.bootId, configRevision: 1, config: { ...minimalSt.config, setupDone },
+    }) }
+    if (url.endsWith('/state')) {
+      overviewRequested = true
+      return pending
+    }
+    return { ok: true, json: async () => ({ ok: true }) }
+  }
+  p.render()
+  try {
+    await new Promise(setImmediate)
+    assert.equal(overviewRequested, true)
+    assert.equal(p.state[11], true)
+    assert.equal(p.state[0].partial, true)
+    assert.equal(p.state[2].persona.current, 'dafeiyu')
+    check(text(p.render().tree))
+  } finally {
+    resolveState({ ok: true, json: async () => ({ ...minimalSt, config: { ...minimalSt.config, setupDone } }) })
+  }
+}
+
+test('完整状态未返回时核心面板已可操作，配置已经就绪', async () => {
+  await renderWithPendingDetails(true, tree => assert.match(tree, /详情状态/))
+})
+
+test('首次安装等待完整状态时安全显示向导占位', async () => {
+  await renderWithPendingDetails(false, tree => {
+    assert.match(tree, /设置向导.*正在读取向导所需状态/)
+    assert.doesNotMatch(tree, /关闭向导/)
+  })
+})
+
+test('子页轮询在同步异常后继续，避免并发并取消卸载时的请求', async () => {
+  const p = loadPanel()
+  let calls = 0
+  let signal
+  let finish
+  const stop = p.panelTest.pollPanel(current => {
+    if (++calls === 1) throw new Error('同步失败')
+    signal = current
+    return new Promise(resolve => { finish = resolve })
+  }, 5000)
+  try {
+    const [{ fn: tick }] = p.intervals
+    await new Promise(setImmediate)
+    assert.equal(calls, 1)
+    tick()
+    tick()
+    await new Promise(setImmediate)
+    assert.equal(calls, 2)
+    tick()
+    await new Promise(setImmediate)
+    assert.equal(calls, 2, '上一个请求未返回时不能启动下一个')
+    stop()
+    assert.equal(signal.aborted, true)
+    finish()
+    await new Promise(setImmediate)
+    tick()
+    await new Promise(setImmediate)
+    assert.equal(calls, 2, '卸载后不能继续轮询')
+  } finally {
+    stop()
+    finish?.()
   }
 })

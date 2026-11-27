@@ -285,6 +285,52 @@ test('时间轴类型和平台筛选使用 meta.platform / via 汇总，路由�
   assert.match(response.list[0].displayText, /看过《候鸟》/)
 })
 
+test('时间轴同一经历时间保持原有顺序，梗概先于见闻', (t) => {
+  const { mem, seed } = setup(t)
+  const saidAt = Date.now() - DAY
+  const base = { chatId: ownerChat.chatId, saidAt, text: '同一天的经历' }
+  seed([
+    { ...base, id: 'invalid', kind: 'seen', source: 'event', at: saidAt + 3, invalidAt: saidAt + 4 },
+    { ...base, id: 'older-seen', kind: 'seen', source: 'event', at: saidAt + 1 },
+    { ...base, id: 'newer-seen', kind: 'seen', source: 'event', at: saidAt + 2 },
+  ], { gists: [
+    { ...base, id: 'older-gist', kind: 'gist', at: saidAt + 1 },
+    { ...base, id: 'newer-gist', kind: 'gist', at: saidAt + 2 },
+  ] })
+  assert.deepEqual(mem.timeline().map((item) => item.id), ['newer-gist', 'older-gist', 'newer-seen', 'older-seen', 'invalid'])
+})
+
+test('时间轴路由只生成所请求的分页条目，保留总数和全局筛选项', async (t) => {
+  const { mem, seed, cfg, hub, dsh, identity } = setup(t)
+  const at = Date.now()
+  seed(Array.from({ length: 4 }, (_, i) => ({
+    id: `seen-${i}`, kind: 'seen', source: 'event', at: at - i, text: `见闻 ${i}`,
+    meta: { title: `见闻 ${i}`, platform: 'custom-video' },
+  })), { gists: [
+    { id: 'gist', kind: 'gist', chatId: ownerChat.chatId, level: 1, text: '梗概', at, via: 'custom-chat' },
+  ] })
+  const expected = mem.timeline({ kind: 'seen' })
+  let formatted = 0
+  const tierDays = cfg.memory.tierDays
+  Object.defineProperty(cfg.memory, 'tierDays', { get: () => { formatted++; return tierDays } })
+  const routes = new Map()
+  memoryModule.setup({ config: () => cfg, dsh, log, core: { hub, identity, routeOwner: identity.routeOwner, http: { query: (req) => req.query || {} } }, context() {}, on() {}, every() {}, tool() {}, route: (path, handler) => routes.set(path, handler) })
+  formatted = 0
+  const route = routes.get('/memory/timeline')
+  const response = await route({ query: { kind: 'seen', limit: '1', offset: '1' } })
+  assert.deepEqual(response.list, expected.slice(1, 2))
+  assert.equal(response.total, 4)
+  assert.equal(response.hasMore, true)
+  assert.deepEqual(response.facets, { chats: [ownerChat.chatId], platforms: ['custom-chat', 'custom-video'] })
+  assert.equal(formatted, 1, '只为本页的一条见闻生成展示字段')
+  const empty = await route({ query: { kind: 'seen', limit: '1', offset: '4' } })
+  assert.deepEqual(empty.list, [])
+  assert.equal(empty.total, 4)
+  assert.equal(empty.hasMore, false)
+  assert.deepEqual(empty.facets, response.facets)
+  assert.equal(formatted, 1, '空页不生成展示字段')
+})
+
 test('流水压成 gist 时保留所有 via，seen 不混入聊天梗概', async (t) => {
   const at = Date.now() - 2 * DAY
   const { mem, calls } = setup(t, { memory: { keepChatlogDays: 0, keepChatlogSet: true }, rows: [

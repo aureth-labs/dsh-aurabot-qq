@@ -1,7 +1,8 @@
 // 翻唱：点歌 → 下载（网易云）→ 分离人声和伴奏 → RVC 换成她的声音 → 混音 → 截成语音条发回去。
 // 推理引擎用 Applio（MIT，固定版本），人声分离用 audio-separator，都装在一个独立的 Python 环境里，不碰系统环境。
 
-import { spawn, execFileSync } from 'node:child_process'
+import { spawn, execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import { autoShift, medianF0, pcm16ToFloat, voiceKind } from './pitch.js'
 import { chmodSync, existsSync, mkdirSync, readdirSync, statSync, statfsSync, writeFileSync, readFileSync, rmSync, copyFileSync, renameSync, openSync, readSync, closeSync } from 'node:fs'
 import { join, basename, dirname, delimiter, posix, win32 } from 'node:path'
@@ -13,6 +14,8 @@ import { searchSongs, songUrl, account } from './netease.js'
 import { readZip } from './zip.js'
 import { installLinuxUv } from './linux-uv.js'
 import { SongClipError, validateSongClip, selectedWindow, clipCacheParts, clipLabel, clipFade } from './segment.js'
+
+const runSongProbe = promisify(execFile)
 
 export const APPLIO_REPO = 'https://github.com/IAHispano/Applio.git'
 export const APPLIO_COMMIT = 'c817f1f83f689ef72e0dfeb1c17ae990b9248506'
@@ -584,7 +587,7 @@ export async function cutFirstWith({
   return { file: out, cut: true, length: w.length }
 }
 
-export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, say, onSung, local, readPcm: readPcmInjected, platform = process.platform, runInstallCommand = run } = {}) {
+export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, say, onSung, local, readPcm: readPcmInjected, platform = process.platform, runInstallCommand = run, runEnvironmentProbe = runSongProbe } = {}) {
   const cfg = () => getConfig().song
   const linux = platform === 'linux'
   const P = () => pathsOf(cfg().root || defaultRoot(platform), { platform })
@@ -604,26 +607,35 @@ export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, say,
   // 光看 shim 文件在不在会骗人：env/Scripts/*.exe 在 Linux 上只是一行「转给真解释器」的脚本，
   // 真解释器（venv）被删了文件还在，一跑就 127。所以真跑一次探针。
   // status 是面板轮询接口，结果缓存 10 秒，免得每个请求都起进程。
-  let probe = { at: 0, root: '', python: false, separator: false }
-  function probeEnv(p) {
-    if (probe.root === p.root && Date.now() - probe.at < 10_000) return probe
-    let python = false
-    let separator = false
-    if (existsSync(p.python)) {
-      try {
-        // find_spec 只查包在不在，不真 import（audio_separator 会拖 torch，几秒）
-        const out = execFileSync(p.python, ['-c', 'import importlib.util as u;print(1 if u.find_spec("audio_separator") else 0)'], { encoding: 'utf8', timeout: 8000, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] })
-        python = true
-        separator = String(out).trim().endsWith('1') && existsSync(p.separatorExe)
-      } catch (error) {}
+  const missingEnv = { python: false, separator: false }
+  const probeController = new AbortController()
+  let probe = null
+  let pendingProbe = null
+  async function probeEnv(p) {
+    if (probeController.signal.aborted) return missingEnv
+    if (probe?.path === p.python && Date.now() - probe.at < 10_000) return probe.env
+    if (pendingProbe) {
+      if (pendingProbe.path === p.python) return pendingProbe.promise
+      await pendingProbe.promise
+      return P().python === p.python ? probeEnv(p) : missingEnv
     }
-    probe = { at: Date.now(), root: p.root, python, separator }
-    return probe
+    const promise = (async () => {
+      let env = missingEnv
+      if (existsSync(p.python)) {
+        try {
+          // 只查包是否存在，子进程非阻塞，多个状态读取复用同一次探测。
+          const { stdout } = await runEnvironmentProbe(p.python, ['-c', 'import importlib.util as u;print(1 if u.find_spec("audio_separator") else 0)'], { encoding: 'utf8', timeout: 8000, maxBuffer: 16384, windowsHide: true, signal: probeController.signal })
+          env = { python: true, separator: stdout.trim().endsWith('1') && existsSync(p.separatorExe) }
+        } catch (error) {}
+      }
+      if (!probeController.signal.aborted) probe = { at: Date.now(), path: p.python, env }
+      return env
+    })().finally(() => { pendingProbe = null })
+    pendingProbe = { path: p.python, promise }
+    return promise
   }
 
-  function status() {
-    const p = P()
-    const env = probeEnv(p)
+  function status(p = P(), env = probe?.path === p.python ? probe.env : missingEnv) {
     const voices = listVoices(p.models)
     const parts = {
       python: env.python,
@@ -653,6 +665,12 @@ export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, say,
       history: history.slice(0, 10),
       message: !voices.length ? '还没有音色：在下面「音色模型」里导入你有权使用的 RVC 模型（.pth 或 zip）' : ready ? (cfg().enabled ? '可以点歌了' : '准备好了，打开开关就能用') : '还差一些组件，点「一键安装」',
     }
+  }
+
+  async function refreshStatus() {
+    const p = P()
+    const env = await probeEnv(p)
+    return P().python === p.python ? status(p, env) : status()
   }
 
   // ---------- 一键安装（几个 GB，要十几分钟）----------
@@ -685,7 +703,7 @@ export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, say,
       mkdirSync(p.models, { recursive: true })
       await step('创建 Python 环境', '第一次要下载 Python 3.12（约 30 MB）和安装工具，一般 1~3 分钟', async () => {
         uv = await ensureUv(p, note)
-        if (linux ? probeEnv(p).python : existsSync(p.python)) return note('  已经有了，跳过')
+        if (linux ? (await probeEnv(p)).python : existsSync(p.python)) return note('  已经有了，跳过')
         if (linux) p = pathsOf(p.root, { platform, allowLegacy: false })
         const stop = watchDownload(join(p.root, 'python'))
         try {
@@ -1177,32 +1195,37 @@ export function createSongStudio({ getConfig, log, sendVoiceFile, sendText, say,
     }
   }
 
-  /** 点一首：马上返回，做好了自己发到聊天里。 */
-  function request(options) {
-    try { return enqueue(options) }
+  /** 探测就绪后入队，做好了自己发到聊天里。 */
+  async function request(options, permitted = () => true) {
+    try { return await enqueue(options, permitted) }
     catch (error) {
       log.warn('翻唱点歌未完成：', error?.message || error)
       return { ok: false, message: '点歌未完成，请先查看翻唱面板的任务状态再重试；详细原因已记录在本机日志。' }
     }
   }
 
-  function enqueue({ song, songId, file, pitch, voice, chatId, acapella, startSec, durationSec }) {
+  async function enqueue({ song, songId, file, pitch, voice, chatId, acapella, startSec, durationSec }, permitted) {
     const c = cfg()
     if (!c.enabled) return { ok: false, message: '翻唱还没打开（面板「翻唱」标签里开）' }
     const selection = validateSongClip({ startSec, durationSec }, c.maxVoiceSec)
     if (!selection.ok) return selection
-    const st = status()
+    const st = await refreshStatus()
+    if (probeController.signal.aborted || !cfg().enabled || !permitted()) return { ok: false, message: '点歌权限或设置已变化，请重新点歌' }
+    const currentSelection = validateSongClip({ startSec, durationSec }, cfg().maxVoiceSec)
+    if (!currentSelection.ok) return currentSelection
     if (!st.ready) return { ok: false, message: '翻唱环境还没装好：' + st.message }
     if (!song && !songId && !file) return { ok: false, message: '要说唱哪首歌' }
     if (queue.length >= 5) return { ok: false, message: '排队的歌太多了，等会儿再点' }
-    queue.push({ query: song || basename(file || ''), songId, file, pitch, voice, chatId, acapella: Boolean(acapella), clip: selection.clip })
+    queue.push({ query: song || basename(file || ''), songId, file, pitch, voice, chatId, acapella: Boolean(acapella), clip: currentSelection.clip })
     const ahead = queue.length - 1 + (current ? 1 : 0)
     pump()
-    return { ok: true, message: `已接下「${song || basename(file || '')}」${selection.clip ? `（${clipLabel(selection.clip)}）` : ''}${ahead ? `，前面还有 ${ahead} 首` : ''}。制作时间取决于片段长度和电脑性能，做好会发语音。` }
+    return { ok: true, message: `已接下「${song || basename(file || '')}」${currentSelection.clip ? `（${clipLabel(currentSelection.clip)}）` : ''}${ahead ? `，前面还有 ${ahead} 首` : ''}。制作时间取决于片段长度和电脑性能，做好会发语音。` }
   }
 
   return {
     status,
+    refreshStatus,
+    dispose: () => probeController.abort(),
     convertSpeech,
     install: () => { runInstall(); return { ok: true, message: '开始安装，要下载好几个 GB，可能要十几分钟' } },
     request,

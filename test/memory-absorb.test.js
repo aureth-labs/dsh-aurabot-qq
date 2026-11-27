@@ -368,6 +368,27 @@ test('三个管理只读路由复用 store，查看后不新增持久化文件',
   assert.deepEqual(s.state().items.map((m) => m.hits), [undefined, undefined])
 })
 
+test('人物面板合并并发流水扫描，统计遇到流水更新时丢弃旧结果', async (t) => {
+  const s = setup(t)
+  const at = Date.now()
+  s.seed([fact('a', '朋友喜欢喝红茶')])
+  for (let i = 0; i < 100; i++) s.rows.push({ chatId: chat(A).chatId, uid: A, who: '阿甲', text: '合成消息', t: at })
+  let revision = 0
+  let reads = 0
+  const read = s.hub.chatLogOf
+  s.hub.chatLogRevision = () => revision
+  s.hub.chatLogOf = (day) => { reads++; return read(day) }
+  const handlers = routes(s)
+  const [overview, graph] = await Promise.all([handlers.get('/persona/overview')(), handlers.get('/persona/graph')()])
+  assert.equal(overview.list[0].interactions, 100)
+  assert.equal(graph.nodes[0].interactions, 100)
+  assert.equal(reads, 1)
+  setImmediate(() => { s.rows[0].forgottenAt = at; revision++ })
+  const platforms = handlers.get('/memory/platforms')
+  assert.equal((await platforms()).ok, false)
+  assert.deepEqual((await platforms()).list, [{ platform: 'qq', episodes: 99, gists: 0, seen: 0 }])
+})
+
 // 用实际面板函数验证交互和窄宽 SVG 的坐标边界，不依赖 DOM 或浏览器。
 function panelHarness(name, props, respond = async () => ({ ok: true })) {
   const source = readFileSync(new URL('../client/client.js', import.meta.url), 'utf8')

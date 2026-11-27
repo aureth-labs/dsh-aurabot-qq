@@ -26,7 +26,11 @@ function setup(t, state, json = false) {
   const previous = process.env.AURABOT_DATA_DIR
   process.env.AURABOT_DATA_DIR = dir
   if (state) writeFileSync(join(dir, 'memories.json'), JSON.stringify(state, null, 2))
-  if (json) writeFileSync(join(dir, 'memory-json-fallback.json'), '{}')
+  if (json) {
+    // 权威 JSON 回退表示 SQLite 文件仍在，但已不能充当最新状态。
+    writeFileSync(join(dir, 'memory.sqlite'), 'stale sqlite')
+    writeFileSync(join(dir, 'memory-json-fallback.json'), '{}')
+  }
   writeFileSync(join(dir, 'config.json'), '{}')
   t.after(() => {
     if (previous === undefined) delete process.env.AURABOT_DATA_DIR
@@ -86,6 +90,7 @@ for (const version of versions) {
     const bytes = readFileSync(join(dir, 'memories.json'))
     const store = storage(t, dir)
     assert.deepEqual(store.load(), original)
+    assert.deepEqual(store.snapshot(), original, '首次迁移后预览立即可用')
     assert.equal(store.status().backend, 'sqlite')
     assert.equal(existsSync(join(dir, 'memories.json')), false)
     assert.equal(migratedFiles(dir).length, 1)

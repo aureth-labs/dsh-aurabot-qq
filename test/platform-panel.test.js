@@ -59,7 +59,7 @@ test('顶部状态按主平台判断，SnowLuma/OneBot 标签只在 QQ 直连时
 })
 
 test('平台页状态每 5 秒自动刷新，旧版能力提示明确', () => {
-  assert.ok(client.includes('setInterval(tick, 5000)'), '平台页缺状态轮询')
+  assert.match(client, /pollPanel\(signal => get\('\/platforms', \{ signal \}\)\.then\(r => \{[^]*?\}\), 5000\)/, '平台页缺状态轮询')
   assert.ok(client.includes('旧版直连（由 QQ 网关页管理）'), '旧版直连能力提示缺失')
 })
 

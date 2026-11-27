@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { readJson, renameWithRetrySync } from '../src/core/store.js'
+import { readJson, renameWithRetrySync, writeAtomicAsync } from '../src/core/store.js'
 
 const dir = mkdtempSync(join(tmpdir(), 'aurabot-readjson-'))
 const file = (name) => join(dir, name)
@@ -85,4 +85,31 @@ test('renameWithRetrySync：超过重试上限后抛出原始错误', () => {
   }, { code: 'EPERM' })
   assert.equal(calls, 3)
   assert.deepEqual(sleeps, [20, 40])
+})
+
+test('后台原子写入等待重试时允许更新提交，过时快照不覆盖文件', async () => {
+  const target = file('deferred.json')
+  let current = true
+  let attempts = 0
+  let unblock
+  let started
+  const waiting = new Promise(resolve => { started = resolve })
+  const pending = writeAtomicAsync(target, (async function* () {
+    yield '{"old":'
+    yield 'true}'
+  })(), {
+    isCurrent: () => current,
+    rename() {
+      attempts++
+      throw Object.assign(new Error('locked'), { code: 'EBUSY' })
+    },
+    wait: () => new Promise(resolve => { unblock = resolve; started() }),
+  })
+  await waiting
+  current = false
+  writeFileSync(target, '{"new":true}')
+  unblock()
+  assert.equal(await pending, false)
+  assert.equal(attempts, 1)
+  assert.deepEqual(readJson(target), { new: true })
 })

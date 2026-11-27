@@ -35,10 +35,10 @@ test('日记和记忆返回失败对象也不能把内部原因拼进聊天',asy
  const r=await runCommand(parseCommand('/diary'),{kind:'private'}, {getConfig:()=>cfg,qzone:{writeDiary:async()=>({ok:false,message:'上一篇还在写'})}})
  assert.match(r,/上一篇还在写/)
 })
-test('翻唱排队异常不透传，模型收到的失败概括不含路径代码',()=>{
+test('翻唱排队异常不透传，模型收到的失败概括不含路径代码',async()=>{
  for(const message of errors){
   const s=createSongStudio({getConfig:()=>{throw Error(message)},log:{warn(){}}})
-  const result=s.request({song:'红日'});assert.equal(result.ok,false);assert.match(result.message,/点歌未完成/)
+  const result=await s.request({song:'红日'});assert.equal(result.ok,false);assert.match(result.message,/点歌未完成/)
   assert.doesNotMatch(result.message+songFailureReason(Error(message)),/Private|private|wsl|Traceback|password|ENOENT|run\.js/)
  }
  assert.match(songFailureReason(Error('版权限制 /home/private/a')),/歌曲版本暂时下载不了/)

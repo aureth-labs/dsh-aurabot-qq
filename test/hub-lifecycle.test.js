@@ -751,3 +751,18 @@ test('用量接入：真实会话事件记一次，失败重试分别记，非 A
   assert.equal(read().runs, 2)
   assert.equal(read().totalTokens, 2020)
 })
+
+test('普通重置释放已归档会话的工具、上下文和索引', async (t) => {
+  const { hub, fake } = setup(t, { buildTools: () => [{ name: 'reset-probe' }] })
+  await hub.pushToSession(ownerChat, [{ type: 'text', text: '先建会话' }], OWNER)
+  const agent = [...fake.agents.values()][0]
+  assert.ok(agent.tools.has('reset-probe'))
+  assert.ok(agent.contexts.size)
+  const sid = agent.session.id
+  assert.equal(hub.chatOfSession(sid), CHAT)
+  assert.equal(hub.resetChat(CHAT), true)
+  assert.equal(agent.tools.size, 0)
+  assert.equal(agent.contexts.size, 0)
+  assert.equal(hub.chatOfSession(sid), '')
+  assert.equal(hub.isOwnedSession(sid), false)
+})

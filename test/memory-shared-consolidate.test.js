@@ -652,6 +652,8 @@ test('§9.3 只读审计 auditShared：零写盘零模型调用，准确报告�
   assert.equal(audit.sharedEnabled, true)
   assert.equal(audit.canonicalChatId, 'qq:private:1481')
   assert.equal(audit.backfill.autoEnabled, false)
+  assert.equal(audit.platformStats.find((p) => p.platform === 'qq')?.episodes, 1)
+  assert.equal(audit.platformStats.find((p) => p.platform === 'feishu')?.episodes, 1)
 
   // 规范多平台 chatId 不得退化成 unknown
   assert.equal(audit.factsByPlatform.some((p) => p.platform === 'unknown'), false, '规范地址记忆不得计为 unknown')
@@ -676,6 +678,23 @@ test('§9.3 只读审计 auditShared：零写盘零模型调用，准确报告�
   const cmpIds = new Set(audit.plannedCompressions.clusters[0].items.map((x) => x.id))
   assert.deepEqual([...cmpIds].sort(), [softA.id, softB.id, softC.id, softD.id].sort())
   assert.ok(!cmpIds.has(perm.id) && !cmpIds.has(grp.id))
+})
+
+test('只读审计分批统计平台流水，扫描期间收到消息则丢弃旧审计结果', async (t) => {
+  const s = setupStore(t)
+  const today = dayKey()
+  const row = { t: Date.now(), chatId: 'qq:private:1481236341', who: '主人', uid: '1481236341', text: '测试消息' }
+  for (let i = 0; i < 80; i++) s.pushRow(today, { ...row })
+  const read = s.hub.chatLogOf
+  let reads = 0
+  t.mock.method(s.hub, 'chatLogOf', day => {
+    const rows = read(day)
+    if (++reads === 2) setImmediate(() => s.pushRow(today, { ...row }))
+    return rows
+  })
+  assert.equal(await s.mem.auditShared(), null, '统计期间流水发生变化时不返回混合快照')
+  const audit = await s.mem.auditShared()
+  assert.equal(audit.platformStats.find((p) => p.platform === 'qq')?.episodes, 81)
 })
 
 test('审阅意见 P1：主人多平台私聊中「关于朋友」的事实独立成簇压缩，与主人簇及群/非主人严格隔离', async (t) => {

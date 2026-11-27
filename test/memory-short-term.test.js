@@ -107,3 +107,29 @@ test('过期、关闭和忘掉都不再使用；忘掉期间的结果丢弃', as
   await memory.tick()
   assert.doesNotMatch(memory.contextVia({ qq: QQ }), /正在聊旅行/)
 })
+
+test('短期印象切片先排除群聊和旧消息，扫描期间让出宿主', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'short-term-scope-'))
+  const now = Date.now()
+  const day = new Intl.DateTimeFormat('sv-SE').format(new Date(now))
+  let attempts = 0
+  let yielded = false
+  const rows = Array.from({ length: 1500 }, (_, i) => ({
+    chatId: i % 2 ? 'group:group-fixture' : 'private:private-fixture',
+    uid: String(i), t: i % 2 ? now - 100 : now - 3 * 3600_000, text: '合成消息',
+  }))
+  const cfg = normalize({ memory: { enabled: true, dailyConsolidate: false, vector: { enabled: false }, keepChatlogDays: -1 } })
+  const mem = createMemoryStore({
+    directory: dir, getConfig: () => cfg, log,
+    hub: { chatLogDays: () => [day], chatLogOf: () => rows },
+    identity: {
+      isOwner() { attempts++; return false },
+      lookup() { attempts++; return null },
+    },
+  })
+  t.after(() => { mem.close(); rmSync(dir, { recursive: true, force: true }) })
+  setImmediate(() => { yielded = true })
+  await mem.tick()
+  assert.equal(attempts, 0)
+  assert.equal(yielded, true)
+})

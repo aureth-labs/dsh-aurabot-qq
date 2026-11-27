@@ -6,14 +6,18 @@ import { createMemoryStore, memoryLine, looksLikeRuleMemory, parseValidityDate, 
 export { looksLikeRuleMemory } from '../../features/memory.js'
 // 记忆星图：算法全在 memory-graph.js（原样搬自记忆中枢 0.9.2 的 graph.mjs，纯函数）。
 // 这里只用它的建边/布局/亮度和 tier 值域映射，不搬中枢的 assoc.mjs 和 pipeline.mjs。
-import { buildEdges, layoutGraph3d, brightness, regionOf, FADING_THRESHOLD, LAYOUT_VERSION, toStarTier, toHostTier, STAR_TIER_LABEL } from '../../features/memory-graph.js'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { brightness, regionOf, FADING_THRESHOLD, LAYOUT_VERSION, toStarTier, toHostTier, STAR_TIER_LABEL } from '../../features/memory-graph.js'
+import { readFileSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
+import { Worker } from 'node:worker_threads'
 import { join } from 'node:path'
-import { dataDir } from '../../core/store.js'
+import { dataDir, writeAtomicAsync } from '../../core/store.js'
 import { personaScope, personaNow, personaDataDir, personaDataRoots, readPersona, safeId } from '../../persona/personas.js'
 import { defineTool, str } from '../../tools/tools.js'
 import { isOwnerPrivateChat } from '../../chat/access.js'
 import { formatChatId, normalizeChatId, parseChatId } from '../../gateway/address.js'
+
+const GRAPH_LAYOUT_TIMEOUT_MS = 15_000
 
 /** 把「2026-03-05」或「2026-03-01..2026-03-31」解析成检索用的时间窗；裸的年月算整月。 */
 function parsePeriod(text) {
@@ -292,7 +296,44 @@ export default {
         } catch { return null }
       }
       const readGraph = () => { const file = graphFile(); if (!file) return {}; try { return JSON.parse(readFileSync(file, 'utf8')) } catch { return {} } }
-      const writeGraph = (s) => { const file = graphFile(); if (!file) return; try { writeFileSync(file, JSON.stringify(s)) } catch (error) { api.log.warn?.('星图状态保存失败：' + error.message) } }
+      let graphJob = null
+      let cancelLayout = null
+      let closed = false
+      api.onDispose?.(() => {
+        closed = true
+        cancelLayout?.(new Error('记忆模块已卸载'))
+      })
+
+      function graphLayout(items, prev, day) {
+        return new Promise((resolve, reject) => {
+          const running = new Worker(new URL('../../features/memory-graph-worker.js', import.meta.url),
+            { workerData: { items, prev, day }, execArgv: [] })
+          let settled = false
+          const finish = (error, result) => {
+            if (settled) return false
+            settled = true
+            clearTimeout(timer)
+            cancelLayout = null
+            if (error) reject(error)
+            else resolve(result)
+            return true
+          }
+          const cancel = error => {
+            if (finish(error)) void running.terminate().catch(() => {})
+          }
+          // 先于面板请求截止，结束本轮布局并让后续请求重新计算。
+          const timer = setTimeout(() => {
+            const error = new Error('星图布局超时，请稍后重试')
+            error.code = 'GRAPH_LAYOUT_TIMEOUT'
+            cancel(error)
+          }, GRAPH_LAYOUT_TIMEOUT_MS)
+          timer.unref()
+          cancelLayout = cancel
+          running.once('message', result => finish(null, result))
+          running.once('error', finish)
+          running.once('exit', () => finish(new Error('星图布局进程已结束')))
+        })
+      }
 
       /** 组装一颗星：记忆条目 + 中枢算法要的清晰度参数（tier 翻成 short/long/core）。 */
       const starOf = (m, meta) => {
@@ -300,7 +341,7 @@ export default {
         return { ...m, tier: toStarTier(m.tier), S: mt.tau, lastHit: mt.lastHit || m.lastHit }
       }
 
-      const buildGraph = (day = 0) => {
+      async function computeGraph(day, file, isCurrent) {
         const meta = new Map((memory.metaAll() || []).map((x) => [x.id, x]))
         const live = (memory.list('') || []).filter((m) => !m.invalidAt)
         // 「归档星云」= 过时/归档的记忆（中枢原本从 memory.archived() 拿）
@@ -308,11 +349,19 @@ export default {
           ...m, archivedAt: m.invalidAt, tier: toStarTier(m.tier),
         }))
         const items = [...live, ...archived].map((m) => starOf(m, meta))
-        const edges = buildEdges(items)
-        const prev = readGraph()
-        const out = layoutGraph3d(items, { edges, prev: prev.layout || null, now: Date.now(), day })
-        // 布局结果存下来，下次打开星图不用重算（和中枢一样的行为）
-        writeGraph({ ...prev, layout: out, at: Date.now(), version: LAYOUT_VERSION })
+        let prev = {}
+        if (file) {
+          try { prev = JSON.parse(await readFile(file, 'utf8')) || {} } catch {}
+        }
+        if (!isCurrent()) return { ok: false, message: '记忆已变化，请重新读取星图' }
+        const { edges, out } = await graphLayout(items, prev.layout || null, day)
+        if (!isCurrent()) return { ok: false, message: '记忆已变化，请重新读取星图' }
+        if (file) {
+          try {
+            await writeAtomicAsync(file, JSON.stringify({ ...prev, layout: out, at: Date.now(), version: LAYOUT_VERSION }), { isCurrent })
+          } catch (error) { api.log.warn?.('星图状态保存失败：' + error.message) }
+        }
+        if (!isCurrent()) return { ok: false, message: '记忆已变化，请重新读取星图' }
         // stars 是面板直接渲染的数据：条目 + 坐标 + 亮度。layoutGraph3d 只回 positions，
         // 这里把两者合起来，省得面板自己去查表。
         const now2 = Date.now()
@@ -357,6 +406,27 @@ export default {
         }
         // edges 给渲染器画关系线用（kind: person/tag/similar/conflict，和中枢的语义一致）。
         return { ok: true, version: out.version, radius: out.radius, layout, stats: stat, groups: out.groups, clusters: out.clusters, childOf: out.childOf, settle: out.settle, edges, stars }
+      }
+
+      function buildGraph(day = 0) {
+        const persona = personaNow(api.config())
+        const store = storeOf(persona)
+        const revision = store.graphRevision()
+        const file = graphFile()
+        const key = JSON.stringify([persona, revision, file, day])
+        if (graphJob) {
+          if (graphJob.key === key) return graphJob.result
+          return { ok: false, message: '星图正在计算，请稍后刷新' }
+        }
+        const isCurrent = () => !closed && personaNow(api.config()) === persona && store.graphRevision() === revision
+        const result = computeGraph(day, file, isCurrent)
+          .catch(error => {
+            api.log.warn?.('星图布局计算失败：' + error.message)
+            return { ok: false, message: error.code === 'GRAPH_LAYOUT_TIMEOUT' ? error.message : '星图布局暂不可用' }
+          })
+          .finally(() => { graphJob = null })
+        graphJob = { key, result }
+        return result
       }
 
       api.route('/memory/graph', async (req) => {
@@ -473,7 +543,8 @@ export default {
       })
       api.route('/memory/graph/sync', async () => buildGraph())
       api.route('/memory/graph/optimize', async () => {
-        const r = buildGraph()
+        const r = await buildGraph()
+        if (r.ok === false) return r
         const moved = (r?.settle && r.settle.maxMove) || 0
         return { ...r, message: moved > 2 ? `已优化星团位置，最大移动 ${Math.round(moved)}` : '星团位置已经是最优的' }
       })
@@ -519,9 +590,19 @@ export default {
         return memory.setAutoRecall(Boolean(body.on))
       })
     }
-    api.route('/persona/overview', async () => ({ ok: true, list: memory.personaOverview() }))
-    api.route('/persona/graph', async () => ({ ok: true, ...memory.personaGraph() }))
-    api.route('/memory/platforms', async () => ({ ok: true, list: memory.platformStats() }))
+    const changedHistory = () => ({ ok: false, message: '聊天流水已更新，请刷新后重试' })
+    api.route('/persona/overview', async () => {
+      const list = await memory.personaOverviewAsync()
+      return list ? { ok: true, list } : changedHistory()
+    })
+    api.route('/persona/graph', async () => {
+      const graph = await memory.personaGraphAsync()
+      return graph ? { ok: true, ...graph } : changedHistory()
+    })
+    api.route('/memory/platforms', async () => {
+      const list = await memory.platformStatsAsync()
+      return list ? { ok: true, list } : changedHistory()
+    })
     api.route('/memory/related', async (req) => {
       const { id, kind } = http.query(req)
       return { ok: true, list: memory.recommendations({ id, kind }) }
@@ -575,19 +656,16 @@ export default {
       const q = http.query(req)
       const limit = Math.min(200, Math.max(1, Math.trunc(Number(q.limit) || 50)))
       const offset = Math.max(0, Math.trunc(Number(q.offset) || 0))
-      const all = memory.timeline({ kind: q.kind, platform: q.platform, chatId: q.chatId, level: q.level, about: q.about })
-      // 筛选选项基于完整时间轴，不受当前筛选影响，否则选了群之后其他群就消失了
-      const facetBase = (q.kind || q.platform || q.chatId || q.level || q.about) ? memory.timeline({}) : all
-      const list = all.slice(offset, offset + limit)
+      // 同一快照同时计算当前页与筛选项，避免为 facets 再读一遍库。
+      const { items: list, total, facets } = memory.timeline({
+        kind: q.kind, platform: q.platform, chatId: q.chatId, level: q.level, about: q.about, includeFacets: true,
+      }, { offset, limit })
       return {
         ok: true,
         list,
-        total: all.length,
-        hasMore: offset + list.length < all.length,
-        facets: {
-          chats: [...new Set(facetBase.map((g) => g.chatId).filter(Boolean))],
-          platforms: [...new Set(facetBase.flatMap((g) => g.platforms || []))].sort(),
-        },
+        total,
+        hasMore: offset + list.length < total,
+        facets,
       }
     })
     api.route('/memory/gists/delete', async (req) => memory.deleteGist((await http.body(req)).id))
@@ -671,7 +749,10 @@ export default {
       return { ok: true, message: '相处经验已保存' }
     })
     api.route('/memory/backlog', async () => ({ ok: true, ...await memory.backlog() }))
-    api.route('/memory/audit-shared', async () => ({ ok: true, ...(await memory.auditShared()) }))
+    api.route('/memory/audit-shared', async () => {
+      const audit = await memory.auditShared()
+      return audit ? { ok: true, ...audit } : changedHistory()
+    })
     api.route('/memory/extract', async (req) => {
       const b = await http.body(req)
       // 立即整理一次：连今天的也提炼（今天的聊天流水不删，写日记还要用）

@@ -1,5 +1,6 @@
 // Only provider-reported usage; no text/token estimation and no guessed gateway prices.
-import { dataDir, readJson, writeJson } from './store.js'
+import { dataDir, readJson, writeAtomicAsync, writeJson } from './store.js'
+import { setImmediate as yieldToHost } from 'node:timers/promises'
 import { officialCost, REFERENCE_DATE } from './official-reference.js'
 import { beijingDayKey } from './offpeak.js'
 export const KEEP_DAYS = 90
@@ -8,8 +9,19 @@ const DAY_MS = 86_400_000
 let state = null
 let pricing = DEFAULT_PRICING
 let timer = null
+let writing = false
+let dirty = false
+let writeEpoch = 0
 let writeFailed = false
 const indexed = new Map()
+const reportJobs = new Map()
+const REPORT_BATCH = 256
+const WRITE_DELAY_MS = 1500
+const WRITE_RETRY_DELAY_MS = 5000
+const USAGE_EVENTS = new Set([
+  'model/selection', 'request/header', 'tool/call', 'llm/retry-started',
+  'assistant/message', 'assistant/attempt', 'compaction/summary',
+])
 const file = () => dataDir('usage.json')
 const count = v => Number.isSafeInteger(v) && v >= 0 ? v : 0
 const dayKey = at => beijingDayKey(at)
@@ -118,8 +130,8 @@ export function moduleOf(row) {
 }
 
 
-export function costOf(row, at = row?.at) {
-  const p = priceOf(row?.model, at, pricing, row?.provider)
+export function costOf(row, at = row?.at, reportPricing = pricing) {
+  const p = priceOf(row?.model, at, reportPricing, row?.provider)
   const written = count(row?.written)
   const unknown = { cost: 0, fresh: 0, cached: 0, output: 0, write: 0, unpriced: true }
   if (!p || (written && !(typeof p.cacheWrite === 'number' && Number.isFinite(p.cacheWrite) && p.cacheWrite >= 0))) return unknown
@@ -131,21 +143,42 @@ export function costOf(row, at = row?.at) {
   return Number.isFinite(cost) ? { cost, fresh, cached, output, write, unpriced: false } : unknown
 }
 
-function totalsOf(rows) {
-  const t = { runs: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0, cacheWriteTokens: 0, totalTokens: 0, cost: 0, unpricedCalls: 0, officialUSD: 0, officialMissing: 0 }
-  for (const r of rows) {
-    const c = costOf(r)
-    t.runs += count(r.runs) || 1
-    t.promptTokens += count(r.in) + count(r.cached) + count(r.written)
-    t.completionTokens += count(r.out)
-    t.cachedTokens += count(r.cached)
-    t.cacheWriteTokens += count(r.written)
-    const usd = officialCost(r)
-    if (usd === null) t.officialMissing += count(r.runs) || 1
-    else t.officialUSD += usd
-    t.cost += c.cost
-    if (c.unpriced) t.unpricedCalls += count(r.runs) || 1
+function newTotals() {
+  return { runs: 0, promptTokens: 0, completionTokens: 0, cachedTokens: 0, cacheWriteTokens: 0, totalTokens: 0, cost: 0, unpricedCalls: 0, officialUSD: 0, officialMissing: 0 }
+}
+
+function addTotals(t, value) {
+  t.runs += value.runs
+  t.promptTokens += value.promptTokens
+  t.completionTokens += value.completionTokens
+  t.cachedTokens += value.cachedTokens
+  t.cacheWriteTokens += value.cacheWriteTokens
+  t.cost += value.cost
+  t.unpricedCalls += value.unpricedCalls
+  t.officialUSD += value.officialUSD
+  t.officialMissing += value.officialMissing
+}
+
+function amounts(row, reportPricing) {
+  const usd = officialCost(row)
+  const billing = costOf(row, row.at, reportPricing)
+  const runs = count(row.runs) || 1
+  const cached = count(row.cached)
+  const written = count(row.written)
+  return {
+    runs,
+    promptTokens: count(row.in) + cached + written,
+    completionTokens: count(row.out),
+    cachedTokens: cached,
+    cacheWriteTokens: written,
+    cost: billing.cost,
+    unpricedCalls: billing.unpriced ? runs : 0,
+    officialUSD: usd ?? 0,
+    officialMissing: usd === null ? runs : 0,
   }
+}
+
+function finishTotals(t) {
   t.totalTokens = t.promptTokens + t.completionTokens
   t.cacheHitRate = t.promptTokens ? t.cachedTokens / t.promptTokens : null
   // An incomplete subtotal is not a total price. Unknown is never shown as free.
@@ -154,15 +187,20 @@ function totalsOf(rows) {
   if (!t.runs || t.unpricedCalls) t.cost = null
   return t
 }
-function groupBy(rows, keyOf) {
-  const groups = new Map()
-  for (const r of rows) {
-    const key = keyOf(r)
-    if (!groups.has(key)) groups.set(key, [])
-    groups.get(key).push(r)
+function addGroup(groups, key, value) {
+  let group = groups.get(key)
+  if (!group) {
+    group = newTotals()
+    groups.set(key, group)
   }
-  return [...groups].map(([key, rs]) => ({ key, ...totalsOf(rs) })).sort((a,b) => b.totalTokens-a.totalTokens || a.key.localeCompare(b.key))
+  addTotals(group, value)
 }
+
+function finishGroups(groups) {
+  return [...groups].map(([key, totals]) => ({ key, ...finishTotals(totals) }))
+    .sort((a, b) => b.totalTokens - a.totalTokens || a.key.localeCompare(b.key))
+}
+
 function prune(now = Date.now()) {
   if (!state) return
   const cut = dayKey(now - (KEEP_DAYS - 1) * DAY_MS)
@@ -172,17 +210,89 @@ function prune(now = Date.now()) {
   }
   for (const [id, cursor] of Object.entries(state.sessions)) if (dayKey(cursor.at || 0) < cut) delete state.sessions[id]
 }
-export function flushUsage() {
+function flushUsageSync() {
   if (timer) clearTimeout(timer)
   timer = null
+  dirty = false
+  writeEpoch++
   if (!state) return
-  try { writeJson(file(), state); writeFailed = false } catch { writeFailed = true }
+  try { writeJson(file(), state); writeFailed = false }
+  catch { dirty = writeFailed = true }
 }
-export function closeUsage() { flushUsage(); state = null; indexed.clear() }
-function saveSoon() {
-  if (timer) return
-  timer = setTimeout(flushUsage, 1500)
+
+export function flushUsage() {
+  flushUsageSync()
+  scheduleWrite()
+}
+
+export function closeUsage() {
+  flushUsageSync()
+  state = null
+  dirty = false
+  indexed.clear()
+  reportJobs.clear()
+}
+
+async function* usageChunks(snapshot) {
+  const { days, sessions, ...header } = snapshot
+  yield JSON.stringify(header).slice(0, -1) + ',"days":{'
+  let firstDay = true
+  for (const [day, rows] of Object.entries(days)) {
+    yield (firstDay ? '' : ',') + JSON.stringify(day) + ':['
+    firstDay = false
+    for (let start = 0; start < rows.length; start += REPORT_BATCH) {
+      yield (start ? ',' : '') + JSON.stringify(rows.slice(start, start + REPORT_BATCH)).slice(1, -1)
+      await yieldToHost()
+    }
+    yield ']'
+  }
+  yield '},"sessions":{'
+  let batch = []
+  let firstSession = true
+  for (const [id, cursor] of Object.entries(sessions)) {
+    batch.push((firstSession ? '' : ',') + JSON.stringify(id) + ':' + JSON.stringify(cursor))
+    firstSession = false
+    if (batch.length >= REPORT_BATCH) {
+      yield batch.join('')
+      batch = []
+      await yieldToHost()
+    }
+  }
+  yield batch.join('') + '}}'
+}
+
+function scheduleWrite() {
+  if (timer || writing || !dirty || !state) return
+  timer = setTimeout(flushInBackground, writeFailed ? WRITE_RETRY_DELAY_MS : WRITE_DELAY_MS)
   timer.unref?.()
+}
+
+async function flushInBackground() {
+  timer = null
+  if (!state) return
+  const epoch = writeEpoch
+  const target = file()
+  const snapshot = {
+    ...state,
+    days: Object.fromEntries(Object.entries(state.days).map(([key, rows]) => [key, rows.slice()])),
+    sessions: Object.fromEntries(Object.entries(state.sessions).map(([key, cursor]) => [key, { ...cursor }])),
+  }
+  writing = true
+  dirty = false
+  try {
+    const written = await writeAtomicAsync(target, usageChunks(snapshot), { isCurrent: () => epoch === writeEpoch })
+    if (written && epoch === writeEpoch) writeFailed = false
+  } catch {
+    if (epoch === writeEpoch) dirty = writeFailed = true
+  } finally {
+    writing = false
+    scheduleWrite()
+  }
+}
+
+function saveSoon() {
+  dirty = true
+  scheduleWrite()
 }
 export function initUsage(override) {
   if (state) flushUsage()
@@ -202,6 +312,7 @@ export function initUsage(override) {
   state = { ...raw, version: 2, startedAt: raw.startedAt || Date.now(), days, sessions: raw.sessions || {} }
   pricing = override && typeof override === 'object' ? { ...DEFAULT_PRICING, ...override } : DEFAULT_PRICING
   indexed.clear()
+  reportJobs.clear()
   prune()
   for (const rows of Object.values(days)) for (const r of rows) if (r.id) indexed.set(r.id, r)
   saveSoon()
@@ -237,7 +348,7 @@ export function recordRetrievalUsage(task, model, usage) {
 // Mirrors DSH's tokenUsage fold: last settlement wins within a turn/step; retry starts a new charge.
 // Stored cursors make a repeated event / a resumed session idempotent without retaining chat content.
 export function recordSessionUsage(sessionId, chat, event, target = {}) {
-  if (!state || !sessionId || !event || !Number.isSafeInteger(event.seq)) return
+  if (!state || !sessionId || !USAGE_EVENTS.has(event?.type) || !Number.isSafeInteger(event.seq)) return
   const old = state.sessions[sessionId]
   if (old && event.seq <= old.seq) return
   const c = old || { seq: -1, at: 0, model: '', provider: '', last: null }
@@ -270,26 +381,79 @@ export function recordSessionUsage(sessionId, chat, event, target = {}) {
   // Only numeric accounting metadata is persisted, never event messages or headers.
   saveSoon()
 }
-export function usageReport({ now = Date.now(), range = '7' } = {}) {
-  prune(now)
-  const all = Object.values(state?.days || {}).flat().filter(r => r.at <= now)
+function usageAccumulator(now, range) {
   const startToday = Date.parse(dayKey(now) + 'T00:00:00+08:00')
-  const bounds = { today: [startToday, now], yesterday: [startToday - DAY_MS, startToday - 1],
-    '7': [startToday - 6 * DAY_MS, now], '30': [startToday - 29 * DAY_MS, now], all: [0, now] }
-  const pick = Object.hasOwn(bounds, String(range)) ? String(range) : '7'
-  const rowsFor = key => all.filter(r => r.at >= bounds[key][0] && r.at <= bounds[key][1])
-  const rows = rowsFor(pick)
+  const ranges = {
+    today: { from: startToday, to: now, totals: newTotals() },
+    yesterday: { from: startToday - DAY_MS, to: startToday - 1, totals: newTotals() },
+    last7: { from: startToday - 6 * DAY_MS, to: now, totals: newTotals() },
+    last30: { from: startToday - 29 * DAY_MS, to: now, totals: newTotals() },
+    all: { from: 0, to: now, totals: newTotals() },
+  }
+  const rangeNames = { today: 'today', yesterday: 'yesterday', 7: 'last7', 30: 'last30', all: 'all' }
+  const pick = Object.hasOwn(rangeNames, range) ? range : '7'
+  const selected = ranges[rangeNames[pick]]
+  const windows = Object.values(ranges)
+  const byChat = new Map(), byModule = new Map(), byMemoryTask = new Map(), byModel = new Map()
+  const background = newTotals()
+  let firstRecordAt = Infinity
+  const reportPricing = pricing
+  const startedAt = state?.startedAt
   return {
-    referenceDate: REFERENCE_DATE, currency: pricing.currency || '元', days: KEEP_DAYS, range: pick, startedAt: state?.startedAt,
-    firstRecordAt: all.length ? all.reduce((n,r) => Math.min(n,r.at), Infinity) : null,
-    writeFailed,
-    ranges: Object.fromEntries([['today','today'],['yesterday','yesterday'],['last7','7'],['last30','30'],['all','all']].map(([label,key]) => [label,totalsOf(rowsFor(key))])),
-    current: { ...totalsOf(rows),
-      byChat: groupBy(rows.filter(r => /^(group|private):/.test(r.chat || '')), r => r.chat),
-      background: totalsOf(rows.filter(r => !/^(group|private):/.test(r.chat || ''))),
-      byModule: groupBy(rows, moduleOf),
-      byMemoryTask: groupBy(rows.filter(r => moduleOf(r) === '记忆'), r => r.task || '未细分'),
-      byModel: groupBy(rows, r => [r.provider, r.model].filter(Boolean).join(' / ') || '未记录模型'),
+    add(row) {
+      if (row.at > now) return
+      firstRecordAt = Math.min(firstRecordAt, row.at)
+      const value = amounts(row, reportPricing)
+      for (const window of windows) {
+        if (row.at >= window.from && row.at <= window.to) addTotals(window.totals, value)
+      }
+      if (row.at < selected.from || row.at > selected.to) return
+      if (/^(group|private):/.test(row.chat || '')) addGroup(byChat, row.chat, value)
+      else addTotals(background, value)
+      const module = moduleOf(row)
+      addGroup(byModule, module, value)
+      if (module === '记忆') addGroup(byMemoryTask, row.task || '未细分', value)
+      addGroup(byModel, [row.provider, row.model].filter(Boolean).join(' / ') || '未记录模型', value)
+    },
+    result() {
+      const totals = Object.fromEntries(Object.entries(ranges).map(([key, window]) => [key, finishTotals(window.totals)]))
+      return {
+        referenceDate: REFERENCE_DATE, currency: reportPricing.currency || '元', days: KEEP_DAYS, range: pick, startedAt,
+        firstRecordAt: Number.isFinite(firstRecordAt) ? firstRecordAt : null,
+        writeFailed,
+        ranges: totals,
+        current: { ...totals[rangeNames[pick]], byChat: finishGroups(byChat), background: finishTotals(background),
+          byModule: finishGroups(byModule), byMemoryTask: finishGroups(byMemoryTask), byModel: finishGroups(byModel) },
+      }
     },
   }
+}
+
+export function usageReport({ now = Date.now(), range = '7' } = {}) {
+  prune(now)
+  const report = usageAccumulator(now, String(range))
+  for (const rows of Object.values(state?.days || {})) for (const row of rows) report.add(row)
+  return report.result()
+}
+
+/** 面板报表按批次让出事件循环，每种时间范围至多一个在途快照。 */
+export function usageReportAsync({ range = '7' } = {}) {
+  const key = ['today', 'yesterday', '7', '30', 'all'].includes(String(range)) ? String(range) : '7'
+  if (reportJobs.has(key)) return reportJobs.get(key)
+  const now = Date.now()
+  prune(now)
+  const report = usageAccumulator(now, key)
+  const days = Object.values(state?.days || {}).map(rows => rows.slice())
+  const job = (async () => {
+    let scanned = 0
+    for (const rows of days) for (const row of rows) {
+      if (scanned++ % REPORT_BATCH === 0) await yieldToHost()
+      report.add(row)
+    }
+    return report.result()
+  })().finally(() => {
+    if (reportJobs.get(key) === job) reportJobs.delete(key)
+  })
+  reportJobs.set(key, job)
+  return job
 }

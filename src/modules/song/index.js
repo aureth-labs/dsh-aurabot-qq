@@ -113,6 +113,8 @@ export default {
       }),
     })
 
+    api.onDispose?.(() => song.dispose())
+
     // 面板里打开了才给她（没开就别让她答应唱歌）
     api.tool(({ chat, sessionId }) => (api.config().song.enabled && chat.kind !== 'system' ? defineTool({
       name: 'song_cover',
@@ -121,10 +123,11 @@ export default {
       required: ['song'],
       slow: '好，我这就去弄，稍等一会儿（做好了发你）。',
       execute: async ({ song: name, pitch, acapella, start_sec, duration_sec }) => {
-        if (api.config().song.ownerOnly && !hub.turnSendersAllOwner(sessionId) && !privateCapabilityAllowed(api.config(), chat, 'song')) return { ok: false, message: '你还没有获得点歌权限' }
+        const permitted = () => !api.config().song.ownerOnly || hub.turnSendersAllOwner(sessionId) || privateCapabilityAllowed(api.config(), chat, 'song')
+        if (!permitted()) return { ok: false, message: '你还没有获得点歌权限' }
         const caps = typeof api.caps === 'function' ? api.caps(chat.chatId) : null
         if (caps && !caps.voice && !caps.file) return { ok: false, message: '当前平台不支持发送语音或音频文件，无法在这里发翻唱' }
-        const r = song.request({ song: name, pitch, acapella, startSec: start_sec, durationSec: duration_sec, chatId: chat.chatId })
+        const r = await song.request({ song: name, pitch, acapella, startSec: start_sec, durationSec: duration_sec, chatId: chat.chatId }, permitted)
         if (r?.ok && caps && !caps.voice && caps.file) {
           return { ...r, degraded: 'voice->file', message: `${r.message}（当前平台不支持语音条，做好后将改用音频文件发出）` }
         }
@@ -132,7 +135,7 @@ export default {
       },
     }) : []))
 
-    api.route('/song/status', async () => ({ ok: true, ...song.status() }))
+    api.route('/song/status', async () => ({ ok: true, ...(await song.refreshStatus()) }))
     api.route('/song/install', async () => song.install())
     api.route('/song/root/check', async (req) => ({ ok: true, ...checkRoot(http.query(req).path || '') }))
     api.route('/song/drives', async () => ({ ok: true, list: listDrives() }))

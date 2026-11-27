@@ -341,3 +341,20 @@ test('summarizeModules 纯内存：不调 scanUser 重扫、不做文件系统�
   assert.ok(!/scanUser\s*\(/.test(body), 'summarizeModules 不准调 scanUser（首屏只准碰内存）')
   assert.ok(!/readdirSync|statSync|readFileSync/.test(body), 'summarizeModules 不准碰文件系统')
 })
+
+test('精简保存返回已提交配置与版本，跳过完整状态聚合', async () => {
+  const reply = await callRaw('/save', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-aurabot-save-view': 'compact' },
+    body: { ownerName: '精简保存' },
+  })
+  assert.equal(reply.status, 200)
+  assert.equal(reply.json.ok, true)
+  assert.equal(reply.json.config.ownerName, '精简保存')
+  assert.equal(reply.json.config.snowluma.webuiPassword, '')
+  assert.ok(reply.json.committedPaths.includes('/ownerName'))
+  assert.equal(Object.hasOwn(reply.json, 'sessions'), false)
+  assert.equal(Object.hasOwn(reply.json, 'snowluma'), false)
+  const legacy = await callRaw('/save', { method: 'POST', body: { ownerName: '旧版保存' } })
+  assert.ok(legacy.json.sessions)
+})

@@ -2,6 +2,8 @@
 
 import { randomUUID } from 'node:crypto'
 import { closeSync, fsyncSync, openSync, readFileSync, writeFileSync, writeSync, mkdirSync, renameSync, existsSync, unlinkSync } from 'node:fs'
+import { mkdir, unlink, writeFile } from 'node:fs/promises'
+import { setTimeout as delay } from 'node:timers/promises'
 import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 
@@ -77,6 +79,33 @@ export function writeJson(file, value) {
   } catch (error) {
     try { unlinkSync(tmp) } catch {}
     throw error
+  }
+}
+
+/**
+ * 异步写入可迭代的数据块。提交前重新核对调用方代次，避免旧快照覆盖同步提交。
+ * 校验与一次原子改名在同一个调用栈中，文件占用时的退避不阻塞宿主。
+ */
+export async function writeAtomicAsync(file, data, { isCurrent = () => true, rename = renameSync, wait = delay } = {}) {
+  await mkdir(dirname(file), { recursive: true })
+  const tmp = `${file}.tmp-${process.pid}-${randomUUID().slice(0, 8)}`
+  let committed = false
+  try {
+    if (!isCurrent()) return false
+    await writeFile(tmp, data, 'utf8')
+    for (let attempt = 0; attempt <= 5; attempt++) {
+      if (!isCurrent()) return false
+      try {
+        rename(tmp, file)
+        committed = true
+        return true
+      } catch (error) {
+        if (!TRANSIENT_RENAME_CODES.has(error?.code) || attempt === 5) throw error
+        await wait(20 * (attempt + 1))
+      }
+    }
+  } finally {
+    if (!committed) await unlink(tmp).catch(() => {})
   }
 }
 

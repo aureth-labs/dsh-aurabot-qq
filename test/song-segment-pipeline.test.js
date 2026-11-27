@@ -19,7 +19,7 @@ test('片段无人声不封禁整首；越界不发语音；失败后下一首�
   put(mode,'-100');const input=join(data,'song.wav');put(input,'input')
   const cfg=normalize({song:{enabled:true,root,separatorModel:'test.onnx',keepWork:false}}),sent=[],notices=[],spoken=[];let conversions=0,failConversion=false,delivery,sung=0
   const s=createSongStudio({getConfig:()=>cfg,log:{info(){},warn(){}},local:{active:()=>true,call:async(_n,o)=>{conversions++;if(failConversion)throw Error('ENOENT /home/private/secret.py at internalFn()');put(o.output,'converted');return o.output}},say:async o=>spoken.push(o),onSung:()=>sung++,sendVoiceFile:async(_c,f)=>{if(delivery===undefined)sent.push(f);return delivery},sendText:async(_c,t)=>notices.push(t)})
-  async function request(o){assert.equal(s.request({song:'测试',file:input,chatId:'private:'+Date.now(),...o}).ok,true);for(let i=0;i<500;i++){if(!s.status().current)return;await new Promise(r=>setTimeout(r,10))}throw Error('queue timeout')}
+  async function request(o){assert.equal((await s.request({song:'测试',file:input,chatId:'private:'+Date.now(),...o})).ok,true);for(let i=0;i<500;i++){if(!s.status().current)return;await new Promise(r=>setTimeout(r,10))}throw Error('queue timeout')}
   await request({startSec:20,durationSec:8});assert.equal(sent.length,0);assert.match(notices.at(-1),/这段没有检测到人声/)
   assert.equal(existsSync(join(data,'songs/no-vocals.json')),false);assert.equal(readFileSync(calls,'utf8').trim().split('\n').length,1,'no retry of a different track')
   await request({startSec:100,durationSec:8});assert.match(notices.at(-1),/歌尾/);assert.equal(sent.length,0)

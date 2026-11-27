@@ -57,7 +57,7 @@ function setup(t, patch = {}) {
     else process.env.AURABOT_DATA_DIR = old
     rmSync(dir, { recursive: true, force: true })
   })
-  return { cfg, logs, calls, make, state: () => readMemoryState(dir) }
+  return { cfg, logs, calls, hub, make, state: () => readMemoryState(dir) }
 }
 
 const row = (chatId, uid, text, t) => ({ chatId, uid, who: uid === BOT ? 'bot' : '小明', text, t })
@@ -128,4 +128,27 @@ test('空闲提炼只给选入的行占预算，其余原文不进模型、群�
   s.logs.set(day, rows); const m = s.make(); await m.tick(); assert.equal(extractCalls(s).length, 0)
   rows[2].t = at + 240000; await m.tick(); const calls = extractCalls(s); assert.equal(calls.length, 1); assert.match(calls[0].text, /直接互动/); assert.doesNotMatch(calls[0].text, /环境流水|现在仍在聊天/)
   assert.equal((await m.backlog()).pending, 0); assert.equal((await m.backlog()).outOfScope, 2); assert.equal(s.state().extractBatches.count, 1)
+})
+
+test('空闲提炼扫描分片期间收到的新消息应阻止该轮提炼', async (t) => {
+  const s = setup(t)
+  const day = dayKey()
+  const chat = `private:${A}`
+  const oldRows = lines(chat, A, '之前的私聊', 40, Date.now() - 3 * 3600_000)
+  s.logs.set(day, oldRows)
+  let revision = 0
+  s.hub.chatLogRevision = () => revision
+  const read = s.hub.chatLogOf
+  s.hub.chatLogOf = (date) => {
+    const rows = read(date)
+    if (!revision && date === day) setImmediate(() => {
+      s.logs.set(day, [...oldRows, row(chat, A, '刚刚恢复聊天', Date.now())])
+      revision++
+    })
+    return rows
+  }
+  const mem = s.make()
+  await mem.tick()
+  assert.equal(revision, 1)
+  assert.equal(extractCalls(s).length, 0)
 })

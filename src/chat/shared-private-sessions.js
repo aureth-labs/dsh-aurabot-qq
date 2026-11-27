@@ -115,11 +115,11 @@ export function sharedQuietHistory(session, afterSeq = null) {
 }
 
 // read and write must use the same synchronous persistence as the ordinary session map.
-export function createSharedPrivateSessions({ read, write, fork, create, restore, recover, verifyCandidate, rename, onRetired, log }) {
+export function createSharedPrivateSessions({ read, readSharedMap = () => read().multiPrivate, write, fork, create, restore, recover, verifyCandidate, rename, onRetired, log }) {
   const creating = new Map()
   const checkpointRecoveries = new Set()
   const failing = reason => ({ ok: false, reason })
-  const readShared = () => read().multiPrivate || initialShared()
+  const readShared = () => readSharedMap() || initialShared()
   const update = change => {
     const map = read()
     const shared = map.multiPrivate || initialShared()

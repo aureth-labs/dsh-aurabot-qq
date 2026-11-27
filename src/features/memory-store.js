@@ -1,5 +1,5 @@
 // 记忆的持久化边界：业务仍然整份 load/save，SQLite 内按行比较并原子提交。
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import { dataDir, readJson, writeJson } from '../core/store.js'
@@ -12,6 +12,7 @@ export const MEMORY_SCHEMA = 1
 export const MEMORY_FILES = ['memory.sqlite', 'memory.sqlite-wal', 'memory.sqlite-shm', 'memories.json', 'memory-json-fallback.json']
 const empty = () => ({ items: [] })
 const tables = ['items', 'gists', 'kv', 'meta']
+const stateFiles = MEMORY_FILES.filter(name => name !== 'memory.sqlite-shm')
 
 function rowsOf(state) {
   if (!state || typeof state !== 'object' || Array.isArray(state) || !Array.isArray(state.items)) throw new Error('记忆格式不正确')
@@ -69,9 +70,19 @@ export function createMemoryStorage({ directory = () => dataDir(), log = console
   let snapshot
   let lastState
   let backend
+  let loadedStamp
+  let revision = 0
   let warned = false
   let fallbackReason = ''
   const path = (name) => join(root, name)
+  const stateStamp = () => {
+    try {
+      return stateFiles.map(name => {
+        const stat = statSync(path(name), { bigint: true, throwIfNoEntry: false })
+        return stat ? `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}` : ''
+      }).join('|')
+    } catch { return null }
+  }
   const warn = (error) => {
     fallbackReason = error?.message || String(error)
     if (!warned) { log?.warn?.(`记忆存储改用 JSON：${fallbackReason}`); warned = true }
@@ -83,6 +94,7 @@ export function createMemoryStorage({ directory = () => dataDir(), log = console
     closeDatabase()
     root = next
     snapshot = lastState = backend = undefined
+    loadedStamp = undefined
     warned = false
   }
   function jsonState() {
@@ -185,7 +197,9 @@ export function createMemoryStorage({ directory = () => dataDir(), log = console
       }
       db = new Database(file)
       initialize(db)
-      const state = readDatabase(db)
+      db.exec('BEGIN')
+      let state
+      try { state = readDatabase(db) } finally { db.exec('ROLLBACK') }
       snapshot = rowsOf(state)
       lastState = state
       backend = 'sqlite'
@@ -198,26 +212,36 @@ export function createMemoryStorage({ directory = () => dataDir(), log = console
       }
     }
   }
-  // 句柄不跨同步操作持有，避免插件重载和 Windows 恢复/搬目录时占用数据库文件。
-  // 比较快照保留在内存中；连接关闭并不会把未变化的行重新写一遍。
-  function load() {
+  // 以主库、WAL 与 JSON 来源的指纹校验快照。另一个实例写入、备份替换或 JSON 回退
+  // 都会刷新；仍不跨操作持有 SQLite 句柄，避免 Windows 恢复/搬目录时占用文件。
+  function refresh() {
+    selectDirectory()
+    const stamp = stateStamp()
+    if (lastState && stamp && loadedStamp === stamp) return
+    backend = snapshot = undefined
     openDatabase()
-    if (backend === 'sqlite') {
-      try {
-        // 每次读都刷新比较快照；不把调用方随后对对象的修改当成「已保存」。
-        const state = readDatabase(db)
-        snapshot = rowsOf(state)
-        lastState = structuredClone(state)
-        return state
-      } catch (error) { fallback(error) } finally { closeDatabase() }
-    }
-    lastState = jsonState()
+    closeDatabase()
+    if (backend !== 'sqlite') lastState = jsonState()
+    const after = stateStamp()
+    loadedStamp = stamp && stamp === after ? after : undefined
+    revision++
+  }
+  function load() {
+    refresh()
+    // 首次建库或迁移会改变文件指纹。补读稳定版本，供只读预览直接取缓存。
+    if (backend === 'sqlite' && !loadedStamp) refresh()
     return structuredClone(lastState)
   }
   function save(state) {
+    refresh()
     openDatabase()
     if (backend === 'sqlite') {
-      try { writeRows(state); return } catch (error) { fallback(error) } finally { closeDatabase() }
+      try { writeRows(state) } catch (error) { fallback(error) } finally { closeDatabase() }
+      if (backend === 'sqlite') {
+        loadedStamp = stateStamp()
+        revision++
+        return
+      }
     }
     // JSON 写入仍使用现有的临时文件 + 改名。先确保 JSON 是上一版完整状态，
     // 再标记权威后端，最后原子替换为新状态；三步之间退出也不会读到陈旧残档。
@@ -228,12 +252,16 @@ export function createMemoryStorage({ directory = () => dataDir(), log = console
     }
     writeJson(path('memories.json'), state)
     lastState = structuredClone(state)
+    loadedStamp = stateStamp()
+    revision++
   }
   return {
     load, save,
-    snapshot: () => backend && lastState ? structuredClone(lastState) : null,
-    status: () => { openDatabase(); closeDatabase(); return { backend, schema: backend === 'sqlite' ? MEMORY_SCHEMA : null, reason: backend === 'json' ? fallbackReason : '' } },
-    close: () => { closeDatabase(); backend = undefined; snapshot = undefined },
+    field: (key) => { refresh(); return structuredClone(lastState[key]) },
+    revision: () => { refresh(); return revision },
+    snapshot: () => lastState && loadedStamp && stateStamp() === loadedStamp ? structuredClone(lastState) : null,
+    status: () => { refresh(); return { backend, schema: backend === 'sqlite' ? MEMORY_SCHEMA : null, reason: backend === 'json' ? fallbackReason : '' } },
+    close: () => { closeDatabase(); backend = snapshot = lastState = loadedStamp = undefined },
   }
 }
 

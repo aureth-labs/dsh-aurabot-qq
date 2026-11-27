@@ -15,24 +15,89 @@ window.__ModuleLoader__.load({
     const API = '/aurabot/api'
 
     // ---------------- 小工具 ----------------
-    const get = (p) => fetch(API + p, { cache: 'no-store' }).then((r) => r.json()).catch((e) => ({ ok: false, message: '连不上插件：' + e.message }))
-    // 面板 tab 缓存：GET 结果 30 秒内复用，切 tab 不重复拉；任何 POST 成功或上传后清空。
+    const get = (p, { signal, timeout = 20000 } = {}) => {
+      if (typeof AbortController !== 'function' || typeof setTimeout !== 'function') {
+        return fetch(API + p, { cache: 'no-store', signal }).then(r => r.json())
+          .catch(error => ({ ok: false, message: '连不上插件：' + error.message }))
+      }
+      const ctl = new AbortController()
+      const abort = () => ctl.abort()
+      if (signal?.aborted) abort()
+      else signal?.addEventListener('abort', abort, { once: true })
+      const timer = setTimeout(abort, timeout)
+      return fetch(API + p, { cache: 'no-store', signal: ctl.signal })
+        .then((r) => r.json())
+        .catch((error) => ({ ok: false, message: ctl.signal.aborted ? '读取已取消或超时' : '连不上插件：' + error.message }))
+        .finally(() => {
+          clearTimeout(timer)
+          signal?.removeEventListener('abort', abort)
+        })
+    }
+    // 缓存只留少量近期页面，保存后的旧请求不能重新填充缓存。
     const getCache = new Map()
     const CACHE_TTL = 30000
-    const bustCache = () => getCache.clear()
+    const CACHE_CAPACITY = 40
+    let cacheGeneration = 0
+    const bustCache = () => { cacheGeneration++; getCache.clear() }
     const getCached = (p, force = false) => {
+      const now = Date.now()
+      for (const [key, entry] of getCache) if (now - entry.at >= CACHE_TTL) getCache.delete(key)
       const hit = getCache.get(p)
-      if (!force && hit && Date.now() - hit.at < CACHE_TTL) return Promise.resolve(hit.data)
+      if (!force && hit) {
+        getCache.delete(p)
+        getCache.set(p, hit)
+        return Promise.resolve(hit.data)
+      }
+      const generation = cacheGeneration
       return get(p).then((data) => {
-        if (!data || data.ok !== false) getCache.set(p, { at: Date.now(), data })
+        if (generation === cacheGeneration && data && data.ok !== false) {
+          getCache.set(p, { at: Date.now(), data })
+          while (getCache.size > CACHE_CAPACITY) getCache.delete(getCache.keys().next().value)
+        }
         return data
       })
     }
     const post = (p, body, headers) =>
-      fetch(API + p, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body || {}) })
+      fetch(API + p, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...(p === '/save' ? { 'x-aurabot-save-view': 'compact' } : {}), ...headers },
+        body: JSON.stringify(body || {}),
+      })
         .then((r) => r.json())
         .then((data) => { if (!data || data.ok !== false) bustCache(); return data })
         .catch((e) => ({ ok: false, message: '连不上插件：' + e.message }))
+    function pollPanel(task, interval) {
+      const doc = typeof document === 'object' ? document : null
+      let controller = null
+      let pending = false
+      let stopped = false
+      const tick = () => {
+        if (stopped || pending || doc?.visibilityState === 'hidden') return
+        controller = typeof AbortController === 'function' ? new AbortController() : null
+        const signal = controller?.signal
+        pending = true
+        Promise.resolve().then(() => {
+          if (!stopped && !signal?.aborted && doc?.visibilityState !== 'hidden') return task(signal)
+        }).catch(() => {}).finally(() => {
+          controller = null
+          pending = false
+        })
+      }
+      const visibility = () => {
+        if (doc?.visibilityState === 'hidden') controller?.abort()
+        else tick()
+      }
+      tick()
+      const timer = interval ? setInterval(tick, interval) : null
+      doc?.addEventListener?.('visibilitychange', visibility)
+      return () => {
+        stopped = true
+        if (timer != null) clearInterval(timer)
+        doc?.removeEventListener?.('visibilitychange', visibility)
+        controller?.abort()
+      }
+    }
+
     const confirmBackupJournalQuarantine = () => window.confirm('将损坏的备份恢复日志移到备份文件夹以保留排查副本？')
     const quarantineBackupJournal = () => post('/backup/recovery/quarantine', { confirmed: true }, { 'x-aurabot-backup': '1' })
     const clone = (o) => JSON.parse(JSON.stringify(o))
@@ -69,15 +134,9 @@ window.__ModuleLoader__.load({
     // ---------------- 面板轻量读取层（首屏提速，2026-11-16） ----------------
     // 同 URL 在途合并：相同地址只放行一个在途请求，周期轮询重叠时复用同一个 Promise，防止连环打。
     const inflight = new Map()
-    const sharedGet = (p) => {
-      if (inflight.has(p)) return inflight.get(p)
-      const pr = get(p).finally(() => inflight.delete(p))
-      inflight.set(p, pr)
-      return pr
-    }
     // 轻量 GET（/panel/bootstrap、/panel/pulse、/panel/config）：3 秒截止（AbortController），
     // 失败按可识别原因归类（超时/启动中/连不上/权限受限），退避节奏由调用方（根组件）控制。
-    // 旧 /state 与各诊断接口不经过这里，保持原有行为。
+    // 完整状态同样有截止时间，允许在轻量入口就绪后独立重试。
     const PANEL_READ_TIMEOUT = 3000
     const panelGet = (p, opts) => {
       const timeout = (opts && opts.timeout) || PANEL_READ_TIMEOUT
@@ -102,13 +161,15 @@ window.__ModuleLoader__.load({
     }
     // 轻量 GET 也走在途合并（同一地址同时只有一个在途请求）
     const sharedPanelGet = (p, opts) => {
-      const key = 'panel:' + p
-      if (inflight.has(key)) return inflight.get(key)
-      const pr = panelGet(p, opts).finally(() => inflight.delete(key))
-      inflight.set(key, pr)
+      const jobs = opts?.jobs || inflight
+      if (jobs.has(p)) return jobs.get(p)
+      const pr = panelGet(p, opts).finally(() => {
+        if (jobs.get(p) === pr) jobs.delete(p)
+      })
+      jobs.set(p, pr)
       return pr
     }
-    const bustPanelGet = (p) => { inflight.delete('panel:' + p) }
+    const bustPanelGet = (p, jobs = inflight) => { jobs.delete(p) }
     // /save 回执的 committedPaths / unchangedPaths 是 JSON Pointer（如 /voice/enabled）；
     // 草稿内部用点路径（voice.enabled），这里换算（~0/~1 转义按 RFC 6901 还原）。
     const ptrToDots = (ptr) => String(ptr || '').split('/').filter(Boolean)
@@ -1555,13 +1616,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
 
     function RecentLogs({ go }) {
       const [items, setItems] = useState(null)
-      useEffect(() => {
-        let alive = true
-        const load = () => get('/logs?limit=8&level=info').then((r) => alive && setItems(r.entries || []))
-        load()
-        const t = setInterval(load, 5000)
-        return () => { alive = false; clearInterval(t) }
-      }, [])
+      useEffect(() => pollPanel(signal => get('/logs?limit=8&level=info', { signal }).then(r => {
+        if (!signal?.aborted && r.ok !== false) setItems(r.entries || [])
+      }), 5000), [])
       return h(Card, { title: '最近动态', right: h(Btn, { kind: 'ghost', small: true, onClick: () => go('logs') }, '全部日志 →') },
         items === null ? h(Empty, { icon: '⏳', text: '加载中…' }) : items.length === 0 ? h(Empty, { text: '还没有动静' }) :
           h('div', { className: 'ab-logs', style: { maxHeight: 240 } }, items.slice().reverse().map((e, i) => h(LogLine, { key: i, e }))))
@@ -1784,13 +1841,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           if (manual) toast(error.message || '检测失败', 'err')
         }).finally(() => setBusy(false))
       }
-      useEffect(() => {
-        let alive = true
-        const tick = () => get('/tools').then((r) => { if (alive) setData(r) }).catch(() => {})
-        tick()
-        const timer = setInterval(tick, 5000)
-        return () => { alive = false; clearInterval(timer) }
-      }, [])
+      useEffect(() => pollPanel(signal => get('/tools', { signal }).then(r => {
+        if (!signal?.aborted && r.ok !== false) setData(r)
+      }), 5000), [])
       const tools = (data && data.tools) || []
       useEffect(() => {
         setDrafts((prev) => {
@@ -2404,13 +2457,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [recoveryCheck, setRecoveryCheck] = useState(null)
       const [recoveryRetry, setRecoveryRetry] = useState(0)
       const [steerLimitDraft, setSteerLimitDraft] = useState(null)
-      useEffect(() => {
-        let alive = true
-        const tick = () => get('/platforms').then((r) => { if (alive) setData(r) }).catch(() => {})
-        tick()
-        const timer = setInterval(tick, 5000)
-        return () => { alive = false; clearInterval(timer) }
-      }, [])
+      useEffect(() => pollPanel(signal => get('/platforms', { signal }).then(r => {
+        if (!signal?.aborted && r.ok !== false) setData(r)
+      }), 5000), [])
       const list = (data && data.instances) || []
       const owner = data && data.owner
       const multiPrivate = data?.multiPrivate
@@ -10093,14 +10142,11 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [startSec, setStartSec] = useState('')
       const [durationSec, setDurationSec] = useState('')
       const [acct, setAcct] = useState(null)
-      const load = () => get('/song/status').then((r) => r.ok && setS(r))
+      const load = (signal) => get('/song/status', { signal }).then((r) => r.ok && !signal?.aborted && setS(r))
       // 安装中 / 正在唱的时候每 3 秒刷新一次进度
       useEffect(() => {
-        load()
         const busy = s && (s.install.running || s.current || s.queue.length)
-        if (!busy) return
-        const t = setInterval(load, 3000)
-        return () => clearInterval(t)
+        return pollPanel(load, busy ? 3000 : 0)
       }, [s && s.install.running, s && Boolean(s.current), s && s.queue.length])
       if (!s) return h(Empty, { icon: '⏳', text: '加载中…' })
       const search = async () => { if (!q.trim()) return; setFound(null); const r = await get('/song/search?q=' + encodeURIComponent(q)); setFound(r.list || []); if (!r.ok) toast(r.message, 'err') }
@@ -12260,8 +12306,10 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [level, setLevel] = useState('info')
       const [area, setArea] = useState('')
       const [auto, setAuto] = useState(true)
-      const load = useCallback(() => get('/logs?limit=400&level=' + level + '&area=' + area).then((r) => setItems(r.entries || [])), [level, area])
-      useEffect(() => { load(); if (!auto) return; const t = setInterval(load, 3000); return () => clearInterval(t) }, [load, auto])
+      const load = useCallback(signal => get('/logs?limit=400&level=' + level + '&area=' + area, { signal }).then(r => {
+        if (!signal?.aborted && r.ok !== false) setItems(r.entries || [])
+      }), [level, area])
+      useEffect(() => pollPanel(load, auto ? 3000 : 0), [load, auto])
       return h(Card, { title: '日志', desc: '所有后台动作都在这里，令牌和密码已自动打码。完整日志文件在 %USERPROFILE%\\.dsh\\plugins-data\\aurabot\\logs\\。',
         right: h('div', { className: 'ab-flex' },
           h(Select, { value: level, onChange: setLevel, width: 110, options: [['debug', '全部'], ['info', '一般'], ['warn', '警告'], ['error', '错误']].map(([value, label]) => ({ value, label })) }),
@@ -13039,7 +13087,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [wizardOpen, setWizardOpen] = useState(false)
       const [boot, setBoot] = useState(null)         // /panel/bootstrap 成功摘要
       const [bootErr, setBootErr] = useState(null)   // { code, message }：TIMEOUT / BOOTSTRAPPING / CONNECT / AUTH / STATE / CONFIG
-      const [ready, setReady] = useState(false)      // bootstrap + /state 水合 + /panel/config 草稿全部就绪
+      const [ready, setReady] = useState(false)      // bootstrap 与配置草稿已就绪
       const [lastSyncAt, setLastSyncAt] = useState(0) // 最近一次 pulse 成功时间（失败时保留旧数据并标注更新时间）
       const toastTimer = useRef(null)
       const dirtyRef = useRef(false)
@@ -13058,21 +13106,35 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const bootRef = useRef(null)          // 最近一次有效的 bootstrap/pulse 摘要（bootId/版本/导航版本）
       const configRevRef = useRef(null)     // 当前草稿基线对应的 configRevision
       const draftSnapRef = useRef(null)     // 最近一次权威配置快照（/panel/config 或保存回执）
-      const readRegistry = useRef(new Set()) // 在途轻量读取的 AbortController，卸载时统一放弃
+      const readRegistry = useRef(new Set()) // 卸载或宿主切换时取消在途读取
+      const jobsRef = useRef(new Map())
+      const reads = useCallback((path, timeout) => sharedPanelGet(path, {
+        registry: readRegistry.current, jobs: jobsRef.current, timeout,
+      }), [])
+      const readEpoch = useRef(0)
+      const configReadEpoch = useRef(0)
       const retryRef = useRef(null)
-      // /state 用于首次水合和操作后的状态刷新，草稿由 /panel/config 初始化。
       const loadState = useCallback(async () => {
-        const r = await sharedGet('/state')
-        if (!r || r.ok === false) { setErr(r && r.message ? r.message : '读不到插件状态'); return r }
+        const epoch = readEpoch.current
+        const startBoot = bootRef.current?.bootId
+        const r = await reads('/state', 12000)
+        if (epoch !== readEpoch.current || startBoot !== bootRef.current?.bootId) return r
+        if (!r || r.ok === false) { setErr(r?.message || '读不到插件状态'); return r }
         if (Number(r.startedAt)) pluginStartRef.current = Number(r.startedAt)
         setErr('')
         setSt(draftSnapRef.current ? { ...r, config: clone(draftSnapRef.current) } : r)
         return r
-      }, [])
+      }, [reads])
       // 正在编辑时保留草稿和群设置基线。接收顺位单独对齐，避免覆盖平台绑定自动追加的账号。
       const loadConfigDraft = useCallback(async () => {
-        const r = await sharedPanelGet('/panel/config', { registry: readRegistry.current })
-        if (!r || r.ok === false) return r
+        const epoch = configReadEpoch.current
+        const bootEpoch = readEpoch.current
+        const r = await reads('/panel/config')
+        if (epoch !== configReadEpoch.current || bootEpoch !== readEpoch.current || !r || r.ok === false) return r
+        if (bootRef.current?.bootId && r.bootId && r.bootId !== bootRef.current.bootId) {
+          return { ok: false, message: '插件已重新启动，正在重新读取配置' }
+        }
+        if (r.configRevision != null && configRevRef.current != null && r.configRevision < configRevRef.current) return r
         const snap = clone(r.config || {})
         const prevServerOrder = draftSnapRef.current?.ownerPrimary?.fallbackOrder
         const nextServerOrder = snap.ownerPrimary?.fallbackOrder
@@ -13100,13 +13162,12 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           return current
         })
         return r
-      }, [])
+      }, [reads])
       const reload = useCallback(async () => {
         const [r] = await Promise.all([loadState(), loadConfigDraft()])
         return r
       }, [loadState, loadConfigDraft])
-      // 启动序列：外壳先渲染 → /panel/bootstrap（3 秒截止 + 指数退避）→ 并行水合 /state 与 /panel/config。
-      // bootstrap 前不打 /state；未就绪时按可识别状态提示（超时/启动中/连不上/权限受限）。
+      // bootstrap 和脱敏配置足以启用导航与表单，详细状态另行加载。
       useEffect(() => {
         let stopped = false
         let timer = null
@@ -13114,8 +13175,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         const clear = () => { if (timer) { clearTimeout(timer); timer = null } }
         const attempt = async () => {
           if (stopped) return
-          const r = await sharedPanelGet('/panel/bootstrap', { registry: readRegistry.current })
-          if (stopped) return
+          const epoch = ++readEpoch.current
+          const r = await reads('/panel/bootstrap')
+          if (stopped || epoch !== readEpoch.current) return
           if (!r || r.ok === false) {
             setBootErr({ code: (r && r.code) || 'CONNECT', message: (r && r.message) || '暂时连不上插件' })
             if ((r && r.code) === 'AUTH') return // 权限受限：自动重试没有意义，等用户/管理员处理
@@ -13125,24 +13187,39 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           }
           bootRef.current = r
           setBoot(r)
-          const [sr, cr] = await Promise.all([loadState(), loadConfigDraft()])
-          if (stopped) return
-          if (!sr || sr.ok === false || !cr || cr.ok === false) {
-            const msg = !sr || sr.ok === false ? (sr && sr.message) || '读不到插件状态' : (cr && cr.message) || '读不到插件配置'
-            setBootErr({ code: !sr || sr.ok === false ? 'STATE' : 'CONFIG', message: msg })
+          const cr = await loadConfigDraft()
+          if (stopped || epoch !== readEpoch.current) return
+          if (!cr || cr.ok === false) {
+            setBootErr({ code: 'CONFIG', message: cr?.message || '读不到插件配置' })
             delay = Math.min(delay * 2, 15000)
             timer = setTimeout(attempt, delay)
             return
           }
+          const summary = r.connections || []
+          setSt({
+            partial: true,
+            config: clone(draftSnapRef.current || cr.config),
+            version: r.version,
+            connections: summary,
+            onebot: connectionsToOnebot(summary, {}) || {},
+            platforms: summary.map((row) => ({
+              ...row, instance: row.instanceId, state: row.stage === 'verifying' ? 'connecting' : row.stage,
+            })),
+            personas: [],
+            mood: { label: '状态正在读取' },
+            modules: r.modules || [],
+          })
           setBootErr(null)
           setReady(true)
+          void loadState()
         }
         retryRef.current = () => { clear(); delay = 2000; attempt() }
         attempt()
         return () => { stopped = true; clear(); retryRef.current = null }
       }, [])
-      // 卸载时放弃所有在途轻量读取（bootstrap/pulse/config）
       useEffect(() => () => {
+        readEpoch.current++
+        jobsRef.current.clear()
         for (const ctl of readRegistry.current) { try { ctl.abort() } catch (e) { /* 已结束的忽略 */ } }
         readRegistry.current.clear()
       }, [])
@@ -13153,14 +13230,16 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         let stopped = false
         let timer = null
         let failures = 0
+        let pendingRead = false
         const mountedAt = Date.now()
         const clear = () => { if (timer) { clearTimeout(timer); timer = null } }
         const schedule = (ms) => { if (!stopped) { clear(); timer = setTimeout(tick, ms) } }
         const tick = async () => {
-          if (stopped) return
-          if (document.visibilityState === 'hidden') return
-          const r = await sharedPanelGet('/panel/pulse', { registry: readRegistry.current })
-          if (stopped) return
+          if (stopped || pendingRead || document.visibilityState === 'hidden') return
+          pendingRead = true
+          const r = await reads('/panel/pulse')
+          pendingRead = false
+          if (stopped || document.visibilityState === 'hidden') return
           if (!r || r.ok === false) {
             failures++
             schedule(Math.min(12000 * Math.pow(2, Math.min(failures - 1, 2)), 30000))
@@ -13175,7 +13254,14 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             setReady(false)
             setBoot(null)
             bootRef.current = null
+            configRevRef.current = null
+            jobsRef.current.clear()
+            for (const ctl of readRegistry.current) ctl.abort()
             if (retryRef.current) retryRef.current()
+            return
+          }
+          if (r.configRevision != null && configRevRef.current != null && r.configRevision < configRevRef.current) {
+            schedule(2000)
             return
           }
           // 轻量合并：controls（总开关/试运行/调试）与 connections 快照就地更新到 st；草稿一律不动
@@ -13207,7 +13293,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           else if (r.configRevision != null && configRevRef.current == null) configRevRef.current = r.configRevision
           // 导航版本变化：合并一次 bootstrap 刷新
           if (r.navigationRevision != null && bootRef.current && bootRef.current.navigationRevision != null && r.navigationRevision !== bootRef.current.navigationRevision) {
-            sharedPanelGet('/panel/bootstrap', { registry: readRegistry.current }).then((b) => {
+            reads('/panel/bootstrap').then((b) => {
               if (!stopped && b && b.ok !== false) { setBoot(b); bootRef.current = b }
             })
           }
@@ -13251,6 +13337,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         loadConfigDraft() // 顺手把基线对齐到最新权威快照（没在编辑时直接采纳）
       }
       const saveImpl = async (override) => {
+        const bootEpoch = readEpoch.current
         const { allow, commandAllow, capabilityAllow, ...rest } = clone(override || draft)
         // 基线来自 /panel/config 快照；只提交本次编辑过的顶层字段，没变的键不回传
         //（整表字段照旧整键发送，mergeFromPanel 语义不变）。
@@ -13281,7 +13368,8 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         }
         if (Object.keys(expected).length) body._groupSettingsBase = expected
         // 提交前使先前的配置 GET 过期（读到一半的旧快照不许再被当成新基线）
-        bustPanelGet('/panel/config')
+        configReadEpoch.current++
+        bustPanelGet('/panel/config', jobsRef.current)
         const r = await post('/save', body)
         if (r.ok === false) {
           if (typeof r.message === 'string' && r.message.indexOf('连不上插件') === 0) {
@@ -13308,7 +13396,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           toast(r.message || '保存好了', 'ok')
           return true
         }
-        if (bootRef.current && r.bootId && r.bootId !== bootRef.current.bootId) {
+        if (bootEpoch !== readEpoch.current || (bootRef.current && r.bootId && r.bootId !== bootRef.current.bootId)) {
           // 宿主已重启：本次回执失效，保留草稿并提示重新核对
           toast('插件刚刚重启过：这次保存是否已生效需要重新核对（未保存的草稿已保留）。', 'err')
           await reload()
@@ -13316,14 +13404,15 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         }
         // 新回执：基线整体推进到回执版本；已确认字段（committedPaths）以权威快照为准，
         // unchangedPaths 只清脏标记（值本来就一致），其余本地草稿（含提交期间的新改动）原样保留。
-        if (r.configRevision != null) configRevRef.current = r.configRevision
-        const snap = clone(r.config || draftSnapRef.current || {})
+        const hasNewerConfig = r.configRevision != null && configRevRef.current != null && r.configRevision < configRevRef.current
+        if (!hasNewerConfig && r.configRevision != null) configRevRef.current = r.configRevision
+        const snap = clone((hasNewerConfig ? draftSnapRef.current : r.config) || draftSnapRef.current || {})
         draftSnapRef.current = snap
         const committed = (r.committedPaths || []).map(ptrToDots)
         // #520：dirty 基线不能直接用脱敏 snap，否则草稿里填过的 secret 永远和它不相等，
         // 「有改动还没保存」一直显示。基线用本次完整草稿，但已提交字段以服务端归一化快照为准，
         // 并清空 secret 原文（保留 *Set 标志），避免明文留在草稿里、后续保存覆盖新密钥。
-        let savedDraft = maskSecretFields(clone(override || draft))
+        let savedDraft = maskSecretFields(clone(hasNewerConfig ? snap : override || draft))
         for (const dots of committed) savedDraft = setPath(savedDraft, dots, getPath(snap, dots))
         if (Array.isArray(snap.ownerPrimary?.fallbackOrder)) savedDraft = setPath(savedDraft, 'ownerPrimary.fallbackOrder', clone(snap.ownerPrimary.fallbackOrder))
         maskSecretFields(savedDraft)
@@ -13443,11 +13532,11 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           : qqBackend === 'onebot'
             ? h('span', { className: 'ab-pill' }, 'OneBot ' + (qqConnected ? '已连接' : '未连接'))
             : null
-      const persona = st.personas.find((p) => p.id === cfg.persona.current)
+      const persona = (st.personas || []).find((p) => p.id === cfg.persona?.current)
       const props = { st, boot, draft, setDraft: setD, toast, reload, go, openWizard: () => setWizardOpen(true), voiceView, setVoiceView: pickVoiceView, memoryView, setMemoryView: pickMemoryView, contentView, setContentView: pickContentView }
       const showWizard = !cfg.setupDone || wizardOpen
       // 标签页：内置的按模块在不在跑决定显示；自己写的模块有设置或面板的各占一页
-      const mods = st.modules || []
+      const mods = st.partial ? (boot?.modules || []) : (st.modules || [])
       const running = (id) => { const m = mods.find((x) => x.id === id); return Boolean(m && m.running) }
       // 哪些模块的界面已经有内置页：标签页自己的 id，或者在 TAB_MODS 里给某个内置页供内容的模块
       // （memory 的界面就在「心情与记忆」「人物记忆」里，purpose 在「主动搭话」里）。
@@ -13457,8 +13546,8 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       // （设置照样在内置标签页里改）。为什么允许内置模块带面板：面板只按「有没有声明 panel」判断，
       // 内置模块自己写了 panel.js 也应该能显示，不然那文件永远没入口。
       const hasUi = (m) => !hasBuiltinPage(m.id) && (m.running === 'user' && !m.builtin
-        ? Boolean((m.settings || []).length || m.panel)
-        : m.running === 'builtin' && Boolean(m.panel))
+        ? Boolean(m.hasSettings || (m.settings || []).length || m.hasPanel || m.panel)
+        : m.running === 'builtin' && Boolean(m.hasPanel || m.panel))
       // 写了 tab 的模块嵌进那个内置标签页；没写（或写的页不存在）的单独一页
       // 旧模块的 tab: 'persona' 原本嵌在「人格」，继续放回原页。
       const tabOf = (m) => {
@@ -13487,6 +13576,12 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         overview: Overview, manage: Manage, platforms: Platforms, tools: Tools, connect: Connect, character: Persona, access: Access, group: Group, model: Model, voice: VoiceTab,
         stickers: Stickers, imagegen: ImageGen, video: Video, diary: Diary, speakup: SpeakUp, autotelic: Autotelic, pet: PetPanel, mood: Mood, memory: MemoryTab, song: Song, content: ContentTab, local: LocalApi, browser: Browser, security: Security, market: Market, modules: Modules, logs: Logs, about: About, backup: Backup,
       }[curTab.id] || Overview
+      // 依赖完整状态的页面独立显示等待提示，导航与配置型页面保持可用。
+      const needsDetails = st.partial && !['manage', 'platforms', 'tools', 'group', 'model', 'logs', 'market'].includes(curTab.id)
+      const waitingForDetails = (title, message, onClose) => h(Card, { title },
+        h('span', { className: 'ab-muted', role: err ? 'alert' : 'status' }, err || message),
+        err ? h(Btn, { small: true, onClick: () => { setErr(''); void loadState() } }, '重试') : null,
+        onClose ? h(Btn, { small: true, kind: 'ghost', onClick: onClose }, '关闭向导') : null)
       // 哪些标签有没保存的改动
       // group 键补上 files/forward：整理合并转发/发文件是聊天页的独立配置域，不补则改动不显示未保存标记
       const TAB_KEYS = { platforms: ['platforms'], tools: [], character: ['personaLook'], connect: ['snowluma', 'botQQ'], access: ['ownerQQ', 'ownerName', 'ownerLevel', 'ownerPrimary', 'approvalNotify', 'approvalViaQQ', 'qqApi', 'longTasks', 'profilePerms', 'subagentBackground'], group: ['group', 'merge', 'titleFilter', 'memberFilter', 'chat', 'files', 'forward'], model: ['model', 'chatModels'], voice: ['voice'], stickers: ['stickers'], imagegen: ['imageGen'], video: ['video', 'local'], diary: ['diary', 'qzoneSocial'], speakup: ['speakUp', 'ext'], autotelic: [], pet: [], mood: ['mood', 'memory'], song: ['song'], content: ['bili', 'douyin', 'heybox'], local: ['local'], browser: ['browser'], security: ['security', 'update'] }
@@ -13517,7 +13612,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
               h('div', { className: 'ab-switch-row' }, h('span', null, '总开关'), h(Switch, { on: cfg.enabled, onChange: (v) => quickToggle('enabled', v) })),
               h('div', { className: 'ab-switch-row' }, h('span', { className: 'ab-muted' }, '试运行'), h(Switch, { on: cfg.dryRun, onChange: (v) => toggleRun('dryRun', v), title: '开着时只写日志，不真的发到 QQ（记忆照写）' })),
               h('div', { className: 'ab-switch-row' }, h('span', { className: 'ab-muted' }, '调试'), h(Switch, { on: cfg.debug, onChange: (v) => toggleRun('debug', v), title: '调试：不真发，也不写任何记忆和聊天流水，只在日志里看。开它会自动关掉试运行' })))),
-          showWizard ? h(Wizard, { st, draft, setDraft: setD, save, toast, reload, onClose: () => setWizardOpen(false) }) : null,
+          showWizard ? (st.partial
+            ? waitingForDetails('设置向导', '正在读取向导所需状态…', cfg.setupDone ? () => setWizardOpen(false) : null)
+            : h(Wizard, { st, draft, setDraft: setD, save, toast, reload, onClose: () => setWizardOpen(false) })) : null,
           showWizard ? null : h(NavBar, {
             tabs, cur: curTab, go, dirtyOf: tabDirty, subRef: tabsRef,
             mark: (t) => {
@@ -13529,9 +13626,11 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           }),
           showWizard ? null : h(SnowLumaCompatBanner, { st, go }),
           saveConflict ? h('div', { className: 'ab-note err', role: 'alert' }, saveConflict, h(Btn, { small: true, onClick: discardDraft }, '读取最新设置')) : null,
-          showWizard ? null : h(TabBoundary, { key: curTab.id, onHome: () => go('overview') }, h(body, { ...props, mod: curTab.ext, extensions: voiceExtensions })),
+          showWizard ? null : needsDetails
+            ? waitingForDetails('详情状态', '正在读取详情…')
+            : h(TabBoundary, { key: curTab.id, onHome: () => go('overview') }, h(body, { ...props, mod: curTab.ext, extensions: voiceExtensions })),
           // dsh-image 已经嵌进「生图」页的「接口格式」里了，这里再渲染一次就是同一张卡出现两遍。
-          showWizard || curTab.ext || curTab.id === 'voice' ? null : mods.filter((m) => hasUi(m) && tabOf(m) === curTab.id && !(curTab.id === 'imagegen' && m.id === 'dsh-image')).map((m) => h('div', { key: 'embed-' + m.id, style: { marginTop: 14 } }, h(ExtPage, { ...props, mod: m.id, embedded: true }))),
+          showWizard || st.partial || curTab.ext || curTab.id === 'voice' ? null : mods.filter((m) => hasUi(m) && tabOf(m) === curTab.id && !(curTab.id === 'imagegen' && m.id === 'dsh-image')).map((m) => h('div', { key: 'embed-' + m.id, style: { marginTop: 14 } }, h(ExtPage, { ...props, mod: m.id, embedded: true }))),
           dirty && !showWizard ? h('div', { className: 'ab-savebar' }, h('span', { className: 'msg' }, '有改动还没保存'),
             h('span', { className: 'ab-muted ab-small' }, h('span', { className: 'ab-kbd' }, 'Ctrl'), ' + ', h('span', { className: 'ab-kbd' }, 'S')),
             h(Btn, { kind: 'ghost', onClick: discardDraft }, '撤销'),

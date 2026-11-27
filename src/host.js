@@ -40,7 +40,7 @@ import { buildFaceIndex } from './chat/faces.js'
 import { FACE_TABLE } from './chat/face-table.js'
 import { dataDir, ensureDir } from './core/store.js'
 import { createUsageFx } from './core/usage-fx.js'
-import { initUsage, usageReport, closeUsage } from './core/usage.js'
+import { initUsage, usageReportAsync, closeUsage } from './core/usage.js'
 import { createUpdateChecker, changelogSection, hostEnv, updatePlan, repoOf } from './core/update.js'
 import { parseCommand, runCommand, createMutes, commandList } from './chat/commands.js'
 import { ownerPrivateChatIds, groupResponseMode } from './chat/access.js'
@@ -863,6 +863,9 @@ export function apply(ctx, opts = {}) {
       if (legacyQqActive() && onebotState === 'connected') onebot.restart()
     }
     secrets()
+    if (before.persona.current !== cfg.persona.current || before.persona.dataOwner !== cfg.persona.dataOwner) {
+      hub?.invalidateSessionIndex?.()
+    }
     if (bridge && (before.bridge.dshTools !== cfg.bridge.dshTools || before.persona.current !== cfg.persona.current)) bridge.refresh()
     const platformsChanged = JSON.stringify(before.platforms) !== JSON.stringify(cfg.platforms)
     const ownershipChanged = before.legacyQqEnabled !== cfg.legacyQqEnabled
@@ -3935,7 +3938,8 @@ export function apply(ctx, opts = {}) {
       // 桌宠的「干活状态」动画 / 结束提醒：把同一条事件顺手转给 pet 模块（模块没开就是 null，纯旁路）
       // QQ 聊天会话不转：聊天每句都有 turn/start→turn/end，桌宠会每句话弹一次「完工」气泡/动作（#184）
       try {
-        if (!isChatSession(hub, session)) use('pet')?.onSessionEvent?.(session, event)
+        const pet = use('pet')
+        if (pet?.onSessionEvent && !isChatSession(hub, session)) pet.onSessionEvent(session, event)
       } catch (error) { log.debug?.('桌宠状态联动出错：', error.message) }
       // 审批请求顺手通知到主人私聊（只通知，不代答）
       if (event && event.type === 'approval/asked') notifyApproval(session, event)
@@ -3944,7 +3948,13 @@ export function apply(ctx, opts = {}) {
       // 她弹选择（ask_user_question）：从工具调用事件里认，答完再撤
       if (event && (event.type === 'tool/call' || event.type === 'tool/result')) noticeQuestion(session, event)
     })
-    return () => { try { if (typeof off === 'function') off() } catch (error) {} }
+    const offDisposed = ctx.on('session/disposed', session => {
+      try { hub.onSessionDisposed?.(session) } catch (error) { log.debug('会话释放失败：', error.message) }
+    })
+    return () => {
+      try { if (typeof off === 'function') off() } catch (error) {}
+      try { if (typeof offDisposed === 'function') offDisposed() } catch (error) {}
+    }
   }, 'aurabot: 盯会话')
 
   // ---------- 启动 / 看门狗 ----------
@@ -4373,11 +4383,27 @@ export function apply(ctx, opts = {}) {
   }
   const petStatus = () => redactTokens(use('pet')?.status?.() ?? null)
 
-  route('/state', async () => overview())
+  let pendingOverview = null
+  route('/state', async () => {
+    const revision = configRevision()
+    if (pendingOverview?.revision === revision) return pendingOverview.result
+    const entry = { revision, result: overview().finally(() => {
+      if (pendingOverview === entry) pendingOverview = null
+    }) }
+    pendingOverview = entry
+    return entry.result
+  })
   // token 用量与花费：今日 / 昨日 / 近 7 天 / 近 30 天，各带模块明细
   // ?range=today|yesterday|7|30|all —— 面板点哪张指标卡就按哪个区间出明细
   const getUsageFx = createUsageFx()
-  route('/usage', async (req) => ({ ok: true, fx: await getUsageFx(query(req).fx === 'refresh'), ...usageReport({ range: query(req).range || '7' }) }))
+  route('/usage', async (req) => {
+    const { range, fx: fxAction } = query(req)
+    const [fx, report] = await Promise.all([
+      getUsageFx(fxAction === 'refresh'),
+      usageReportAsync({ range }),
+    ])
+    return { ok: true, fx, ...report }
+  })
 
   // JSON Pointer（RFC 6901）小工具：保存回执按 /voice/enabled 这类路径逐字段确认（方案 §2.2）。
   const pointerGet = (obj, pointer) => String(pointer || '').split('/').slice(1)
@@ -4396,6 +4422,7 @@ export function apply(ctx, opts = {}) {
 
   route('/save', async (req) => {
     const body = await readBody(req)
+    const compact = req.headers?.['x-aurabot-save-view'] === 'compact'
     // 面板草稿可能早于 QQ 的 /quiet /chatty；拒绝覆盖期间改过的群设置。
     // 只检查新版面板显式附带的基线，旧版和模块的局部保存维持原约定。
     if (body?.memory && Object.hasOwn(body.memory, 'passiveGroups')) {
@@ -4445,10 +4472,17 @@ export function apply(ctx, opts = {}) {
       if (isDeepStrictEqual(pointerGet(cfg, p), pointerGet(before, p))) unchangedPaths.push(p)
       else committedPaths.push(p)
     }
-    // 本次请求的回执（定义在提交之后、使用之前，避免 pw 失败分支的 TDZ）：
-    // 版本 = 本次请求触发的全部同步提交后的最高版本（如 SnowLuma 密码自动保存会再提交一次）；
-    // 异步回执不得借用别的请求版本，所以在这里闭包当场取值。
-    const saveReceipt = () => ({ bootId, configRevision: configRevision(), committedPaths, unchangedPaths })
+    const saveResponse = async (result) => {
+      // 紧凑回执的快照和版本在同一段同步代码中读取。
+      const view = compact
+        ? {
+            ok: true,
+            config: publicConfig(cfg),
+            ...(body?.modules || Object.hasOwn(body || {}, 'safeMode') ? { modules: mods.status() } : {}),
+          }
+        : await overview()
+      return { ...view, bootId, configRevision: configRevision(), committedPaths, unchangedPaths, ...result }
+    }
     let pw = null
     if (newPw && newPw !== before.snowluma.webuiPassword) pw = await snowluma.setPassword(newPw)
     const changedConn = before.gateway !== cfg.gateway || ['httpUrl', 'wsUrl', 'httpToken', 'wsToken', 'dir'].some((k) => before.snowluma[k] !== cfg.snowluma[k])
@@ -4460,10 +4494,12 @@ export function apply(ctx, opts = {}) {
     if (!before.enabled && cfg.enabled) setTimeout(safe(watchdog, '看门狗'), 100)
     if (before.enabled && !cfg.enabled) onebot.stop()
     log.info(`设置已保存｜总开关 ${cfg.enabled ? '开' : '关'}｜试运行 ${cfg.dryRun && !cfg.debug ? '开' : '关'}｜调试 ${cfg.debug ? '开' : '关'}`)
-    await mods.sync().catch(() => {})
-    // 模块启停 / 生图开关变化后工具清单可能变了：已挂载的会话重新挂一遍
-    try { hub.remountAll?.('设置已保存') } catch (error) { log.debug('重挂工具失败：', error.message) }
-    if (pw && !pw.ok) return { ...(await overview()), ...saveReceipt(), ok: false, message: '其他设置保存了，但控制台密码没改：' + pw.message }
+    if (before !== cfg) {
+      await mods.sync().catch(() => {})
+      // 真正修改配置后仍刷新已挂载工具，避免旧会话继续用已停用的模块。
+      try { hub.remountAll?.('设置已保存') } catch (error) { log.debug('重挂工具失败：', error.message) }
+    }
+    if (pw && !pw.ok) return saveResponse({ ok: false, message: '其他设置保存了，但控制台密码没改：' + pw.message })
     let debugNote = ''
     if (cfg.debug) {
       try {
@@ -4473,7 +4509,7 @@ export function apply(ctx, opts = {}) {
         log.debug('建调试会话失败：', error.message)
       }
     }
-    return { ...(await overview()), ...saveReceipt(), message: '保存好了' + (pw ? '，' + pw.message : '') + debugNote }
+    return saveResponse({ message: '保存好了' + (pw ? '，' + pw.message : '') + debugNote })
   })
 
   route('/debug/session', async () => {
@@ -5488,6 +5524,8 @@ export function apply(ctx, opts = {}) {
       use('memory')?.closePersona?.(id)
       try { rmSync(dir, { recursive: true, force: true }) } catch (error) {
         return { ok: false, list: listPersonas(), message: '人格删掉了，但它的数据没删干净：' + error.message }
+      } finally {
+        hub.invalidateSessionIndex?.()
       }
     }
     return { ok: true, list: listPersonas() }
@@ -6838,7 +6876,13 @@ export function apply(ctx, opts = {}) {
     const b = await readBody(req)
     const source = String(b.source || '').trim()
     if (!source) return { ok: false, message: '先选 QQ 版数据目录' }
-    try { return { ...(await importFromQQ({ source, dryRun: false, log })), ok: true } } catch (error) { return { ok: false, message: error.message } }
+    try {
+      return { ...(await importFromQQ({ source, dryRun: false, log })), ok: true }
+    } catch (error) {
+      return { ok: false, message: error.message }
+    } finally {
+      hub.invalidateSessionIndex?.()
+    }
   })
 
   route('/modules/reload', async (req) => {

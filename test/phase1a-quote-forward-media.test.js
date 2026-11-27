@@ -14,6 +14,7 @@ import { join } from 'node:path'
 import { createHub } from '../src/chat/hub.js'
 import { createGateway } from '../src/gateway/index.js'
 import { createQqAdapter } from '../src/adapters/qq/index.js'
+import { segmentsToParts } from '../src/adapters/qq/inbound.js'
 import { createFeishuAdapter } from '../src/adapters/feishu/index.js'
 import { createWecomAdapter, encryptWecomFile, WECOM_WS_CMD } from '../src/adapters/wecom/index.js'
 import { createDingtalkAdapter } from '../src/adapters/dingtalk/index.js'
@@ -1012,4 +1013,29 @@ test('WeCom / DingTalk 引用原图端到端通道：引用图片进入 quoteIma
   assert.equal(/\[引用：\[图片\]\]/.test(capturedTurns[1].text), false, 'q.ok=true 时应剥离重复 [引用：[图片]]')
   const dtRefBytes = await hub.referenceImage({ chatId: 'dingtalk:group:cid_dt_e2e' }, 'quote')
   assert.deepEqual(dtRefBytes, png1x1)
+})
+
+test('近期引用缓存不保留完整语音和过大的内联图片，保留占位与引用标识', async (t) => {
+  const cid = 'qq:private:10000001'
+  let mid = 200
+  const gateway = {
+    instances: () => [],
+    caps: () => ({ features: { 'message.quote.read': false, 'message.history.read': false } }),
+    features: () => ({ 'message.quote.read': false, 'message.history.read': false }),
+    toParts: (_chatId, segments) => segmentsToParts(segments).parts,
+    send: async () => ({ messageId: String(++mid) }),
+  }
+  const { hub } = setupHubTest(t, { gateway })
+  const inline = 'base64://' + Buffer.alloc(512 * 1024, 5).toString('base64')
+  const result = await hub.sendSegments(cid, [
+    { type: 'record', data: { file: inline } },
+    { type: 'image', data: { file: inline } },
+  ], '合成媒体')
+  assert.equal(String(result.message_id), '201')
+  const quote = await hub.quotedInfo('201', { chatId: cid, userId: '10000001' })
+  assert.equal(quote.ok, true)
+  assert.equal(quote.records, 1)
+  assert.equal(quote.images.length, 1)
+  assert.equal(quote.images[0].data.messageId, '201')
+  assert.doesNotMatch(JSON.stringify(quote), /base64:\/\//)
 })
