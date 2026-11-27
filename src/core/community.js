@@ -10,6 +10,7 @@
 
 import { createHash, randomUUID } from 'node:crypto'
 import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { access, readFile, readdir } from 'node:fs/promises'
 import { dirname, join, resolve, sep } from 'node:path'
 import { inflateRawSync, crc32 } from 'node:zlib'
 import { dataDir } from './store.js'
@@ -23,12 +24,15 @@ const MAX_ZIP_BYTES = 25 * 1024 * 1024
 const MAX_FILE_BYTES = 64 * 1024 * 1024
 const ID_RE = /^[a-z][a-z0-9-]{1,39}$/
 const INDEX_TTL = 5 * 60_000
+const MARKET_INDEX_TIMEOUT = 8_000
+const INDEX_FAIL_TTL = 30_000
 const RETRY_MS = 1000
 // 安装量用模块库 Releases 里安装包的下载次数：不用额外服务，代价是 GitHub 接口没登录时一小时只给 60 次，
 // 所以读一次缓存一小时；读失败也记下来，5 分钟内不再试，别把额度耗在断网上。
 const STATS_TTL = 60 * 60_000
 const STATS_FAIL_TTL = 5 * 60_000
 const RELEASES_PAGES = 3
+const EMPTY_STATS = { counts: {}, released: {}, source: '', at: 0 }
 
 /** fetch 断网时只说 fetch failed，这里把真正的原因换成人话。 */
 const isNetError = (error) => error instanceof TypeError || error?.name === 'TimeoutError' || error?.name === 'AbortError' || Boolean(error?.cause?.code)
@@ -131,36 +135,82 @@ export function createCommunity({ mods, getConfig, setConfig, log, version, aliv
   // 模块市场索引地址：单一真相，index 下载 / 安装量读取都用它。
   // 支持换地址（自建索引 / 镜像 / 内网）：先看配置 ext.market.registryUrl，再退环境变量，最后回到内置 github。
   const registryUrlOf = () => resolveRegistryUrl(registryUrl, getConfig)
-  let cache = null // { at, index }
+  let cache = null // { at, url, index, sequence }
+  let indexSequence = 0
+  let panelRefresh = null
   let busy = null // 同一时间只跑一个安装 / 卸载
   let progress = null // 安装中：{ id, name, stage: 'index' | 'download' | 'install' | 'start', received, total }
-  let statsCache = null // { at, repo, value }：安装量，见 loadStats
-  let statsMiss = null // { at, repo }：上次读安装量失败的时间
+  let statsState = null
 
   const readSource = (id) => {
     try { return JSON.parse(readFileSync(join(dirOf(id), SOURCE_FILE), 'utf8')) } catch (error) { return null }
   }
   const hasFolder = (id) => existsSync(dirOf(id))
 
-  async function loadIndex({ force = false } = {}) {
-    const url = registryUrlOf()
+  async function fetchIndex(url, signal) {
+    const r = await fetcher(url, { signal, cache: 'no-store' })
+    if (!r.ok) throw new Error(`读不到社区模块索引（HTTP ${r.status}）`)
+    const index = await r.json()
+    signal.throwIfAborted()
+    if (index?.schema !== 1 || (index.modules != null && !Array.isArray(index.modules))) throw new Error('社区模块索引的格式不受支持，检查市场地址或更新插件')
+    return index
+  }
+
+  function rememberIndex(url, sequence, index) {
+    if (!alive() || registryUrlOf() !== url || (cache && cache.sequence > sequence)) return
+    cache = { at: Date.now(), url, index, sequence }
+    if (panelRefresh?.url === url) {
+      panelRefresh.failedAt = null
+      panelRefresh.message = ''
+    }
+  }
+
+  async function loadIndex({ force = false, url = registryUrlOf() } = {}) {
     // 换地址后旧缓存作废（按 URL 判），否则改完地址可能 5 分钟内仍读到旧的索引。
     if (!force && cache && cache.url === url && Date.now() - cache.at < INDEX_TTL) return cache.index
-    const index = await withRetry(async () => {
-      const r = await fetcher(url, { signal: AbortSignal.timeout(20_000), cache: 'no-store' })
-      if (!r.ok) throw new Error(`读不到社区模块索引（HTTP ${r.status}）`)
-      return r.json()
-    }, retryMs)
-    if (index?.schema !== 1) throw new Error('社区模块索引的格式是新版的，先更新插件')
-    cache = { at: Date.now(), url, index }
+    const sequence = ++indexSequence
+    const index = await withRetry(() => fetchIndex(url, AbortSignal.timeout(20_000)), retryMs)
+    rememberIndex(url, sequence, index)
     return index
+  }
+
+  function panelIndexState(url, force) {
+    if (panelRefresh?.url !== url) {
+      panelRefresh?.controller?.abort()
+      if (statsState?.url !== url) statsState?.controller?.abort()
+      panelRefresh = { url, controller: null, job: null, failedAt: null, message: '', forceStats: false }
+    }
+    const state = panelRefresh
+    const snapshot = cache?.url === url ? cache : null
+    const now = Date.now()
+    if (force) state.forceStats = true
+    const retry = state.failedAt == null || now - state.failedAt >= INDEX_FAIL_TTL
+    if (!state.job && alive() && (force || (retry && (!snapshot || now - snapshot.at >= INDEX_TTL)))) {
+      const sequence = ++indexSequence
+      const controller = new AbortController()
+      const timeout = AbortSignal.timeout(MARKET_INDEX_TIMEOUT)
+      const signal = AbortSignal.any([controller.signal, timeout])
+      state.controller = controller
+      state.failedAt = null
+      state.message = ''
+      state.job = fetchIndex(url, signal).then(index => {
+        if (!controller.signal.aborted) rememberIndex(url, sequence, index)
+      }, error => {
+        if (controller.signal.aborted || (cache?.url === url && cache.sequence > sequence)) return
+        const message = timeout.aborted ? '读取模块市场超时，请重试'
+          : isNetError(error) ? '连不上模块市场，请检查网络或代理后重试' : error.message
+        state.failedAt = Date.now()
+        state.message = message
+      }).finally(() => { state.job = null; state.controller = null })
+    }
+    return { state, snapshot }
   }
 
   const revokedReason = (index, id, v) => (index.revoked || []).find((r) => r.id === id && r.versions?.includes(v))?.reason || ''
 
   /** 索引里的仓库地址 → owner/repo。索引是可下载的第三方数据，只认长得对的。 */
-  function repoOf(index) {
-    for (const url of [index?.assetsBase, index?.homepage, registryUrlOf()]) {
+  function repoOf(index, indexUrl) {
+    for (const url of [index?.assetsBase, index?.homepage, indexUrl]) {
       const m = String(url || '').match(/github\.com\/([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)/)
       if (m && ID_RE.test(m[1].toLowerCase()) && ID_RE.test(m[2].toLowerCase())) return `${m[1]}/${m[2]}`
     }
@@ -186,53 +236,69 @@ export function createCommunity({ mods, getConfig, setConfig, log, version, aliv
     return { counts, released }
   }
 
-  /**
-   * 下载量是锦上添花：最多等 6 秒，等不到就先当没有，别把市场页拖住。
-   * 超时后台继续，下一次进来就用缓存了（不重复打接口）。
-   */
-  function statsWithin(index, { force = false } = {}) {
-    return new Promise((done) => {
-      const timer = setTimeout(() => done({ counts: {}, released: {}, source: '', at: 0, failed: true }), 6000)
-      loadStats(index, { force }).then((value) => { clearTimeout(timer); done(value) }, () => { clearTimeout(timer); done({ counts: {}, released: {}, source: '', at: 0, failed: true }) })
-    })
+  async function readStats(repo, signal) {
+    const counts = {}
+    const released = {}
+    // 有令牌就用上：没登录时 GitHub 接口一小时只给 60 次。
+    const token = String(process.env.AURABOT_GITHUB_TOKEN || process.env.GITHUB_TOKEN || '').trim()
+    for (let page = 1; page <= RELEASES_PAGES; page++) {
+      signal.throwIfAborted()
+      const r = await fetcher(`https://api.github.com/repos/${repo}/releases?per_page=100&page=${page}`, {
+        signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]),
+        headers: { accept: 'application/vnd.github+json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
+      })
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      const list = await r.json()
+      signal.throwIfAborted()
+      const pageSum = sumReleases(list)
+      for (const [id, n] of Object.entries(pageSum.counts)) counts[id] = (counts[id] || 0) + n
+      for (const [id, at] of Object.entries(pageSum.released)) if (!released[id] || at > released[id]) released[id] = at
+      if (!Array.isArray(list) || list.length < 100) break
+    }
+    return { counts, released, source: repo, at: Date.now() }
   }
 
-  /**
-   * 每个模块的安装量（近似值：Releases 里安装包的下载次数，更新也算一次）。
-   * 读不到就返回空表，市场照常能用——统计不是必需功能，不能因为它挂掉。
-   */
-  async function loadStats(index, { force = false } = {}) {
-    const repo = repoOf(index)
-    if (!repo) return { counts: {}, released: {}, source: '', at: 0 }
-    if (!force && statsCache && statsCache.repo === repo && Date.now() - statsCache.at < STATS_TTL) return statsCache.value
-    if (!force && statsMiss && statsMiss.repo === repo && Date.now() - statsMiss.at < STATS_FAIL_TTL) return { counts: {}, released: {}, source: repo, at: 0, failed: true }
-    try {
-      const counts = {}
-      const released = {}
-      // 有令牌就用上：没登录时 GitHub 接口一小时只给 60 次，用户多的机器会不够
-      const token = String(process.env.AURABOT_GITHUB_TOKEN || process.env.GITHUB_TOKEN || '').trim()
-      for (let page = 1; page <= RELEASES_PAGES; page++) {
-        const r = await fetcher(`https://api.github.com/repos/${repo}/releases?per_page=100&page=${page}`, {
-          signal: AbortSignal.timeout(5000),
-          headers: { accept: 'application/vnd.github+json', ...(token ? { authorization: `Bearer ${token}` } : {}) },
-        })
-        // 403 是没登录的额度用完了：别再翻页，已有的照用
-        if (!r.ok) throw new Error(`HTTP ${r.status}`)
-        const list = await r.json()
-        const pageSum = sumReleases(list)
-        for (const [id, n] of Object.entries(pageSum.counts)) counts[id] = (counts[id] || 0) + n
-        for (const [id, at] of Object.entries(pageSum.released)) if (!released[id] || at > released[id]) released[id] = at
-        if (!Array.isArray(list) || list.length < 100) break
-      }
-      const value = { counts, released, source: repo, at: Date.now() }
-      statsCache = { at: value.at, repo, value }
-      statsMiss = null
-      return value
-    } catch (error) {
-      statsMiss = { at: Date.now(), repo }
-      log.debug?.('读不到模块下载量：', error?.message || error)
-      return { counts: {}, released: {}, source: repo, at: 0, failed: true }
+  function currentStats(state) {
+    if (!state) return EMPTY_STATS
+    const failed = state.failedAt != null
+    return { ...(state.value || EMPTY_STATS), source: state.repo, failed }
+  }
+
+  function requestStats(index, url, force) {
+    const repo = repoOf(index, url)
+    if (!repo || !alive() || registryUrlOf() !== url) return null
+    if (statsState?.url !== url || statsState.repo !== repo) {
+      statsState?.controller?.abort()
+      statsState = { url, repo, value: null, failedAt: null, job: null, controller: null }
     }
+    const state = statsState
+    const now = Date.now()
+    const due = !state.value || now - state.value.at >= STATS_TTL
+    const retry = state.failedAt == null || now - state.failedAt >= STATS_FAIL_TTL
+    if (!state.job && (force || (retry && due))) {
+      const controller = new AbortController()
+      state.controller = controller
+      state.job = readStats(repo, controller.signal).then(value => {
+        state.value = value
+        state.failedAt = null
+      }, error => {
+        if (!controller.signal.aborted) {
+          state.failedAt = Date.now()
+          log.debug?.('读不到模块下载量：', error?.message || error)
+        }
+      }).finally(() => { state.job = null; state.controller = null })
+    }
+    return state
+  }
+
+  // 旧客户端仍最多等待统计 6 秒，新面板直接使用快照。
+  function statsWithin(state) {
+    if (!state?.job) return Promise.resolve(currentStats(state))
+    return new Promise((done) => {
+      const timer = setTimeout(() => done({ ...currentStats(state), failed: true }), 6000)
+      const finish = () => { clearTimeout(timer); done(currentStats(state)) }
+      state.job.then(finish, finish)
+    })
   }
 
   /** 当前启用的平台（实例名 qq#2 只算平台 qq）。 */
@@ -252,56 +318,113 @@ export function createCommunity({ mods, getConfig, setConfig, log, version, aliv
   }
 
   /** 平台不满足只提示，不阻断安装；用户可以先装上，等启用平台后再生效。 */
-  function platformNote(e) {
-    const wants = platformsOf(e)
+  function platformNote(wants, active) {
     if (wants.includes('*')) return ''
-    const active = enabledPlatforms()
     if (!active.size) return '当前没有启用任何平台'
     const missing = wants.filter((platform) => !active.has(platform))
     return missing.length ? `需要平台：${missing.join('、')}（当前未启用）` : ''
   }
 
   /** 这一条现在装不了的原因；能装返回空串。 */
-  function blocked(index, e) {
+  function blocked(index, e, known) {
     if (Number(e.api) > API_VERSION) return `要扩展接口 v${e.api}，现在的插件只有 v${API_VERSION}，先更新插件`
     if (compareVersions(e.minPluginVersion, version) > 0) return `要插件 ${e.minPluginVersion} 以上，现在是 ${version}，先更新插件`
     if (revokedReason(index, e.id, e.version)) return `这个版本已撤回：${revokedReason(index, e.id, e.version)}`
-    const known = new Set(mods.status().map((m) => m.id))
-    const missing = (e.requires || []).filter((dep) => !known.has(dep))
+    const installed = known ?? new Set(mods.status().map((m) => m.id))
+    const missing = (e.requires || []).filter((dep) => !installed.has(dep))
     return missing.length ? `要先装：${missing.join('、')}` : ''
   }
 
-  function view(index, e, counts = {}, released = {}) {
-    const src = readSource(e.id)
+  function view(index, e, { stats, folders, sources, known, active }) {
+    const src = sources.get(e.id)
+    const platforms = platformsOf(e)
     return {
       ...e,
       // 市场排序用的时间：新索引给 publishedAt；兼容 snake_case 的索引；都没有时退 GitHub Release 时间。
       publishedAt: e.publishedAt || e.published_at || '',
       updatedAt: e.updatedAt || e.updated_at || '',
-      releasedAt: released[e.id] || '',
+      releasedAt: stats.released[e.id] || '',
       installed: src?.version || '',
-      foreign: !src && hasFolder(e.id), // 同名文件夹是用户自己写的
+      foreign: !src && folders.has(e.id), // 同名文件夹是用户自己写的
       update: Boolean(src && compareVersions(e.version, src.version) > 0),
-      blocked: blocked(index, e),
-      platforms: platformsOf(e),
-      platformNote: platformNote(e),
+      blocked: blocked(index, e, known),
+      platforms,
+      platformNote: platformNote(platforms, active),
       moved: e.id in MOVED,
       // 安装量：模块库 Releases 里安装包的下载次数（更新也算），读不到时是 0
-      downloads: Number(counts[e.id]) || 0,
+      downloads: Number(stats.counts[e.id]) || 0,
     }
   }
 
-  async function list({ force = false } = {}) {
-    const index = await loadIndex({ force })
-    const stats = await statsWithin(index, { force })
-    const counts = stats.counts || {}
-    const released = stats.released || {}
-    const entries = (index.modules || []).filter((e) => ID_RE.test(String(e.id))).map((e) => view(index, e, counts, released))
-    // 已安装但索引里没有了（下架）的也列出来，好让用户卸载
-    const known = new Set(entries.map((e) => e.id))
-    const delisted = mods.status().filter((m) => !known.has(m.id) && readSource(m.id)).map((m) => ({ id: m.id, name: m.name, description: m.description, version: readSource(m.id).version, installed: readSource(m.id).version, delisted: true, capabilities: [], platforms: [], platformNote: '', blocked: '', downloads: Number(counts[m.id]) || 0, publishedAt: '', updatedAt: '', releasedAt: released[m.id] || '' }))
-    const revoked = entries.concat(delisted).filter((e) => e.installed && revokedReason(index, e.id, e.installed)).map((e) => ({ id: e.id, version: e.installed, reason: revokedReason(index, e.id, e.installed) }))
-    return { list: [...entries, ...delisted], revoked, generatedAt: index.generatedAt || '', downloads: { source: stats.source || '', at: stats.at || 0, failed: Boolean(stats.failed) } }
+  async function describeIndex(index, stats, { background = false } = {}) {
+    const downloads = { source: stats.source, at: stats.at, failed: Boolean(stats.failed) }
+    if (!index) return { list: [], revoked: [], generatedAt: '', downloads }
+    const entries = (index.modules || []).filter(e => typeof e?.id === 'string' && ID_RE.test(e.id))
+    const liveStatuses = background ? mods.marketStatus?.() : null
+    const statuses = [...(liveStatuses ?? mods.status())]
+    const known = new Set(statuses.map(m => m.id))
+    const active = enabledPlatforms()
+    // 扫一次目录，只读实际存在的来源文件。文件 IO 不阻塞其它面板请求。
+    const localRoot = userDir()
+    const localEntries = await readdir(localRoot, { withFileTypes: true }).catch(() => [])
+    const folders = new Set(localEntries.map(entry => entry.name))
+    if (liveStatuses) {
+      // 安全模式和已停用模块可能还在磁盘上，但没有进入运行时模块表。
+      const missing = localEntries.filter(entry => entry.isDirectory() && !/^[_.]/.test(entry.name) && !known.has(entry.name))
+      const installed = await Promise.all(missing.map(async ({ name }) => {
+        const dir = join(localRoot, name)
+        try {
+          await access(join(dir, 'index.mjs')).catch(() => access(join(dir, 'index.js')))
+          return name
+        } catch { return null }
+      }))
+      for (const id of installed) {
+        if (!id) continue
+        known.add(id)
+        statuses.push({ id, name: id, description: '' })
+      }
+    }
+    const candidates = new Set([...entries.map(e => e.id), ...known])
+    const sources = new Map(await Promise.all([...candidates]
+      .filter(id => folders.has(id))
+      .map(async id => {
+        try { return [id, JSON.parse(await readFile(join(localRoot, id, SOURCE_FILE), 'utf8'))] }
+        catch { return [id, null] }
+      })))
+    const listed = new Set(entries.map(e => e.id))
+    const list = entries.map(e => view(index, e, { stats, folders, sources, known, active }))
+    // 已安装但索引里没有了（下架）的也列出来，好让用户卸载。
+    for (const m of statuses) {
+      const src = sources.get(m.id)
+      if (listed.has(m.id) || !src) continue
+      list.push({ id: m.id, name: m.name, description: m.description, version: src.version, installed: src.version, delisted: true, capabilities: [], platforms: [], platformNote: '', blocked: '', downloads: Number(stats.counts[m.id]) || 0, publishedAt: '', updatedAt: '', releasedAt: stats.released[m.id] || '' })
+    }
+    const revoked = list.filter(e => e.installed && revokedReason(index, e.id, e.installed))
+      .map(e => ({ id: e.id, version: e.installed, reason: revokedReason(index, e.id, e.installed) }))
+    return { list, revoked, generatedAt: index.generatedAt || '', downloads }
+  }
+
+  async function list({ force = false, background = false } = {}) {
+    const url = registryUrlOf()
+    if (!background) {
+      const index = await loadIndex({ force, url })
+      const stats = await statsWithin(requestStats(index, url, force))
+      return describeIndex(index, stats)
+    }
+    const { state, snapshot } = panelIndexState(url, force)
+    const index = snapshot?.index
+    const loading = Boolean(state.job)
+    const stats = index ? requestStats(index, url, !loading && state.forceStats) : null
+    if (index && !loading) state.forceStats = false
+    const status = { loading, cached: Boolean(snapshot), failed: state.failedAt != null, message: state.message }
+    const downloadsLoading = Boolean(stats?.job)
+    const result = await describeIndex(index, currentStats(stats), { background: true })
+    const currentUrl = registryUrlOf()
+    if (currentUrl !== url) {
+      panelIndexState(currentUrl, false)
+      return { list: [], revoked: [], generatedAt: '', index: { loading: true, cached: false, failed: false, message: '' }, downloads: { source: '', at: 0, failed: false, loading: false } }
+    }
+    return { ...result, index: status, downloads: { ...result.downloads, loading: downloadsLoading } }
   }
 
   async function download(index, e) {

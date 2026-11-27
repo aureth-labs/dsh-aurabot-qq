@@ -2061,6 +2061,15 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     return { navigationRevision: navigationRevisionCounter, modules }
   }
 
+  // 市场只需要本地模块的标识和标题，直接读热重载维护的内存状态。
+  function marketStatus() {
+    const ids = new Set([...builtinDefs.keys(), ...userSeen.keys(), ...live.keys()])
+    return [...ids].map(id => {
+      const def = live.get(id)?.def || builtinDefs.get(id) || userMeta.get(id)
+      return { id, name: def?.name || id, description: def?.description || '' }
+    })
+  }
+
   /** file 是不是在 root 目录里面（root 自己不算；越过 root 的 ../ 一律不算）。 */
   function inside(root, file) {
     const rel = relative(resolve(root), resolve(file))
@@ -2185,7 +2194,7 @@ export function createModules({ ctx, core, getConfig, setConfig, logger, version
     use: exportsOf, has: (id) => live.has(id), running: (id) => live.get(id)?.source || null, generation: () => generation,
     capabilitiesOf,
     // 面板首屏提速：导航摘要（纯内存）与导航版本号（安装/启停/失败/重载时递增）
-    summarizeModules, navigationRevision: () => navigationRevisionCounter,
+    summarizeModules, marketStatus, navigationRevision: () => navigationRevisionCounter,
     emit, claim, filter, filterSync, buildTools, resolveTool, toolAliases,
     // 插件核心自己听事件（不属于任何模块，不会被撤掉）
     listen: (event, fn) => { const item = { id: '@core', fn }; listeners.set(event, [...(listeners.get(event) || []), item]); return () => listeners.set(event, (listeners.get(event) || []).filter((x) => x !== item)) }, contextFor, rules, commands, dshTools, builtinOff, activePlatforms: () => [...activePlatforms()], handle,

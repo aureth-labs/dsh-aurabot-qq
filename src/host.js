@@ -5797,8 +5797,12 @@ export function apply(ctx, opts = {}) {
 
   // 模块（面板「扩展」页）
   route('/modules', async () => ({ ok: true, dir: mods.dir(), safeMode: cfg.safeMode, apiVersion: API_VERSION, list: mods.status(), prompt: mods.promptFor('') }))
+  // view=panel 读取当前快照并返回后台刷新状态。旧调用未指定 view 时仍等待索引，
+  // 单次索引请求限时 20 秒，网络错误可重试一次，下载统计最多再等待 6 秒。
   route('/modules/community', async (req) => {
-    try { return { ok: true, ...(await community.list({ force: query(req).force === '1' })) } } catch (error) { return { ok: false, message: error.message, list: [] } }
+    const { force, view } = query(req)
+    try { return { ok: true, ...(await community.list({ force: force === '1', background: view === 'panel' })) } }
+    catch (error) { return { ok: false, message: error.message, list: [] } }
   })
   route('/modules/tutorial', async () => {
     try { return { ok: true, text: readFileSync(join(ROOT, 'docs', 'MODULE-TUTORIAL.md'), 'utf8') } } catch (error) { return { ok: false, message: '教程文件不见了' } }

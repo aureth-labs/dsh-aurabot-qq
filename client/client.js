@@ -10504,21 +10504,58 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
       const [show, setShow] = useState('all')
       const [cat, setCat] = useState('')
       const [sort, setSort] = useState('hot') // hot | latest | updated | default
-      const load = (force) => get('/modules/community' + (force ? '?force=1' : '')).then(setData)
-      useEffect(() => { load() }, [])
+      const mounted = useRef(false)
+      const cancelList = useRef(null)
+      const load = useCallback((force = false, clear = false) => {
+        if (!mounted.current) return
+        cancelList.current?.()
+        if (clear) setData(null)
+        let active = true
+        let refresh = force
+        const stop = pollPanel(async (signal) => {
+          const r = await get('/modules/community?view=panel' + (refresh ? '&force=1' : ''), { signal })
+          if (!active || signal?.aborted) return
+          refresh = false
+          setData(prev => {
+            if (r.ok !== false || !prev?.index?.cached) return r
+            return {
+              ...prev,
+              index: { ...prev.index, loading: false, failed: true, message: r.message },
+              downloads: { ...prev.downloads, loading: false },
+            }
+          })
+          if (!r.index?.loading && !r.downloads?.loading) stop()
+        }, 1000)
+        cancelList.current = () => { active = false; stop() }
+      }, [])
+      useEffect(() => {
+        mounted.current = true
+        load()
+        return () => { mounted.current = false; cancelList.current?.() }
+      }, [load])
       // 模块市场地址：下拉选官方源（GitHub / Gitee 镜像）或自定义。拉当前值与可选源，改完可保存或恢复默认。
       const [regUrl, setRegUrl] = useState('')
       const [regDef, setRegDef] = useState('')
       const [regSources, setRegSources] = useState([])
       const [regMode, setRegMode] = useState('')
-      const loadReg = () => get('/panel/market/registry').then((r) => {
-        if (!r.ok) return
-        setRegUrl(r.registryUrl || '')
-        setRegDef(r.default || '')
-        setRegMode('')
-        if (Array.isArray(r.sources) && r.sources.length) setRegSources(r.sources)
-      })
-      useEffect(() => { loadReg() }, [])
+      const savedRegUrl = useRef(null)
+      const cancelRegRead = useRef(null)
+      useEffect(() => {
+        let active = true
+        const stop = pollPanel(async (signal) => {
+          const r = await get('/panel/market/registry', { signal })
+          if (!active || signal?.aborted) return
+          stop()
+          if (!r.ok) return
+          savedRegUrl.current = r.registryUrl || ''
+          setRegUrl(savedRegUrl.current)
+          setRegDef(r.default || '')
+          if (Array.isArray(r.sources) && r.sources.length) setRegSources(r.sources)
+        }, 1000)
+        const cancel = () => { active = false; stop() }
+        cancelRegRead.current = cancel
+        return cancel
+      }, [])
       const REG_SOURCE_FALLBACK = [
         { id: 'github', label: 'GitHub 官方源', url: 'https://raw.githubusercontent.com/aureth-labs/dsh-aurabot-qq-mods/registry/index.json' },
         { id: 'gitee', label: 'Gitee 官方镜像', url: 'https://raw.giteeusercontent.com/aureth-labs/dsh-aurabot-qq-mods/raw/registry/index.json' },
@@ -10544,22 +10581,30 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           const value = typeof override === 'string' ? override : String(regUrl).trim()
           const r = await post('/panel/market/registry', { registryUrl: value })
           if (!r.ok) toast(r.message || '没成功', 'err')
-          else { toast(r.message || '保存好了', 'ok'); loadReg(); load(true) }
-        } catch (e) { toast(e.message) } finally { setBusy('') }
+          else {
+            toast(r.message || '保存好了', 'ok')
+            if (mounted.current) {
+              cancelRegRead.current?.()
+              const newUrl = r.registryUrl || ''
+              const sourceChanged = newUrl !== savedRegUrl.current
+              savedRegUrl.current = newUrl
+              setRegUrl(newUrl)
+              setRegMode('')
+              load(true, sourceChanged)
+            }
+          }
+        } catch (e) { toast(e.message) } finally { if (mounted.current) setBusy('') }
       }
       // 一直查进度：恢复备份、老用户迁移时模块在后台装，不是从这个页面点的
-      useEffect(() => {
-        let was = false
-        const tick = () => get('/modules/community/progress').then((r) => {
-          const now = r.progress || null
-          setProg(now)
-          if (was && !now) load()
-          was = Boolean(now)
-        })
-        const t = setInterval(tick, busy ? 300 : 1000)
-        tick()
-        return () => clearInterval(t)
-      }, [busy])
+      const progressSeen = useRef(false)
+      useEffect(() => pollPanel(async (signal) => {
+        const r = await get('/modules/community/progress', { signal })
+        if (!mounted.current || signal?.aborted || r.ok === false) return
+        const now = r.progress || null
+        setProg(now)
+        if (progressSeen.current && !now && !busy) load()
+        progressSeen.current = Boolean(now)
+      }, busy ? 300 : 1000), [busy, load])
       const percent = prog && prog.total ? Math.min(100, Math.round(prog.received / prog.total * 100)) : 0
       const stageText = () => {
         if (prog.stage === 'index') return '读取模块列表…'
@@ -10573,9 +10618,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         h('div', { className: 'ab-flex', style: { justifyContent: 'space-between' } }, h('b', null, (prog.batch ? '正在一键更新 ' + prog.batch.index + '/' + prog.batch.total + '：' : '正在安装「') + (prog.name || prog.id) + (prog.batch ? '' : '」')), h('span', { className: 'ab-muted ab-small' }, stageText())),
         h('div', { style: { height: 6, borderRadius: 3, background: 'var(--ab-foam-2)', marginTop: 8, overflow: 'hidden' } },
           h('div', { style: { height: '100%', width: (STAGE_BAR[prog.stage] || Math.max(12, 10 + percent * 0.8)) + '%', background: 'var(--ab-sea)', transition: 'width .3s' } }))) : null
-      const done = async (r) => {
+      const done = (r) => {
         toast(r.message, r.ok ? 'ok' : 'err')
-        await load()
+        load()
         reload()
       }
       const install = async (m) => {
@@ -10584,15 +10629,16 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         if (!confirm((m.installed ? '更新' : '安装') + '「' + m.name + '」？\n\n' + why)) return
         if (m.replacesBuiltin && !confirm('「' + m.name + '」会替换同名内置模块，确定吗？')) return
         setBusy(m.id)
-        try { await done(await post('/modules/community/install', { id: m.id, confirmReplace: Boolean(m.replacesBuiltin) })) } finally { setBusy('') }
+        try { done(await post('/modules/community/install', { id: m.id, confirmReplace: Boolean(m.replacesBuiltin) })) } finally { if (mounted.current) setBusy('') }
       }
       const remove = async (m) => {
         if (!confirm('卸载「' + m.name + '」？\n模块目录和本地改动会移到 modules/.trash。')) return
         const purge = confirm('把模块数据和设置也清掉吗？\n确定 = 清除数据和设置\n取消 = 保留数据和设置，重装还能用')
         setBusy(m.id)
-        try { await done(await post('/modules/community/remove', { id: m.id, purge })) } finally { setBusy('') }
+        try { done(await post('/modules/community/remove', { id: m.id, purge })) } finally { if (mounted.current) setBusy('') }
       }
       const list = (data && data.list) || []
+      const index = data?.index || {}
       const stats = (data && data.downloads) || {}
       const counts = { all: list.length, installed: list.filter((m) => m.installed).length, update: list.filter((m) => m.update).length }
       // 一键更新：把「可更新」的模块一次更新完。后端整批只占一个锁，单个失败不影响后面的。
@@ -10603,9 +10649,9 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         setBusy('update-all')
         try {
           const r = await post('/modules/community/update-all', {})
-          await done(r)
+          done(r)
           if (r.failed && r.failed.length) toast('没更新成功：' + r.failed.map((x) => x.name || x.id).join('、'), 'err')
-        } catch (e) { toast(e.message, 'err') } finally { setBusy('') }
+        } catch (e) { toast(e.message, 'err') } finally { if (mounted.current) setBusy('') }
       }
       const word = q.trim().toLowerCase()
       const cats = [...new Set(list.map((m) => m.category).filter(Boolean))]
@@ -10675,12 +10721,16 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
             h('button', { type: 'button', className: cx('ab-chip', effectiveSort === 'latest' && 'on'), onClick: () => setSort((v) => (v === 'latest' ? 'default' : 'latest')), title: '按模块当前版本的发布时间排序（索引 publishedAt，缺失时用 GitHub Release 时间）' }, '最新发布'),
             h('button', { type: 'button', className: cx('ab-chip', effectiveSort === 'updated' && 'on'), onClick: () => setSort((v) => (v === 'updated' ? 'default' : 'updated')), title: '按模块最近更新时间排序（索引 updatedAt，缺失时用发布时间）' }, '最近更新')),
           cats.length > 1 ? h('div', { className: 'ab-flex', style: { marginTop: 10 } }, [''].concat(cats).map((c) => h('button', { key: c || 'any', type: 'button', className: cx('ab-chip', cat === c && 'on'), onClick: () => setCat(c) }, c ? CATEGORY_LABEL[c] || c : '全部分类'))) : null,
-          stats.failed && list.length ? h('div', { className: 'ab-small ab-muted', style: { marginTop: 8 } }, '这次没读到下载次数（GitHub 接口连不上或额度用完了），按热度排不了，可以改用「最新发布 / 最近更新」。') : null,
+          index.loading && index.cached ? h('div', { className: 'ab-small ab-muted', role: 'status', style: { marginTop: 8 } }, '正在更新模块列表…') : null,
+          stats.loading && list.length ? h('div', { className: 'ab-small ab-muted', role: 'status', style: { marginTop: 8 } }, '正在更新下载次数…') : null,
+          !stats.loading && stats.failed && list.length ? h('div', { className: 'ab-small ab-muted', style: { marginTop: 8 } }, '这次没读到下载次数（GitHub 接口连不上或额度用完了），按热度排不了，可以改用「最新发布 / 最近更新」。') : null,
           missingTimes ? h('div', { className: 'ab-small ab-muted', style: { marginTop: 8 } }, '有 ' + missingTimes + ' 个模块没有发布时间/更新时间，按原顺序排在最后。') : null,
           ((data && data.revoked) || []).map((r) => h('div', { key: r.id, className: 'ab-note err', style: { marginTop: 10 } }, '「' + r.id + '」' + r.version + ' 已撤回：' + r.reason + '。建议关闭或卸载。'))),
-        !data ? h(Empty, { icon: '⏳', text: '加载中…' }) : null,
-        data && data.ok === false ? h('div', { className: 'ab-note warn' }, '市场打不开：' + data.message) : null,
-        data && data.ok !== false && !shown.length ? h(Empty, { icon: '🐟', text: list.length ? '没有符合条件的模块' : '市场里还没有模块' }) : null,
+        !data || (index.loading && !index.cached) ? h(Empty, { icon: '⏳', text: '正在读取模块列表…' }) : null,
+        data && (data.ok === false || index.failed) ? h('div', { className: 'ab-note warn', role: 'status' },
+          (index.cached ? '未能更新，显示上次读取的列表：' : '市场打不开：') + (index.message || data.message || '读不到模块列表'),
+          ' 点击上方「刷新」可重新读取。') : null,
+        data && data.ok !== false && !index.loading && (!index.failed || index.cached) && !shown.length ? h(Empty, { icon: '🐟', text: list.length ? '没有符合条件的模块' : '市场里还没有模块' }) : null,
         shown.length ? h('div', { className: 'ab-grid ab-market-grid' }, shown.map(card)) : null,
         h(ModuleTutorial, { toast }))
     }
