@@ -25,6 +25,7 @@
 import {
   DEFAULT_EMOTIONS, emotionLabels, emotionProfiles, profileOf, resolveEmotion,
 } from '../features/mood-emotions.js';
+import { BIG } from '../core/config.js';
 
 export const PURPOSE_STATE_VERSION = 1;
 // 到期事实优先关心；只由记忆库提供到期的一件，不在目的状态里复制排程。
@@ -163,7 +164,7 @@ export function normalizePurposeConfig(input = {}, { ownerQQ = '' } = {}) {
     gapMaxMs,
     initialDelayMinMs: clampInt(src.initialDelayMinMs, DEFAULT_PURPOSE_CONFIG.initialDelayMinMs, MINUTE, 12 * HOUR),
     // 0 = 不限次数（仍受 token 额度与安静时段约束）。
-    dailyMax: clampInt(src.dailyMax, DEFAULT_PURPOSE_CONFIG.dailyMax, 0, 24),
+    dailyMax: clampInt(src.dailyMax, DEFAULT_PURPOSE_CONFIG.dailyMax, 0, BIG),
     quietStart: parseClock(src.quietStart, DEFAULT_PURPOSE_CONFIG.quietStart).text,
     quietEnd: parseClock(src.quietEnd, DEFAULT_PURPOSE_CONFIG.quietEnd).text,
     idleThresholdMs: clampInt(src.idleThresholdMs, DEFAULT_PURPOSE_CONFIG.idleThresholdMs, 0, 12 * HOUR),
@@ -273,7 +274,7 @@ export function normalizePurposeState(raw, now = Date.now()) {
   const base = createPurposeState(now);
   if (!isPlainObject(raw)) return base;
   base.day = /^\d{4}-\d{2}-\d{2}$/.test(String(raw.day ?? '')) ? String(raw.day) : localDateKey(now);
-  base.countToday = clampInt(raw.countToday, 0, 0, 99);
+  base.countToday = clampInt(raw.countToday, 0, 0, BIG);
   base.lastRunAt = Number(raw.lastRunAt) || 0;
   base.lastAttemptAt = Number(raw.lastAttemptAt) || 0;
   base.lastSentAt = Number(raw.lastSentAt) || 0;
@@ -1138,7 +1139,7 @@ export function applyPersonaOverrides(config, persona = null) {
     out.riskScale = Math.min(2, Math.max(0.3, (Number(config.riskScale) || 1) * ov.riskScale));
   }
   if (Number.isFinite(ov.dailyMaxBonus) && (Number(out.dailyMax) || 0) > 0) {
-    out.dailyMax = clampInt(out.dailyMax + ov.dailyMaxBonus, out.dailyMax, 0, 24);
+    out.dailyMax = clampInt(out.dailyMax + ov.dailyMaxBonus, out.dailyMax, 0, BIG); // 上限口径不封顶（与 normalizePurposeConfig 同步，BIG 只防手滑）
   }
   out.connectFloor = Number.isFinite(ov.connectFloor)
     ? Math.min(0.3, Math.max(0, ov.connectFloor))

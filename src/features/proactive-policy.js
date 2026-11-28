@@ -44,6 +44,7 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { inHourWindow, nextWindowStart } from '../core/time-window.js'
+import { BIG } from '../core/config.js'
 
 const MINUTE = 60_000
 const VERSION = 1
@@ -167,7 +168,7 @@ function normalizeBudgetState(raw, at, ownerQQ) {
   for (const [name, lim] of Object.entries(limits)) {
     if (!isPlainObject(lim)) continue
     s.sourceLimits[name] = {
-      dailyMax: clampInt(lim.dailyMax, 0, 0, 999),
+      dailyMax: clampInt(lim.dailyMax, 0, 0, BIG), // 与全模块「上限不封顶」统一口径（BIG 只防手滑）；纯展示字段
       minGapMs: clampInt(lim.minGapMs, 0, 0, 24 * 60 * MINUTE),
     }
   }
@@ -227,7 +228,7 @@ export function createSharedBudget({ ownerQQ, dataDir, now, log, dailyMax, minGa
   function setLimits({ source, dailyMax: srcDailyMax, minGapMs: srcMinGap, sharedDailyMax } = {}) {
     const name = String(source ?? '').trim() || 'unknown'
     state.sourceLimits[name] = {
-      dailyMax: clampInt(srcDailyMax, 0, 0, 999),
+      dailyMax: clampInt(srcDailyMax, 0, 0, BIG), // 同上：不封顶口径，纯展示
       minGapMs: clampInt(srcMinGap, 0, 0, 24 * 60 * MINUTE),
     }
     if (sharedDailyMax !== undefined && sharedDailyMax !== null) {
@@ -420,7 +421,9 @@ export function createPurposePolicy({ getConfig, engine, state, now, dataDir, lo
 
   function enabled() {
     const cfg = cfgOf()
-    return cfg.enabled !== false && cfg.ext?.purpose?.enabled === true
+    // 缺省 = 开（与 purpose/module.js 的 enabled: cfg.enabled !== false && ext.enabled !== false 对齐）：
+    // 只在显式 false（主人关过）时才关。
+    return cfg.enabled !== false && cfg.ext?.purpose?.enabled !== false
   }
 
   /** 配置 → 门闸参数（与 purpose/module.js 的 purposeConfig 同口径，这里自带一份）。 */
@@ -430,18 +433,21 @@ export function createPurposePolicy({ getConfig, engine, state, now, dataDir, lo
     const su = cfg.speakUp || {}
     const awakeFrom = clampInt(ext.awakeFrom ?? su.awakeFrom, 8, 0, 24)
     const awakeTo = clampInt(ext.awakeTo ?? su.awakeTo, 23, 0, 24)
-    const attemptMaxRaw = clampInt(ext.maxPerDay ?? su.maxPerDay, 4, 0, 24)
+    const attemptMaxRaw = clampInt(ext.maxPerDay ?? su.maxPerDay, 3, 0, BIG) // 默认与 purpose/module.js 统一为 3；上限不封顶（BIG 只防手滑）
     const attemptMax = unlimitedIfZero(attemptMaxRaw)
-    const speechMax = unlimitedIfZero(clampInt(ext.speechMaxPerDay ?? attemptMaxRaw, attemptMaxRaw, 0, 24))
+    const speechMax = unlimitedIfZero(clampInt(ext.speechMaxPerDay ?? attemptMaxRaw, attemptMaxRaw, 0, BIG))
+    // pacing 与 purpose/module.js purposeConfig 同系数（conservative 1.5×、active 0.6×），保证面板预览与实际闸门一致
+    const pace = { conservative: 1.5, default: 1, active: 0.6 }[ext.pacing] || 1
     const gapMinMin = clampInt(ext.minIntervalMinutes ?? su.minIntervalMinutes, 90, 5, 2880)
     const gapMaxMin = Math.max(gapMinMin, clampInt(ext.maxIntervalMinutes ?? su.maxIntervalMinutes, 240, 5, 2880))
+    const clampGap = (ms) => Math.min(24 * 60 * MINUTE, Math.max(5 * MINUTE, ms))
     return {
       awakeFrom,
       awakeTo,
       attemptMax,
       speechMax,
-      gapMinMs: gapMinMin * MINUTE,
-      gapMaxMs: gapMaxMin * MINUTE,
+      gapMinMs: clampGap(Math.round(gapMinMin * pace) * MINUTE),
+      gapMaxMs: clampGap(Math.round(gapMaxMin * pace) * MINUTE),
     }
   }
 

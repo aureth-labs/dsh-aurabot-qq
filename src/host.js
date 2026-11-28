@@ -1392,6 +1392,7 @@ export function apply(ctx) {
         : null,
       quietStart: quiet.quietStart,
       quietEnd: quiet.quietEnd,
+      // 面板回显必须等于引擎生效值：purposeConfig 读 ext.maxPerDay ?? su.maxPerDay（覆写位，见 PURPOSE_MODULE_API §5），这里同序读。
       dailyMax: Number.isFinite(ext.maxPerDay) ? ext.maxPerDay : (Number.isFinite(sp.maxPerDay) ? sp.maxPerDay : null),
       awakeFrom,
       awakeTo,

@@ -112,6 +112,11 @@ preview 变为 async（打分是 I/O）；`/panel/purpose/status` 附 `models` �
 `allow`（白名单朋友线，memory.js 相识判定与 QQ 内 `/speak` 命令同读此键）——
 ext.purpose 同名键可覆写。追问键已翻到 `ext.purpose.nudge`（读保持 `ext.purpose.nudge ?? speakUp.nudge ?? true` 双层兼容）；
 小闹钟键 `speakUp.reminderEnabled/reminderLimit/reminderRetry` 由 purpose 维护（P2b 迁入）。
+**说话节奏 `ext.purpose.pacing`**（保守/默认/活跃三档，默认 `default`；未知值回退 default）：
+`conservative` = 说话间隔（`minIntervalMinutes/maxIntervalMinutes` → gapMinMs/gapMaxMs）整体 ×1.5，
+`active` = ×0.6；乘完后仍夹回引擎统一区间 **[5 分钟, 24 小时]**（不会突破沉默下限，也不会憋超过一天）。
+同一系数同步应用于面板 gateConf 预览（`proactive-policy.js`），预览与实际排程一致；
+`dailyMax`（`speakUp.maxPerDay`）与 pacing 独立——pacing 管多密，dailyMax 管总量（0 = 不限）。
 
 ## 6. 其它接线事实
 

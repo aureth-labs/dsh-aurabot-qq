@@ -10,6 +10,7 @@
 // （P1~P3）仍在，companion 会见目的引擎开着而自动让位，迁移说明见 docs/PURPOSE_MODULE_API.md。
 
 import { dataDir, readJson, writeJson } from '../core/store.js'
+import { BIG } from '../core/config.js'
 import { randomUUID } from 'node:crypto'
 import { quietWindowOf } from '../core/time-window.js'
 import { cleanOutboundText } from '../chat/reply.js'
@@ -60,6 +61,10 @@ export function purposeConfig(cfg = {}) {
   // awakeTo=24 是「醒到午夜」不是全天：7~24 ⇒ 安静 00:00~07:00；只有 0~24（真全天醒）才关闭安静时段。
   const quiet = quietWindowOf(awakeFrom, awakeTo)
   // normalizePurposeConfig 只认引擎字段，打分模型在归一化后补挂（面板下拉同款结构校验）
+  // pacing 节流（面板「说话节奏」）：conservative 放慢 1.5×、active 加密 0.6×、default/未知值 = 1。
+  // 乘在 clamp 之后、分钟→毫秒换算之前；乘完夹回引擎认的 [5 分钟, 24 小时]（与 engine.js normalize 同口径）。
+  const pace = { conservative: 1.5, default: 1, active: 0.6 }[ext.pacing] || 1
+  const clampGap = (ms) => Math.min(24 * 60 * MINUTE, Math.max(5 * MINUTE, ms))
   return {
     ...normalizePurposeConfig({
       // 总开关只看本模块自己的设置（ext.purpose.enabled）。P1/Q1 拍板默认开：
@@ -67,10 +72,10 @@ export function purposeConfig(cfg = {}) {
       // 与旧的「主动搭话」互不影响——companion 见 ext.purpose.enabled 会自动让位。
       enabled: cfg.enabled !== false && ext.enabled !== false,
       ownerUin: cfg.ownerQQ,
-      gapMinMs: clampInt(ext.minIntervalMinutes ?? su.minIntervalMinutes, 90, 5, 2880) * MINUTE,
-      gapMaxMs: clampInt(ext.maxIntervalMinutes ?? su.maxIntervalMinutes, 240, 5, 2880) * MINUTE,
+      gapMinMs: clampGap(Math.round(clampInt(ext.minIntervalMinutes ?? su.minIntervalMinutes, 90, 5, 2880) * pace) * MINUTE),
+      gapMaxMs: clampGap(Math.round(clampInt(ext.maxIntervalMinutes ?? su.maxIntervalMinutes, 240, 5, 2880) * pace) * MINUTE),
       initialDelayMinMs: clampInt(ext.initialDelayMinutes, 15, 1, 720) * MINUTE,
-      dailyMax: clampInt(ext.maxPerDay ?? su.maxPerDay, 3, 0, 20),
+      dailyMax: clampInt(ext.maxPerDay ?? su.maxPerDay, 3, 0, BIG),
       idleThresholdMs: clampInt(ext.idleMinutes ?? su.idleMinutes, 40, 0, 1440) * MINUTE,
       minMaterials: clampInt(ext.minMaterials, DEFAULT_PURPOSE_CONFIG.minMaterials, 0, 20),
       maxMaterials: clampInt(ext.maxMaterials, DEFAULT_PURPOSE_CONFIG.maxMaterials, 6, 80),
@@ -578,16 +583,22 @@ export function createPurpose({ getConfig, setConfig, hub, log, isMuted, mood, m
 
   // ---------- 生成 + 投递 + 回执（hub.deliver 内部吞错，成功判定看返回值） ----------
   async function runOnce({ reason = '定时', config, state, force = false, friend = '' } = {}) {
-    const cooldown = hub.systemSessionCooldown?.('purpose', { key: friend })
+    // force=true（手动触发 fire()）跳过排程类闸门（会话冷却/聊天冷却）；
+    // 但 dailyMax 计数与投递记账照常——手动开口同样占当日次数（防烧钱）。
+    const cooldown = force ? null : hub.systemSessionCooldown?.('purpose', { key: friend })
     if (cooldown) return { outcome: 'skipped-cooldown', retryAt: cooldown.retryAt }
     // 迁进私聊会话之后（#446），会话故障的退避是记在 `private:<QQ>` 上的，不是 `system:purpose`。
     // 这里必须先查它：否则第一次挂载失败之后每个 tick 都会重新 prepare、重算驱动力/目标并落盘，
     // 把状态文件改得面目全非（实测会把 drives 一路推高），而实际一条消息都发不出去。
     const cfg = getConfig()
+    // 注意：chatCooldown 是「私聊会话挂载失败退避」（记在 private:<QQ> 上），不是排程冷却——
+    // 对 force 同样生效：否则挂载故障期间每次手动触发都会重新 prepare 落盘、推高 drives（见 #446 注释）。
     const roomCooldown = friend ? null : hub.chatCooldown?.(chatIdOf(cfg))
     if (roomCooldown) return { outcome: 'skipped-cooldown', retryAt: roomCooldown.retryAt }
     const now = Date.now()
     ensurePurposeDay(state, now)
+    // 每日上限对 force 同样生效（手动开口也占当日次数，防烧钱）；0 = 不限（与 engine.js 同口径）。
+    if (config.dailyMax > 0 && state.countToday >= config.dailyMax) return { outcome: 'daily-max' }
     const ctx = await prepare(cfg, config, state, now, friend)
     state.drives = ctx.drives
     state.drivesAt = now

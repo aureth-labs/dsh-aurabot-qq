@@ -471,7 +471,7 @@ function deepMerge(base, over) {
   return out
 }
 
-const BIG = 1e6 // 没有天然上限的数值：只防手滑填出离谱值，不当真限制
+export const BIG = 1e6 // 没有天然上限的数值：只防手滑填出离谱值，不当真限制
 const num = (v, d, lo, hi) => {
   const n = Number(v)
   return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : d
