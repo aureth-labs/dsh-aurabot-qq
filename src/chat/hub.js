@@ -3239,10 +3239,17 @@ export function createHub({ dsh, getConfig, log, onebot, outbox, stickers, tts, 
     let route = null
     if (imageRoom > 0) {
       route = await visionRoute(chat)
-      for (const x of fresh) {
+      // Spend the bounded image slots on requests to the bot first, then recent
+      // background quotes. Old quotations must not crowd out the question's image.
+      const recent = fresh.slice().reverse()
+      const quotes = [...recent.filter(x => x.direct || x.at), ...recent.filter(x => !x.direct && !x.at)]
+      const seenQuotes = new Set()
+      for (const x of quotes) {
         if (!x.quote?.ok || (!x.quote.images.length && !x.quote.stickers.length)) continue
+        if (seenQuotes.has(x.replyId)) continue
         const take = Math.min(2, imageRoom - quotedImages.length)
         if (take <= 0) break
+        seenQuotes.add(x.replyId)
         quotedImages.push(...await quoteImages(x.quote, take, route))
       }
     }
