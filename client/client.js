@@ -4089,9 +4089,19 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
               h(Btn, { small: true, onClick: doPreview, disabled: busy === 'preview' }, busy === 'preview' ? '预览中…' : '预览'),
               h('span', { className: 'ab-muted ab-small' }, s && s.running ? '上一轮还没结束' : '')),
             showPv && pv ? h('div', { className: 'ab-note', style: { marginTop: 8 } },
-              h('div', { className: 'ab-small' }, '素材 ' + pv.materialCount + ' 条 · 候选 ' + pv.candidates.length + ' 个（阈值 ' + pv.thresholds.minCuriosity + '）'),
-              pv.candidates.map((c) => h('div', { key: c.title, className: 'ab-small', style: { marginTop: 4 } }, '✓ 「' + c.title + '」 ' + c.score.toFixed(2) + ' — ' + c.reason)),
-              pv.rejected.slice(0, 3).map((x, i) => h('div', { key: i, className: 'ab-small ab-muted', style: { marginTop: 2 } }, '✗ 「' + x.title + '」 ' + x.score.toFixed(2) + ' — ' + x.why)),
+              // v5 的 /autotelic/preview 换了形状（observe / recent / schedule / nextFireAt），
+              // 旧渲染直接读 pv.candidates.length 会整页崩（真机抓过：Cannot read properties of undefined）。
+              // 两套形状都认：有 v5 标记走新文案，老接口按原样渲染，字段一律判空。
+              pv.v5
+                ? h('div', null,
+                  h('div', { className: 'ab-small' }, '最近注意到 ' + ((pv.observe && pv.observe.total) || 0) + ' 条 · 下次回味 ' + (pv.nextFireAt ? timeAgo(pv.nextFireAt) + '（' + new Date(pv.nextFireAt).toLocaleString() + '）' : '还没排')
+                    + (pv.schedule ? ' · 今日 ' + (pv.schedule.countToday || 0) + ' / ' + (pv.schedule.maxPerDay || 0) + ' 轮' : '')),
+                  (pv.recent || []).slice(0, 5).map((x) => h('div', { key: x.id, className: 'ab-small', style: { marginTop: 4 } }, '· [' + (x.tag || x.source || '观察') + '] ' + clipText(x.text, 90))),
+                  pv.hint ? h('div', { className: 'ab-small ab-muted', style: { marginTop: 4 } }, pv.hint) : null)
+                : h('div', null,
+                  h('div', { className: 'ab-small' }, '素材 ' + (pv.materialCount || 0) + ' 条 · 候选 ' + (pv.candidates || []).length + ' 个' + (pv.thresholds ? '（阈值 ' + (pv.thresholds.minCuriosity != null ? pv.thresholds.minCuriosity : '?') + '）' : '')),
+                  (pv.candidates || []).map((c) => h('div', { key: c.title, className: 'ab-small', style: { marginTop: 4 } }, '✓ 「' + c.title + '」 ' + (c.score != null ? c.score.toFixed(2) : '?') + ' — ' + (c.reason || ''))),
+                  (pv.rejected || []).slice(0, 3).map((x, i) => h('div', { key: i, className: 'ab-small ab-muted', style: { marginTop: 2 } }, '✗ 「' + x.title + '」 ' + (x.score != null ? x.score.toFixed(2) : '?') + ' — ' + (x.why || '')))),
               // 预审否决（账本里记着的，2026-11-05 少爷定）：让她「想办但被拦下」的东西看得见
               (s && s.screenVetoes && s.screenVetoes.length)
                 ? h('div', { style: { marginTop: 8, paddingTop: 8, borderTop: '1px dashed var(--ab-line, #dbe5ea)' } },
