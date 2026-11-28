@@ -1,0 +1,14 @@
+{
+  "id": "video-understand",
+  "name": "视频理解",
+  "version": "1.0.0",
+  "description": "可复用的视频理解基础模块：B站字幕提取 → ASR 语音识别 → 抽帧+视觉描述三条主力路线，统一 understand/supports/estimate/status 接口，内置路由降级与结果缓存，支持 DSH 内置通道与第三方 OpenAI 兼容接口双通道切换。",
+  "category": "tool",
+  "tags": ["视频", "字幕", "ASR", "语音识别", "视觉理解", "基础能力"],
+  "author": "Aurabot contributors",
+  "license": "MIT",
+  "api": 1,
+  "minPluginVersion": "1.2.0",
+  "requires": [],
+  "capabilities": ["network", "filesystem", "process"]
+}

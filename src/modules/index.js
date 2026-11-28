@@ -20,5 +20,6 @@ import contacts from './contacts/index.js'
 import video from './video/index.js'
 import imageRecovery from './image-recovery/index.js'
 import inputRejectionNotice from './input-rejection-notice/index.js'
+import videoUnderstand from './video-understand/index.js'
 
-export const BUILTINS = [stickers, voice, mood, memory, qqTools, qqApi, imagegen, diary, qzoneSocial, purpose, autotelic, bili, song, profile, contacts, video, imageRecovery, inputRejectionNotice]
+export const BUILTINS = [stickers, voice, mood, memory, qqTools, qqApi, imagegen, diary, qzoneSocial, purpose, autotelic, bili, song, profile, contacts, video, imageRecovery, inputRejectionNotice, videoUnderstand]

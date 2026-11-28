@@ -79,16 +79,17 @@ export function grabFrame(ffmpeg, url, at, { width = 512, timeoutMs = 15000, max
 
 const SYSTEM = '你在看一个视频的若干张截图。只写画面上确实能看到的东西：场景、人物、物体、动作、画面里的文字 / 字幕条 / 贴纸。不要猜剧情，不要编造没出现的内容，不要发表感想。用 3~6 句中文写。'
 
-/** 把几帧交给视觉模型，换一段画面描述。 */
-export async function describeFrames(dsh, { info, frames, cfg }) {
+/** 把几帧交给视觉模型，换一段画面描述。model/prompt/maxTokens 为可选覆盖（video-understand 模块复用），不传时行为不变。 */
+export async function describeFrames(dsh, { info, frames, cfg, model, prompt, maxTokens }) {
   const images = frames.map((f) => ({ data: f.toString('base64'), mediaType: 'image/jpeg' }))
   const text = await askModel(dsh, {
-        module: 'bili-vision',
     cfg,
+    module: 'bili-vision',
+    ...(model && model.provider && model.model ? { model } : {}),
     system: SYSTEM,
-    text: `这些截图来自视频《${info.title}》（UP主 ${info.author || '?'}，时长 ${Math.round(Number(info.duration) || 0)} 秒），按时间先后排列，大致分布在全片 5%~95% 的位置。\n把它们当成「我看到了什么」如实记下来。`,
+    text: prompt || `这些截图来自视频《${info.title}》（UP主 ${info.author || '?'}，时长 ${Math.round(Number(info.duration) || 0)} 秒），按时间先后排列，大致分布在全片 5%~95% 的位置。\n把它们当成「我看到了什么」如实记下来。`,
     images,
-    maxTokens: 1000,
+    maxTokens: maxTokens || 1000,
     temperature: 0.3,
   })
   return String(text || '').trim()
