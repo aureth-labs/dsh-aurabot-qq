@@ -982,6 +982,22 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
         list: (path, props) => h(ListArea, { value: getPath(draft, path) || [], placeholder: props && props.placeholder, numbers: props && props.numbers, onChange: (v) => setDraft(setPath(draft, path, v)) }),
         select: (path, options, props) => h(Select, { value: getPath(draft, path) ?? '', options, onChange: (v) => setDraft(setPath(draft, path, v)), ...(props || {}) }),
         choices: (path, options) => h(Choices, { value: getPath(draft, path), options, onChange: (v) => setDraft(setPath(draft, path, v)) }),
+        // 密钥输入：publicConfig 只回流 *Set、不回流原文；按后端约定空串=没改（保留旧值），
+        // 只有显式 null=清空。把输入框删空不会触发保存，所以已配置时必须给一个清空按钮。
+        secret: (path, props) => {
+          const value = getPath(draft, path)
+          const isSet = Boolean(getPath(draft, `${path}Set`))
+          const input = h('input', {
+            className: cx('ab-input', props && props.size),
+            type: 'password',
+            value: value ?? '',
+            placeholder: value === null ? '保存后清空' : (props && props.placeholder),
+            onChange: (e) => setDraft(setPath(draft, path, e.target.value)),
+          })
+          if (!isSet) return input
+          return h('div', { className: 'ab-flex' }, input,
+            h(Btn, { small: true, kind: 'ghost', onClick: () => setDraft(setPath(draft, path, value === null ? '' : null)) }, value === null ? '撤销' : '清空'))
+        },
       }
     }
 
@@ -1604,7 +1620,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
     function OneBotFields({ draft, f }) {
       return h(Fragment, null,
         h(Row, { label: 'WebSocket 地址', hint: '正向 WebSocket（OneBot v11），收消息靠它，必填。DSH 在 Docker 里的话，要填 DSH 容器能访问到的地址' }, f.text('snowluma.wsUrl', { size: 'wide', placeholder: 'ws://127.0.0.1:3001' })),
-        h(Row, { label: 'WebSocket 令牌', hint: '对方设了 access_token 就填，没设留空' }, f.text('snowluma.wsToken', { type: 'password', placeholder: draft.snowluma.wsTokenSet ? '已保存' : '没有就留空' })),
+        h(Row, { label: 'WebSocket 令牌', hint: '对方设了 access_token 就填，没设留空' }, f.secret('snowluma.wsToken', { placeholder: draft.snowluma.wsTokenSet ? '已保存' : '没有就留空' })),
         h(Row, { label: 'HTTP 地址', hint: '可选。填了就用 HTTP 调接口，不填就都走 WebSocket' }, f.text('snowluma.httpUrl', { size: 'wide', placeholder: 'http://127.0.0.1:3000' })),
         h(Row, { label: 'HTTP 令牌' }, f.text('snowluma.httpToken', { type: 'password', placeholder: draft.snowluma.httpTokenSet ? '已保存' : '没有就留空' })))
     }
@@ -1730,7 +1746,7 @@ body[data-ds-dark-theme] .ab-root,.ab-root.ab-dark{--ab-shadow:0 1px 2px rgba(0,
           h(Row, { label: '手动 HTTP 地址', hint: '留空 = 自动' }, f.text('snowluma.httpUrl', { placeholder: 'http://127.0.0.1:3000' })),
           h(Row, { label: '手动 WS 地址', hint: '留空 = 自动' }, f.text('snowluma.wsUrl', { placeholder: 'ws://127.0.0.1:3001' })),
           h(Row, { label: '手动 HTTP 令牌' }, f.text('snowluma.httpToken', { type: 'password', placeholder: draft.snowluma.httpTokenSet ? '已保存' : '留空 = 自动' })),
-          h(Row, { label: '手动 WS 令牌' }, f.text('snowluma.wsToken', { type: 'password', placeholder: draft.snowluma.wsTokenSet ? '已保存' : '留空 = 自动' })),
+          h(Row, { label: '手动 WS 令牌' }, f.secret('snowluma.wsToken', { placeholder: draft.snowluma.wsTokenSet ? '已保存' : '留空 = 自动' })),
         ),
       )
     }
